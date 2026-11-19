@@ -157,19 +157,31 @@ describe('Tier 1 Feature Coverage: Features F19 - F20 (Automated Tests, Orca Val
       expect(manifest.contributes.panels[0].id).toBe('datanoa-panel')
     })
 
-    it('F20-02: headless component & editor check scenario declarations', () => {
-      const checkFilePath = path.join(projectRoot, 'src/panel/index.check.ts')
-      expect(fs.existsSync(checkFilePath)).toBe(true)
+    it('F20-02: production HTML/CSS/ESM Side Panel & modular Studio editor entry points', () => {
+      const panelHtmlPath = path.join(projectRoot, 'src/panel/panel.html')
+      const panelCssPath = path.join(projectRoot, 'src/panel/panel.css')
+      const panelCorePath = path.join(projectRoot, 'src/panel/panel-core.js')
+      expect(fs.existsSync(panelHtmlPath)).toBe(true)
+      expect(fs.existsSync(panelCssPath)).toBe(true)
+      expect(fs.existsSync(panelCorePath)).toBe(true)
 
-      const checkSource = fs.readFileSync(checkFilePath, 'utf8')
-      expect(checkSource).toContain('defineCheck')
-      expect(checkSource).toContain('empty:')
-      expect(checkSource).toContain('tree:')
-      expect(checkSource).toContain("'tree-dark':")
-      expect(checkSource).toContain("theme: 'dark'")
+      const panelHtml = fs.readFileSync(panelHtmlPath, 'utf8')
+      expect(panelHtml).toContain('./panel.css')
+      expect(panelHtml).toContain('./panel-core.js')
 
-      const editorPath = path.join(projectRoot, 'src/editor/index.ts')
-      expect(fs.existsSync(editorPath)).toBe(true)
+      for (const rel of [
+        'src/editor/index.ts',
+        'src/editor/db-icons.ts',
+        'src/editor/connection-modal.ts',
+        'src/editor/studio-modals.ts',
+        'src/editor/grid-formatters.ts',
+        'src/editor/schema-ddl.ts',
+        'src/drivers/common/sql-lexer.ts',
+        'src/drivers/common/sql-formatter.ts',
+        'src/drivers/common/sql-migration.ts',
+      ]) {
+        expect(fs.existsSync(path.join(projectRoot, rel)), `Missing modular file: ${rel}`).toBe(true)
+      }
     })
 
     it('F20-03: asserts all vendor bundles are strictly under 1 MiB with zero eval and new Function', () => {

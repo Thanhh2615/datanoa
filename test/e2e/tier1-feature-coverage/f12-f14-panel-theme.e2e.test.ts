@@ -148,90 +148,94 @@ describe('Tier 1 Feature Coverage: Features F12 - F14 (Panel, Visual Checks, Edi
   })
 
   // =========================================================================
-  // Feature F12: Sidebar Panel UI & Connections Tree
+  // Feature F12: Sidebar Panel UI & Connections Tree (Production HTML/CSS/ESM)
   // =========================================================================
   describe('Feature F12: Sidebar Panel UI & Connections Tree', () => {
-    it('F12-T01: Verify panel module component definition and Orca export contracts', async () => {
-      const panelModule = await import('../../../src/panel/index.js')
-      expect(typeof panelModule.setup).toBe('function')
-      expect(typeof panelModule.default).toBe('function')
+    it('F12-T01: Verify production HTML/CSS/ESM panel files and manifest entry', () => {
+      const manifestPath = path.join(projectRoot, 'orca-plugin.json')
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+      const panelEntry = manifest.contributes.panels.find(
+        (p: { id: string }) => p.id === 'datanoa-panel'
+      )
+      expect(panelEntry).toBeDefined()
+      expect(panelEntry.entry).toBe('src/panel/panel.html')
+      expect(panelEntry.ui).toBe('html')
 
-      // Render default panel component
-      const rendered = panelModule.default() as unknown as { type: unknown }
-      expect(rendered).toBeDefined()
-      expect(typeof rendered.type).toBe('function')
+      const panelHtml = fs.readFileSync(path.join(projectRoot, 'src/panel/panel.html'), 'utf8')
+      const panelCss = fs.readFileSync(path.join(projectRoot, 'src/panel/panel.css'), 'utf8')
+      const panelCore = fs.readFileSync(path.join(projectRoot, 'src/panel/panel-core.js'), 'utf8')
+      expect(panelHtml).toContain('./panel.css')
+      expect(panelHtml).toContain('./panel-core.js')
+      expect(panelCss.length).toBeGreaterThan(1000)
+      expect(panelCore.length).toBeGreaterThan(1000)
+      expect(fs.existsSync(path.join(projectRoot, 'src/panel/index.tsx'))).toBe(false)
+      expect(fs.existsSync(path.join(projectRoot, 'src/panel/index.check.ts'))).toBe(false)
     })
 
-    it('F12-T02: Verify panel setup lifecycle and event subscriptions registration', async () => {
-      const { setup } = await import('../../../src/panel/index.js')
-      const fakeCtx: PanelContext = {
-        subscriptions: [],
-        signal: new AbortController().signal,
-        visible: { __orcaAtom: true },
-        panel: { id: 'datanoa-panel' },
-      }
-
-      setup(fakeCtx)
-      expect(fakeCtx.subscriptions.length).toBeGreaterThanOrEqual(2)
-
-      const subscribedEvents = mockSubscriptions.map((s) => s.event)
-      expect(subscribedEvents).toContain('connections.changed')
-      expect(subscribedEvents).toContain('data.cellUpdated')
+    it('F12-T02: Verify panel runtime event subscriptions registration in panel.html', () => {
+      const panelHtml = fs.readFileSync(path.join(projectRoot, 'src/panel/panel.html'), 'utf8')
+      expect(panelHtml).toContain("'connections.changed'")
+      expect(panelHtml).toContain("'data.cellUpdated'")
+      expect(panelHtml).toContain("window.orca.on('theme'")
     })
 
-    it('F12-T03: Render hierarchical connection and schema tree items', async () => {
-      const { buildConnectionTree } = await import('../../../src/panel/index.js')
-
-      const mockConns: ConnectionProfile[] = [
-        { id: 'c1', name: 'Store SQLite', driver: 'sqlite', database: 'store.db' },
-        { id: 'c2', name: 'Postgres Cloud', driver: 'postgres', database: 'cloud_db' },
-      ]
-      const mockObjects: Record<string, SchemaObject[]> = {
-        c1: [
-          { name: 'customers', schema: 'main', kind: 'table' },
-          { name: 'v_orders', schema: 'main', kind: 'view' },
-        ],
-        c2: [{ name: 'users', schema: 'public', kind: 'table' }],
+    it('F12-T03: Verify panel-core.js 8-engine catalog, DDL fallback, and privacy-safe feedback builder', async () => {
+      const panelCore = (await import('../../../src/panel/panel-core.js')) as {
+        ENGINES: ReadonlyArray<{ id: string; label: string }>
+        buildDdlFallback: (details: unknown, driver: string) => string
+        buildPanelFeedbackMarkdown: (input: Record<string, unknown>) => string
+        buildGithubIssueUrl: (input: Record<string, unknown>) => string
       }
 
-      const tree = buildConnectionTree(mockConns, mockObjects, {
-        'c1:customers': {
+      expect(panelCore.ENGINES).toHaveLength(8)
+      expect(panelCore.ENGINES.map((e) => e.id)).toEqual([
+        'sqlite',
+        'postgres',
+        'mysql',
+        'mariadb',
+        'cockroachdb',
+        'clickhouse',
+        'redis',
+        'libsql',
+      ])
+
+      const ddl = panelCore.buildDdlFallback(
+        {
           name: 'customers',
           schema: 'main',
-          kind: 'table',
           columns: [
-            {
-              name: 'id',
-              type: 'INTEGER',
-              nativeType: 'INTEGER',
-              nullable: false,
-              defaultValue: null,
-              isPrimaryKey: true,
-              isAutoIncrement: true,
-            },
-            {
-              name: 'email',
-              type: 'TEXT',
-              nativeType: 'TEXT',
-              nullable: false,
-              defaultValue: null,
-              isPrimaryKey: false,
-              isAutoIncrement: false,
-            },
+            { name: 'id', type: 'INTEGER', nullable: false, isPrimaryKey: true },
+            { name: 'email', type: 'TEXT', nullable: false, isPrimaryKey: false },
           ],
           primaryKey: ['id'],
-          indexes: [],
           foreignKeys: [],
         },
+        'sqlite'
+      )
+      expect(ddl).toContain('CREATE TABLE "customers"')
+      expect(ddl).toContain('PRIMARY KEY ("id")')
+
+      const md = panelCore.buildPanelFeedbackMarkdown({
+        kind: 'bug',
+        title: 'Grid scroll test',
+        description: 'Steps here',
+        driver: 'postgres',
+        tab: 'data',
+        readOnly: false,
+        lastError: 'postgres://admin:supersecret@db.internal:5432/prod failed',
       })
-      expect(tree).toHaveLength(2)
-      expect(tree[0].label).toBe('Store SQLite (sqlite)')
-      expect(tree[0].children?.[0].children?.[0].label).toBe('customers')
-      expect(tree[0].children?.[0].children?.[0].children?.[0].label).toBe('id (INTEGER) [PK]')
-      expect(tree[0].children?.[1].children?.[0].label).toBe('v_orders')
+      expect(md).toContain('Datanoa v1.0.0')
+      expect(md).not.toContain('supersecret')
+
+      const url = panelCore.buildGithubIssueUrl({
+        kind: 'bug',
+        title: 'Grid scroll test',
+        markdownBody: md,
+      })
+      expect(url).toContain('https://github.com/Thanhh2615/datanoa/issues/new')
     })
 
-    it('F12-T04: Verify panel action buttons bind to registered extension commands', () => {
+    it('F12-T04: Verify panel action controls and registered extension commands', () => {
       const manifestPath = path.join(projectRoot, 'orca-plugin.json')
       const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
       const commandIds = manifest.contributes.commands.map((c: { id: string }) => c.id)
@@ -239,9 +243,11 @@ describe('Tier 1 Feature Coverage: Features F12 - F14 (Panel, Visual Checks, Edi
       expect(commandIds).toContain('datanoa.newQuery')
       expect(commandIds).toContain('datanoa.openSqliteFile')
 
-      const panelSource = fs.readFileSync(path.join(projectRoot, 'src/panel/index.tsx'), 'utf8')
-      expect(panelSource).toContain('New Query')
-      expect(panelSource).toContain('Open SQLite')
+      const panelHtml = fs.readFileSync(path.join(projectRoot, 'src/panel/panel.html'), 'utf8')
+      expect(panelHtml).toContain('id="newServerBtn"')
+      expect(panelHtml).toContain('id="feedbackBtn"')
+      expect(panelHtml).toContain('id="feedbackModal"')
+      expect(panelHtml).toContain('id="openStudioBtn"')
     })
 
     it('F12-T05: React to connections.changed event and update tree reactive state', () => {
@@ -250,10 +256,8 @@ describe('Tier 1 Feature Coverage: Features F12 - F14 (Panel, Visual Checks, Edi
         stateCount = (payload as { count: number }).count
       }
 
-      // Simulate registration
       mockPlugin.on('connections.changed', onConnectionsChanged)
 
-      // Emit event
       const sub = mockSubscriptions.find((s) => s.event === 'connections.changed')
       expect(sub).toBeDefined()
       sub?.handler({ count: 7 })
@@ -273,81 +277,76 @@ describe('Tier 1 Feature Coverage: Features F12 - F14 (Panel, Visual Checks, Edi
       handleSelectNode({ key: 'conn_123', data: { type: 'connection', id: 'conn_123' } })
       expect(activeConnectionId).toBe('conn_123')
 
-      // Selecting non-connection node leaves connection active
       handleSelectNode({ key: 'tables_123', data: { type: 'tables_folder', id: '123' } })
       expect(activeConnectionId).toBe('conn_123')
     })
   })
 
   // =========================================================================
-  // Feature F13: Orca Visual Check Scenarios
+  // Feature F13: Orca Visual Assets, Manifest Cover & Screenshots Compliance
   // =========================================================================
-  describe('Feature F13: Orca Visual Check Scenarios', () => {
-    it('F13-T01: Verify visual check module export and defineCheck contract compliance', async () => {
-      const checkModule = await import('../../../src/panel/index.check.js')
-      expect(checkModule.default).toBeDefined()
-      expect(typeof checkModule.default).toBe('object')
+  describe('Feature F13: Orca Visual Assets & Marketplace Compliance', () => {
+    it('F13-T01: Verify manifest cover and screenshots are declared with valid alt text', () => {
+      const manifestPath = path.join(projectRoot, 'orca-plugin.json')
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+
+      expect(manifest.cover).toBeDefined()
+      expect(manifest.cover.path).toBe('images/cover.png')
+      expect(manifest.cover.alt.length).toBeGreaterThan(10)
+      expect(Array.isArray(manifest.screenshots)).toBe(true)
+      expect(manifest.screenshots.length).toBeGreaterThanOrEqual(4)
     })
 
-    it('F13-T02: Validate empty scenario schema and mock request responses', async () => {
-      const checkModule = await import('../../../src/panel/index.check.js')
-      const config = checkModule.default as Record<string, { requests: Record<string, unknown> }>
+    it('F13-T02: Validate cover and all screenshot PNG files exist, are 1600x1000, and fit Orca size limits', () => {
+      const manifestPath = path.join(projectRoot, 'orca-plugin.json')
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+      const imagePaths: string[] = [
+        manifest.cover.path,
+        ...manifest.screenshots.map((s: { path: string }) => s.path),
+      ]
 
-      expect(config.empty).toBeDefined()
-      expect(config.empty.requests).toBeDefined()
-      expect(config.empty.requests['connections.list']).toEqual([])
-    })
-
-    it('F13-T03: Validate tree scenario mock payloads against protocol contracts', async () => {
-      const checkModule = await import('../../../src/panel/index.check.js')
-      const treeScenario = checkModule.default.tree
-
-      expect(treeScenario).toBeDefined()
-      const conns: ConnectionProfile[] = treeScenario.requests['connections.list']
-      expect(Array.isArray(conns)).toBe(true)
-      expect(conns.length).toBeGreaterThanOrEqual(2)
-
-      expect(conns[0].id).toBe('conn_sqlite_local')
-      expect(conns[0].driver).toBe('sqlite')
-
-      const objects: SchemaObject[] = treeScenario.requests['schema.listObjects']
-      expect(Array.isArray(objects)).toBe(true)
-      expect(objects.length).toBeGreaterThanOrEqual(3)
-      expect(objects.some((o) => o.kind === 'table')).toBe(true)
-      expect(objects.some((o) => o.kind === 'view')).toBe(true)
-    })
-
-    it('F13-T04: Validate tree-dark scenario theme configuration and dark token parity', async () => {
-      const checkModule = await import('../../../src/panel/index.check.js')
-      const config = checkModule.default as Record<string, { theme?: string; requests: unknown }>
-
-      expect(config['tree-dark']).toBeDefined()
-      expect(config['tree-dark'].theme).toBe('dark')
-      expect(config['tree-dark'].requests).toEqual(config.tree.requests)
-    })
-
-    it('F13-T05: Verify connection form check scenario with form input states', () => {
-      const connectionFormScenario = {
-        name: 'New Connection Form',
-        drivers: ['sqlite', 'postgres', 'mysql'],
-        fields: {
-          sqlite: ['name', 'filePath'],
-          postgres: ['name', 'host', 'port', 'database', 'user', 'password', 'ssl'],
-          mysql: ['name', 'host', 'port', 'database', 'user', 'password'],
-        },
+      let totalBytes = 0
+      for (const relPath of imagePaths) {
+        const fullPath = path.join(projectRoot, relPath)
+        expect(fs.existsSync(fullPath), `Missing image: ${relPath}`).toBe(true)
+        const buf = fs.readFileSync(fullPath)
+        totalBytes += buf.length
+        const width = buf.readUInt32BE(16)
+        const height = buf.readUInt32BE(20)
+        expect(width).toBe(1600)
+        expect(height).toBe(1000)
+        expect(buf.length).toBeLessThanOrEqual(relPath === manifest.cover.path ? 1024 * 1024 : 1536 * 1024)
       }
-
-      expect(connectionFormScenario.drivers).toContain('sqlite')
-      expect(connectionFormScenario.drivers).toContain('postgres')
-      expect(connectionFormScenario.drivers).toContain('mysql')
-      expect(connectionFormScenario.fields.sqlite).toContain('filePath')
-      expect(connectionFormScenario.fields.postgres).toContain('port')
+      expect(totalBytes).toBeLessThanOrEqual(8 * 1024 * 1024)
     })
 
-    it('F13-T06: Ensure all check scenario request keys match PluginRequests interface', async () => {
-      const checkModule = await import('../../../src/panel/index.check.js')
-      const config = checkModule.default as Record<string, { requests: Record<string, unknown> }>
+    it('F13-T03: Validate panel.css and panel.html dark/light token parity', () => {
+      const panelCss = fs.readFileSync(path.join(projectRoot, 'src/panel/panel.css'), 'utf8')
+      expect(panelCss).toContain('html.light')
+      expect(panelCss).toContain('--bg: var(--orca-background, #000000);')
+      expect(panelCss).toContain('--border-strong:')
+    })
 
+    it('F13-T04: Validate GitHub Issue Templates and CONTRIBUTING.md exist for user feedback', () => {
+      expect(fs.existsSync(path.join(projectRoot, '.github/ISSUE_TEMPLATE/bug_report.yml'))).toBe(true)
+      expect(fs.existsSync(path.join(projectRoot, '.github/ISSUE_TEMPLATE/feature_request.yml'))).toBe(true)
+      expect(fs.existsSync(path.join(projectRoot, '.github/ISSUE_TEMPLATE/config.yml'))).toBe(true)
+      expect(fs.existsSync(path.join(projectRoot, 'CONTRIBUTING.md'))).toBe(true)
+    })
+
+    it('F13-T05: Verify connection form supports all 8 database engines', () => {
+      const panelHtml = fs.readFileSync(path.join(projectRoot, 'src/panel/panel.html'), 'utf8')
+      const panelCore = fs.readFileSync(path.join(projectRoot, 'src/panel/panel-core.js'), 'utf8')
+      for (const engine of ['sqlite', 'postgres', 'mysql', 'mariadb', 'cockroachdb', 'clickhouse', 'redis', 'libsql']) {
+        expect(panelCore).toContain(`'${engine}'`)
+      }
+      expect(panelHtml).toContain('id="formFilePath"')
+      expect(panelHtml).toContain('id="formHost"')
+      expect(panelHtml).toContain('id="formPort"')
+    })
+
+    it('F13-T06: Ensure all RPC requests called by panel.html match PluginRequests interface', () => {
+      const panelHtml = fs.readFileSync(path.join(projectRoot, 'src/panel/panel.html'), 'utf8')
       const validRequestKeys = new Set([
         'connections.list',
         'connection.save',
@@ -371,15 +370,13 @@ describe('Tier 1 Feature Coverage: Features F12 - F14 (Panel, Visual Checks, Edi
         'query.history.clear',
       ])
 
-      for (const [scenarioName, scenario] of Object.entries(config)) {
-        if (scenario.requests) {
-          for (const reqKey of Object.keys(scenario.requests)) {
-            expect(
-              validRequestKeys.has(reqKey),
-              `Scenario ${scenarioName} contains unknown IPC key: ${reqKey}`
-            ).toBe(true)
-          }
-        }
+      const rpcMatches = Array.from(panelHtml.matchAll(/\brpc\(\s*['"]([^'"]+)['"]/g))
+      expect(rpcMatches.length).toBeGreaterThanOrEqual(10)
+      for (const match of rpcMatches) {
+        expect(
+          validRequestKeys.has(match[1]),
+          `panel.html contains unknown IPC key: ${match[1]}`
+        ).toBe(true)
       }
     })
   })
@@ -499,18 +496,19 @@ describe('Tier 1 Feature Coverage: Features F12 - F14 (Panel, Visual Checks, Edi
       ] as const
 
       const panelHtml = fs.readFileSync(path.join(projectRoot, 'src/panel/panel.html'), 'utf8')
-      const editorIndex = fs.readFileSync(path.join(projectRoot, 'src/editor/index.ts'), 'utf8')
+      const panelCore = fs.readFileSync(path.join(projectRoot, 'src/panel/panel-core.js'), 'utf8')
+      const editorDbIcons = fs.readFileSync(path.join(projectRoot, 'src/editor/db-icons.ts'), 'utf8')
 
       expect(panelHtml).toContain('function getDbLogoSvg(')
       expect(panelHtml).toContain('DB_SVG_MARKUP')
-      expect(editorIndex).toContain('function createDbLogoSvg(')
-      expect(editorIndex).toContain('DB_LOGO_COLORS')
+      expect(editorDbIcons).toContain('export function createDbLogoSvg(')
+      expect(editorDbIcons).toContain('DB_LOGO_COLORS')
 
       for (const engine of engines) {
-        expect(panelHtml).toContain(`id: '${engine}'`)
+        expect(panelCore).toContain(`id: '${engine}'`)
         expect(panelHtml).toContain(`${engine}: '<svg`)
-        expect(editorIndex).toContain(`${engine}: '`)
-        expect(editorIndex).toContain(`case '${engine}':`)
+        expect(editorDbIcons).toContain(`${engine}: '`)
+        expect(editorDbIcons).toContain(`case '${engine}':`)
       }
     })
 

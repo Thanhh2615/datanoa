@@ -1187,11 +1187,25 @@ describe('Wave 12 — Full-System 60fps Stability, Virtualization & UX Regressio
       const emptySidebarCta = findButtonByText(dom.body, '+ Connect Database')
       expect(emptySidebarCta).not.toBeNull()
 
-      // 2. Command Palette includes "New Database Connection..."
+      // 2. Command Palette includes "New Database Connection..." & "Report Bug / Request Feature..."
       dom.window.dispatchEvent(new FakeEvent({ type: 'keydown', key: 'k', ctrlKey: true, bubbles: true }))
       const palette1 = dom.body.querySelector('.datanoa-cmd-palette')
       expect(palette1?.textContent).toContain('New Database Connection...')
+      expect(palette1?.textContent).toContain('Report Bug / Request Feature...')
       dom.window.dispatchEvent(new FakeEvent({ type: 'keydown', key: 'Escape', bubbles: true }))
+
+      // 2b. Feedback / Report Issue button opens privacy-safe feedback modal targeting Thanhh2615/datanoa
+      const feedbackBtn = dom.body.querySelector<FakeHTMLButtonElement>('.datanoa-feedback-btn')
+      expect(feedbackBtn).not.toBeNull()
+      feedbackBtn?.click()
+      await flushMicrotasks(4)
+      const feedbackModal = dom.body.querySelector('.datanoa-feedback-modal')
+      expect(feedbackModal).not.toBeNull()
+      const diagText = feedbackModal?.querySelector('.datanoa-feedback-diag')?.textContent ?? ''
+      expect(diagText).toContain('Datanoa v1.0.0')
+      expect(diagText).toContain('Surface: Fullscreen Studio')
+      dom.window.dispatchEvent(new FakeEvent({ type: 'keydown', key: 'Escape', bubbles: true }))
+      expect(dom.body.querySelector('.datanoa-feedback-modal')).toBeNull()
 
       // 3. Open + Connect modal -> verify all 8 engine tiles
       addConnBtn?.click()

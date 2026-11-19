@@ -63,7 +63,7 @@ describe('Tier 1 Feature Coverage: Features F1 - F4 (Scaffold, Protocol, Dialect
       expect(manifest.manifestVersion).toBe(2)
       expect(manifest.id).toBe('datanoa')
       expect(manifest.name).toBe('Datanoa')
-      expect(manifest.version).toBe('0.1.0')
+      expect(manifest.version).toMatch(/^\d+\.\d+\.\d+$/)
       expect(manifest.execution).toBe('trusted-worker')
       expect(manifest.pluginApi).toBe(1)
       expect(manifest.main).toBe('src/worker/index.ts')
@@ -77,7 +77,9 @@ describe('Tier 1 Feature Coverage: Features F1 - F4 (Scaffold, Protocol, Dialect
         'package.json',
         'tsconfig.json',
         'src/worker/index.ts',
-        'src/panel/index.tsx',
+        'src/panel/panel.html',
+        'src/panel/panel.css',
+        'src/panel/panel-core.js',
         'src/editor/index.ts',
         'src/protocol.ts',
         'vendor/pg.js',
