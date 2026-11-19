@@ -1207,7 +1207,7 @@ describe('Wave 12 — Full-System 60fps Stability, Virtualization & UX Regressio
       const feedbackModal = dom.body.querySelector('.datanoa-feedback-modal')
       expect(feedbackModal).not.toBeNull()
       const diagText = feedbackModal?.querySelector('.datanoa-feedback-diag')?.textContent ?? ''
-      expect(diagText).toContain('Datanoa v1.0.0')
+      expect(diagText).toContain('Datanoa v1.0.1')
       expect(diagText).toContain('Surface: Fullscreen Studio')
       dom.window.dispatchEvent(new FakeEvent({ type: 'keydown', key: 'Escape', bubbles: true }))
       expect(dom.body.querySelector('.datanoa-feedback-modal')).toBeNull()
