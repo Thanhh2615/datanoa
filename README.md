@@ -2,35 +2,36 @@
   <img src="assets/icon.png" alt="Datanoa Logo" width="88" height="88" />
 </p>
 
-<h1 align="center">Datanoa — Multi-Engine OLED Database Studio for Orca</h1>
+<h1 align="center">Datanoa — Database Client &amp; SQL Studio for Orca</h1>
 
 <p align="center">
-  <strong>JetBrains DataGrip-grade schema explorer, 60fps virtualized data grid, visual table designer, and multi-statement SQL &amp; Redis console built natively for Orca's True OLED (<code>#000000</code>) and Light themes.</strong>
+  <strong>Browse tables, edit data inline, design schemas visually, and run SQL or Redis queries across 8 database engines — right inside Orca.</strong>
 </p>
 
 <p align="center">
   <a href="https://onorca.dev"><img src="https://img.shields.io/badge/Orca-%3E%3D1.4.248-000000?style=flat-square&logoColor=white&labelColor=141414&color=38bdf8" alt="Orca >=1.4.248" /></a>
-  <a href="#8-supported-database-engines"><img src="https://img.shields.io/badge/Engines-8%20Databases-4ade80?style=flat-square&labelColor=141414" alt="8 Database Engines" /></a>
-  <a href="#60fps-virtualized-grid-bulk-operations--power-utilities"><img src="https://img.shields.io/badge/Virtual%20Grid-60fps-60a5fa?style=flat-square&labelColor=141414" alt="60fps Virtual Grid" /></a>
+  <a href="#8-supported-database-engines"><img src="https://img.shields.io/badge/Databases-8%20Engines-4ade80?style=flat-square&labelColor=141414" alt="8 Database Engines" /></a>
+  <a href="#data-grid-bulk-operations--sql-console"><img src="https://img.shields.io/badge/Editor-SQL%20%26%20Schema%20Designer-60a5fa?style=flat-square&labelColor=141414" alt="SQL & Schema Designer" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-e6e6e6?style=flat-square&labelColor=141414" alt="MIT License" /></a>
   <a href="https://github.com/Thanhh2615/datanoa/issues/new/choose"><img src="https://img.shields.io/badge/Feedback-Report%20Bug%20%2F%20Request%20Feature-fbbf24?style=flat-square&labelColor=141414" alt="Report Bug / Request Feature" /></a>
 </p>
 
 <p align="center">
-  <img src="images/cover.png" alt="Datanoa Studio Split View — OLED PostgreSQL Console, 60fps Virtual Data Grid, Multi-Cell Aggregates & JSON Value Inspector" width="100%" />
+  <img src="images/cover.png" alt="Datanoa Studio — Database Client and SQL Studio for Orca" width="100%" />
 </p>
 
 ---
 
 ## Why Datanoa?
 
-Most editor database extensions force a trade-off between lightweight single-engine viewers and heavy external Java/Electron GUI apps. **Datanoa** brings a complete, zero-stub multi-engine database workstation directly inside **Orca** (`>=1.4.248`) across two synchronized surfaces:
+Switch less between your code editor and heavy external database tools. **Datanoa** brings a complete database client, schema designer, and SQL/Redis workspace directly into **Orca** (`>=1.4.248`):
 
-- **Dual-Surface Architecture:** Work side-by-side with your code in the **Orca Right Sidebar Panel**, or pop open a standalone fullscreen **Datanoa Studio** tab (`.datanoa` / `.sql`) from Orca's `+` Tab Bar menu.
-- **8 Database Engines Out of the Box:** Connect to **SQLite**, **PostgreSQL**, **MySQL**, **MariaDB**, **CockroachDB**, **ClickHouse**, **Redis**, and **LibSQL / Turso** with zero native compilation or external CLI dependencies.
-- **True Orca OLED (`#000000`) & Light Mode Parity:** Inherits `--orca-*` host tokens directly without overriding `:root` theme variables, embeds Orca Desktop's bundled `Geist` variable font (`Geist-Variable.woff2`) for zero-FOUT typography parity, and switches cleanly between True OLED dark mode and `html.light`.
-- **60fps Windowed Virtualization:** Smoothly scroll, filter, pin columns, and drag-select rectangular cell ranges across 10,000-row pages at 60fps with live status-bar math aggregates (`Count`, `Sum`, `Avg`, `Min`, `Max`).
-- **Transactional Safety First:** Stage inline edits, cloned rows, bulk fills, pasted TSV/CSV rows, and visual schema migrations locally, preview the exact dialect-quoted DML/DDL statements, and commit atomically inside database transactions with optimistic concurrency verification.
+- **Side Panel & Fullscreen Studio:** Inspect tables right beside your code in Orca's **Right Sidebar Panel**, or open a fullscreen **Datanoa Studio** tab (`.datanoa` / `.sql`) straight from Orca's `+` Tab Bar menu.
+- **8 Database Engines Built In:** Connect to **SQLite**, **PostgreSQL**, **MySQL**, **MariaDB**, **CockroachDB**, **ClickHouse**, **Redis**, and **LibSQL / Turso** with zero native compilation or external CLI dependencies.
+- **Auto-Discovery & One-Click URI Setup:** Paste a connection URI (`Neon`, `Supabase`, `Turso`, `Upstash`, `ClickHouse Cloud`, `CockroachDB Cloud`, `RDS`) or auto-detect `.env` connection strings and local `.db` / `.sqlite` files in your workspace.
+- **Fast Virtualized Data Grid:** Smoothly browse, filter, sort, pin columns, and drag-select ranges across large tables with instant status-bar math aggregates (`Count`, `Sum`, `Avg`, `Min`, `Max`).
+- **Safe Transactional Editing & Schema Design:** Stage inline cell edits, cloned/pasted rows, and visual `ALTER TABLE` schema migrations locally, review the exact generated SQL, and commit atomically inside transactions with optimistic concurrency checks.
+- **Native Orca Look & Feel:** Automatically adapts to Orca's Dark and Light themes (`--orca-*` design tokens and `Geist` typography).
 
 ---
 
@@ -86,12 +87,12 @@ Datanoa integrates into Orca across four natural entry points:
 
 ## Visual Walkthrough & Screenshots
 
-### 1. OLED Split View — SQL Console, 60fps Virtual Data Grid & Value/JSON Inspector
+### 1. Split View — SQL Console, Interactive Data Grid & Value/JSON Inspector
 
-Write multi-statement SQL with dialect-aware syntax highlighting and smart column/alias autocomplete in the top pane while browsing and staging edits on hundreds of thousands of rows below — complete with live multi-cell selection math (`Count`, `Sum`, `Avg`, `Min`, `Max`), `CLONE` row badges, Foreign Key jump badges (`↗`), and a dockable **Value / JSON Inspector**.
+Write multi-statement SQL with dialect-aware syntax highlighting and smart column/alias autocomplete in the top pane while browsing and staging edits on large tables below — complete with live multi-cell selection math (`Count`, `Sum`, `Avg`, `Min`, `Max`), `CLONE` row badges, Foreign Key jump badges (`↗`), and a dockable **Value / JSON Inspector**.
 
 <p align="center">
-  <img src="images/studio-split-view.png" alt="Datanoa Studio OLED Split View with SQL Console, 60fps Virtual Data Grid, Multi-Cell Selection Aggregates & JSON Value Inspector" width="100%" />
+  <img src="images/studio-split-view.png" alt="Datanoa Studio Split View with SQL Console, Interactive Data Grid, Multi-Cell Selection Aggregates & JSON Value Inspector" width="100%" />
 </p>
 
 ### 2. 8-Engine Connection Manager, URI Quick-Fill & Workspace Auto-Detect
@@ -118,17 +119,17 @@ Switch Orca to a light theme and Datanoa adapts automatically. Collapse the left
   <img src="images/studio-light-theme.png" alt="Datanoa Studio in Clean Light Theme with Horizontal Top Table Switcher Bar, Pinned Columns & Find Highlight" width="100%" />
 </p>
 
-### 5. Docked Side Panel — Multi-Engine Explorer, 60fps Data Grid & Quick SQL Runner
+### 5. Docked Side Panel — Schema Explorer, Data Grid & Quick SQL Runner
 
 Use the **Datanoa Side Panel** without leaving your active code editor: expand multiple database connections simultaneously in the **Explorer** tree, stage and filter data in the virtualized **Data** tab with live multi-cell selection math, or run multi-statement queries in the **SQL** tab with persistent history and 1-click exports.
 
 <p align="center">
-  <img src="images/side-panel-explorer.png" alt="Datanoa Side Panel Showcase — Multi-Engine Explorer Tree, 60fps Virtualized Data Grid & Quick SQL Runner" width="100%" />
+  <img src="images/side-panel-explorer.png" alt="Datanoa Side Panel Showcase — Schema Explorer Tree, Virtualized Data Grid & Quick SQL Runner" width="100%" />
 </p>
 
 ---
 
-## 60fps Virtualized Grid, Bulk Operations & Power Utilities
+## Data Grid, Bulk Operations & SQL Console
 
 - **Rectangular Multi-Cell Selection & Live Math Aggregates:** Drag across cells, Shift-click ranges, click row numbers or column headers, or press `Ctrl+A`. The status bar immediately computes **`Count`**, **`Sum`**, **`Avg`**, **`Min`**, and **`Max`** across numeric cells (click the aggregate pill to copy statistics to the clipboard).
 - **Multi-Format Copy, Paste & Export:**

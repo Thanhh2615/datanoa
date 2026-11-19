@@ -1,7 +1,7 @@
 {
   "name": "datanoa",
   "version": "1.0.0",
-  "description": "Multi-Engine OLED Database Studio for Orca (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, Turso/LibSQL)",
+  "description": "All-in-one database client and SQL studio for Orca (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, Turso/LibSQL)",
   "private": true,
   "type": "module",
   "license": "MIT",

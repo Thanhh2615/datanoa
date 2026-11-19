@@ -14,13 +14,13 @@
   "icon": "assets/icon.png",
   "cover": {
     "path": "images/cover.png",
-    "alt": "Datanoa Studio banner showcasing the OLED fullscreen SQL console, virtual data grid, docked Side Panel, and 8 supported database engines"
+    "alt": "Datanoa Studio database client for Orca showing SQL editor, interactive data grid, schema explorer, and 8 supported database engines"
   },
   "screenshots": [
     {
       "path": "images/studio-split-view.png",
-      "alt": "Datanoa Studio OLED split view with PostgreSQL SQL console, 60fps virtual data grid, multi-cell selection aggregates, and JSON value inspector",
-      "caption": "OLED Split View with SQL Console, 60fps Virtual Data Grid, and JSON Inspector",
+      "alt": "Datanoa Studio split view with PostgreSQL SQL console, interactive data grid, multi-cell selection aggregates, and JSON value inspector",
+      "caption": "Split View with SQL Console, Interactive Data Grid, and JSON Inspector",
       "theme": "dark"
     },
     {
@@ -32,23 +32,23 @@
     {
       "path": "images/schema-designer.png",
       "alt": "Datanoa Visual Table Structure Designer showing staged column edits, data type combobox, foreign keys, indexes, and live migration SQL preview",
-      "caption": "Staged visual table structure designer with live DDL diff preview",
+      "caption": "Visual table structure designer with live DDL migration preview",
       "theme": "dark"
     },
     {
       "path": "images/studio-light-theme.png",
-      "alt": "Datanoa Studio in high-contrast light theme with horizontal top table bar, pinned columns, and find match highlighting",
-      "caption": "Full light theme parity with pinned columns and instant filter/find",
+      "alt": "Datanoa Studio in light theme with horizontal top table bar, pinned columns, and instant find highlighting",
+      "caption": "Light theme support with pinned columns and instant filter/find",
       "theme": "light"
     },
     {
       "path": "images/side-panel-explorer.png",
-      "alt": "Datanoa Side Panel showing multi-engine explorer tree, 60fps virtualized data grid with live aggregates, and quick SQL runner",
-      "caption": "60fps Side Panel explorer, virtualized data grid, and quick SQL runner",
+      "alt": "Datanoa Side Panel showing schema explorer tree, interactive data grid with live aggregates, and quick SQL runner",
+      "caption": "Docked Side Panel explorer, data grid, and quick SQL runner",
       "theme": "dark"
     }
   ],
-  "description": "Multi-Engine OLED Database Studio for Orca (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, Turso/LibSQL).",
+  "description": "All-in-one database client and SQL studio for Orca. Browse tables, edit data inline, design schemas, and run queries across SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, and Turso/LibSQL.",
   "engines": {
     "orca": ">=1.4.248"
   },
