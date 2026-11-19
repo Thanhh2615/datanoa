@@ -987,14 +987,15 @@ describe('Wave 12 — Full-System 60fps Stability, Virtualization & UX Regressio
       expect(html).not.toMatch(/<datalist\b/i)
     })
 
-    it('passes Gate A: compiles panel.html <script type="module"> with zero TS2304/TS2552 diagnostics', () => {
+    it('passes Gate A: compiles panel.html <script type="module"> AND panel-core.js with zero TS2304/TS2552 diagnostics', () => {
       const panelHtmlPath = path.join(REPO_ROOT, 'src', 'panel', 'panel.html')
+      const panelCorePath = path.join(REPO_ROOT, 'src', 'panel', 'panel-core.js')
       const html = fs.readFileSync(panelHtmlPath, 'utf8')
       const match = /<script\b[^>]*type=["']module["'][^>]*>([\s\S]*?)<\/script>/i.exec(html)
       expect(match).not.toBeNull()
 
       const scriptSource = match?.[1] ?? ''
-      const virtualFile = path.join(REPO_ROOT, '__virtual_wave12_panel__.js')
+      const virtualFile = path.join(REPO_ROOT, 'src', 'panel', '__virtual_wave12_panel__.js')
       const options: ts.CompilerOptions = {
         allowJs: true,
         checkJs: true,
@@ -1035,23 +1036,27 @@ describe('Wave 12 — Full-System 60fps Stability, Virtualization & UX Regressio
         },
       }
 
-      const program = ts.createProgram([virtualFile], options, virtualHost)
-      const sourceFile = program.getSourceFile(virtualFile)
-      expect(sourceFile).toBeDefined()
+      const program = ts.createProgram([virtualFile, panelCorePath], options, virtualHost)
+      const panelSourceFile = program.getSourceFile(virtualFile)
+      const coreSourceFile = program.getSourceFile(panelCorePath)
+      expect(panelSourceFile).toBeDefined()
+      expect(coreSourceFile).toBeDefined()
 
-      const undeclared = program
-        .getSemanticDiagnostics(sourceFile)
-        .filter((d) => d.code === 2304 || d.code === 2552)
-        .map((d) => {
-          const msg = ts.flattenDiagnosticMessageText(d.messageText, '\n')
-          const pos =
-            d.file && d.start !== undefined
-              ? d.file.getLineAndCharacterOfPosition(d.start)
-              : { line: 0, character: 0 }
-          return `TS${d.code} at L${pos.line + 1}:C${pos.character + 1}: ${msg}`
-        })
+      const collectUndeclared = (sf: ts.SourceFile | undefined) =>
+        program
+          .getSemanticDiagnostics(sf)
+          .filter((d) => d.code === 2304 || d.code === 2552)
+          .map((d) => {
+            const msg = ts.flattenDiagnosticMessageText(d.messageText, '\n')
+            const pos =
+              d.file && d.start !== undefined
+                ? d.file.getLineAndCharacterOfPosition(d.start)
+                : { line: 0, character: 0 }
+            return `${path.basename(d.file?.fileName ?? 'unknown')} TS${d.code} at L${pos.line + 1}:C${pos.character + 1}: ${msg}`
+          })
 
-      expect(undeclared).toEqual([])
+      expect(collectUndeclared(panelSourceFile)).toEqual([])
+      expect(collectUndeclared(coreSourceFile)).toEqual([])
     })
   })
 

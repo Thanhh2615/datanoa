@@ -1879,16 +1879,19 @@ export function validatePanelStructDraft(draft, driver, knownTableNames = []) {
 export function sanitizeFeedbackError(rawError) {
   const raw = String(rawError || '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').trim()
   if (!raw) return ''
-  let clean = raw.replace(
-    /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/\s@]*@)?([^\s/:?#]+)(:\d+)?/g,
-    '$1<redacted-host>'
-  )
-  clean = clean.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 <redacted>')
-  clean = clean.replace(/\b(password|passwd|pwd|authToken|token|secret|api_?key)\s*[:=]\s*([^\s,;&"'`]+)/gi, '$1=***')
-  clean = clean.replace(/[A-Za-z]:\\[^\s"'`<>|]+/gi, '<local-path>')
-  clean = clean.replace(/\/(?:Users|home|var|tmp|etc|opt|mnt)\/[^\s"'`<>|]+/g, '<local-path>')
-  if (clean.length > 400) {
-    clean = `${clean.slice(0, 397)}...`
+  let clean = raw
+    .replace(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s'"<>]+/g, '<redacted-uri>')
+    .replace(/\b(?:password|passwd|pwd|user|username|token|secret|authToken|api_?key)\s*[:=]\s*[^\s,;'"<>]+/gi, '<redacted-secret>')
+    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer <redacted-token>')
+    .replace(/[A-Za-z]:\\[^\s'"<>]+/g, '<redacted-path>')
+    .replace(/\/(?:Users|home|var|tmp|etc|opt|private|mnt|srv)\/[^\s'"<>]+/g, '<redacted-path>')
+    .replace(/[^\s@'"<>]+@[^\s@'"<>]+\.[^\s@'"<>]+/g, '<redacted-endpoint>')
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, '<redacted-ip>')
+    .replace(/\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.(?:co|com|io|net|org|dev|tech|cloud|app|local|internal|lan)(?::\d+)?\b/gi, '<redacted-host>')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (clean.length > 280) {
+    clean = `${clean.slice(0, 277)}...`
   }
   return clean
 }
@@ -1900,6 +1903,8 @@ export function buildPanelFeedbackMarkdown({
   driver = '',
   tab = 'explorer',
   readOnly = false,
+  orcaApi = '',
+  platform = '',
   lastError = '',
   version = DATANOA_VERSION,
 } = {}) {
@@ -1910,6 +1915,8 @@ export function buildPanelFeedbackMarkdown({
   const engineLabel = engineEntry ? `${engineEntry.label} (${engineEntry.id})` : driver ? String(driver) : 'None'
   const tabLabel = String(tab || 'explorer')
   const roLabel = readOnly ? 'Yes' : 'No'
+  const apiLabel = String(orcaApi || 'v1').trim()
+  const platformLabel = String(platform || 'unknown').trim()
   const safeErr = sanitizeFeedbackError(lastError)
 
   const lines = []
@@ -1926,10 +1933,12 @@ export function buildPanelFeedbackMarkdown({
   lines.push('')
   lines.push('### Environment (Privacy-Safe)')
   lines.push(`- **Plugin:** Datanoa v${version}`)
+  lines.push(`- **Orca API:** ${apiLabel}`)
   lines.push('- **Surface:** Side Panel')
   lines.push(`- **Active Engine:** ${engineLabel}`)
   lines.push(`- **Active Tab:** ${tabLabel}`)
   lines.push(`- **Read-Only:** ${roLabel}`)
+  lines.push(`- **Platform:** ${platformLabel}`)
 
   if (normalizedKind === 'bug' && safeErr) {
     lines.push('')
@@ -1953,6 +1962,7 @@ export function buildGithubIssueUrl({ kind = 'bug', title = '', markdownBody = '
     : prefix
 
   const params = new URLSearchParams()
+  params.set('template', normalizedKind === 'feature' ? 'feature_request.yml' : 'bug_report.yml')
   params.set('labels', normalizedKind === 'feature' ? 'enhancement' : 'bug')
   params.set('title', finalTitle)
   const trimmedBody = String(markdownBody || '').trim()

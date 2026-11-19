@@ -889,7 +889,8 @@
 
     function getDbLogoSvg(driver, size = 14) {
       const safe = Object.prototype.hasOwnProperty.call(DB_SVG_MARKUP, driver) ? driver : 'sqlite'
-      return DB_SVG_MARKUP[safe].replace(/width="14" height="14"/, `width="${size}" height="${size}"`)
+      const safeSize = Number.isFinite(Number(size)) ? Math.max(8, Math.min(64, Math.round(Number(size)))) : 14
+      return DB_SVG_MARKUP[safe].replace(/width="14" height="14"/, `width="${safeSize}" height="${safeSize}"`)
     }
 
     function setDbLogoElement(container, driver, size = 14) {
@@ -9401,6 +9402,20 @@
     let cmdPaletteActiveIdx = 0
     let filteredPaletteCommands = []
 
+    function detectPanelOrcaApiVersion() {
+      const api = window.orca?.api
+      if (api && typeof api.major === 'number') {
+        return typeof api.minor === 'number' ? `v${api.major}.${api.minor}` : `v${api.major}`
+      }
+      return 'v1'
+    }
+
+    function detectPanelPlatform() {
+      const nav = typeof navigator !== 'undefined' ? navigator : null
+      const label = nav?.userAgentData?.platform || nav?.platform || ''
+      return String(label).trim() || 'unknown'
+    }
+
     function getPanelFeedbackPayload() {
       const conn = getActiveConn()
       return {
@@ -9410,6 +9425,8 @@
         driver: conn?.driver || '',
         tab: state.tab || 'explorer',
         readOnly: Boolean(conn?.readOnly),
+        orcaApi: detectPanelOrcaApiVersion(),
+        platform: detectPanelPlatform(),
         lastError: state.lastError || '',
         version: DATANOA_VERSION,
       }
@@ -9424,10 +9441,12 @@
       const safeErr = sanitizeFeedbackError(payload.lastError)
       const items = [
         ['Plugin', `Datanoa v${DATANOA_VERSION}`],
+        ['Orca API', payload.orcaApi],
         ['Surface', 'Side Panel'],
         ['Active Engine', engineText],
         ['Active Tab', payload.tab],
         ['Read-Only', payload.readOnly ? 'Yes' : 'No'],
+        ['Platform', payload.platform],
       ]
       if (feedbackKind === 'bug' && safeErr) {
         items.push(['Last Error', safeErr.length > 44 ? `${safeErr.slice(0, 41)}...` : safeErr])

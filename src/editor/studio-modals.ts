@@ -98,15 +98,36 @@ export function sanitizeDiagnosticErrorText(rawError: string): string {
   if (!raw) return ''
   return raw
     .replace(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s'"<>]+/g, '<redacted-uri>')
-    .replace(/\b(?:password|passwd|pwd|token|secret|authToken|api_key|apikey)\s*[:=]\s*[^\s,;'"<>]+/gi, '<redacted-secret>')
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer <redacted-token>')
+    .replace(/\b(?:password|passwd|pwd|user|username|token|secret|authToken|api_key|apikey)\s*[:=]\s*[^\s,;'"<>]+/gi, '<redacted-secret>')
+    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer <redacted-token>')
     .replace(/[A-Za-z]:\\[^\s'"<>]+/g, '<redacted-path>')
     .replace(/\/(?:Users|home|var|tmp|etc|opt|private|mnt|srv)\/[^\s'"<>]+/g, '<redacted-path>')
     .replace(/[^\s@'"<>]+@[^\s@'"<>]+\.[^\s@'"<>]+/g, '<redacted-endpoint>')
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, '<redacted-ip>')
-    .replace(/\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.(?:co|com|io|net|org|dev|tech|cloud|app|local)(?::\d+)?\b/gi, '<redacted-host>')
+    .replace(/\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.(?:co|com|io|net|org|dev|tech|cloud|app|local|internal|lan)(?::\d+)?\b/gi, '<redacted-host>')
     .replace(/\s+/g, ' ')
     .slice(0, 280)
+}
+
+function detectOrcaApiVersion(): string {
+  if (typeof window === 'undefined') return 'v1'
+  const api = (window as unknown as { orca?: { api?: { major?: number; minor?: number } } }).orca?.api
+  if (api && typeof api.major === 'number') {
+    return typeof api.minor === 'number' ? `v${api.major}.${api.minor}` : `v${api.major}`
+  }
+  return 'v1'
+}
+
+function detectRuntimePlatform(): string {
+  if (typeof navigator !== 'undefined') {
+    const navPlatform = (navigator as unknown as { userAgentData?: { platform?: string }; platform?: string })
+    const label = navPlatform.userAgentData?.platform || navPlatform.platform || ''
+    if (label.trim()) return label.trim()
+  }
+  if (typeof process !== 'undefined' && typeof process.platform === 'string') {
+    return process.platform
+  }
+  return 'unknown'
 }
 
 export function buildStudioDiagnosticSummary(ctx: {
@@ -117,10 +138,12 @@ export function buildStudioDiagnosticSummary(ctx: {
 }): string {
   const lines: string[] = [
     'Datanoa v1.0.0',
+    `Orca API: ${detectOrcaApiVersion()}`,
     'Surface: Fullscreen Studio',
     `Active Engine: ${ctx.activeDriver ?? 'none'}`,
     `View Mode: ${ctx.activeViewMode}`,
     `Read-Only: ${Boolean(ctx.isReadOnly)}`,
+    `Platform: ${detectRuntimePlatform()}`,
   ]
   const sanitizedErr = sanitizeDiagnosticErrorText(ctx.lastQueryErrorText || '')
   if (sanitizedErr) {
@@ -1036,8 +1059,9 @@ export function openStudioFeedbackModal(
     const sectionHeader =
       kind === 'bug' ? '### Steps to Reproduce / Details' : '### Feature Request / Details'
     const markdownBody = `${sectionHeader}\n${details}\n\n### Environment Diagnostics\n\`\`\`text\n${diagText}\n\`\`\``
+    const templateParam = kind === 'bug' ? 'bug_report.yml' : 'feature_request.yml'
     const labelParam = kind === 'bug' ? 'bug' : 'enhancement'
-    const githubUrl = `${GITHUB_NEW_ISSUE_BASE_URL}?labels=${labelParam}&title=${encodeURIComponent(title)}&body=${encodeURIComponent(markdownBody)}`
+    const githubUrl = `${GITHUB_NEW_ISSUE_BASE_URL}?template=${templateParam}&labels=${labelParam}&title=${encodeURIComponent(title)}&body=${encodeURIComponent(markdownBody)}`
     return { title, markdownBody, githubUrl }
   }
 

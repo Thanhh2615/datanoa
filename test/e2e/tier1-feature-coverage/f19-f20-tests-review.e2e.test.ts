@@ -60,7 +60,7 @@ describe('Tier 1 Feature Coverage: Features F19 - F20 (Automated Tests, Orca Val
 
       expect(config.test.coverage.provider).toBe('v8')
       expect(config.test.coverage.include).toContain('src/**/*.ts')
-      expect(config.test.coverage.exclude).toContain('src/panel/index.check.ts')
+      expect(config.test.coverage.exclude).toContain('src/**/*.d.ts')
     })
 
     it('F19-02: verifies all canonical test scripts are configured in package.json', () => {

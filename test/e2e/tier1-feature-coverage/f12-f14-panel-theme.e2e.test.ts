@@ -222,10 +222,21 @@ describe('Tier 1 Feature Coverage: Features F12 - F14 (Panel, Visual Checks, Edi
         driver: 'postgres',
         tab: 'data',
         readOnly: false,
-        lastError: 'postgres://admin:supersecret@db.internal:5432/prod failed',
+        orcaApi: 'v1.2',
+        platform: 'Win32',
+        lastError:
+          'Failed postgres://admin:supersecret@db.internal:5432/prod Bearer eyJhbGciOiJIUzI1NiJ9 10.0.1.42 D:\\prod.db /var/lib/pg/secret.conf',
       })
       expect(md).toContain('Datanoa v1.0.0')
+      expect(md).toContain('v1.2')
+      expect(md).toContain('Win32')
       expect(md).not.toContain('supersecret')
+      expect(md).not.toContain('admin')
+      expect(md).not.toContain('db.internal')
+      expect(md).not.toContain('eyJhbGciOiJIUzI1NiJ9')
+      expect(md).not.toContain('10.0.1.42')
+      expect(md).not.toContain('prod.db')
+      expect(md).not.toContain('secret.conf')
 
       const url = panelCore.buildGithubIssueUrl({
         kind: 'bug',
@@ -233,6 +244,7 @@ describe('Tier 1 Feature Coverage: Features F12 - F14 (Panel, Visual Checks, Edi
         markdownBody: md,
       })
       expect(url).toContain('https://github.com/Thanhh2615/datanoa/issues/new')
+      expect(url).toContain('template=bug_report.yml')
     })
 
     it('F12-T04: Verify panel action controls and registered extension commands', () => {
