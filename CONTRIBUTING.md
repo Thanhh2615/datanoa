@@ -1,6 +1,6 @@
 # Contributing to Datanoa
 
-Thank you for helping improve **Datanoa** — the Multi-Engine OLED Database Studio for **Orca** (`>=1.4.248`)!
+Thank you for helping improve **Datanoa** — the database client and SQL studio plugin for **Orca** (`>=1.4.248`)!
 
 Whether you are reporting a bug, requesting a database feature, or submitting a pull request, this guide covers everything you need to set up, verify, and contribute cleanly.
 
@@ -95,17 +95,17 @@ datanoa/
 │   │   ├── connection-modal.ts           # 8-Engine Connection Manager Modal
 │   │   ├── studio-modals.ts              # Command Palette, Shortcuts, Create/Drop & Feedback modals
 │   │   ├── console.ts                    # CodeMirror 6 SQL & Redis console + smart autocomplete
-│   │   ├── grid.ts                       # 60fps virtualized data grid & inline batch staging
+│   │   ├── grid.ts                       # Virtualized data grid & inline batch staging
 │   │   ├── grid-formatters.ts            # Pure cell coercion, window math & clipboard helpers
 │   │   ├── grid-selection.ts             # Rectangular multi-cell selection & live aggregate math
 │   │   ├── schema-inspector.ts           # Visual Table Structure Designer & migration confirmation
 │   │   ├── schema-ddl.ts                 # Multi-line DDL syntax highlighter & dialect type catalogs
-│   │   ├── theme.ts                      # Assembled True OLED (#000000) & Light Mode stylesheet
+│   │   ├── theme.ts                      # Assembled Dark & Light Mode stylesheet
 │   │   ├── theme-grid.ts                 # Grid, pinned column, filter & value inspector styles
 │   │   └── theme-modals.ts               # Schema designer, combobox & modal styles
 │   ├── panel/                            # Docked Right Sidebar Panel
 │   │   ├── panel.html                    # Side Panel DOM markup & controller
-│   │   ├── panel.css                     # Side Panel True OLED & Light Mode stylesheet
+│   │   ├── panel.css                     # Side Panel Dark & Light Mode stylesheet
 │   │   └── panel-core.js                 # Pure Side Panel SQL, migration & feedback helpers
 │   └── worker/
 │       ├── index.ts                      # Trusted Worker IPC request handlers
@@ -147,6 +147,6 @@ Before opening a Pull Request, please ensure your changes satisfy all repository
 
 1. **Strict TypeScript Hygiene:** Zero `: any`, zero `as any`, and zero `!` non-null assertions across `src/` and `test/`.
 2. **CSP & Bundle Limits:** No `eval(`, no `new Function(`, and every file under `vendor/` must remain strictly `< 1 MiB`.
-3. **True OLED & Light Theme Parity:** Always use `--orca-*` CSS custom properties with `#000000` OLED dark fallbacks and test both dark mode and `html.light`. Never override `:root` `--orca-*` host tokens.
+3. **Dark & Light Theme Parity:** Always use `--orca-*` CSS custom properties with clean dark fallbacks (`#000000`) and verify both dark mode and `html.light`. Never override `:root` `--orca-*` host tokens.
 4. **Secret Redaction:** Never log or persist database passwords, bearer tokens, or unmasked connection URIs outside `orca.secrets`.
 5. **Verification Gate:** Run `npm run verify` and confirm `0` errors across build, typecheck, `orca plugin validate`, `orca plugin check`, and `vitest`.

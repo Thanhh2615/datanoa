@@ -141,7 +141,7 @@ Use the **Datanoa Side Panel** without leaving your active code editor: expand m
 - **Quick Filter & Server `WHERE` / `ORDER BY` Bar:** Right-click any cell to **`Filter by Value (=)`** or **`Exclude Value (!=)`**, or type custom `WHERE` and `ORDER BY` clauses protected by `sanitizeFilterClause` against statement breakout.
 - **1-Click Foreign Key Jump (`Ctrl+Click` / `↗`):** Click the `↗` badge or `Ctrl+Click` any foreign key cell to open the referenced parent table filtered directly to that primary key.
 - **Dockable Value & JSON Inspector:** Inspect and edit large text or JSON payloads, validate JSON syntax live, one-click **`Format JSON`** / **`Minify JSON`**, set `NULL`, or copy values.
-- **Dialect-Aware SQL Console & Smart Autocomplete:** Powered by CodeMirror 6 with `stablyai.orca-oled-theme` syntax highlighting, dialect-aware SQL formatting (`Shift+Alt+F`), caret-aware statement splitting (`Ctrl+Enter` runs the statement at the cursor; `Ctrl+Shift+Enter` runs all statements), table/alias-aware column autocomplete (`computeSmartSqlCompletions`), Redis command completion, `EXPLAIN` execution plan runner, and persistent 50-entry Query History.
+- **Dialect-Aware SQL Console & Smart Autocomplete:** Powered by CodeMirror 6 with syntax highlighting, dialect-aware SQL formatting (`Shift+Alt+F`), caret-aware statement splitting (`Ctrl+Enter` runs the statement at the cursor; `Ctrl+Shift+Enter` runs all statements), table/alias-aware column autocomplete, Redis command completion, `EXPLAIN` execution plans, and persistent Query History.
 
 ---
 
@@ -163,7 +163,7 @@ Use the **Datanoa Side Panel** without leaving your active code editor: expand m
 | `Delete` / `Backspace` | Stage `NULL` across selected nullable cells (blocks `NOT NULL` columns safely) | Data Grid & Side Panel |
 | `Ctrl+Click` (or click `↗`) | Jump directly to referenced Foreign Key row in parent table | Data Grid & Side Panel |
 | `Ctrl + Mouse Wheel` | Smooth horizontal panning across wide data grids, SQL results & DDL cards | Fullscreen Studio & Side Panel |
-| `Drag / Double-Click Column Edge` | Resize column width at 60fps or auto-fit column width (`64px–480px`) to content | Fullscreen Studio & Side Panel |
+| `Drag / Double-Click Column Edge` | Resize column width smoothly or auto-fit column width (`64px–480px`) to content | Fullscreen Studio & Side Panel |
 | `Escape` | Cancel inline edit or close active context menu, popover, drawer, or modal | Fullscreen Studio & Side Panel |
 
 ---
