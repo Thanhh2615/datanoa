@@ -1,0 +1,9 @@
+{
+  "extends": "./.orca/types/tsconfig.json",
+  "compilerOptions": {
+    "skipLibCheck": true
+  },
+  "include": ["src", "test", "build"],
+  "exclude": ["test/e2e/**"]
+}
+

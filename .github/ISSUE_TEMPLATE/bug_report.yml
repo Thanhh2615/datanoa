@@ -1,0 +1,60 @@
+name: Bug Report
+description: Report a bug, crash, UI glitch, or database driver issue in Datanoa
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve **Datanoa**! Please fill out the details below. If you opened this from Datanoa's in-app **Feedback / Report Issue** button, the diagnostic summary is already pre-filled.
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      description: Where did the issue occur?
+      options:
+        - Fullscreen Studio (.datanoa / .sql tab)
+        - Side Panel (Right Sidebar)
+        - Both / Background Worker
+    validations:
+      required: true
+  - type: dropdown
+    id: driver
+    attributes:
+      label: Database Engine
+      options:
+        - SQLite
+        - PostgreSQL
+        - MySQL
+        - MariaDB
+        - CockroachDB
+        - ClickHouse
+        - Redis
+        - LibSQL / Turso
+        - Multiple / General UI
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this issue?
+      placeholder: |
+        1. Connect to ...
+        2. Open table ...
+        3. Click ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs Actual Behavior
+      description: What did you expect to happen, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostic Environment (No Secrets)
+      description: Version and non-sensitive diagnostic info (please do not paste passwords or connection URIs).
+      render: markdown

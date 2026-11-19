@@ -1,0 +1,36 @@
+name: Feature Request / UI Improvement
+description: Suggest a new feature, database engine improvement, or UX enhancement for Datanoa
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea to make **Datanoa** faster, smoother, or more useful? Share it below!
+  - type: dropdown
+    id: category
+    attributes:
+      label: Area
+      options:
+        - Data Grid & Inline Editing
+        - SQL Console & Autocomplete
+        - Visual Table Structure Designer (Schema Inspector)
+        - Connection Manager & Auto-Discovery
+        - Database Engine / Driver Support
+        - Theme / UI / UX Polish
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Use Case
+      description: What workflow or problem are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: How should this feature work in Datanoa?
+    validations:
+      required: true

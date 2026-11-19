@@ -1,0 +1,81 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stablyai/orca/main/docs/schemas/plugins/orca-plugin.v2.schema.json",
+  "manifestVersion": 2,
+  "id": "datanoa",
+  "name": "Datanoa",
+  "version": "0.1.0",
+  "license": "MIT",
+  "icon": "assets/icon.png",
+  "description": "Multi-Engine OLED Database Studio for Orca (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, Turso/LibSQL).",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker/index.ts",
+  "contributes": {
+    "newFiles": [
+      {
+        "id": "datanoa-studio",
+        "title": "Datanoa Studio",
+        "extension": ".datanoa",
+        "template": "templates/studio.datanoa"
+      }
+    ],
+    "commands": [
+      {
+        "id": "datanoa.openSqliteFile",
+        "title": "Datanoa: Open SQLite File"
+      },
+      {
+        "id": "datanoa.newQuery",
+        "title": "Datanoa: New SQL Query"
+      }
+    ],
+    "panels": [
+      {
+        "id": "datanoa-panel",
+        "title": "Datanoa",
+        "icon": "database",
+        "entry": "src/panel/panel.html",
+        "ui": "html"
+      }
+    ],
+    "customEditors": [
+      {
+        "id": "datanoa-studio",
+        "title": "Datanoa Studio",
+        "extensions": [".sql", ".datanoa"],
+        "entry": "src/editor/index.ts",
+        "frame": "isolated"
+      }
+    ],
+    "settings": [
+      {
+        "key": "maxRows",
+        "title": "Max Rows Ceiling",
+        "description": "Maximum number of rows returned by a query",
+        "type": "integer",
+        "default": 1000,
+        "minimum": 1,
+        "maximum": 50000
+      },
+      {
+        "key": "queryTimeoutSeconds",
+        "title": "Query Timeout (seconds)",
+        "description": "Maximum execution time before cancelling a query",
+        "type": "integer",
+        "default": 30,
+        "minimum": 1,
+        "maximum": 110
+      }
+    ]
+  },
+  "capabilities": [
+    { "kind": "storage:own" },
+    { "kind": "secrets:own" },
+    { "kind": "workspace:read" },
+    { "kind": "workspace:write" },
+    { "kind": "settings:own" }
+  ]
+}
