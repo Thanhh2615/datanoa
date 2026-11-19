@@ -1880,12 +1880,13 @@ export function sanitizeFeedbackError(rawError) {
   const raw = String(rawError || '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').trim()
   if (!raw) return ''
   let clean = raw.replace(
-    /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^:/?#\s@]*:)([^@\s]+)(@)/g,
-    '$1***$3'
+    /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^/\s@]*@)?([^\s/:?#]+)(:\d+)?/g,
+    '$1<redacted-host>'
   )
+  clean = clean.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 <redacted>')
   clean = clean.replace(/\b(password|passwd|pwd|authToken|token|secret|api_?key)\s*[:=]\s*([^\s,;&"'`]+)/gi, '$1=***')
-  clean = clean.replace(/[A-Za-z]:\\Users\\[^\s"'`<>|]+/gi, '<local-path>')
-  clean = clean.replace(/\/(?:Users|home)\/[^\s"'`<>|]+/g, '<local-path>')
+  clean = clean.replace(/[A-Za-z]:\\[^\s"'`<>|]+/gi, '<local-path>')
+  clean = clean.replace(/\/(?:Users|home|var|tmp|etc|opt|mnt)\/[^\s"'`<>|]+/g, '<local-path>')
   if (clean.length > 400) {
     clean = `${clean.slice(0, 397)}...`
   }
