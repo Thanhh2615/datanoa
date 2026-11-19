@@ -133,7 +133,7 @@ describe('Tier 1 Feature Coverage: Features F19 - F20 (Automated Tests, Orca Val
       )
       expect(manifest.manifestVersion).toBe(2)
       expect(manifest.id).toBe('datanoa')
-      expect(manifest.name).toBe('Datanoa')
+      expect(manifest.name).toBe('Datanoa Studio')
       expect(manifest.license).toBe('MIT')
       expect(manifest.icon).toBe('assets/icon.png')
       expect(manifest.execution).toBe('trusted-worker')
