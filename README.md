@@ -1,155 +1,198 @@
 <p align="center">
-  <img src="assets/icon.png" alt="Datanoa Logo" width="84" height="84" />
+  <img src="assets/icon.png" alt="Datanoa Logo" width="88" height="88" />
 </p>
 
-# Datanoa — Multi-Engine OLED Database Studio for Orca
+<h1 align="center">Datanoa — Multi-Engine OLED Database Studio for Orca</h1>
 
-**Datanoa** is a production-grade, zero-stub Database Studio extension for **Orca** (`>=1.4.248`). Inspired by JetBrains DataGrip and built specifically around Orca's True OLED (`#000000`) and Light theme token system, Datanoa gives you unified schema exploration, transactional inline data editing, multi-statement SQL & Redis execution, execution plan analysis, and `.env` / `.db` auto-discovery across **8 database engines** without leaving your workspace.
+<p align="center">
+  <strong>JetBrains DataGrip-grade schema explorer, 60fps virtualized data grid, visual table designer, and multi-statement SQL &amp; Redis console built natively for Orca's True OLED (<code>#000000</code>) and Light themes.</strong>
+</p>
+
+<p align="center">
+  <a href="https://onorca.dev"><img src="https://img.shields.io/badge/Orca-%3E%3D1.4.248-000000?style=flat-square&logoColor=white&labelColor=141414&color=38bdf8" alt="Orca >=1.4.248" /></a>
+  <a href="#8-supported-database-engines"><img src="https://img.shields.io/badge/Engines-8%20Databases-4ade80?style=flat-square&labelColor=141414" alt="8 Database Engines" /></a>
+  <a href="#60fps-virtualized-grid-bulk-operations--power-utilities"><img src="https://img.shields.io/badge/Virtual%20Grid-60fps-60a5fa?style=flat-square&labelColor=141414" alt="60fps Virtual Grid" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-e6e6e6?style=flat-square&labelColor=141414" alt="MIT License" /></a>
+  <a href="https://github.com/Thanhh2615/datanoa/issues/new/choose"><img src="https://img.shields.io/badge/Feedback-Report%20Bug%20%2F%20Request%20Feature-fbbf24?style=flat-square&labelColor=141414" alt="Report Bug / Request Feature" /></a>
+</p>
+
+<p align="center">
+  <img src="images/cover.png" alt="Datanoa Studio Split View — OLED PostgreSQL Console, 60fps Virtual Data Grid, Multi-Cell Aggregates & JSON Value Inspector" width="100%" />
+</p>
 
 ---
 
-## True Orca OLED & Light Theme Parity
+## Why Datanoa?
 
-- **True OLED Canvas (`#000000`):** Reads Orca host-injected `--orca-*` tokens directly (`--orca-background`, `--orca-editor-surface`, `--orca-secondary`, `--orca-border`, `--orca-foreground`, `--orca-primary`, `--orca-primary-foreground`, `--orca-accent`) with `#000000` OLED canvas fallbacks, `#0a0a0a` / `#0f0f0f` / `#141414` elevated surfaces, `#1f1f1f` hairline borders, and `#e6e6e6` on `#000000` primary actions.
-- **Zero Host Token Overrides:** Never overwrites `:root` `--orca-*` variables, preserving `stablyai.orca-oled-theme` and user themes automatically.
-- **Full Light Mode Parity:** Detects host theme via `orca.on('theme')` and luminance probing of `--orca-background`, toggling `html.light` cleanly across both the Sidebar Panel and Full Studio Editor.
-- **Native Orca Typography Sync & Embedded `Geist` Variable Font:** Synchronizes font family, size, weight, line height, and ligatures directly from Orca via `editor.readTypography` and `editor.typography.changed`, while embedding Orca Desktop's bundled `Geist` variable font (`assets/fonts/Geist-Variable.woff2` / `src/assets/geist-font.ts`, `GEIST_FONT_DATA_URI`) via `@font-face` in both the isolated Custom Editor and Sidebar Panel HTML for exact visual parity with Orca Desktop (`Cascadia Code` / `ui-monospace` for SQL & tabular metrics).
-- **OLED CodeMirror 6 Highlighting:** Configured with `HighlightStyle` tuned to `stablyai.orca-oled-theme` SQL syntax colors.
+Most editor database extensions force a trade-off between lightweight single-engine viewers and heavy external Java/Electron GUI apps. **Datanoa** brings a complete, zero-stub multi-engine database workstation directly inside **Orca** (`>=1.4.248`) across two synchronized surfaces:
+
+- **Dual-Surface Architecture:** Work side-by-side with your code in the **Orca Right Sidebar Panel**, or pop open a standalone fullscreen **Datanoa Studio** tab (`.datanoa` / `.sql`) from Orca's `+` Tab Bar menu.
+- **8 Database Engines Out of the Box:** Connect to **SQLite**, **PostgreSQL**, **MySQL**, **MariaDB**, **CockroachDB**, **ClickHouse**, **Redis**, and **LibSQL / Turso** with zero native compilation or external CLI dependencies.
+- **True Orca OLED (`#000000`) & Light Mode Parity:** Inherits `--orca-*` host tokens directly without overriding `:root` theme variables, embeds Orca Desktop's bundled `Geist` variable font (`Geist-Variable.woff2`) for zero-FOUT typography parity, and switches cleanly between True OLED dark mode and `html.light`.
+- **60fps Windowed Virtualization:** Smoothly scroll, filter, pin columns, and drag-select rectangular cell ranges across 10,000-row pages at 60fps with live status-bar math aggregates (`Count`, `Sum`, `Avg`, `Min`, `Max`).
+- **Transactional Safety First:** Stage inline edits, cloned rows, bulk fills, pasted TSV/CSV rows, and visual schema migrations locally, preview the exact dialect-quoted DML/DDL statements, and commit atomically inside database transactions with optimistic concurrency verification.
 
 ---
 
 ## 8 Supported Database Engines
 
-| Engine | Driver ID | Default Port | Transport / Implementation |
-|---|---|---|---|
-| **SQLite** | `sqlite` | Local file / `:memory:` | Built-in `node:sqlite` (`DatabaseSync`) isolated in `worker_threads` |
-| **PostgreSQL** | `postgres` | `5432` | Pre-bundled `pg` + `pg-cursor` (`vendor/pg.js`) with optional TLS |
-| **MySQL** | `mysql` | `3306` | Pre-bundled pure-JS `mysql2` (`vendor/mysql2.js`) |
-| **MariaDB** | `mariadb` | `3306` | Pre-bundled pure-JS `mysql2` (`vendor/mysql2.js`) |
-| **CockroachDB** | `cockroachdb` | `26257` | PostgreSQL wire protocol (`vendor/pg.js`) with SSL default enabled |
-| **ClickHouse** | `clickhouse` | `8123` / `8443` | Native HTTP(S) `JSONCompact` & parameterized mutation driver |
-| **Redis** | `redis` | `6379` | Zero-dependency TCP / TLS RESP2 protocol client (`db0`–`db15`, `SCAN`) |
-| **Turso / LibSQL** | `libsql` | `443` | Hrana v2 HTTP pipeline client with encrypted `authToken` storage |
-
-### 1-Click Connection URI Quick-Fill & Workspace Auto-Detect
-
-- **Connection URI Parser (`connection.parseUri`):** Paste any `postgres://`, `postgresql://`, `mysql://`, `mariadb://`, `cockroachdb://`, `cockroach://`, `clickhouse://`, `clickhouses://`, `http://`, `https://`, `redis://`, `rediss://`, `libsql://`, `sqlite://`, or `file:` URI to auto-populate engine selection, host, port, database, TLS flags, credentials, and SQLite read-only mode.
-- **Workspace `.env` & `.db` Auto-Detection (`workspace.detectConnections`, `sqlite.scanFolder`):**
-  - Scans root `.env`, `.env.local`, and `.env.development` files for database URLs (`DATABASE_URL`, `POSTGRES_URL`, `MYSQL_URL`, `REDIS_URL`, `CLICKHOUSE_URL`, `TURSO_DATABASE_URL`, `LIBSQL_URL`, and related keys).
-  - Performs bounded asynchronous BFS discovery (`800ms` budget, max depth `4`, max `350` dirs, max `60` results) for `.db`, `.sqlite`, and `.sqlite3` files while blocking home/system roots (`isBlockedScanRoot`) and skipping `node_modules`, `.git`, build outputs, and caches.
+| Engine | Driver ID | Default Port | Wire Protocol & Transport | Cloud Auto-SSL & Resilience | Transaction & Mutation Safety |
+|---|---|---|---|---|---|
+| **SQLite** | `sqlite` | Local file / `:memory:` | Built-in `node:sqlite` (`DatabaseSync`) isolated in Node `worker_threads` | Instant workspace `.db` / `.sqlite` / `.sqlite3` BFS scanner (`800ms` budget) | `BEGIN IMMEDIATE` batch transactions + **12-step atomic table rebuild** for full `ALTER TABLE` parity |
+| **PostgreSQL** | `postgres` | `5432` | Pre-bundled `pg` + `pg-cursor` (`vendor/pg.js`) with `DATE` string preservation & `rowMode: 'array'` | Auto-SSL on 22+ cloud providers, `options` (`endpoint=...`) preservation & **Supabase IPv6-to-IPv4 Supavisor bridge** | `BEGIN` / `COMMIT` / `ROLLBACK` transactions, backend `pg_cancel_backend(pid)` query cancellation & optimistic concurrency |
+| **MySQL** | `mysql` | `3306` | Pre-bundled pure-JS `mysql2` (`vendor/mysql2.js`) with connection pooling | Cloud Auto-SSL (`sslmode=require`, PlanetScale, Aiven, AWS RDS, Railway, TiDB Cloud) | Pooled transactional batch staging, `KILL QUERY` cancellation & MySQL `/*!...*/` executable comment awareness |
+| **MariaDB** | `mariadb` | `3306` | Pre-bundled pure-JS `mysql2` (`vendor/mysql2.js`) with MariaDB metadata introspection | Cloud Auto-SSL & URI flag resolution (`tls`, `ssl`, `sslmode`) | Atomic batch DML transactions & backtick-escaped DDL migration planner |
+| **CockroachDB** | `cockroachdb` | `26257` | PostgreSQL wire protocol (`vendor/pg.js`) with CockroachDB DDL/cluster awareness | TLS enabled by default + full `?options=--cluster=...` round-trip preservation | Distributed SQL transactional batch commit & dialect-aware `EXPLAIN` |
+| **ClickHouse** | `clickhouse` | `8123` / `8443` | Native HTTP(S) `JSONCompact` streaming & parameterized mutation driver | Auto-HTTPS on port `8443` and `.clickhouse.cloud` endpoints with basic/header auth | Dialect-aware `ALTER TABLE ... UPDATE` / `DELETE` & `INSERT INTO` batch execution |
+| **Redis** | `redis` | `6379` | Zero-dependency native TCP / TLS RESP2 protocol client (`db0`–`db15`) | Auto-TLS on `rediss://` and `.upstash.io` endpoints (respecting explicit `ssl` toggle) | Non-blocking `SCAN` keyspace pagination, type inspection (`string`, `hash`, `list`, `set`, `zset`) & command runner |
+| **LibSQL / Turso** | `libsql` | `443` | Hrana v2 HTTP pipeline client (`/v2/pipeline`) | HTTPS / `libsql://` transport with encrypted `authToken` storage in Orca's `secrets:own` vault | Batched pipeline transactions + atomic 12-step SQLite-compatible schema migration rebuild |
 
 ---
 
-## JetBrains DataGrip / Database Tools Parity
+## Install in Orca
 
-- **Multi-Data-Source Expandable Tree:** Expand multiple database connections simultaneously with custom engine vector SVG logos (`getDbLogoSvg` / `createDbLogoSvg`), `DEV` / `STAGING` / `PROD` environment badges, `RO` indicators, nested `Tables` / `Views` / `Keyspaces` → `Columns` / `Indexes` / `Foreign Keys`, live table & column search, safe delete confirmation modal (`Confirm Delete Connection`) before removing a connection, and right-click context menus (`Open Data`, `Open in Full Studio`, `Jump to Console`, `Generate SELECT / INSERT / UPDATE / CREATE DDL`, `Edit`, `Duplicate`, `Refresh`, `Delete`).
-- **Server-Side `WHERE` & `ORDER BY` Filter Bar & Configurable Page Size (`100`–`10,000`):** Execute filtered and sorted table pages on the server (`data.fetchPage`) with statement-breakout protection (`sanitizeFilterClause` rejects unquoted `;`, `--`, `/*`, and unclosed quotes) and switch rows per page (`100`, `500`, `1,000`, `5,000`, `10,000`) on the fly in both Panel and Full Studio.
-- **Smart Context-Aware SQL & Redis Autocomplete + Query Status/Error Banners:** Context-aware CodeMirror completion (`computeSmartSqlCompletions`) suggests active/referenced table columns directly inside `SELECT`, `WHERE`, and `ORDER BY` clauses, boosts table names after `FROM` / `JOIN` / `UPDATE` / `INTO`, resolves table aliases (`a.col`), and completes Redis commands (`SCAN`, `GET`, `HGETALL`, etc.), paired with prominent `.datanoa-query-banner` / `#sqlSuccessBanner` / `#sqlErrorBanner` feedback and query-aware empty states.
-- **Transactional Batch Staging & DML Preview:** Stage inline cell edits, new rows (`+ Row`, automatically omitting unedited `AUTOINCREMENT` and `DEFAULT` columns such as `DEFAULT datetime('now')` so the database evaluates true engine defaults cleanly and displaying `(auto)` / `(default)` cell placeholders), row deletions (`− Row`), and row clones (`Clone` / `Clone Row`) with live pending counters, preview exact dialect SQL statements (`DML Preview` → `data.previewChanges`), commit atomically inside dialect transactions (`Submit` → `data.applyChanges`), or roll back locally (`Revert`). Inline edits enforce optimistic concurrency matching on original values.
-- **Transpose View:** Toggle `Transpose` (`⇄ Transpose`) to inspect wide tables row-by-column without horizontal scrolling fatigue.
-- **7-Format Data Extractor:** Copy result grids cleanly as `SQL INSERT`, `SQL UPDATE`, `JSON`, `NDJSON`, `CSV`, `TSV`, or `Markdown`.
-- **Caret-Aware Multi-Statement SQL Runner & `EXPLAIN`:** Split SQL scripts cleanly across quotes, dollar-quoted (`$$`) blocks, and comments (`findStatementAtOffset`) so `Ctrl+Enter` runs the statement at the cursor while `Execute All` / `Run All` runs all statements end-to-end. Run `Explain` (`query.explain`) for execution plans and abort long queries mid-flight (`query.cancel`).
-- **Persistent Query History:** Browse, filter, and recall up to 50 recent queries with driver badges, duration metrics, and error indicators (`query.history.list`, `query.history.clear`).
-- **Staged Visual Table Structure Designer (`Schema Inspector` / `Schema` Tab & SQLite 12-Step Rebuild):** Design tables interactively in the same DataGrip/TablePlus-grade staged grid (`+ Column`, `+ Index / Key` with composite multi-column pills & `UNIQUE` support, `+ Foreign Key` with `ON DELETE` rules, inline table rename, inline column type/PK/Nullable editing, smart `Default Value` auto-quoting with 1-click `×` clear button, `DDL Preview` drawer, `Apply [N]` via `Ctrl+S`, and `Revert`). Powered by a multi-dialect migration builder (`buildTableMigrationSql`) that performs an atomic 12-step `PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE; CREATE TABLE ...; INSERT INTO ... SELECT ...; DROP TABLE ...; ALTER TABLE ... RENAME TO ...; COMMIT; PRAGMA foreign_keys = ON;` table rebuild on SQLite/LibSQL whenever column types, defaults, nullability, PKs, or FKs change.
-- **Cleanly Formatted Multi-Line `CREATE TABLE` DDL Viewer:** Inspect formatted multi-line `CREATE TABLE`, `PRIMARY KEY`, `FOREIGN KEY`, and `CREATE [UNIQUE] INDEX` DDL (`formatDdlForDisplay`, `schema.generateDdl` / `reconstructTableDdl`) preserving exact identifier casing alongside scrollable Columns, Foreign Keys, and Indexes matrices.
-- **Dockable Cell & JSON Value Inspector:** Single-click cells to highlight and stage without shrinking the grid; open the Value Inspector on demand via the **Edit Cell** button or grid context menu (**Edit in Value Inspector**) to edit multi-line text, pretty-print JSON payloads (`Format JSON`), set `NULL`, or copy values.
-- **Environment Color Guards & Read-Only Lock:** Tag connections as `none`, `dev`, `staging`, or `prod` (`colorTag`), display caution banners on `PROD` / `Read-Only` connections, and enforce worker-level mutation blocking (`isMutatingStatement`) across both single and multi-statement SQL buffers whenever `readOnly` is active.
+### 1. From Orca Community Plugins (Recommended)
 
-### Keyboard & Mouse Shortcuts
+Open **Orca** → **Settings** → **Plugins** → **Community Plugins** (`https://github.com/stablyai/orca-community-plugins.git`), search for **Datanoa** (`thanhh2615.datanoa`), and click **Install**.
+
+### 2. Via Orca CLI
+
+```bash
+orca plugin install https://github.com/Thanhh2615/datanoa.git
+```
+
+### 3. Local Development
+
+```bash
+git clone https://github.com/Thanhh2615/datanoa.git
+cd datanoa
+npm install
+npm run verify
+orca plugin dev load .
+```
+
+---
+
+## How to Open & Use Datanoa
+
+Datanoa integrates into Orca across four natural entry points:
+
+1. **Open Fullscreen Studio from Orca's `+` Tab Bar:** Click **`+`** on Orca's editor tab bar and select **Datanoa Studio** to open a standalone `.datanoa` studio tab.
+2. **Open the Docked Side Panel:** Click the **Datanoa** database icon in Orca's Right Sidebar Panel to browse schemas, inspect rows, or run quick queries right beside your code.
+3. **Open Any `.sql` or `.datanoa` File:** Opening any `.sql` or `.datanoa` file in your workspace launches the full Datanoa Studio custom editor automatically.
+4. **Connect in One Click (`+ Connect`):** Click **`+ Connect`** in either Fullscreen Studio or the Side Panel to paste a connection URI (`postgres://`, `mysql://`, `redis://`, `libsql://`, `clickhouse://`, `sqlite://`), pick any of the 8 database engines, or click **`Auto-Detect (.env & .db)`** to import credentials from `.env` / `.env.local` / `.env.development` and local SQLite `.db` files.
+
+---
+
+## Visual Walkthrough & Screenshots
+
+### 1. 8-Engine Connection Manager, URI Quick-Fill & Workspace Auto-Detect
+
+Paste any cloud or local database URI (`Neon`, `Supabase`, `Turso`, `Upstash`, `ClickHouse Cloud`, `CockroachDB Cloud`, `RDS`), auto-detect `.env` variables (`DATABASE_URL`, `REDIS_URL`, `TURSO_DATABASE_URL`) and workspace SQLite files, tag environments (`None`, `Dev`, `Staging`, `Prod`), and verify connectivity with live latency diagnostics.
+
+<p align="center">
+  <img src="images/studio-connection-modal.png" alt="Datanoa 8-Engine Connection Modal with Quick URI Parser, Workspace .env & .db Auto-Discovery, and Cloud Auto-SSL" width="100%" />
+</p>
+
+### 2. Visual Table Structure Designer & Live Migration SQL Preview
+
+Edit table schemas visually in **Schema Inspector** mode: add, rename, or re-type columns with the in-DOM dialect Data Type Combobox, configure Primary Keys, Nullability, and smart Default Values, manage composite Indexes and Foreign Keys (`ON DELETE CASCADE` / `SET NULL` / `RESTRICT`), inspect live `ALTER TABLE` / `CREATE INDEX` DDL in the **Staged Schema Migration SQL** drawer, and apply atomically (`Ctrl+S`). On SQLite and LibSQL, complex structural edits automatically execute a 12-step atomic table rebuild preserving data, indexes, and foreign keys.
+
+<p align="center">
+  <img src="images/schema-designer.png" alt="Datanoa Visual Table Structure Designer with Staged Column Changes, In-DOM Data Type Combobox & Live Migration SQL Preview" width="100%" />
+</p>
+
+### 3. Clean Light Theme (`html.light`), Horizontal Top Table Switcher & Pinned Columns
+
+Switch Orca to a light theme and Datanoa adapts automatically. Collapse the left sidebar into the **Horizontal Top Table Switcher Bar** to maximize horizontal grid space, pin key identifier columns (`id`, `order_code`) to the left edge with opaque elevation shadows, and use **Find & Highlight (`Ctrl+F`)** to jump across matching cells in real time.
+
+<p align="center">
+  <img src="images/studio-light-theme.png" alt="Datanoa Studio in Clean Light Theme with Horizontal Top Table Switcher Bar, Pinned Columns & Find Highlight" width="100%" />
+</p>
+
+### 4. Docked Side Panel — Multi-Engine Explorer, 60fps Data Grid & Quick SQL Runner
+
+Use the **Datanoa Side Panel** without leaving your active code editor: expand multiple database connections simultaneously in the **Explorer** tree, stage and filter data in the virtualized **Data** tab with live multi-cell selection math, or run multi-statement queries in the **SQL** tab with persistent history and 1-click exports.
+
+<p align="center">
+  <img src="images/side-panel-explorer.png" alt="Datanoa Side Panel Showcase — Multi-Engine Explorer Tree, 60fps Virtualized Data Grid & Quick SQL Runner" width="100%" />
+</p>
+
+---
+
+## 60fps Virtualized Grid, Bulk Operations & Power Utilities
+
+- **Rectangular Multi-Cell Selection & Live Math Aggregates:** Drag across cells, Shift-click ranges, click row numbers or column headers, or press `Ctrl+A`. The status bar immediately computes **`Count`**, **`Sum`**, **`Avg`**, **`Min`**, and **`Max`** across numeric cells (click the aggregate pill to copy statistics to the clipboard).
+- **Multi-Format Copy, Paste & Export:**
+  - Copy any cell range as **TSV** (`Ctrl+C`), **CSV**, **JSON**, **NDJSON**, **SQL `IN (...)` list**, **SQL `INSERT`**, **SQL `UPDATE`**, or **Markdown table** from the right-click context menu or Export selector.
+  - **Paste as New Row(s) (`Ctrl+V`):** Paste multi-row TSV or CSV data from Excel, Google Sheets, or another table directly into existing cells or as newly staged rows.
+  - **Bulk Fill Selected Cells:** Fill an entire rectangular selection with a constant value or `NULL` in one operation.
+- **Transactional Row Staging & `CLONE` Badges:** Stage inline cell edits (sky-blue highlight), new rows (`+ Row`), row deletions (`− Row`), and cloned rows (`Clone` → marked with a `CLONE` badge while automatically omitting unedited `AUTOINCREMENT` and `DEFAULT` columns so the database engine evaluates true defaults cleanly). Preview exact SQL via **`DML Preview`** before clicking **`Submit [N]`** (`Ctrl+S`).
+- **Pin / Freeze Columns & Column Visibility:** Pin arbitrary columns to the left edge of the grid and toggle column visibility per table (persisted across sessions).
+- **Quick Filter & Server `WHERE` / `ORDER BY` Bar:** Right-click any cell to **`Filter by Value (=)`** or **`Exclude Value (!=)`**, or type custom `WHERE` and `ORDER BY` clauses protected by `sanitizeFilterClause` against statement breakout.
+- **1-Click Foreign Key Jump (`Ctrl+Click` / `↗`):** Click the `↗` badge or `Ctrl+Click` any foreign key cell to open the referenced parent table filtered directly to that primary key.
+- **Dockable Value & JSON Inspector:** Inspect and edit large text or JSON payloads, validate JSON syntax live, one-click **`Format JSON`** / **`Minify JSON`**, set `NULL`, or copy values.
+- **Dialect-Aware SQL Console & Smart Autocomplete:** Powered by CodeMirror 6 with `stablyai.orca-oled-theme` syntax highlighting, dialect-aware SQL formatting (`Shift+Alt+F`), caret-aware statement splitting (`Ctrl+Enter` runs the statement at the cursor; `Ctrl+Shift+Enter` runs all statements), table/alias-aware column autocomplete (`computeSmartSqlCompletions`), Redis command completion, `EXPLAIN` execution plan runner, and persistent 50-entry Query History.
+
+---
+
+## Keyboard Shortcuts
 
 | Shortcut / Gesture | Action | Scope |
 |---|---|---|
-| `Ctrl / Cmd + Mouse Wheel` | Smooth horizontal panning on wide tables, SQL results, DDL cards & schema matrices | Panel & Full Studio |
-| `Drag Column Border` | Smooth 60fps `<colgroup>` column width resizing across `#` & data columns | Panel & Full Studio |
-| `Double-Click Column Border` | Auto-fit column width (`64px–480px`) to visible header & cell content | Panel & Full Studio |
-| `Double-Click` | Open inline cell editor (`Enter` / smart `blur` to commit) | Data Grid |
-| `Tab` / `Shift+Tab` | Commit current cell edit and jump to next / previous editable cell | Data Grid |
-| `Ctrl+Enter` (`Cmd+Enter`) | Execute SQL statement at current caret position | SQL Console |
-| `Execute All` (`Run All`) | Execute entire multi-statement SQL buffer sequentially | SQL Console |
-| `Ctrl+S` / `Cmd+S` | Transactional batch submit of all staged inserts, updates & deletes | Data Grid |
-| `Escape` | Cancel active inline cell edit or dismiss context menus / drawers | Panel & Full Studio |
+| `Ctrl+Enter` / `Cmd+Enter` | Execute SQL statement at current caret position (or active selection) | SQL Console & Side Panel |
+| `Ctrl+Shift+Enter` | Execute all statements in the SQL console sequentially | SQL Console |
+| `Shift+Alt+F` | Format SQL buffer with dialect-aware indentation & keyword casing | SQL Console & Side Panel |
+| `Ctrl+S` / `Cmd+S` | Submit staged data edits (`INSERT` / `UPDATE` / `DELETE`) or staged schema migration | Data Grid & Schema Designer |
+| `Ctrl+F` / `Cmd+F` | Focus Find & Highlight bar (`Enter` / `Shift+Enter` to cycle matches) | Data Grid & Side Panel |
+| `Ctrl+K` / `Ctrl+P` | Open Quick Switcher / Command Palette (tables, connections, views, actions) | Fullscreen Studio |
+| `Ctrl+/` | Open Keyboard Shortcuts cheatsheet modal | Fullscreen Studio |
+| `Arrow Keys` / `Shift+Arrow` | Navigate cells and extend rectangular multi-cell selection | Data Grid & Side Panel |
+| `Ctrl+A` / `Cmd+A` | Select all visible cells in the current table or query result | Data Grid & Side Panel |
+| `Ctrl+C` / `Ctrl+V` | Copy selected range as TSV / Paste TSV or CSV data into grid | Data Grid & Side Panel |
+| `Enter` / `F2` / `Double-Click` | Open inline cell editor (`Tab` / `Shift+Tab` to commit and move horizontally) | Data Grid & Side Panel |
+| `Delete` / `Backspace` | Stage `NULL` across selected nullable cells (blocks `NOT NULL` columns safely) | Data Grid & Side Panel |
+| `Ctrl+Click` (or click `↗`) | Jump directly to referenced Foreign Key row in parent table | Data Grid & Side Panel |
+| `Ctrl + Mouse Wheel` | Smooth horizontal panning across wide data grids, SQL results & DDL cards | Fullscreen Studio & Side Panel |
+| `Drag / Double-Click Column Edge` | Resize column width at 60fps or auto-fit column width (`64px–480px`) to content | Fullscreen Studio & Side Panel |
+| `Escape` | Cancel inline edit or close active context menu, popover, drawer, or modal | Fullscreen Studio & Side Panel |
 
 ---
 
-## Architecture & Security Model
+## Security, Privacy & Capabilities
 
-Datanoa runs under Orca's `"trusted-worker"` execution model (`manifestVersion: 2`, `pluginApi: 1`):
+Datanoa runs under Orca's `"trusted-worker"` execution model (`manifestVersion: 2`, `pluginApi: 1`) with minimal, scoped permissions:
 
-1. **Sidebar Panel (`src/panel/panel.html`, `ui: "html"`):** Self-contained OLED HTML/CSS/SVG Studio sidebar panel, paired with `src/panel/index.tsx` and `src/panel/index.check.ts` for declarative check coverage.
-2. **Full Studio Custom Editor (`src/editor/index.ts`, `frame: "isolated"`):** Custom editor for `.sql` and `.datanoa` documents (`.datanoa/*.datanoa` workspace tabs opened via `studio.open` with `.datanoa/.gitignore` isolation), hosting CodeMirror 6 (`src/editor/console.ts`), the virtualized staging grid (`src/editor/grid.ts`), and schema/DDL inspector (`src/editor/schema-inspector.ts`).
-3. **Trusted Worker (`src/worker/index.ts`):**
-   - `connections.list` and `SessionManager.findProfile` read exclusively from `orca.storage` (`datanoa.savedConnections`) so listing connections never triggers filesystem crawls.
-   - `SessionManager` stores passwords (`pwd_<id>`) and Turso/LibSQL tokens (`tok_<id>`) strictly in Orca's encrypted `secrets:own` vault and strips secrets from sanitized JSON responses (`sanitizeJsonPayload`).
-   - SQLite operations execute inside an isolated Node `worker_threads` worker (`src/drivers/sqlite/thread.ts`).
-4. **Type-Safe IPC Contract (`src/protocol.ts`):** Single source of truth augmenting `orca`'s `PluginRequests` and `PluginPanelEvents` across worker, panel, editor, and test suites.
-5. **CSP & Bundle Compliance:** All vendor bundles (`vendor/pg.js`, `vendor/mysql2.js`, `vendor/codemirror.js`) are minified ESM modules strictly `< 1 MiB` per file with zero `eval(` and zero `new Function(`.
-6. **Licensing:** Released under the [MIT License](LICENSE) with full dependency attributions in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+| Capability | Purpose in Datanoa |
+|---|---|
+| `storage:own` | Stores non-sensitive connection profiles (`datanoa.savedConnections`), query history, and UI view state (`datanoa.studioViewState`, `datanoa.panelViewState`). |
+| `secrets:own` | Stores database passwords (`pwd_<id>`) and Turso/LibSQL bearer tokens (`tok_<id>`) exclusively inside Orca's OS-backed encrypted secrets vault. Secrets are never written to plain storage or `.datanoa` files. |
+| `workspace:read` | Enables bounded `.env` / `.env.local` connection discovery and asynchronous BFS discovery of workspace `.db` / `.sqlite` / `.sqlite3` files (blocking system/home root crawls). |
+| `workspace:write` | Creates `.datanoa/` studio session files and exports user-requested CSV / JSON / SQL / Markdown dumps. |
+| `settings:own` | Reads user-configured `maxRows` (`1–50,000`, default `1,000`) and `queryTimeoutSeconds` (`1–110`, default `30`). |
 
----
-
-## Project Structure
-
-```text
-datanoa/
-├── assets/
-│   ├── fonts/Geist-Variable.woff2      # Bundled Orca Geist variable font (SIL OFL-1.1)
-│   └── icon.png                        # 256x256 plugin icon (< 1 MiB)
-├── build/
-│   └── bundle-drivers.mjs              # esbuild vendor bundler + 1 MiB size & CSP audit
-├── src/
-│   ├── assets/
-│   │   ├── geist-font.ts               # Base64 WOFF2 GEIST_FONT_DATA_URI (< 100 KB)
-│   │   └── logo.ts                     # 64x64 Base64 PNG DATANOA_LOGO_DATA_URI
-│   ├── protocol.ts                     # Canonical IPC contracts & JsonValue sanitizer
-│   ├── drivers/
-│   │   ├── index.ts                    # 8-engine driver registry
-│   │   ├── common/                     # Shared URI parser, SQL tools, schema, update builder
-│   │   ├── sqlite/                     # node:sqlite driver + worker_threads runner
-│   │   ├── postgres/                   # PostgreSQL & CockroachDB driver (vendor/pg.js)
-│   │   ├── mysql/                      # MySQL & MariaDB driver (vendor/mysql2.js)
-│   │   ├── clickhouse/                 # ClickHouse HTTP JSONCompact driver
-│   │   ├── redis/                      # Zero-dependency TCP/TLS RESP2 client
-│   │   └── libsql/                     # Turso / LibSQL Hrana v2 HTTP pipeline client
-│   ├── editor/                         # Isolated Custom Editor (.sql / .datanoa)
-│   ├── panel/                          # Sidebar HTML panel + TSX / check compatibility
-│   └── worker/                         # Trusted worker IPC handlers, discovery & session manager
-├── test/
-│   ├── drivers/                        # SQLite, Postgres, MySQL & multi-engine integration tests
-│   ├── worker/                         # URI parser, SQL tools & trusted-worker RPC tests
-│   └── e2e/
-│       ├── panel-editor-runtime.e2e.test.ts # Static JS semantic, font, grid DOM & SQLite runtime gate
-│       ├── harness/                    # MockOrcaRuntime, fixtures & test helpers
-│       └── tier1-feature-coverage/     # Tier-1 feature E2E suite (F1–F20)
-├── vendor/                             # Pre-bundled pg, mysql2 & codemirror (< 1 MiB each)
-├── LICENSE                             # MIT License
-├── THIRD-PARTY-NOTICES.md              # Bundled open-source notices
-└── orca-plugin.json                    # Orca v2 plugin manifest
-```
+- **Strict Read-Only & `PROD` Guards:** Connections marked **Read-Only** enforce worker-level mutation blocking (`isMutatingStatement`) across every single-statement and multi-statement query (`INSERT`, `UPDATE`, `DELETE`, `ALTER`, `DROP`, `TRUNCATE`, `CREATE`, `REPLACE`, and Redis write commands), powered by a dialect-aware SQL lexer (`src/drivers/common/sql-lexer.ts`) that properly scans dollar-quoted strings (`$tag$...$tag$`), PostgreSQL `E'...'` escapes, MySQL/MariaDB/ClickHouse `\'` & `#` comments, and MySQL `/*!...*/` executable comments.
+- **CSP & Bundle Compliance:** All pre-bundled vendor modules (`vendor/pg.js`, `vendor/mysql2.js`, `vendor/codemirror.js`) are audited at build time (`build/bundle-drivers.mjs`) to ensure each file is strictly `< 1 MiB` with zero `eval(` and zero `new Function(`.
+- **Zero Telemetry:** Datanoa makes zero background network calls and collects zero telemetry. Network connections occur exclusively to user-configured database endpoints.
 
 ---
 
-## Build, Typecheck, Test & Verification
+## Feedback, Bug Reports & Feature Requests
 
-Prerequisites: **Node.js `>=22`** (Node 24 recommended for native `node:sqlite`) and **Orca `>=1.4.248`**.
+Have a bug to report or a feature / UI improvement to suggest?
 
-```powershell
-# Install dependencies
-npm install
+1. **In-App Feedback Modal (1-Click):**
+   - In **Fullscreen Studio**, click **`Feedback`** in the bottom-right status bar (next to `?`), run **`Report Bug / Request Feature...`** from the Command Palette (`Ctrl+K`), or click **`Report Issue`** directly on any query error banner.
+   - In the **Datanoa Side Panel**, click **`Feedback`** in the top header bar.
+   - Choose **Bug Report** or **Feature Request**, enter a summary, and review the auto-filled **Privacy-Safe Diagnostic Summary** (contains only Datanoa version, surface, active engine type, view mode, read-only status, and sanitized error text with URI credentials masked — **never** hostnames, usernames, passwords, tokens, or file paths).
+   - Click **`Open on GitHub Issues ↗`** to launch a pre-filled issue on GitHub (while also copying the Markdown report to your clipboard automatically), or click **`Copy Report`**.
+2. **Direct on GitHub:**
+   - Open a guided Bug Report or Feature Request anytime at **[github.com/Thanhh2615/datanoa/issues](https://github.com/Thanhh2615/datanoa/issues/new/choose)**.
 
-# Bundle pg, mysql2, and CodeMirror into vendor/ (< 1 MiB, CSP audited)
-npm run build
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local build, test (`385+` tests), and pull request guidelines, and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for bundled open-source license attributions.
 
-# Generate .orca/types and run strict TypeScript typechecking
-npm run typecheck
+---
 
-# Run full Vitest suite (15 files / 314 tests: drivers, worker, SQL tools, URI parser, runtime gates & E2E)
-npm test
+## License
 
-# Run Orca CLI manifest, check, and runtime test verification
-orca plugin validate .
-orca plugin check .
-orca plugin test .
-
-# Or run the combined verification pipeline
-npm run verify
-```
+Released under the [MIT License](LICENSE). Copyright © 2026 Thanhh2615.

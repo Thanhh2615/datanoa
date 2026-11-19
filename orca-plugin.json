@@ -3,9 +3,45 @@
   "manifestVersion": 2,
   "id": "datanoa",
   "name": "Datanoa",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "license": "MIT",
+  "author": {
+    "name": "Thanhh2615",
+    "url": "https://github.com/Thanhh2615"
+  },
+  "repository": "https://github.com/Thanhh2615/datanoa",
+  "homepage": "https://github.com/Thanhh2615/datanoa",
   "icon": "assets/icon.png",
+  "cover": {
+    "path": "images/cover.png",
+    "alt": "Datanoa Studio OLED split view with PostgreSQL SQL console, 60fps virtual data grid, multi-cell selection aggregates, and JSON value inspector"
+  },
+  "screenshots": [
+    {
+      "path": "images/studio-connection-modal.png",
+      "alt": "Datanoa New Database Connection modal with 8 database engines, quick URI parser, and .env and SQLite auto-discovery",
+      "caption": "Connect to 8 database engines with URI parsing and .env/.db auto-discovery",
+      "theme": "dark"
+    },
+    {
+      "path": "images/schema-designer.png",
+      "alt": "Datanoa Visual Table Structure Designer showing staged column edits, data type combobox, foreign keys, indexes, and live migration SQL preview",
+      "caption": "Staged visual table structure designer with live DDL diff preview",
+      "theme": "dark"
+    },
+    {
+      "path": "images/studio-light-theme.png",
+      "alt": "Datanoa Studio in high-contrast light theme with horizontal top table bar, pinned columns, and find match highlighting",
+      "caption": "Full light theme parity with pinned columns and instant filter/find",
+      "theme": "light"
+    },
+    {
+      "path": "images/side-panel-explorer.png",
+      "alt": "Datanoa Side Panel showing multi-engine explorer tree, 60fps virtualized data grid with live aggregates, and quick SQL runner",
+      "caption": "60fps Side Panel explorer, virtualized data grid, and quick SQL runner",
+      "theme": "dark"
+    }
+  ],
   "description": "Multi-Engine OLED Database Studio for Orca (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, Turso/LibSQL).",
   "engines": {
     "orca": ">=1.4.248"
