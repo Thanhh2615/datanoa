@@ -45,10 +45,74 @@ import {
   checkCellEditGate,
   coerceCellInputValue,
   copyTextToClipboard,
+  getCellValue,
+  setCellValue,
+  cloneRowData,
+  isNativeDomElement,
   type SelectedCellInfo,
 } from './grid.js'
-import { SchemaInspectorView, formatDdlForDisplay } from './schema-inspector.js'
+import {
+  SchemaInspectorView,
+  formatDdlForDisplay,
+  COMMON_COLUMN_TYPES,
+  REFERENTIAL_ACTIONS,
+  DDL_KEYWORDS,
+  DDL_TYPES,
+  DDL_TOKEN_REGEX,
+  appendFormattedDdl,
+  escapeHtml,
+  normalizeTableDetailsForDraft,
+} from './schema-inspector.js'
 import { EDITOR_STYLE as THEME_EDITOR_STYLE } from './theme.js'
+import {
+  DB_LOGO_COLORS,
+  STUDIO_ENGINES,
+  CONNECTION_ENGINES,
+  CONNECTION_ENV_TAGS,
+  getStudioEngineMeta,
+  getConnectionEngineMeta,
+  isKnownConnectionDriver,
+  createSvgElement,
+  createDbLogoSvg,
+  setButtonLoading,
+  formatAggregateNumber,
+  formatRelativeTimestamp,
+  downloadTextFile,
+  extractPredicateColumnName,
+  isEditableShortcutTarget,
+  parseClientQuickFilterPredicate,
+  fuzzyMatchScore,
+  extractQueriedTableName,
+  copyTextFallback,
+  type StudioEngineMeta,
+  type ConnectionEngineMeta,
+} from './db-icons.js'
+import {
+  openStudioConnectionModal,
+  maskUriSecret,
+  maskConnectionUriSecret,
+  compactFilePath,
+  type StudioConnectionModalContext,
+  type ConnectionSubmission,
+  type ParseUriResponse,
+  type DiscoveredSqliteFile,
+  type DiscoveredEnvConnection,
+  type WorkspaceDetectResponse,
+} from './connection-modal.js'
+import {
+  openStudioCreateTableModal,
+  openCreateTableModal,
+  openStudioDangerTableModal,
+  openDangerTableModal,
+  openStudioCommandPalette,
+  openCommandPalette,
+  openStudioShortcutsModal,
+  openShortcutsModal,
+  openStudioFeedbackModal,
+  openFeedbackModal,
+  sanitizeDiagnosticErrorText,
+  buildStudioDiagnosticSummary,
+} from './studio-modals.js'
 import {
   ACTIVE_CONNECTION_STORAGE_KEY,
   sanitizeJsonPayload,
@@ -84,6 +148,14 @@ export {
   VirtualDataGrid,
   SchemaInspectorView,
   formatDdlForDisplay,
+  COMMON_COLUMN_TYPES,
+  REFERENTIAL_ACTIONS,
+  DDL_KEYWORDS,
+  DDL_TYPES,
+  DDL_TOKEN_REGEX,
+  appendFormattedDdl,
+  escapeHtml,
+  normalizeTableDetailsForDraft,
   extractExecutableSql,
   extractCaretStatementSql,
   computeSmartSqlCompletions,
@@ -92,12 +164,60 @@ export {
   formatCellValue,
   calculateVisibleWindow,
   checkCellEditGate,
+  coerceCellInputValue,
+  getCellValue,
+  setCellValue,
+  cloneRowData,
+  isNativeDomElement,
+  DB_LOGO_COLORS,
+  STUDIO_ENGINES,
+  CONNECTION_ENGINES,
+  CONNECTION_ENV_TAGS,
+  getStudioEngineMeta,
+  getConnectionEngineMeta,
+  isKnownConnectionDriver,
+  createSvgElement,
+  createDbLogoSvg,
+  setButtonLoading,
+  formatAggregateNumber,
+  formatRelativeTimestamp,
+  downloadTextFile,
+  extractPredicateColumnName,
+  isEditableShortcutTarget,
+  parseClientQuickFilterPredicate,
+  fuzzyMatchScore,
+  extractQueriedTableName,
+  copyTextFallback,
+  openStudioConnectionModal,
+  maskUriSecret,
+  maskConnectionUriSecret,
+  compactFilePath,
+  openStudioCreateTableModal,
+  openCreateTableModal,
+  openStudioDangerTableModal,
+  openDangerTableModal,
+  openStudioCommandPalette,
+  openCommandPalette,
+  openStudioShortcutsModal,
+  openShortcutsModal,
+  openStudioFeedbackModal,
+  openFeedbackModal,
+  sanitizeDiagnosticErrorText,
+  buildStudioDiagnosticSummary,
   buildAlterTableSql,
   buildTableMigrationSql,
   createInitialTableDraft,
   countTableStructureChanges,
   normalizeSqlDefaultExpression,
   validateTableStructureDraft,
+  type StudioEngineMeta,
+  type ConnectionEngineMeta,
+  type StudioConnectionModalContext,
+  type ConnectionSubmission,
+  type ParseUriResponse,
+  type DiscoveredSqliteFile,
+  type DiscoveredEnvConnection,
+  type WorkspaceDetectResponse,
   type TableMigrationPlan,
   type TableStructureDraft,
   type DraftColumnItem,
@@ -120,151 +240,6 @@ interface ParsedDatanoaDocument {
   connectionId?: string
   table?: string
   schema?: string
-}
-
-const DB_LOGO_COLORS: Readonly<Record<DatabaseDriverType, string>> = {
-  sqlite: '#38bdf8',
-  postgres: '#60a5fa',
-  mysql: '#fb923c',
-  mariadb: '#c084fc',
-  cockroachdb: '#4ade80',
-  clickhouse: '#facc15',
-  redis: '#f87171',
-  libsql: '#2dd4bf',
-}
-
-function createSvgElement(tag: string, attrs: Record<string, string>): SVGElement {
-  const el = document.createElementNS('http://www.w3.org/2000/svg', tag)
-  for (const [k, v] of Object.entries(attrs)) {
-    el.setAttribute(k, v)
-  }
-  return el
-}
-
-function createDbLogoSvg(driver: DatabaseDriverType): SVGElement {
-  const color = DB_LOGO_COLORS[driver] || '#e6e6e6'
-  const isClickHouse = driver === 'clickhouse'
-  const strokeWidth = driver === 'postgres' || driver === 'mariadb' || driver === 'redis' ? '1.8' : '1.9'
-  const svg = createSvgElement('svg', {
-    width: '14',
-    height: '14',
-    viewBox: '0 0 24 24',
-    fill: isClickHouse ? color : 'none',
-    stroke: isClickHouse ? 'none' : color,
-    'stroke-width': strokeWidth,
-    'stroke-linecap': 'round',
-    'stroke-linejoin': 'round',
-    'aria-hidden': 'true',
-  })
-
-  switch (driver) {
-    case 'sqlite': {
-      svg.appendChild(createSvgElement('ellipse', { cx: '10', cy: '6', rx: '7', ry: '2.5' }))
-      svg.appendChild(
-        createSvgElement('path', { d: 'M3 6v12c0 1.4 3.1 2.5 7 2.5 1.8 0 3.4-.2 4.7-.6' })
-      )
-      svg.appendChild(createSvgElement('path', { d: 'M3 12c0 1.4 3.1 2.5 7 2.5' }))
-      svg.appendChild(
-        createSvgElement('path', {
-          d: 'M21 4c-4.5 1-7.5 4.8-8.2 11.2l3.8-1.4c2.4-2.1 4-5.4 4.4-9.8z',
-        })
-      )
-      break
-    }
-    case 'postgres': {
-      svg.appendChild(
-        createSvgElement('path', {
-          d: 'M7 11c-2.5 0-4-1.8-4-4.2C3 4.6 5 3 7.5 3c2 0 3.5 1 4.5 2.4C13 4 14.5 3 16.5 3 19 3 21 4.6 21 6.8c0 2.4-1.5 4.2-4 4.2',
-        })
-      )
-      svg.appendChild(
-        createSvgElement('path', {
-          d: 'M7 11v4.5c0 2.5 2 4 4.5 4 1.6 0 2.8-.8 3.5-2.1.5 1.6 1.5 3.6 3.5 3.6 1.2 0 2-.9 2-2.2 0-1.1-.8-1.8-1.5-2.2-.8-.5-1.2-1.4-1.2-2.8V11',
-        })
-      )
-      svg.appendChild(createSvgElement('circle', { cx: '9.5', cy: '9', r: '0.8', fill: color }))
-      svg.appendChild(createSvgElement('circle', { cx: '14.5', cy: '9', r: '0.8', fill: color }))
-      break
-    }
-    case 'mysql': {
-      svg.appendChild(
-        createSvgElement('path', {
-          d: 'M3 16c2.5-5 6.8-8.5 12-9.5-1.4 2.4-1.4 4.8.2 6.7 1.2 1.4 3.4 2.1 5.8 1.8-2.6 2.1-6.2 2.8-9.5 1.8-1.9-.6-3.4-2-4.6-3.7',
-        })
-      )
-      svg.appendChild(createSvgElement('path', { d: 'M9.5 8.5L11 5l2.8 2' }))
-      svg.appendChild(createSvgElement('path', { d: 'M3 19.5c3-1 6-1 9 0s6 1 9 0' }))
-      break
-    }
-    case 'mariadb': {
-      svg.appendChild(
-        createSvgElement('path', {
-          d: 'M4 18c1-4 3-7 6-9 2-1.4 5-1.4 6.8.5 1.2 1.3 1.4 3.5 3.2 4.5-1.4 1.5-3.2 2-5.2 1.6-1.4-.3-2.5.4-3 1.8L10.5 20H4v-2z',
-        })
-      )
-      svg.appendChild(createSvgElement('circle', { cx: '14', cy: '10.2', r: '0.8', fill: color }))
-      svg.appendChild(createSvgElement('path', { d: 'M18.5 12.2l2.5-.7' }))
-      svg.appendChild(createSvgElement('path', { d: 'M18.5 14l2.5.6' }))
-      break
-    }
-    case 'cockroachdb': {
-      svg.appendChild(
-        createSvgElement('polygon', {
-          points: '12 3 19 8.5 16.5 19.5 12 21 7.5 19.5 5 8.5',
-        })
-      )
-      svg.appendChild(createSvgElement('line', { x1: '12', y1: '3', x2: '12', y2: '21' }))
-      svg.appendChild(createSvgElement('path', { d: 'M5 8.5l7 4 7-4' }))
-      svg.appendChild(createSvgElement('path', { d: 'M8.5 5.5L6 2.5' }))
-      svg.appendChild(createSvgElement('path', { d: 'M15.5 5.5L18 2.5' }))
-      break
-    }
-    case 'clickhouse': {
-      svg.appendChild(
-        createSvgElement('rect', { x: '3', y: '4', width: '2.8', height: '16', rx: '0.8', fill: color, stroke: 'none' })
-      )
-      svg.appendChild(
-        createSvgElement('rect', { x: '7.5', y: '4', width: '2.8', height: '16', rx: '0.8', fill: color, stroke: 'none' })
-      )
-      svg.appendChild(
-        createSvgElement('rect', { x: '12', y: '4', width: '2.8', height: '16', rx: '0.8', fill: color, stroke: 'none' })
-      )
-      svg.appendChild(
-        createSvgElement('rect', { x: '16.5', y: '4', width: '2.8', height: '12.5', rx: '0.8', fill: color, stroke: 'none' })
-      )
-      svg.appendChild(
-        createSvgElement('rect', {
-          x: '16.5',
-          y: '18',
-          width: '2.8',
-          height: '2',
-          rx: '0.6',
-          opacity: '0.65',
-          fill: color,
-          stroke: 'none',
-        })
-      )
-      break
-    }
-    case 'redis': {
-      svg.appendChild(createSvgElement('polygon', { points: '12 3 21 7.5 12 12 3 7.5' }))
-      svg.appendChild(createSvgElement('polyline', { points: '3 12 12 16.5 21 12' }))
-      svg.appendChild(createSvgElement('polyline', { points: '3 16.5 12 21 21 16.5' }))
-      break
-    }
-    case 'libsql': {
-      svg.appendChild(
-        createSvgElement('polygon', {
-          points: '12 2.5 20.5 7.5 20.5 16.5 12 21.5 3.5 16.5 3.5 7.5',
-        })
-      )
-      svg.appendChild(createSvgElement('path', { d: 'M7.5 12.5c1.5-2 3-2 4.5 0s3 2 4.5 0' }))
-      svg.appendChild(createSvgElement('path', { d: 'M12.8 7.5l-2 4h3l-1.8 4' }))
-      break
-    }
-  }
-
-  return svg
 }
 
 function parseDatanoaDocument(docText: string): ParsedDatanoaDocument {
@@ -306,83 +281,6 @@ function parseDatanoaDocument(docText: string): ParsedDatanoaDocument {
 const STUDIO_VIEW_STATE_STORAGE_KEY = 'datanoa.studioViewState'
 const DEFAULT_RPC_TIMEOUT_MS = 115_000
 
-interface ConnectionEngineMeta {
-  id: DatabaseDriverType
-  label: string
-  defaultPort: number
-  defaultDb: string
-  defaultUser: string
-  defaultSsl: boolean
-}
-
-const CONNECTION_ENGINES: ReadonlyArray<ConnectionEngineMeta> = [
-  { id: 'sqlite', label: 'SQLite', defaultPort: 0, defaultDb: 'main.db', defaultUser: '', defaultSsl: false },
-  { id: 'postgres', label: 'PostgreSQL', defaultPort: 5432, defaultDb: 'postgres', defaultUser: 'postgres', defaultSsl: false },
-  { id: 'mysql', label: 'MySQL', defaultPort: 3306, defaultDb: 'mysql', defaultUser: 'root', defaultSsl: false },
-  { id: 'mariadb', label: 'MariaDB', defaultPort: 3306, defaultDb: 'mysql', defaultUser: 'root', defaultSsl: false },
-  { id: 'cockroachdb', label: 'CockroachDB', defaultPort: 26257, defaultDb: 'defaultdb', defaultUser: 'root', defaultSsl: true },
-  { id: 'clickhouse', label: 'ClickHouse', defaultPort: 8123, defaultDb: 'default', defaultUser: 'default', defaultSsl: false },
-  { id: 'redis', label: 'Redis', defaultPort: 6379, defaultDb: '0', defaultUser: '', defaultSsl: false },
-  { id: 'libsql', label: 'LibSQL / Turso', defaultPort: 443, defaultDb: 'turso', defaultUser: '', defaultSsl: true },
-]
-
-function getConnectionEngineMeta(driver: DatabaseDriverType): ConnectionEngineMeta {
-  return CONNECTION_ENGINES.find((e) => e.id === driver) ?? CONNECTION_ENGINES[0]
-}
-
-function maskConnectionUriSecret(rawUri: string): string {
-  return String(rawUri || '').replace(
-    /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^:/?#\s@]*:)([^@]+)(@)/,
-    '$1***$3'
-  )
-}
-
-const CONNECTION_ENV_TAGS: ReadonlyArray<{ id: ConnectionColorTag; label: string }> = [
-  { id: 'none', label: 'None' },
-  { id: 'dev', label: 'Dev' },
-  { id: 'staging', label: 'Staging' },
-  { id: 'prod', label: 'Prod' },
-]
-
-type ConnectionSubmission = {
-  profile: ConnectionProfile
-  password?: string
-  authToken?: string
-}
-
-interface ParseUriResponse {
-  ok: boolean
-  profile?: Partial<ConnectionProfile>
-  password?: string
-  authToken?: string
-  placeholderPassword?: boolean
-  error?: string
-}
-
-interface DiscoveredSqliteFile {
-  name: string
-  filePath: string
-  sizeBytes: number
-  sizeLabel: string
-}
-
-interface DiscoveredEnvConnection {
-  envKey: string
-  sourceFile: string
-  driver: DatabaseDriverType
-  name: string
-  uri: string
-}
-
-interface WorkspaceDetectResponse {
-  sqliteFiles?: DiscoveredSqliteFile[]
-  envConnections?: DiscoveredEnvConnection[]
-}
-
-function isKnownConnectionDriver(value: unknown): value is DatabaseDriverType {
-  return typeof value === 'string' && CONNECTION_ENGINES.some((e) => e.id === value)
-}
-
 interface TableColumnConfig {
   hidden: string[]
   pinned: string[]
@@ -404,250 +302,6 @@ interface StudioPersistedViewState {
   customSqlPanePx?: number | null
   sqlDraft?: string
   columnConfigByTable?: Record<string, TableColumnConfig>
-}
-
-const BUTTON_ORIG_LABELS = new WeakMap<HTMLButtonElement, string>()
-
-function setButtonLoading(
-  btn: HTMLButtonElement | null,
-  busy: boolean,
-  loadingLabel?: string
-): void {
-  if (!btn) return
-  if (busy) {
-    if (!BUTTON_ORIG_LABELS.has(btn)) {
-      BUTTON_ORIG_LABELS.set(btn, btn.textContent || '')
-    }
-    btn.disabled = true
-    btn.classList?.add?.('is-loading')
-    const labelText = loadingLabel ?? BUTTON_ORIG_LABELS.get(btn) ?? ''
-    let timerEl = btn.querySelector?.('.datanoa-live-timer')
-    if (!timerEl) {
-      btn.innerHTML = ''
-      const spinner = document.createElement('span')
-      spinner.className = 'datanoa-spinner'
-      spinner.setAttribute('aria-hidden', 'true')
-      timerEl = document.createElement('span')
-      timerEl.className = 'datanoa-live-timer'
-      btn.appendChild(spinner)
-      btn.appendChild(timerEl)
-    }
-    timerEl.textContent = labelText
-  } else {
-    btn.classList?.remove?.('is-loading')
-    if (BUTTON_ORIG_LABELS.has(btn)) {
-      btn.textContent = BUTTON_ORIG_LABELS.get(btn) ?? ''
-      BUTTON_ORIG_LABELS.delete(btn)
-    }
-    btn.disabled = false
-  }
-}
-
-function formatAggregateNumber(value: number): string {
-  if (!Number.isFinite(value)) return '0'
-  if (Number.isInteger(value)) return String(value)
-  return String(Number(value.toFixed(4)))
-}
-
-function formatRelativeTimestamp(ts: number): string {
-  if (!Number.isFinite(ts) || ts <= 0) return ''
-  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000))
-  if (diffSec < 10) return 'just now'
-  if (diffSec < 60) return `${diffSec}s ago`
-  const diffMin = Math.floor(diffSec / 60)
-  if (diffMin < 60) return `${diffMin}m ago`
-  const diffHr = Math.floor(diffMin / 60)
-  if (diffHr < 24) return `${diffHr}h ago`
-  const diffDay = Math.floor(diffHr / 24)
-  return `${diffDay}d ago`
-}
-
-function downloadTextFile(content: string, filename: string, mimeType: string): void {
-  if (typeof document === 'undefined' || !document.body || typeof Blob === 'undefined') return
-  if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return
-  const blob = new Blob([content], { type: mimeType })
-  const url = URL.createObjectURL(blob)
-  const link = document.createElement('a')
-  link.href = url
-  link.download = filename
-  link.style.display = 'none'
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
-  setTimeout(() => {
-    URL.revokeObjectURL?.(url)
-  }, 1000)
-}
-
-function extractPredicateColumnName(rawHead: string): { column: string; rest: string } | null {
-  const s = rawHead.trimStart()
-  if (!s) return null
-  const q = s[0]
-  if (q === '"' || q === '`') {
-    let i = 1
-    let col = ''
-    while (i < s.length) {
-      if (s[i] === q) {
-        if (s[i + 1] === q) {
-          col += q
-          i += 2
-          continue
-        }
-        return col ? { column: col, rest: s.slice(i + 1).trimStart() } : null
-      }
-      col += s[i]
-      i++
-    }
-    return null
-  }
-  if (q === '[') {
-    const closeIdx = s.indexOf(']', 1)
-    if (closeIdx <= 1) return null
-    return { column: s.slice(1, closeIdx), rest: s.slice(closeIdx + 1).trimStart() }
-  }
-  const m = /^([^\s=!<>]+)\s*(.*)$/.exec(s)
-  if (!m || !m[1]) return null
-  return { column: m[1], rest: m[2].trimStart() }
-}
-
-function isEditableShortcutTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false
-  const tag = target.tagName.toUpperCase()
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
-  if (target.isContentEditable === true) return true
-  if (typeof target.closest === 'function' && target.closest('.cm-editor, .cm-content')) {
-    return true
-  }
-  return false
-}
-
-function parseClientQuickFilterPredicate(
-  predicateSql: string
-): { column: string; op: 'eq' | 'neq' | 'is-null' | 'is-not-null'; value: unknown } | null {
-  const parsedCol = extractPredicateColumnName(predicateSql.trim())
-  if (!parsedCol) return null
-  const { column, rest } = parsedCol
-  const nullMatch = /^IS\s+(NOT\s+)?NULL$/i.exec(rest)
-  if (nullMatch) {
-    return {
-      column,
-      op: nullMatch[1] ? 'is-not-null' : 'is-null',
-      value: null,
-    }
-  }
-  const cmpMatch = /^(=|!=|<>)\s*(.+)$/.exec(rest)
-  if (cmpMatch && cmpMatch[2]) {
-    const op: 'eq' | 'neq' = cmpMatch[1] === '=' ? 'eq' : 'neq'
-    const rawVal = cmpMatch[2].trim()
-    let parsedVal: unknown = rawVal
-    if (rawVal.startsWith("'") && rawVal.endsWith("'") && rawVal.length >= 2) {
-      parsedVal = rawVal.slice(1, -1).replace(/''/g, "'")
-    } else if (/^true$/i.test(rawVal)) {
-      parsedVal = true
-    } else if (/^false$/i.test(rawVal)) {
-      parsedVal = false
-    } else if (/^[+-]?\d+(?:\.\d+)?$/.test(rawVal)) {
-      parsedVal = Number(rawVal)
-    }
-    return { column, op, value: parsedVal }
-  }
-  return null
-}
-
-function fuzzyMatchScore(query: string, candidate: string): number {
-  const q = query.trim().toLowerCase()
-  if (!q) return 1
-  const c = candidate.toLowerCase()
-  if (c === q) return 100
-  if (c.startsWith(q)) return 80
-  const idx = c.indexOf(q)
-  if (idx >= 0) return 60 - Math.min(idx, 30)
-  let qi = 0
-  let consecutive = 0
-  let score = 0
-  for (let ci = 0; ci < c.length && qi < q.length; ci++) {
-    if (c[ci] === q[qi]) {
-      qi++
-      consecutive++
-      score += 2 + consecutive
-    } else {
-      consecutive = 0
-    }
-  }
-  return qi === q.length ? score : 0
-}
-
-function extractQueriedTableName(sqlText: string): string | null {
-  const cleaned = sqlText
-    .replace(/--[^\r\n]*/g, ' ')
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/\b(?:EXTRACT|TRIM)\s*\([^()]*\bFROM\b[^()]*\)/gi, ' ')
-    .trim()
-  if (!/^\s*(?:WITH\b[\s\S]+?\bSELECT|SELECT)\b/i.test(cleaned)) {
-    return null
-  }
-  const match = /\bFROM\s+(?:["`[\]]?[A-Za-z0-9_]+["`[\]]?\s*\.\s*)?["`[]?([A-Za-z0-9_]+)["`\]]?/i.exec(
-    cleaned
-  )
-  if (!match || !match[1]) return null
-  const candidate = match[1]
-  if (/^(?:SELECT|WHERE|VALUES|LATERAL|UNNEST)$/i.test(candidate)) return null
-  return candidate
-}
-
-function copyTextFallback(text: string, triggerBtn?: HTMLButtonElement | null): void {
-  if (typeof document !== 'undefined' && document.body) {
-    const prevActive =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.setAttribute('readonly', '')
-    ta.style.position = 'fixed'
-    ta.style.top = '-9999px'
-    ta.style.left = '-9999px'
-    ta.style.width = '1px'
-    ta.style.height = '1px'
-    ta.style.opacity = '0'
-    ta.style.pointerEvents = 'none'
-    document.body.appendChild(ta)
-    try {
-      ta.focus({ preventScroll: true })
-    } catch {
-      ta.focus()
-    }
-    ta.select()
-    try {
-      if (typeof ta.setSelectionRange === 'function') {
-        ta.setSelectionRange(0, text.length)
-      }
-    } catch {
-      // Ignore in minimal test DOM
-    }
-    try {
-      document.execCommand?.('copy')
-    } catch {
-      // Ignore fallback failure
-    }
-    ta.remove()
-    if (prevActive && typeof prevActive.focus === 'function') {
-      try {
-        prevActive.focus({ preventScroll: true })
-      } catch {
-        prevActive.focus()
-      }
-    }
-  }
-  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-    void Promise.resolve(navigator.clipboard.writeText(text)).catch(() => {})
-  }
-  if (triggerBtn) {
-    const orig = triggerBtn.dataset.origLabel || triggerBtn.textContent || 'Copy'
-    triggerBtn.dataset.origLabel = orig
-    triggerBtn.textContent = 'Copied!'
-    setTimeout(() => {
-      triggerBtn.textContent = orig
-    }, 1200)
-  }
 }
 
 export class DatanoaStudioEditor {
@@ -699,6 +353,7 @@ export class DatanoaStudioEditor {
   private queryBannerTitleEl: HTMLSpanElement | null = null
   private queryBannerDetailEl: HTMLDivElement | null = null
   private queryBannerCopyBtn: HTMLButtonElement | null = null
+  private queryBannerReportBtn: HTMLButtonElement | null = null
   private queryBannerRetryBtn: HTMLButtonElement | null = null
   private queryBannerBackBtn: HTMLButtonElement | null = null
   private queryBannerRetryHandler: (() => void) | null = null
@@ -746,6 +401,7 @@ export class DatanoaStudioEditor {
   private shortcutHintEl: HTMLSpanElement | null = null
   private statusMetricsEl: HTMLSpanElement | null = null
   private shortcutsBtn: HTMLButtonElement | null = null
+  private feedbackBtn: HTMLButtonElement | null = null
   private gridAreaEl: HTMLDivElement | null = null
   private inspectorAreaEl: HTMLDivElement | null = null
 
@@ -2052,6 +1708,16 @@ export class DatanoaStudioEditor {
       this.updateStatus('Copied query error to clipboard')
     })
 
+    this.queryBannerReportBtn = document.createElement('button')
+    this.queryBannerReportBtn.type = 'button'
+    this.queryBannerReportBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-report-issue-btn'
+    this.queryBannerReportBtn.textContent = 'Report Issue'
+    this.queryBannerReportBtn.title = 'Report this error on GitHub Issues'
+    this.queryBannerReportBtn.style.display = 'none'
+    this.queryBannerReportBtn.addEventListener('click', () => {
+      this.openFeedbackModal('bug')
+    })
+
     const bannerCloseBtn = document.createElement('button')
     bannerCloseBtn.type = 'button'
     bannerCloseBtn.className = 'datanoa-btn datanoa-btn-sm'
@@ -2063,6 +1729,7 @@ export class DatanoaStudioEditor {
     bannerActions.appendChild(this.queryBannerRetryBtn)
     bannerActions.appendChild(this.queryBannerBackBtn)
     bannerActions.appendChild(this.queryBannerCopyBtn)
+    bannerActions.appendChild(this.queryBannerReportBtn)
     bannerActions.appendChild(bannerCloseBtn)
     this.queryBannerEl.appendChild(bannerBody)
     this.queryBannerEl.appendChild(bannerActions)
@@ -2253,11 +1920,22 @@ export class DatanoaStudioEditor {
       this.openShortcutsModal()
     })
 
+    this.feedbackBtn = document.createElement('button')
+    this.feedbackBtn.type = 'button'
+    this.feedbackBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-feedback-btn'
+    this.feedbackBtn.textContent = 'Feedback'
+    this.feedbackBtn.title = 'Report a Bug or Request a Feature on GitHub'
+    this.feedbackBtn.setAttribute('aria-label', 'Report a Bug or Request a Feature on GitHub')
+    this.feedbackBtn.addEventListener('click', () => {
+      this.openFeedbackModal()
+    })
+
     statusBar.appendChild(this.statusStateEl)
     statusBar.appendChild(this.statusSelectionEl)
     statusBar.appendChild(this.shortcutHintEl)
     statusBar.appendChild(this.statusMetricsEl)
     statusBar.appendChild(this.shortcutsBtn)
+    statusBar.appendChild(this.feedbackBtn)
 
     // Assemble Root
     this.rootEl.appendChild(toolbar)
@@ -4051,6 +3729,9 @@ export class DatanoaStudioEditor {
       this.lastQueryErrorText = kind === 'error' ? detail || title : ''
       this.queryBannerCopyBtn.style.display = kind === 'error' ? 'inline-flex' : 'none'
     }
+    if (this.queryBannerReportBtn) {
+      this.queryBannerReportBtn.style.display = kind === 'error' ? 'inline-flex' : 'none'
+    }
     this.queryBannerRetryHandler = opts?.onRetry ?? null
     if (this.queryBannerRetryBtn) {
       this.queryBannerRetryBtn.style.display = opts?.onRetry ? 'inline-flex' : 'none'
@@ -4067,6 +3748,9 @@ export class DatanoaStudioEditor {
   private hideQueryBanner(): void {
     this.lastQueryErrorText = ''
     this.queryBannerRetryHandler = null
+    if (this.queryBannerReportBtn) {
+      this.queryBannerReportBtn.style.display = 'none'
+    }
     if (this.queryBannerRetryBtn) {
       this.queryBannerRetryBtn.style.display = 'none'
     }
@@ -5854,1778 +5538,139 @@ export class DatanoaStudioEditor {
   }
 
   private openConnectionModal(editProfile?: ConnectionProfile): void {
-    if (typeof document === 'undefined') return
-    const isEdit = editProfile !== undefined
-    const editId = editProfile?.id ?? ''
-
-    let driver: DatabaseDriverType = editProfile ? editProfile.driver : 'sqlite'
-    if (!isKnownConnectionDriver(driver)) driver = 'sqlite'
-    let colorTag: ConnectionColorTag = editProfile?.colorTag ?? 'none'
-    let hadPassword = Boolean(editProfile?.hasPassword)
-    let hadAuthToken = Boolean(editProfile?.hasAuthToken)
-    let lastParsedUri = ''
-    let lastParsedPlaceholder = false
-    let placeholderPending = false
-    let lastAutoName = ''
-    let isBusy = false
-    let parseSeq = 0
-    let detectSeq = 0
-    let discoveredEnvs: DiscoveredEnvConnection[] = []
-    let discoveredFiles: DiscoveredSqliteFile[] = []
-    let discoveredFilter = ''
-    let deleteArmed = false
-    let deleteTimer: ReturnType<typeof setTimeout> | null = null
-    let backdropRef: HTMLDivElement | null = null
-    const isModalOpen = (): boolean =>
-      backdropRef !== null && this.activeModalBackdrop === backdropRef
-
-    const createInput = (placeholder: string, mono = false): HTMLInputElement => {
-      const el = document.createElement('input')
-      el.type = 'text'
-      el.className = `datanoa-conn-input${mono ? ' is-mono' : ''}`
-      el.placeholder = placeholder
-      el.setAttribute('autocomplete', 'off')
-      el.spellcheck = false
-      return el
-    }
-
-    const createField = (labelText: string, control: HTMLElement, full = false): HTMLDivElement => {
-      const wrap = document.createElement('div')
-      wrap.className = `datanoa-conn-field${full ? ' is-full' : ''}`
-      const label = document.createElement('label')
-      label.textContent = labelText
-      wrap.appendChild(label)
-      wrap.appendChild(control)
-      return wrap
-    }
-
-    const createCheck = (labelText: string): { wrap: HTMLLabelElement; input: HTMLInputElement } => {
-      const wrap = document.createElement('label')
-      wrap.className = 'datanoa-conn-check'
-      const input = document.createElement('input')
-      input.type = 'checkbox'
-      const text = document.createElement('span')
-      text.textContent = labelText
-      wrap.appendChild(input)
-      wrap.appendChild(text)
-      return { wrap, input }
-    }
-
-    const createButton = (text: string, extraClass = ''): HTMLButtonElement => {
-      const btn = document.createElement('button')
-      btn.type = 'button'
-      btn.className = `datanoa-btn datanoa-btn-sm${extraClass ? ` ${extraClass}` : ''}`
-      btn.textContent = text
-      return btn
-    }
-
-    const showEl = (el: HTMLElement, visible: boolean): void => {
-      el.style.display = visible ? '' : 'none'
-    }
-
-    // ---- Shell ----
-    const modal = document.createElement('div')
-    modal.className = 'datanoa-conn-modal'
-
-    const head = document.createElement('div')
-    head.className = 'datanoa-modal-head'
-    const headTitle = document.createElement('span')
-    headTitle.textContent = isEdit
-      ? `Edit Connection — ${editProfile?.name ?? ''}`
-      : 'New Database Connection'
-    head.appendChild(headTitle)
-
-    const body = document.createElement('div')
-    body.className = 'datanoa-modal-body'
-
-    const noticeBox = document.createElement('div')
-    noticeBox.className = 'datanoa-modal-box'
-    noticeBox.style.display = 'none'
-    noticeBox.setAttribute('role', 'status')
-    const showNotice = (kind: 'error' | 'success' | 'neutral', text: string): void => {
-      noticeBox.className = `datanoa-modal-box${kind === 'neutral' ? '' : ` ${kind}`}`
-      noticeBox.textContent = text
-      noticeBox.style.display = 'block'
-    }
-    const clearNotice = (): void => {
-      noticeBox.style.display = 'none'
-      noticeBox.textContent = ''
-    }
-    body.appendChild(noticeBox)
-
-    // ---- Quick URI bar & workspace auto-detect ----
-    const uriBar = document.createElement('div')
-    uriBar.className = 'datanoa-conn-uri-bar'
-    const uriLabel = document.createElement('div')
-    uriLabel.className = 'datanoa-conn-section-label'
-    uriLabel.textContent = 'Quick Connect'
-    const uriRow = document.createElement('div')
-    uriRow.className = 'datanoa-conn-row'
-    const uriInp = createInput(
-      'Paste connection URI (postgres://, mysql://, redis://, libsql://, clickhouse://, sqlite://)...',
-      true
+    openStudioConnectionModal(
+      {
+        isBackdropActive: (backdrop) =>
+          backdrop !== null && this.activeModalBackdrop === backdrop,
+        mountModal: (modalEl, canClose) => this.mountStudioModal(modalEl, canClose),
+        closeModal: () => this.closeActiveModal(),
+        requestPlugin: <T = unknown>(
+          method: string,
+          payload?: Record<string, unknown>,
+          options?: { timeoutMs?: number }
+        ) => this.requestPlugin<T>(method, payload, options),
+        createElapsedTimer: (onTick) => this.createElapsedTimer(onTick),
+        updateStatus: (stateText, metricsText) => this.updateStatus(stateText, metricsText),
+        activateSavedConnection: (savedId) => this.activateSavedConnection(savedId),
+        onConnectionDeleted: async (deletedId) => {
+          if (this.storedActiveConnectionId === deletedId) this.storedActiveConnectionId = null
+          if (this.pendingDocConnectionId === deletedId) this.pendingDocConnectionId = null
+          if (this.activeConnectionId === deletedId) this.handleConnectionChanged(null)
+          this.updateStatus('Connection deleted')
+          await this.refreshConnections()
+        },
+      },
+      editProfile
     )
-    uriInp.classList.add('datanoa-conn-uri-input')
-    const parseBtn = createButton('Parse URI')
-    uriRow.appendChild(uriInp)
-    uriRow.appendChild(parseBtn)
-
-    const detectRow = document.createElement('div')
-    detectRow.className = 'datanoa-conn-row is-wrap'
-    const detectBtn = createButton('Auto-Detect (.env & .db)')
-    const folderInp = createInput('Optional folder path to scan...', true)
-    folderInp.style.flex = '1 1 160px'
-    const scanBtn = createButton('Scan Folder')
-    detectRow.appendChild(detectBtn)
-    detectRow.appendChild(folderInp)
-    detectRow.appendChild(scanBtn)
-
-    uriBar.appendChild(uriLabel)
-    uriBar.appendChild(uriRow)
-    uriBar.appendChild(detectRow)
-    body.appendChild(uriBar)
-
-    const discoveredBox = document.createElement('div')
-    discoveredBox.className = 'datanoa-conn-discovered'
-    discoveredBox.style.display = 'none'
-    body.appendChild(discoveredBox)
-
-    // ---- Engine grid ----
-    const engineLabel = document.createElement('div')
-    engineLabel.className = 'datanoa-conn-section-label'
-    engineLabel.textContent = 'Database Engine'
-    const engineGrid = document.createElement('div')
-    engineGrid.className = 'datanoa-engine-grid'
-    const engineTiles = new Map<DatabaseDriverType, HTMLButtonElement>()
-    for (const eng of CONNECTION_ENGINES) {
-      const tile = document.createElement('button')
-      tile.type = 'button'
-      tile.className = 'datanoa-engine-tile'
-      tile.dataset.driver = eng.id
-      tile.title = eng.label
-      tile.appendChild(createDbLogoSvg(eng.id))
-      const tileLabel = document.createElement('span')
-      tileLabel.textContent = eng.label
-      tile.appendChild(tileLabel)
-      tile.addEventListener('click', () => {
-        if (isBusy || driver === eng.id) return
-        applyDriver(eng.id, true)
-      })
-      engineTiles.set(eng.id, tile)
-      engineGrid.appendChild(tile)
-    }
-    body.appendChild(engineLabel)
-    body.appendChild(engineGrid)
-
-    // ---- Fields ----
-    const nameInp = createInput('Connection name')
-    const filePathInp = createInput('C:\\path\\to\\database.db', true)
-    const libsqlUrlInp = createInput('libsql://your-db.turso.io', true)
-    const authTokenInp = createInput('Optional Bearer token')
-    authTokenInp.type = 'password'
-    const libsqlDbInp = createInput('Database label (e.g. turso)')
-    const hostInp = createInput('localhost', true)
-    const portInp = createInput('Port', true)
-    portInp.inputMode = 'numeric'
-    const userInp = createInput('Optional')
-    const passwordInp = createInput('Optional')
-    passwordInp.type = 'password'
-    passwordInp.setAttribute('autocomplete', 'new-password')
-    const databaseInp = createInput('Database')
-    const redisDbSel = document.createElement('select')
-    redisDbSel.className = 'datanoa-conn-select'
-    for (let i = 0; i <= 15; i++) {
-      const opt = document.createElement('option')
-      opt.value = String(i)
-      opt.textContent = `db${i}`
-      redisDbSel.appendChild(opt)
-    }
-    const chUrlInp = createInput('http://localhost:8123 (HTTP(S) endpoint)', true)
-    const optionsInp = createInput('--cluster=my-cluster or endpoint=ep-abc123', true)
-    const sslCheck = createCheck('SSL / TLS')
-    const roCheck = createCheck('Read-Only Mode')
-    roCheck.input.checked = Boolean(editProfile?.readOnly)
-
-    const envPills = document.createElement('div')
-    envPills.className = 'datanoa-conn-env-pills'
-    const envPillBtns = new Map<ConnectionColorTag, HTMLButtonElement>()
-    const syncEnvPills = (): void => {
-      envPillBtns.forEach((btn, id) => btn.classList.toggle('active', id === colorTag))
-    }
-    for (const tag of CONNECTION_ENV_TAGS) {
-      const btn = document.createElement('button')
-      btn.type = 'button'
-      btn.className = `datanoa-conn-env-pill env-${tag.id}`
-      btn.textContent = tag.label
-      btn.addEventListener('click', () => {
-        if (isBusy) return
-        colorTag = tag.id
-        syncEnvPills()
-      })
-      envPillBtns.set(tag.id, btn)
-      envPills.appendChild(btn)
-    }
-
-    const fieldsGrid = document.createElement('div')
-    fieldsGrid.className = 'datanoa-conn-fields'
-    const rowName = createField('Connection Name', nameInp, true)
-    const envRow = document.createElement('div')
-    envRow.className = 'datanoa-conn-row is-wrap'
-    envRow.appendChild(envPills)
-    envRow.appendChild(roCheck.wrap)
-    const rowEnv = createField('Environment Tag', envRow, true)
-    const rowFilePath = createField('SQLite File Path', filePathInp, true)
-    const rowLibsqlUrl = createField('LibSQL / Turso URL', libsqlUrlInp, true)
-    const rowAuthToken = createField('Auth Token', authTokenInp)
-    const rowLibsqlDb = createField('Database Label', libsqlDbInp)
-    const rowHost = createField('Host', hostInp)
-    const rowPort = createField('Port', portInp)
-    const rowUser = createField('User', userInp)
-    const rowPassword = createField('Password', passwordInp)
-    const rowDatabase = createField('Database', databaseInp)
-    const rowRedisDb = createField('Redis DB Index', redisDbSel)
-    const rowSsl = createField('Security', sslCheck.wrap)
-    const rowChUrl = createField('HTTP(S) Endpoint URL', chUrlInp, true)
-    const rowOptions = createField('Options (Cluster / Endpoint)', optionsInp, true)
-    for (const row of [
-      rowName,
-      rowEnv,
-      rowFilePath,
-      rowLibsqlUrl,
-      rowAuthToken,
-      rowLibsqlDb,
-      rowHost,
-      rowPort,
-      rowUser,
-      rowPassword,
-      rowDatabase,
-      rowRedisDb,
-      rowSsl,
-      rowChUrl,
-      rowOptions,
-    ]) {
-      fieldsGrid.appendChild(row)
-    }
-    body.appendChild(fieldsGrid)
-
-    // ---- Footer ----
-    const actions = document.createElement('div')
-    actions.className = 'datanoa-modal-actions'
-    const deleteBtn = createButton('Delete Connection', 'datanoa-btn-danger')
-    deleteBtn.style.marginRight = 'auto'
-    const testBtn = createButton('Test Connection')
-    const cancelBtn = createButton('Cancel')
-    const saveBtn = createButton(
-      isEdit ? 'Update Connection' : 'Save & Connect',
-      'datanoa-btn-primary'
-    )
-    if (isEdit) actions.appendChild(deleteBtn)
-    actions.appendChild(testBtn)
-    actions.appendChild(cancelBtn)
-    actions.appendChild(saveBtn)
-
-    const busyControls: Array<HTMLInputElement | HTMLSelectElement | HTMLButtonElement> = [
-      uriInp,
-      parseBtn,
-      detectBtn,
-      folderInp,
-      scanBtn,
-      nameInp,
-      filePathInp,
-      libsqlUrlInp,
-      authTokenInp,
-      libsqlDbInp,
-      hostInp,
-      portInp,
-      userInp,
-      passwordInp,
-      databaseInp,
-      redisDbSel,
-      chUrlInp,
-      optionsInp,
-      sslCheck.input,
-      roCheck.input,
-      deleteBtn,
-      testBtn,
-      cancelBtn,
-      saveBtn,
-      ...Array.from(engineTiles.values()),
-    ]
-    const setBusy = (busy: boolean): void => {
-      isBusy = busy
-      for (const ctrl of busyControls) {
-        ctrl.disabled = busy
-      }
-    }
-
-    // ---- Discovery rendering ----
-    const renderDiscovered = (): void => {
-      discoveredBox.innerHTML = ''
-      const showFiles = driver === 'sqlite' && discoveredFiles.length > 0
-      const showEnvs = discoveredEnvs.length > 0
-      if (!showFiles && !showEnvs) {
-        showEl(discoveredBox, false)
-        return
-      }
-      showEl(discoveredBox, true)
-
-      if (showEnvs) {
-        const label = document.createElement('div')
-        label.className = 'datanoa-conn-section-label'
-        label.textContent = `Detected .env connections (${discoveredEnvs.length})`
-        discoveredBox.appendChild(label)
-        const list = document.createElement('div')
-        list.className = 'datanoa-conn-chip-list'
-        for (const item of discoveredEnvs) {
-          const chip = document.createElement('button')
-          chip.type = 'button'
-          chip.className = 'datanoa-conn-chip'
-          const masked = maskConnectionUriSecret(item.uri)
-          chip.title = `${item.sourceFile} (${item.envKey}): ${masked}`
-          const main = document.createElement('span')
-          main.className = 'datanoa-conn-chip-main'
-          const title = document.createElement('span')
-          title.className = 'datanoa-conn-chip-title'
-          if (isKnownConnectionDriver(item.driver)) title.appendChild(createDbLogoSvg(item.driver))
-          const titleText = document.createElement('span')
-          titleText.textContent = `${item.envKey} (${item.name || item.driver})`
-          title.appendChild(titleText)
-          const sub = document.createElement('span')
-          sub.className = 'datanoa-conn-chip-sub'
-          sub.textContent = masked
-          main.appendChild(title)
-          main.appendChild(sub)
-          const badge = document.createElement('span')
-          badge.className = 'datanoa-badge'
-          badge.textContent = item.sourceFile || '.env'
-          chip.appendChild(main)
-          chip.appendChild(badge)
-          chip.addEventListener('click', () => {
-            if (isBusy) return
-            uriInp.value = item.uri
-            if (!nameInp.value.trim()) {
-              nameInp.value = item.name || item.envKey
-              lastAutoName = nameInp.value
-            }
-            void parseUri(item.uri, true)
-          })
-          list.appendChild(chip)
-        }
-        discoveredBox.appendChild(list)
-      }
-
-      if (showFiles) {
-        const label = document.createElement('div')
-        label.className = 'datanoa-conn-section-label'
-        label.textContent = `Detected SQLite files (${discoveredFiles.length})`
-        discoveredBox.appendChild(label)
-        const filterInp = createInput('Filter discovered .db files...')
-        filterInp.value = discoveredFilter
-        filterInp.addEventListener('input', () => {
-          discoveredFilter = filterInp.value
-          renderDiscovered()
-          const refocus = discoveredBox.querySelector('input')
-          if (refocus instanceof HTMLInputElement) {
-            refocus.focus()
-            refocus.setSelectionRange?.(discoveredFilter.length, discoveredFilter.length)
-          }
-        })
-        discoveredBox.appendChild(filterInp)
-        const q = discoveredFilter.trim().toLowerCase()
-        const filtered = q
-          ? discoveredFiles.filter(
-              (f) =>
-                f.name.toLowerCase().includes(q) || f.filePath.toLowerCase().includes(q)
-            )
-          : discoveredFiles
-        const list = document.createElement('div')
-        list.className = 'datanoa-conn-chip-list'
-        if (filtered.length === 0) {
-          const empty = document.createElement('div')
-          empty.className = 'datanoa-cell-null'
-          empty.textContent = `No SQLite files match "${discoveredFilter}".`
-          list.appendChild(empty)
-        }
-        for (const file of filtered) {
-          const chip = document.createElement('button')
-          chip.type = 'button'
-          chip.className = `datanoa-conn-chip${filePathInp.value.trim() === file.filePath ? ' selected' : ''}`
-          chip.title = file.filePath
-          const main = document.createElement('span')
-          main.className = 'datanoa-conn-chip-main'
-          const title = document.createElement('span')
-          title.className = 'datanoa-conn-chip-title'
-          title.appendChild(createDbLogoSvg('sqlite'))
-          const titleText = document.createElement('span')
-          titleText.textContent = file.name
-          title.appendChild(titleText)
-          const sub = document.createElement('span')
-          sub.className = 'datanoa-conn-chip-sub'
-          sub.textContent = file.filePath
-          main.appendChild(title)
-          main.appendChild(sub)
-          const size = document.createElement('span')
-          size.className = 'datanoa-badge datanoa-badge-unique'
-          size.textContent = file.sizeLabel || `${file.sizeBytes} B`
-          chip.appendChild(main)
-          chip.appendChild(size)
-          chip.addEventListener('click', () => {
-            if (isBusy) return
-            filePathInp.value = file.filePath
-            if (!nameInp.value.trim() || nameInp.value === lastAutoName) {
-              nameInp.value = file.name
-              lastAutoName = file.name
-            }
-            renderDiscovered()
-          })
-          list.appendChild(chip)
-        }
-        discoveredBox.appendChild(list)
-      }
-    }
-
-    // ---- Driver switching ----
-    const applyDriver = (next: DatabaseDriverType, applyDefaults: boolean): void => {
-      const prevMeta = getConnectionEngineMeta(driver)
-      driver = next
-      const meta = getConnectionEngineMeta(next)
-      engineTiles.forEach((tile, id) => tile.classList.toggle('active', id === next))
-      const isSqlite = next === 'sqlite'
-      const isLibsql = next === 'libsql'
-      const isServer = !isSqlite && !isLibsql
-      showEl(rowFilePath, isSqlite)
-      showEl(rowLibsqlUrl, isLibsql)
-      showEl(rowAuthToken, isLibsql)
-      showEl(rowLibsqlDb, isLibsql)
-      showEl(rowHost, isServer)
-      showEl(rowPort, isServer)
-      showEl(rowUser, isServer)
-      showEl(rowPassword, isServer)
-      showEl(rowDatabase, isServer && next !== 'redis')
-      showEl(rowRedisDb, next === 'redis')
-      showEl(rowSsl, isServer)
-      showEl(rowChUrl, next === 'clickhouse')
-      showEl(rowOptions, next === 'postgres' || next === 'cockroachdb')
-      databaseInp.placeholder = meta.defaultDb
-      userInp.placeholder = meta.defaultUser || 'Optional'
-      if (applyDefaults) {
-        const curPort = portInp.value.trim()
-        if (!curPort || curPort === String(prevMeta.defaultPort)) {
-          portInp.value = meta.defaultPort > 0 ? String(meta.defaultPort) : ''
-        }
-        sslCheck.input.checked = meta.defaultSsl
-      }
-      renderDiscovered()
-    }
-
-    // ---- Submission ----
-    const buildSubmission = (id: string): ConnectionSubmission => {
-      const name = nameInp.value.trim()
-      const readOnly = roCheck.input.checked
-      const sameDriverAsStored = isEdit && editProfile?.driver === driver
-
-      if (driver === 'sqlite') {
-        const filePath = filePathInp.value.trim()
-        const baseName = filePath.split(/[\\/]/).filter(Boolean).pop() || 'database.db'
-        return {
-          profile: {
-            id,
-            name: name || baseName,
-            driver: 'sqlite',
-            database: baseName,
-            filePath,
-            readOnly,
-            colorTag,
-          },
-        }
-      }
-
-      if (driver === 'libsql') {
-        const url = libsqlUrlInp.value.trim()
-        const authToken = authTokenInp.value
-        const keepStoredToken = sameDriverAsStored && hadAuthToken
-        const submission: ConnectionSubmission = {
-          profile: {
-            id,
-            name: name || url || 'LibSQL',
-            driver: 'libsql',
-            database: libsqlDbInp.value.trim() || 'turso',
-            url,
-            ssl: /^(?:https|libsql|wss):\/\//i.test(url) || !/^http:\/\//i.test(url),
-            readOnly,
-            colorTag,
-            hasAuthToken: Boolean(authToken) || keepStoredToken,
-          },
-        }
-        if (authToken) submission.authToken = authToken
-        return submission
-      }
-
-      const meta = getConnectionEngineMeta(driver)
-      const host = hostInp.value.trim() || 'localhost'
-      const parsedPort = Number.parseInt(portInp.value.trim(), 10)
-      const port =
-        Number.isFinite(parsedPort) && parsedPort >= 1 && parsedPort <= 65535
-          ? parsedPort
-          : meta.defaultPort
-      const user = userInp.value.trim()
-      const password = passwordInp.value
-      const ssl = sslCheck.input.checked
-      const keepStoredPassword = sameDriverAsStored && hadPassword
-
-      const profile: ConnectionProfile = {
-        id,
-        name: name || `${driver}@${host}`,
-        driver,
-        database:
-          driver === 'redis'
-            ? String(Number.parseInt(redisDbSel.value || '0', 10) || 0)
-            : databaseInp.value.trim() || meta.defaultDb,
-        host,
-        port,
-        ssl,
-        readOnly,
-        colorTag,
-        hasPassword: Boolean(password) || keepStoredPassword,
-      }
-      if (user) profile.user = user
-      if (driver === 'redis') {
-        const rdb = Number.parseInt(redisDbSel.value || '0', 10)
-        profile.redisDb = Number.isFinite(rdb) && rdb >= 0 && rdb <= 15 ? rdb : 0
-      }
-      if (driver === 'postgres' || driver === 'cockroachdb') {
-        const pgOptions = optionsInp.value.trim()
-        if (pgOptions) profile.options = pgOptions
-      }
-      if (driver === 'clickhouse') {
-        const chUrl = chUrlInp.value.trim()
-        if (chUrl) {
-          profile.url = chUrl
-          try {
-            const parsedCh = new URL(chUrl)
-            if (parsedCh.hostname) profile.host = parsedCh.hostname
-            if (parsedCh.port) {
-              const chPort = Number.parseInt(parsedCh.port, 10)
-              if (Number.isFinite(chPort) && chPort >= 1 && chPort <= 65535) profile.port = chPort
-            } else if (parsedCh.protocol === 'https:') {
-              profile.port = 8443
-            } else if (parsedCh.protocol === 'http:') {
-              profile.port = 8123
-            }
-            if (parsedCh.protocol === 'https:') profile.ssl = true
-            else if (parsedCh.protocol === 'http:') profile.ssl = false
-          } catch {
-            // Keep the typed URL verbatim when it is not a valid absolute URL
-          }
-        } else {
-          profile.url = `${ssl ? 'https' : 'http'}://${host}:${port}`
-        }
-      }
-      const submission: ConnectionSubmission = { profile }
-      if (password) submission.password = password
-      return submission
-    }
-
-    // ---- URI parsing ----
-    const parseUri = async (rawUri: string, clearMissingSecret = false): Promise<boolean> => {
-      const uri = rawUri.trim()
-      if (!uri) return false
-      const seq = ++parseSeq
-      setButtonLoading(parseBtn, true, 'Parsing...')
-      try {
-        const res = await this.requestPlugin<ParseUriResponse>('connection.parseUri', { uri })
-        if (seq !== parseSeq || !isModalOpen()) return false
-        if (!res.ok || !res.profile) {
-          showNotice('error', res.error || 'Could not parse connection URI.')
-          return false
-        }
-        const p = res.profile
-        const nextDriver: DatabaseDriverType = isKnownConnectionDriver(p.driver) ? p.driver : 'sqlite'
-        const prevDriver = driver
-        const prevHost = hostInp.value.trim().toLowerCase()
-        const prevUser = userInp.value.trim()
-        const prevLibsqlUrl = libsqlUrlInp.value.trim().toLowerCase()
-        const nextHost = String(p.host ?? '').trim().toLowerCase()
-        const nextUser = String(p.user ?? '').trim()
-        const nextLibsqlUrl = String(p.url ?? '').trim().toLowerCase()
-        const targetChanged =
-          nextDriver !== prevDriver ||
-          (nextDriver === 'libsql'
-            ? nextLibsqlUrl !== prevLibsqlUrl
-            : nextDriver !== 'sqlite' && (nextHost !== prevHost || nextUser !== prevUser))
-
-        // A manually parsed URI defines a fresh target: never inherit another target's stored secret
-        const dropStored = clearMissingSecret || (isEdit && targetChanged)
-        if (dropStored || res.password !== undefined || res.placeholderPassword) hadPassword = false
-        if (dropStored || res.authToken !== undefined) hadAuthToken = false
-        const nextPassword =
-          res.password !== undefined ? res.password : dropStored ? '' : passwordInp.value
-        const nextAuthToken =
-          res.authToken !== undefined ? res.authToken : dropStored ? '' : authTokenInp.value
-
-        filePathInp.value = ''
-        libsqlUrlInp.value = ''
-        authTokenInp.value = ''
-        libsqlDbInp.value = ''
-        hostInp.value = 'localhost'
-        portInp.value = ''
-        databaseInp.value = ''
-        chUrlInp.value = ''
-        optionsInp.value = ''
-        redisDbSel.value = '0'
-        passwordInp.value = ''
-        applyDriver(nextDriver, true)
-        if (p.name) nameInp.value = p.name
-        if (p.readOnly !== undefined) roCheck.input.checked = Boolean(p.readOnly)
-        if (nextDriver === 'sqlite') {
-          filePathInp.value = p.filePath || ''
-        } else if (nextDriver === 'libsql') {
-          libsqlUrlInp.value = p.url || ''
-          libsqlDbInp.value = p.database || ''
-          authTokenInp.value = nextAuthToken
-        } else {
-          if (p.host) hostInp.value = p.host
-          if (p.port) portInp.value = String(p.port)
-          if (p.user !== undefined) userInp.value = p.user
-          if (p.ssl !== undefined) sslCheck.input.checked = Boolean(p.ssl)
-          if (nextDriver === 'redis') {
-            redisDbSel.value = String(p.redisDb ?? 0)
-          } else if (p.database !== undefined) {
-            databaseInp.value = p.database
-          }
-          if (nextDriver === 'clickhouse' && p.url) chUrlInp.value = p.url
-          if (
-            (nextDriver === 'postgres' || nextDriver === 'cockroachdb') &&
-            typeof p.options === 'string' &&
-            p.options.trim()
-          ) {
-            optionsInp.value = p.options.trim()
-          }
-          passwordInp.value = nextPassword
-        }
-        authTokenInp.placeholder =
-          hadAuthToken && isEdit ? 'Stored token preserved (type to replace)' : 'Optional Bearer token'
-        lastParsedUri = uri
-        lastParsedPlaceholder = Boolean(res.placeholderPassword)
-        placeholderPending = lastParsedPlaceholder && !passwordInp.value
-        const engineLabelText = getConnectionEngineMeta(nextDriver).label
-        if (placeholderPending) {
-          passwordInp.placeholder = 'Required (replace placeholder password)'
-          showNotice(
-            'error',
-            `Parsed ${engineLabelText} URI — placeholder password was removed. Enter your actual Database Password below before testing.`
-          )
-          passwordInp.focus?.()
-        } else {
-          passwordInp.placeholder =
-            hadPassword && isEdit ? 'Stored password preserved (type to replace)' : 'Optional'
-          showNotice('success', `Parsed ${engineLabelText} URI`)
-        }
-        return true
-      } catch (err: unknown) {
-        if (seq !== parseSeq || !isModalOpen()) return false
-        showNotice('error', `URI error: ${err instanceof Error ? err.message : String(err)}`)
-        return false
-      } finally {
-        if (seq === parseSeq) {
-          setButtonLoading(parseBtn, false)
-          if (isBusy) parseBtn.disabled = true
-        }
-      }
-    }
-
-    const ensureUriParsed = async (): Promise<boolean> => {
-      const raw = uriInp.value.trim()
-      if (!raw || raw === lastParsedUri) return true
-      return await parseUri(raw, false)
-    }
-
-    const validateRequiredFields = (): boolean => {
-      if (driver === 'sqlite' && !filePathInp.value.trim()) {
-        showNotice('error', 'Please enter a SQLite database file path.')
-        return false
-      }
-      if (driver === 'libsql' && !libsqlUrlInp.value.trim()) {
-        showNotice('error', 'Please enter a LibSQL / Turso URL.')
-        return false
-      }
-      return true
-    }
-
-    const ensurePasswordBeforeSubmit = (): boolean => {
-      if (driver === 'sqlite' || driver === 'libsql') return true
-      const typed = passwordInp.value
-      if (placeholderPending && !typed) {
-        showNotice(
-          'error',
-          'Database Password is required — replace placeholder text like [YOUR-PASSWORD] by typing your actual Database Password.'
-        )
-        passwordInp.focus?.()
-        return false
-      }
-      const keepStored = isEdit && editProfile?.driver === driver && hadPassword
-      if (
-        !typed &&
-        !keepStored &&
-        (driver === 'postgres' || driver === 'cockroachdb') &&
-        /\.supabase\.(?:co|com)$/i.test(hostInp.value.trim())
-      ) {
-        showNotice(
-          'error',
-          'Database Password is required for Supabase PostgreSQL (Project Settings -> Database -> Database password, not your Supabase account login password).'
-        )
-        passwordInp.focus?.()
-        return false
-      }
-      return true
-    }
-
-    // ---- Workspace discovery ----
-    const detectWorkspace = async (folderPath: string, manual: boolean): Promise<void> => {
-      const seq = ++detectSeq
-      const activeBtn = folderPath ? scanBtn : detectBtn
-      setButtonLoading(activeBtn, true, 'Scanning...')
-      try {
-        const folder = folderPath.trim()
-        const [wsRes, folderRes] = await Promise.all([
-          this.requestPlugin<WorkspaceDetectResponse>(
-            'workspace.detectConnections',
-            folder ? { folderPath: folder } : {}
-          ),
-          folder
-            ? this.requestPlugin<{ files?: DiscoveredSqliteFile[] }>('sqlite.scanFolder', {
-                folderPath: folder,
-              }).catch(() => null)
-            : Promise.resolve(null),
-        ])
-        if (seq !== detectSeq || !isModalOpen()) return
-        discoveredEnvs = Array.isArray(wsRes?.envConnections) ? wsRes.envConnections : []
-        const wsFiles = Array.isArray(wsRes?.sqliteFiles) ? wsRes.sqliteFiles : []
-        const extraFiles = Array.isArray(folderRes?.files) ? folderRes.files : []
-        const seen = new Set<string>()
-        discoveredFiles = []
-        for (const f of [...extraFiles, ...wsFiles]) {
-          if (f?.filePath && !seen.has(f.filePath)) {
-            seen.add(f.filePath)
-            discoveredFiles.push(f)
-          }
-        }
-        if (manual && discoveredEnvs.length === 0 && discoveredFiles.length === 0) {
-          showNotice('neutral', 'No .env connections or SQLite database files found.')
-        }
-      } catch (err: unknown) {
-        if (seq !== detectSeq || !isModalOpen()) return
-        discoveredEnvs = []
-        discoveredFiles = []
-        if (manual) {
-          showNotice(
-            'error',
-            `Workspace discovery failed: ${err instanceof Error ? err.message : String(err)}`
-          )
-        }
-      } finally {
-        if (seq === detectSeq) {
-          setButtonLoading(activeBtn, false)
-          if (isBusy) activeBtn.disabled = true
-        }
-      }
-      if (isModalOpen()) renderDiscovered()
-    }
-
-    // ---- Actions ----
-    const runTest = async (): Promise<void> => {
-      if (isBusy) return
-      setBusy(true)
-      setButtonLoading(testBtn, true, 'Testing... 0.0s')
-      const stopTimer = this.createElapsedTimer((elapsed) => {
-        setButtonLoading(testBtn, true, `Testing... ${elapsed}`)
-      })
-      try {
-        if (!(await ensureUriParsed())) return
-        if (!validateRequiredFields() || !ensurePasswordBeforeSubmit()) return
-        showNotice('neutral', 'Testing connection...')
-        const sub = buildSubmission(editId || `conn_test_${Date.now()}`)
-        const res = await this.requestPlugin<{ ok: boolean; message?: string }>(
-          'connection.test',
-          sub,
-          { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
-        )
-        showNotice(
-          res.ok ? 'success' : 'error',
-          res.message ||
-            (res.ok ? 'Connection verified successfully!' : 'Connection test failed.')
-        )
-      } catch (err: unknown) {
-        showNotice('error', `Error: ${err instanceof Error ? err.message : String(err)}`)
-      } finally {
-        stopTimer()
-        setButtonLoading(testBtn, false)
-        setBusy(false)
-      }
-    }
-
-    const runSave = async (): Promise<void> => {
-      if (isBusy) return
-      setBusy(true)
-      let phase = 'Testing...'
-      setButtonLoading(saveBtn, true, 'Testing... 0.0s')
-      const stopTimer = this.createElapsedTimer((elapsed) => {
-        setButtonLoading(saveBtn, true, `${phase} ${elapsed}`)
-      })
-      let savedId = ''
-      try {
-        if (!(await ensureUriParsed())) return
-        if (!validateRequiredFields()) return
-        const targetId = editId || `conn_${driver}_${Date.now()}`
-        if (!ensurePasswordBeforeSubmit()) return
-        showNotice('neutral', 'Verifying & saving connection...')
-        const sub = buildSubmission(targetId)
-        try {
-          const testRes = await this.requestPlugin<{ ok: boolean; message?: string }>(
-            'connection.test',
-            sub,
-            { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
-          )
-          if (!testRes.ok) {
-            showNotice('error', testRes.message || 'Connection test failed.')
-            return
-          }
-        } catch (testErr: unknown) {
-          showNotice(
-            'error',
-            `Connection failed: ${testErr instanceof Error ? testErr.message : String(testErr)}`
-          )
-          return
-        }
-        phase = 'Saving...'
-        const res = await this.requestPlugin<{ ok: boolean; id: string }>(
-          'connection.save',
-          sub,
-          { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
-        )
-        if (!res.ok) {
-          showNotice('error', 'Failed to save connection.')
-          return
-        }
-        savedId = res.id || targetId
-      } catch (err: unknown) {
-        showNotice('error', `Error: ${err instanceof Error ? err.message : String(err)}`)
-      } finally {
-        stopTimer()
-        setButtonLoading(saveBtn, false)
-        setBusy(false)
-      }
-      if (!savedId) return
-      if (isModalOpen()) this.closeActiveModal()
-      this.updateStatus(`Connected to ${nameInp.value.trim() || savedId}`)
-      await this.activateSavedConnection(savedId)
-    }
-
-    const runDelete = async (): Promise<void> => {
-      if (isBusy || !isEdit) return
-      if (!deleteArmed) {
-        deleteArmed = true
-        deleteBtn.textContent = 'Confirm Delete?'
-        if (deleteTimer !== null) clearTimeout(deleteTimer)
-        deleteTimer = setTimeout(() => {
-          deleteArmed = false
-          deleteTimer = null
-          deleteBtn.textContent = 'Delete Connection'
-        }, 4000)
-        return
-      }
-      if (deleteTimer !== null) {
-        clearTimeout(deleteTimer)
-        deleteTimer = null
-      }
-      deleteArmed = false
-      setBusy(true)
-      setButtonLoading(deleteBtn, true, 'Deleting...')
-      let deleted = false
-      try {
-        const res = await this.requestPlugin<{ ok: boolean }>('connection.delete', { id: editId })
-        if (!res.ok) {
-          showNotice('error', 'Failed to delete connection.')
-          return
-        }
-        deleted = true
-      } catch (err: unknown) {
-        showNotice('error', `Delete failed: ${err instanceof Error ? err.message : String(err)}`)
-      } finally {
-        setButtonLoading(deleteBtn, false)
-        setBusy(false)
-      }
-      if (!deleted) return
-      if (isModalOpen()) this.closeActiveModal()
-      if (this.storedActiveConnectionId === editId) this.storedActiveConnectionId = null
-      if (this.pendingDocConnectionId === editId) this.pendingDocConnectionId = null
-      if (this.activeConnectionId === editId) this.handleConnectionChanged(null)
-      this.updateStatus('Connection deleted')
-      await this.refreshConnections()
-    }
-
-    parseBtn.addEventListener('click', () => {
-      if (isBusy) return
-      if (!uriInp.value.trim()) {
-        showNotice('error', 'Paste a connection URI first.')
-        return
-      }
-      void parseUri(uriInp.value, false)
-    })
-    uriInp.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault()
-        if (!isBusy && uriInp.value.trim()) void parseUri(uriInp.value, false)
-      }
-    })
-    detectBtn.addEventListener('click', () => {
-      if (!isBusy) void detectWorkspace('', true)
-    })
-    scanBtn.addEventListener('click', () => {
-      if (isBusy) return
-      if (!folderInp.value.trim()) {
-        showNotice('error', 'Enter a folder path to scan.')
-        return
-      }
-      void detectWorkspace(folderInp.value, true)
-    })
-    folderInp.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault()
-        scanBtn.click()
-      }
-    })
-    nameInp.addEventListener('input', () => {
-      lastAutoName = ''
-    })
-    passwordInp.addEventListener('input', () => {
-      placeholderPending = lastParsedPlaceholder && !passwordInp.value
-      passwordInp.placeholder = placeholderPending
-        ? 'Required (replace placeholder password)'
-        : hadPassword && isEdit
-          ? 'Stored password preserved (type to replace)'
-          : 'Optional'
-    })
-    testBtn.addEventListener('click', () => {
-      void runTest()
-    })
-    saveBtn.addEventListener('click', () => {
-      void runSave()
-    })
-    deleteBtn.addEventListener('click', () => {
-      void runDelete()
-    })
-    cancelBtn.addEventListener('click', () => {
-      if (!isBusy) this.closeActiveModal()
-    })
-
-    // ---- Initial population ----
-    if (editProfile) {
-      nameInp.value = editProfile.name || ''
-      const meta = getConnectionEngineMeta(driver)
-      if (driver === 'sqlite') {
-        filePathInp.value = editProfile.filePath || editProfile.database || ''
-      } else if (driver === 'libsql') {
-        libsqlUrlInp.value = editProfile.url || ''
-        libsqlDbInp.value = editProfile.database || ''
-        if (hadAuthToken) authTokenInp.placeholder = 'Stored token preserved (type to replace)'
-      } else {
-        hostInp.value = editProfile.host || 'localhost'
-        portInp.value = String(editProfile.port || meta.defaultPort)
-        userInp.value = editProfile.user || ''
-        sslCheck.input.checked = Boolean(editProfile.ssl)
-        if (driver === 'redis') {
-          redisDbSel.value = String(editProfile.redisDb ?? 0)
-        } else {
-          databaseInp.value = editProfile.database || ''
-        }
-        if (driver === 'clickhouse') chUrlInp.value = editProfile.url || ''
-        if (typeof editProfile.options === 'string') optionsInp.value = editProfile.options
-        if (hadPassword) passwordInp.placeholder = 'Stored password preserved (type to replace)'
-      }
-      applyDriver(driver, false)
-    } else {
-      hostInp.value = 'localhost'
-      applyDriver(driver, true)
-    }
-    syncEnvPills()
-
-    modal.appendChild(head)
-    modal.appendChild(body)
-    modal.appendChild(actions)
-    backdropRef = this.mountStudioModal(modal, () => !isBusy)
-    if (!backdropRef) return
-    if (isEdit) {
-      nameInp.focus?.()
-      nameInp.select?.()
-    } else {
-      uriInp.focus?.()
-      void detectWorkspace('', false)
-    }
   }
 
   private openCreateTableModal(): void {
-    const conn = this.getActiveConnection()
-    if (!conn || conn.readOnly || conn.driver === 'redis') {
-      this.updateStatus('Cannot create tables on this connection')
-      return
-    }
-    const driver = conn.driver
-    let isCreating = false
-
-    const columns: CreateTableColumnDraft[] = [
-      {
-        name: 'id',
-        dataType: 'INTEGER',
-        nullable: false,
-        defaultValue: '',
-        isPrimaryKey: true,
-        isAutoIncrement: true,
+    openStudioCreateTableModal({
+      mountModal: (modalEl, canClose) => this.mountStudioModal(modalEl, canClose),
+      closeModal: () => this.closeActiveModal(),
+      activeConnection: this.getActiveConnection(),
+      activeConnectionId: this.activeConnectionId,
+      activeSchema: this.activeSchema,
+      updateStatus: (stateText, metricsText) => this.updateStatus(stateText, metricsText),
+      createElapsedTimer: (onTick) => this.createElapsedTimer(onTick),
+      requestPlugin: <T = unknown>(
+        method: string,
+        payload?: Record<string, unknown>,
+        options?: { timeoutMs?: number }
+      ) => this.requestPlugin<T>(method, payload, options),
+      onTableCreated: async (connId, targetName, targetSchema, currentSql) => {
+        if (this.activeConnectionId !== connId) return
+        this.activeTable = targetName
+        this.activeSchema = targetSchema
+        this.showQueryBanner('success', `Table "${targetName}" Created`, currentSql)
+        await this.introspectSchema(connId, false)
       },
-      {
-        name: 'name',
-        dataType: 'TEXT',
-        nullable: false,
-        defaultValue: '',
-        isPrimaryKey: false,
-        isAutoIncrement: false,
-      },
-    ]
-
-    const modal = document.createElement('div')
-    modal.className = 'datanoa-create-table-modal'
-
-    const head = document.createElement('div')
-    head.className = 'datanoa-modal-head'
-    const headTitle = document.createElement('span')
-    headTitle.textContent = 'Create New Table'
-    const badge = document.createElement('span')
-    badge.className = 'datanoa-badge datanoa-badge-pk'
-    badge.textContent = driver.toUpperCase()
-    head.appendChild(headTitle)
-    head.appendChild(badge)
-
-    const body = document.createElement('div')
-    body.className = 'datanoa-modal-body'
-
-    const execErrBox = document.createElement('div')
-    execErrBox.className = 'datanoa-modal-box error'
-    execErrBox.style.display = 'none'
-    body.appendChild(execErrBox)
-
-    const topFields = document.createElement('div')
-    topFields.style.display = 'flex'
-    topFields.style.gap = '8px'
-
-    const tableNameInput = document.createElement('input')
-    tableNameInput.type = 'text'
-    tableNameInput.className = 'datanoa-filter-input'
-    tableNameInput.placeholder = 'Table name (e.g. users)'
-    tableNameInput.value = 'new_table'
-    tableNameInput.style.flex = '2'
-
-    const schemaInput = document.createElement('input')
-    schemaInput.type = 'text'
-    schemaInput.className = 'datanoa-filter-input'
-    schemaInput.placeholder = 'Schema (optional)'
-    schemaInput.value =
-      driver !== 'sqlite' && driver !== 'libsql' ? this.activeSchema || '' : ''
-    schemaInput.style.flex = '1'
-    if (driver === 'sqlite' || driver === 'libsql') {
-      schemaInput.style.display = 'none'
-    }
-
-    topFields.appendChild(tableNameInput)
-    topFields.appendChild(schemaInput)
-    body.appendChild(topFields)
-
-    const colsHeader = document.createElement('div')
-    colsHeader.style.display = 'flex'
-    colsHeader.style.justifyContent = 'space-between'
-    colsHeader.style.alignItems = 'center'
-    const colsTitle = document.createElement('strong')
-    colsTitle.textContent = 'Columns'
-    const addColBtn = document.createElement('button')
-    addColBtn.type = 'button'
-    addColBtn.className = 'datanoa-btn datanoa-btn-sm'
-    addColBtn.textContent = '+ Add Column'
-    colsHeader.appendChild(colsTitle)
-    colsHeader.appendChild(addColBtn)
-    body.appendChild(colsHeader)
-
-    const colTableWrap = document.createElement('div')
-    colTableWrap.className = 'datanoa-matrix-scroll'
-    const colTable = document.createElement('table')
-    colTable.className = 'datanoa-matrix-table datanoa-struct-grid'
-    colTable.innerHTML =
-      '<thead><tr><th>Name</th><th>Type</th><th>PK</th><th>AI</th><th>Null</th><th>Default</th><th></th></tr></thead>'
-    const colTbody = document.createElement('tbody')
-    colTable.appendChild(colTbody)
-    colTableWrap.appendChild(colTable)
-    body.appendChild(colTableWrap)
-
-    const ddlLabel = document.createElement('div')
-    ddlLabel.style.fontWeight = '600'
-    ddlLabel.textContent = 'Live CREATE TABLE Preview:'
-    const ddlPre = document.createElement('pre')
-    ddlPre.className = 'datanoa-modal-sql'
-    body.appendChild(ddlLabel)
-    body.appendChild(ddlPre)
-
-    const actions = document.createElement('div')
-    actions.className = 'datanoa-modal-actions'
-    const cancelBtn = document.createElement('button')
-    cancelBtn.type = 'button'
-    cancelBtn.className = 'datanoa-btn datanoa-btn-sm'
-    cancelBtn.textContent = 'Cancel'
-    const createBtn = document.createElement('button')
-    createBtn.type = 'button'
-    createBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-btn-primary'
-    createBtn.textContent = 'Create Table'
-    actions.appendChild(cancelBtn)
-    actions.appendChild(createBtn)
-
-    let currentSql = ''
-    const updatePreview = () => {
-      try {
-        currentSql = buildCreateTableSql(
-          {
-            tableName: tableNameInput.value,
-            schema: schemaInput.value.trim() || undefined,
-            columns,
-          },
-          driver
-        )
-        ddlPre.textContent = currentSql
-        createBtn.disabled = isCreating || !currentSql
-      } catch (err: unknown) {
-        currentSql = ''
-        const msg = err instanceof Error ? err.message : String(err)
-        ddlPre.textContent = `-- ${msg}`
-        createBtn.disabled = true
-      }
-    }
-
-    const renderCols = () => {
-      colTbody.innerHTML = ''
-      columns.forEach((col, idx) => {
-        const tr = document.createElement('tr')
-
-        const tdName = document.createElement('td')
-        const nameInp = document.createElement('input')
-        nameInp.type = 'text'
-        nameInp.className = 'datanoa-struct-cell-input'
-        nameInp.value = col.name
-        nameInp.placeholder = 'column_name'
-        nameInp.addEventListener('input', () => {
-          col.name = nameInp.value
-          updatePreview()
-        })
-        tdName.appendChild(nameInp)
-
-        const tdType = document.createElement('td')
-        const typeInp = document.createElement('input')
-        typeInp.type = 'text'
-        typeInp.className = 'datanoa-struct-cell-input'
-        typeInp.value = col.dataType
-        typeInp.placeholder = 'TEXT / INTEGER'
-        typeInp.addEventListener('input', () => {
-          col.dataType = typeInp.value
-          updatePreview()
-        })
-        tdType.appendChild(typeInp)
-
-        const tdPk = document.createElement('td')
-        const pkCb = document.createElement('input')
-        pkCb.type = 'checkbox'
-        pkCb.checked = Boolean(col.isPrimaryKey)
-        pkCb.addEventListener('change', () => {
-          col.isPrimaryKey = pkCb.checked
-          if (col.isPrimaryKey) col.nullable = false
-          renderCols()
-          updatePreview()
-        })
-        tdPk.appendChild(pkCb)
-
-        const tdAi = document.createElement('td')
-        const aiCb = document.createElement('input')
-        aiCb.type = 'checkbox'
-        aiCb.checked = Boolean(col.isAutoIncrement)
-        aiCb.addEventListener('change', () => {
-          col.isAutoIncrement = aiCb.checked
-          updatePreview()
-        })
-        tdAi.appendChild(aiCb)
-
-        const tdNull = document.createElement('td')
-        const nullCb = document.createElement('input')
-        nullCb.type = 'checkbox'
-        nullCb.checked = col.nullable !== false
-        nullCb.disabled = Boolean(col.isPrimaryKey)
-        nullCb.addEventListener('change', () => {
-          col.nullable = nullCb.checked
-          updatePreview()
-        })
-        tdNull.appendChild(nullCb)
-
-        const tdDef = document.createElement('td')
-        const defInp = document.createElement('input')
-        defInp.type = 'text'
-        defInp.className = 'datanoa-struct-cell-input'
-        defInp.value = col.defaultValue || ''
-        defInp.placeholder = 'Default...'
-        defInp.addEventListener('input', () => {
-          col.defaultValue = defInp.value
-          updatePreview()
-        })
-        tdDef.appendChild(defInp)
-
-        const tdAct = document.createElement('td')
-        const rmBtn = document.createElement('button')
-        rmBtn.type = 'button'
-        rmBtn.className = 'datanoa-btn datanoa-btn-sm'
-        rmBtn.textContent = '×'
-        rmBtn.disabled = columns.length <= 1
-        rmBtn.addEventListener('click', () => {
-          if (columns.length <= 1) return
-          columns.splice(idx, 1)
-          renderCols()
-          updatePreview()
-        })
-        tdAct.appendChild(rmBtn)
-
-        tr.appendChild(tdName)
-        tr.appendChild(tdType)
-        tr.appendChild(tdPk)
-        tr.appendChild(tdAi)
-        tr.appendChild(tdNull)
-        tr.appendChild(tdDef)
-        tr.appendChild(tdAct)
-        colTbody.appendChild(tr)
-      })
-    }
-
-    addColBtn.addEventListener('click', () => {
-      columns.push({
-        name: `col_${columns.length + 1}`,
-        dataType: 'TEXT',
-        nullable: true,
-        defaultValue: '',
-        isPrimaryKey: false,
-        isAutoIncrement: false,
-      })
-      renderCols()
-      updatePreview()
     })
-
-    tableNameInput.addEventListener('input', updatePreview)
-    schemaInput.addEventListener('input', updatePreview)
-    cancelBtn.addEventListener('click', () => {
-      if (!isCreating) this.closeActiveModal()
-    })
-
-    createBtn.addEventListener('click', () => {
-      if (isCreating || !currentSql || !this.activeConnectionId) return
-      const connId = this.activeConnectionId
-      const targetName = tableNameInput.value.trim()
-      const targetSchema = schemaInput.value.trim() || undefined
-      isCreating = true
-      execErrBox.style.display = 'none'
-      cancelBtn.disabled = true
-      addColBtn.disabled = true
-      setButtonLoading(createBtn, true, 'Creating... 0.0s')
-      const stopTimer = this.createElapsedTimer((elapsedText) => {
-        setButtonLoading(createBtn, true, `Creating... ${elapsedText}`)
-      })
-
-      void (async () => {
-        try {
-          await this.requestPlugin<QueryResult>(
-            'query.run',
-            {
-              connectionId: connId,
-              queryId: `create_tbl_${Date.now()}`,
-              sql: currentSql,
-            },
-            { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
-          )
-          stopTimer()
-          isCreating = false
-          this.closeActiveModal()
-          if (this.activeConnectionId !== connId) return
-          this.activeTable = targetName
-          this.activeSchema = targetSchema
-          this.showQueryBanner('success', `Table "${targetName}" Created`, currentSql)
-          await this.introspectSchema(connId, false)
-        } catch (err: unknown) {
-          stopTimer()
-          isCreating = false
-          setButtonLoading(createBtn, false)
-          cancelBtn.disabled = false
-          addColBtn.disabled = false
-          updatePreview()
-          const msg = err instanceof Error ? err.message : String(err)
-          execErrBox.textContent = `Create Table failed: ${msg}`
-          execErrBox.style.display = 'block'
-        }
-      })()
-    })
-
-    renderCols()
-    updatePreview()
-
-    modal.appendChild(head)
-    modal.appendChild(body)
-    modal.appendChild(actions)
-    this.mountStudioModal(modal, () => !isCreating)
-    tableNameInput.focus?.()
-    tableNameInput.select?.()
   }
 
   private openDangerTableModal(action: 'truncate' | 'drop', item: SchemaObject): void {
-    const conn = this.getActiveConnection()
-    if (!conn || conn.readOnly || conn.driver === 'redis') {
-      this.updateStatus('Cannot run destructive table operation on a Read-Only or Redis connection')
-      return
-    }
-    const driver = conn.driver
-    let sql = ''
-    try {
-      sql =
-        action === 'truncate'
-          ? buildTruncateTableSql(item.name, driver, item.schema)
-          : buildDropTableSql(item.name, item.kind, driver, item.schema)
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err)
-      this.showQueryBanner('error', 'Operation Unavailable', msg)
-      return
-    }
-
-    let isExecuting = false
-    const actionTitle =
-      action === 'truncate'
-        ? `Truncate Table "${item.name}"`
-        : item.kind === 'view'
-          ? `Drop View "${item.name}"`
-          : `Drop Table "${item.name}"`
-
-    const modal = document.createElement('div')
-    modal.className = 'datanoa-danger-modal'
-
-    const head = document.createElement('div')
-    head.className = 'datanoa-modal-head'
-    const titleEl = document.createElement('span')
-    titleEl.textContent = actionTitle
-    const badge = document.createElement('span')
-    badge.className = 'datanoa-badge'
-    badge.style.color = 'var(--danger)'
-    badge.textContent = action === 'truncate' ? 'DELETE ALL ROWS' : 'PERMANENT DROP'
-    head.appendChild(titleEl)
-    head.appendChild(badge)
-
-    const body = document.createElement('div')
-    body.className = 'datanoa-modal-body'
-
-    if (conn.colorTag === 'prod') {
-      const prodWarn = document.createElement('div')
-      prodWarn.className = 'datanoa-modal-box error'
-      prodWarn.textContent =
-        'PRODUCTION CONNECTION WARNING: This action is irreversible and will immediately affect production data!'
-      body.appendChild(prodWarn)
-    }
-
-    const desc = document.createElement('div')
-    desc.textContent =
-      action === 'truncate'
-        ? `This will permanently remove all rows from "${item.name}". Type the exact table name below to confirm.`
-        : `This will permanently drop ${item.kind} "${item.name}" and its data. Type the exact name below to confirm.`
-    body.appendChild(desc)
-
-    const sqlPre = document.createElement('pre')
-    sqlPre.className = 'datanoa-modal-sql'
-    sqlPre.textContent = sql
-    body.appendChild(sqlPre)
-
-    const confirmInput = document.createElement('input')
-    confirmInput.type = 'text'
-    confirmInput.className = 'datanoa-filter-input'
-    confirmInput.placeholder = `Type "${item.name}" to enable confirmation`
-    body.appendChild(confirmInput)
-
-    const execErrBox = document.createElement('div')
-    execErrBox.className = 'datanoa-modal-box error'
-    execErrBox.style.display = 'none'
-    body.appendChild(execErrBox)
-
-    const actions = document.createElement('div')
-    actions.className = 'datanoa-modal-actions'
-    const cancelBtn = document.createElement('button')
-    cancelBtn.type = 'button'
-    cancelBtn.className = 'datanoa-btn datanoa-btn-sm'
-    cancelBtn.textContent = 'Cancel'
-    const confirmBtn = document.createElement('button')
-    confirmBtn.type = 'button'
-    confirmBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-btn-danger-solid'
-    confirmBtn.textContent = action === 'truncate' ? 'Truncate Table' : `Drop ${item.kind === 'view' ? 'View' : 'Table'}`
-    confirmBtn.disabled = true
-    actions.appendChild(cancelBtn)
-    actions.appendChild(confirmBtn)
-
-    confirmInput.addEventListener('input', () => {
-      confirmBtn.disabled = isExecuting || confirmInput.value.trim() !== item.name
-    })
-
-    cancelBtn.addEventListener('click', () => {
-      if (!isExecuting) this.closeActiveModal()
-    })
-
-    confirmBtn.addEventListener('click', () => {
-      if (isExecuting || confirmInput.value.trim() !== item.name || !this.activeConnectionId) return
-      const connId = this.activeConnectionId
-      isExecuting = true
-      execErrBox.style.display = 'none'
-      cancelBtn.disabled = true
-      confirmInput.disabled = true
-      setButtonLoading(confirmBtn, true, 'Executing... 0.0s')
-      const stopTimer = this.createElapsedTimer((elapsedText) => {
-        setButtonLoading(confirmBtn, true, `Executing... ${elapsedText}`)
-      })
-
-      void (async () => {
-        try {
-          await this.requestPlugin<QueryResult>(
-            'query.run',
-            {
-              connectionId: connId,
-              queryId: `${action}_${Date.now()}`,
-              sql,
-            },
-            { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
-          )
-          stopTimer()
-          isExecuting = false
-          this.closeActiveModal()
+    openStudioDangerTableModal(
+      {
+        mountModal: (modalEl, canClose) => this.mountStudioModal(modalEl, canClose),
+        closeModal: () => this.closeActiveModal(),
+        activeConnection: this.getActiveConnection(),
+        activeConnectionId: this.activeConnectionId,
+        updateStatus: (stateText, metricsText) => this.updateStatus(stateText, metricsText),
+        showQueryBanner: (kind, title, detail, opts) =>
+          this.showQueryBanner(kind, title, detail, opts),
+        createElapsedTimer: (onTick) => this.createElapsedTimer(onTick),
+        requestPlugin: <T = unknown>(
+          method: string,
+          payload?: Record<string, unknown>,
+          options?: { timeoutMs?: number }
+        ) => this.requestPlugin<T>(method, payload, options),
+        onDangerActionSucceeded: async (connId, act, obj, actionTitle, sql) => {
           if (this.activeConnectionId !== connId) return
           this.showQueryBanner('success', `${actionTitle} Succeeded`, sql)
-          if (action === 'drop') {
-            if (this.isObjectActive(item.name, item.schema)) {
+          if (act === 'drop') {
+            if (this.isObjectActive(obj.name, obj.schema)) {
               this.activeTable = null
               this.activeSchema = undefined
               this.lastInspectorLoadedKey = ''
             }
             await this.introspectSchema(connId, false)
-          } else if (this.isObjectActive(item.name, item.schema)) {
-            await this.loadTableData(connId, item.name, 1)
+          } else if (this.isObjectActive(obj.name, obj.schema)) {
+            await this.loadTableData(connId, obj.name, 1)
           }
-        } catch (err: unknown) {
-          stopTimer()
-          isExecuting = false
-          setButtonLoading(confirmBtn, false)
-          cancelBtn.disabled = false
-          confirmInput.disabled = false
-          confirmBtn.disabled = confirmInput.value.trim() !== item.name
-          const msg = err instanceof Error ? err.message : String(err)
-          execErrBox.textContent = `Execution failed: ${msg}`
-          execErrBox.style.display = 'block'
-        }
-      })()
-    })
-
-    modal.appendChild(head)
-    modal.appendChild(body)
-    modal.appendChild(actions)
-    this.mountStudioModal(modal, () => !isExecuting)
-    confirmInput.focus?.()
+        },
+      },
+      action,
+      item
+    )
   }
 
   private openCommandPalette(): void {
-    interface PaletteEntry {
-      label: string
-      category: string
-      searchText: string
-      run: () => void
-    }
-
-    const entries: PaletteEntry[] = []
-    for (const obj of this.schemaObjects) {
-      entries.push({
-        label: obj.schema ? `${obj.schema}.${obj.name}` : obj.name,
-        category: obj.kind === 'view' ? 'View' : 'Table',
-        searchText: `${obj.name} ${obj.schema || ''} ${obj.kind}`,
-        run: () => {
-          this.selectSidebarObject(obj)
-        },
-      })
-    }
-    for (const conn of this.connections) {
-      entries.push({
-        label: `${conn.name} (${conn.driver})`,
-        category: 'Connection',
-        searchText: `${conn.name} ${conn.driver} connection`,
-        run: () => {
-          this.handleConnectionChanged(conn.id)
-          this.updateMetadataHeader('connectionId', conn.id)
-        },
-      })
-    }
-    entries.push(
-      {
-        label: 'New Database Connection...',
-        category: 'Command',
-        searchText: 'new add connect database connection server uri',
-        run: () => this.openConnectionModal(),
+    openStudioCommandPalette({
+      mountModal: (modalEl, canClose) => this.mountStudioModal(modalEl, canClose),
+      closeModal: () => this.closeActiveModal(),
+      schemaObjects: this.schemaObjects,
+      connections: this.connections,
+      activeConnection: this.getActiveConnection(),
+      sidebarCollapsed: this.sidebarCollapsed,
+      selectSidebarObject: (obj) => this.selectSidebarObject(obj),
+      selectConnection: (connId) => {
+        this.handleConnectionChanged(connId)
+        this.updateMetadataHeader('connectionId', connId)
       },
-      {
-        label: 'Format SQL (Shift+Alt+F)',
-        category: 'Command',
-        searchText: 'format sql prettify',
-        run: () => this.formatSqlInConsole(),
-      },
-      {
-        label: 'New Table...',
-        category: 'Command',
-        searchText: 'new create table',
-        run: () => this.openCreateTableModal(),
-      },
-      {
-        label: 'Toggle Sidebar / Horizontal Top Bar',
-        category: 'Command',
-        searchText: 'toggle sidebar topbar layout',
-        run: () => this.setSidebarCollapsed(!this.sidebarCollapsed, true),
-      },
-      {
-        label: 'Switch View Mode: Split View',
-        category: 'Command',
-        searchText: 'view mode split',
-        run: () => this.switchMode('split'),
-      },
-      {
-        label: 'Switch View Mode: Data Grid',
-        category: 'Command',
-        searchText: 'view mode data grid',
-        run: () => this.switchMode('grid'),
-      },
-      {
-        label: 'Switch View Mode: SQL Console',
-        category: 'Command',
-        searchText: 'view mode sql console',
-        run: () => this.switchMode('sql'),
-      },
-      {
-        label: 'Switch View Mode: Schema Inspector',
-        category: 'Command',
-        searchText: 'view mode schema inspector structure',
-        run: () => this.switchMode('inspector'),
-      },
-      {
-        label: 'Toggle Query History',
-        category: 'Command',
-        searchText: 'query history drawer',
-        run: () => {
-          void this.toggleQueryHistory()
-        },
-      },
-      {
-        label: 'Refresh Schema',
-        category: 'Command',
-        searchText: 'refresh reload schema',
-        run: () => {
-          void this.handleRefreshAction()
-        },
-      },
-      {
-        label: 'Keyboard Shortcuts (?)',
-        category: 'Command',
-        searchText: 'keyboard shortcuts help cheatsheet',
-        run: () => this.openShortcutsModal(),
-      }
-    )
-
-    const paletteActiveConn = this.getActiveConnection()
-    if (paletteActiveConn) {
-      entries.push({
-        label: 'Edit Active Connection...',
-        category: 'Command',
-        searchText: 'edit configure connection server',
-        run: () => this.openConnectionModal(paletteActiveConn),
-      })
-    }
-
-    const modal = document.createElement('div')
-    modal.className = 'datanoa-cmd-palette'
-
-    const searchInp = document.createElement('input')
-    searchInp.type = 'search'
-    searchInp.className = 'datanoa-cmd-palette-input datanoa-filter-input'
-    searchInp.placeholder = 'Jump to table, connection, or command...'
-
-    const listEl = document.createElement('div')
-    listEl.className = 'datanoa-cmd-palette-list'
-
-    let filtered: PaletteEntry[] = []
-    let activeIdx = 0
-
-    const renderMatches = (scrollActiveIntoView = false) => {
-      const q = searchInp.value.trim()
-      filtered = entries
-        .map((e) => ({ entry: e, score: fuzzyMatchScore(q, `${e.label} ${e.searchText}`) }))
-        .filter((x) => x.score > 0)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 40)
-        .map((x) => x.entry)
-
-      if (activeIdx >= filtered.length) activeIdx = 0
-      listEl.innerHTML = ''
-      if (filtered.length === 0) {
-        const empty = document.createElement('div')
-        empty.className = 'datanoa-cell-null'
-        empty.style.padding = '10px'
-        empty.textContent = 'No matching tables, connections, or commands.'
-        listEl.appendChild(empty)
-        return
-      }
-
-      filtered.forEach((item, idx) => {
-        const btn = document.createElement('button')
-        btn.type = 'button'
-        btn.className = `datanoa-cmd-palette-item${idx === activeIdx ? ' active' : ''}`
-        const labelSpan = document.createElement('span')
-        labelSpan.textContent = item.label
-        const catSpan = document.createElement('span')
-        catSpan.className = 'datanoa-badge'
-        catSpan.textContent = item.category
-        btn.appendChild(labelSpan)
-        btn.appendChild(catSpan)
-        btn.addEventListener('click', () => {
-          this.closeActiveModal()
-          item.run()
-        })
-        listEl.appendChild(btn)
-        if (scrollActiveIntoView && idx === activeIdx) {
-          btn.scrollIntoView?.({ block: 'nearest' })
-        }
-      })
-    }
-
-    searchInp.addEventListener('input', () => {
-      activeIdx = 0
-      renderMatches(false)
+      openConnectionModal: (editProfile) => this.openConnectionModal(editProfile),
+      formatSqlInConsole: () => this.formatSqlInConsole(),
+      openCreateTableModal: () => this.openCreateTableModal(),
+      setSidebarCollapsed: (collapsed, persist) =>
+        this.setSidebarCollapsed(collapsed, persist),
+      switchMode: (mode) => this.switchMode(mode),
+      toggleQueryHistory: () => this.toggleQueryHistory(),
+      handleRefreshAction: () => this.handleRefreshAction(),
+      openShortcutsModal: () => this.openShortcutsModal(),
+      openFeedbackModal: (initialKind) => this.openFeedbackModal(initialKind),
     })
-
-    searchInp.addEventListener('keydown', (e) => {
-      if (e.key === 'ArrowDown') {
-        e.preventDefault()
-        if (filtered.length > 0) {
-          activeIdx = (activeIdx + 1) % filtered.length
-          renderMatches(true)
-        }
-      } else if (e.key === 'ArrowUp') {
-        e.preventDefault()
-        if (filtered.length > 0) {
-          activeIdx = (activeIdx - 1 + filtered.length) % filtered.length
-          renderMatches(true)
-        }
-      } else if (e.key === 'Enter') {
-        e.preventDefault()
-        const target = filtered[activeIdx]
-        if (target) {
-          this.closeActiveModal()
-          target.run()
-        }
-      }
-    })
-
-    renderMatches(false)
-    modal.appendChild(searchInp)
-    modal.appendChild(listEl)
-    this.mountStudioModal(modal)
-    searchInp.focus?.()
   }
 
   private openShortcutsModal(): void {
-    const modal = document.createElement('div')
-    modal.className = 'datanoa-shortcuts-modal'
+    openStudioShortcutsModal({
+      mountModal: (modalEl, canClose) => this.mountStudioModal(modalEl, canClose),
+      closeModal: () => this.closeActiveModal(),
+    })
+  }
 
-    const head = document.createElement('div')
-    head.className = 'datanoa-modal-head'
-    const titleEl = document.createElement('span')
-    titleEl.textContent = 'Keyboard Shortcuts'
-    const closeBtn = document.createElement('button')
-    closeBtn.type = 'button'
-    closeBtn.className = 'datanoa-btn datanoa-btn-sm'
-    closeBtn.textContent = 'Close'
-    closeBtn.addEventListener('click', () => this.closeActiveModal())
-    head.appendChild(titleEl)
-    head.appendChild(closeBtn)
-
-    const body = document.createElement('div')
-    body.className = 'datanoa-modal-body'
-
-    const groups: ReadonlyArray<{
-      title: string
-      items: ReadonlyArray<[string, string]>
-    }> = [
+  public openFeedbackModal(initialKind: 'bug' | 'feature' = 'bug'): void {
+    const conn = this.getActiveConnection()
+    openStudioFeedbackModal(
       {
-        title: 'SQL Console',
-        items: [
-          ['Ctrl+Enter / Cmd+Enter', 'Execute statement at caret (or selection)'],
-          ['Ctrl+Shift+Enter', 'Execute all statements in console'],
-          ['Shift+Alt+F', 'Format SQL in console'],
-        ],
+        mountModal: (modalEl, canClose) => this.mountStudioModal(modalEl, canClose),
+        closeModal: () => this.closeActiveModal(),
+        activeDriver: conn?.driver ?? null,
+        activeViewMode: this.activeViewMode,
+        isReadOnly: this.isActiveConnectionReadOnly(),
+        lastQueryErrorText: this.lastQueryErrorText,
+        updateStatus: (stateText, metricsText) => this.updateStatus(stateText, metricsText),
       },
-      {
-        title: 'Data Grid & Selection',
-        items: [
-          ['Arrow / Shift+Arrow', 'Navigate cells & extend rectangular selection'],
-          ['Ctrl+A', 'Select all visible cells'],
-          ['Ctrl+C / Ctrl+V', 'Copy selection as TSV / Paste TSV or CSV'],
-          ['Enter / F2', 'Edit focused cell inline'],
-          ['Delete / Backspace', 'Set selected cells to NULL'],
-          ['Ctrl+F', 'Find & highlight cells in grid'],
-          ['Ctrl+S', 'Submit staged data edits or schema migration'],
-          ['Ctrl+Scroll', 'Horizontal pan across wide tables'],
-          ['Ctrl+Click (FK cell)', 'Jump to referenced Foreign Key row'],
-        ],
-      },
-      {
-        title: 'Studio Navigation',
-        items: [
-          ['Ctrl+K / Ctrl+P', 'Open Quick Switcher / Command Palette'],
-          ['Ctrl+/', 'Open Keyboard Shortcuts cheatsheet'],
-          ['Escape', 'Close active menu, popover, or modal'],
-        ],
-      },
-    ]
-
-    for (const grp of groups) {
-      const box = document.createElement('div')
-      box.className = 'datanoa-modal-box'
-      const grpTitle = document.createElement('strong')
-      grpTitle.textContent = grp.title
-      box.appendChild(grpTitle)
-
-      const list = document.createElement('div')
-      list.style.display = 'grid'
-      list.style.gridTemplateColumns = '190px 1fr'
-      list.style.gap = '4px 12px'
-      list.style.marginTop = '6px'
-
-      for (const [keys, desc] of grp.items) {
-        const kbd = document.createElement('kbd')
-        kbd.textContent = keys
-        const descSpan = document.createElement('span')
-        descSpan.style.color = 'var(--muted)'
-        descSpan.textContent = desc
-        list.appendChild(kbd)
-        list.appendChild(descSpan)
-      }
-      box.appendChild(list)
-      body.appendChild(box)
-    }
-
-    modal.appendChild(head)
-    modal.appendChild(body)
-    this.mountStudioModal(modal)
+      initialKind
+    )
   }
 
   private async refreshSchemaObjectsOnly(connectionId: string): Promise<void> {
