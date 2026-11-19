@@ -14,9 +14,15 @@
   "icon": "assets/icon.png",
   "cover": {
     "path": "images/cover.png",
-    "alt": "Datanoa Studio OLED split view with PostgreSQL SQL console, 60fps virtual data grid, multi-cell selection aggregates, and JSON value inspector"
+    "alt": "Datanoa Studio banner showcasing the OLED fullscreen SQL console, virtual data grid, docked Side Panel, and 8 supported database engines"
   },
   "screenshots": [
+    {
+      "path": "images/studio-split-view.png",
+      "alt": "Datanoa Studio OLED split view with PostgreSQL SQL console, 60fps virtual data grid, multi-cell selection aggregates, and JSON value inspector",
+      "caption": "OLED Split View with SQL Console, 60fps Virtual Data Grid, and JSON Inspector",
+      "theme": "dark"
+    },
     {
       "path": "images/studio-connection-modal.png",
       "alt": "Datanoa New Database Connection modal with 8 database engines, quick URI parser, and .env and SQLite auto-discovery",

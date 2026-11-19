@@ -86,7 +86,15 @@ Datanoa integrates into Orca across four natural entry points:
 
 ## Visual Walkthrough & Screenshots
 
-### 1. 8-Engine Connection Manager, URI Quick-Fill & Workspace Auto-Detect
+### 1. OLED Split View — SQL Console, 60fps Virtual Data Grid & Value/JSON Inspector
+
+Write multi-statement SQL with dialect-aware syntax highlighting and smart column/alias autocomplete in the top pane while browsing and staging edits on hundreds of thousands of rows below — complete with live multi-cell selection math (`Count`, `Sum`, `Avg`, `Min`, `Max`), `CLONE` row badges, Foreign Key jump badges (`↗`), and a dockable **Value / JSON Inspector**.
+
+<p align="center">
+  <img src="images/studio-split-view.png" alt="Datanoa Studio OLED Split View with SQL Console, 60fps Virtual Data Grid, Multi-Cell Selection Aggregates & JSON Value Inspector" width="100%" />
+</p>
+
+### 2. 8-Engine Connection Manager, URI Quick-Fill & Workspace Auto-Detect
 
 Paste any cloud or local database URI (`Neon`, `Supabase`, `Turso`, `Upstash`, `ClickHouse Cloud`, `CockroachDB Cloud`, `RDS`), auto-detect `.env` variables (`DATABASE_URL`, `REDIS_URL`, `TURSO_DATABASE_URL`) and workspace SQLite files, tag environments (`None`, `Dev`, `Staging`, `Prod`), and verify connectivity with live latency diagnostics.
 
@@ -94,7 +102,7 @@ Paste any cloud or local database URI (`Neon`, `Supabase`, `Turso`, `Upstash`, `
   <img src="images/studio-connection-modal.png" alt="Datanoa 8-Engine Connection Modal with Quick URI Parser, Workspace .env & .db Auto-Discovery, and Cloud Auto-SSL" width="100%" />
 </p>
 
-### 2. Visual Table Structure Designer & Live Migration SQL Preview
+### 3. Visual Table Structure Designer & Live Migration SQL Preview
 
 Edit table schemas visually in **Schema Inspector** mode: add, rename, or re-type columns with the in-DOM dialect Data Type Combobox, configure Primary Keys, Nullability, and smart Default Values, manage composite Indexes and Foreign Keys (`ON DELETE CASCADE` / `SET NULL` / `RESTRICT`), inspect live `ALTER TABLE` / `CREATE INDEX` DDL in the **Staged Schema Migration SQL** drawer, and apply atomically (`Ctrl+S`). On SQLite and LibSQL, complex structural edits automatically execute a 12-step atomic table rebuild preserving data, indexes, and foreign keys.
 
@@ -102,7 +110,7 @@ Edit table schemas visually in **Schema Inspector** mode: add, rename, or re-typ
   <img src="images/schema-designer.png" alt="Datanoa Visual Table Structure Designer with Staged Column Changes, In-DOM Data Type Combobox & Live Migration SQL Preview" width="100%" />
 </p>
 
-### 3. Clean Light Theme (`html.light`), Horizontal Top Table Switcher & Pinned Columns
+### 4. Clean Light Theme (`html.light`), Horizontal Top Table Switcher & Pinned Columns
 
 Switch Orca to a light theme and Datanoa adapts automatically. Collapse the left sidebar into the **Horizontal Top Table Switcher Bar** to maximize horizontal grid space, pin key identifier columns (`id`, `order_code`) to the left edge with opaque elevation shadows, and use **Find & Highlight (`Ctrl+F`)** to jump across matching cells in real time.
 
@@ -110,7 +118,7 @@ Switch Orca to a light theme and Datanoa adapts automatically. Collapse the left
   <img src="images/studio-light-theme.png" alt="Datanoa Studio in Clean Light Theme with Horizontal Top Table Switcher Bar, Pinned Columns & Find Highlight" width="100%" />
 </p>
 
-### 4. Docked Side Panel — Multi-Engine Explorer, 60fps Data Grid & Quick SQL Runner
+### 5. Docked Side Panel — Multi-Engine Explorer, 60fps Data Grid & Quick SQL Runner
 
 Use the **Datanoa Side Panel** without leaving your active code editor: expand multiple database connections simultaneously in the **Explorer** tree, stage and filter data in the virtualized **Data** tab with live multi-cell selection math, or run multi-statement queries in the **SQL** tab with persistent history and 1-click exports.
 
