@@ -62,7 +62,7 @@ describe('Tier 1 Feature Coverage: Features F1 - F4 (Scaffold, Protocol, Dialect
       const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
       expect(manifest.manifestVersion).toBe(2)
       expect(manifest.id).toBe('datanoa')
-      expect(manifest.name).toBe('Datanoa')
+      expect(manifest.name).toBe('Datanoa Studio')
       expect(manifest.version).toMatch(/^\d+\.\d+\.\d+$/)
       expect(manifest.execution).toBe('trusted-worker')
       expect(manifest.pluginApi).toBe(1)

@@ -2,7 +2,7 @@
   <img src="assets/icon.png" alt="Datanoa Logo" width="88" height="88" />
 </p>
 
-<h1 align="center">Datanoa — Database Client &amp; SQL Studio for Orca</h1>
+<h1 align="center">Datanoa Studio — Database Client &amp; SQL Studio for Orca</h1>
 
 <p align="center">
   <strong>Browse tables, edit data inline, design schemas visually, and run SQL or Redis queries across 8 database engines — right inside Orca.</strong>
