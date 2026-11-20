@@ -4,7 +4,7 @@
   "id": "datanoa",
   "publisher": "thanhh2615",
   "name": "Datanoa Studio",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "license": "MIT",
   "author": {
     "name": "Thanhh2615",
@@ -14,36 +14,36 @@
   "homepage": "https://github.com/Thanhh2615/datanoa",
   "icon": "assets/icon.png",
   "cover": {
-    "path": "images/cover.png",
+    "path": "images/cover.webp",
     "alt": "Datanoa Studio database client for Orca showing SQL editor, interactive data grid, schema explorer, and 8 supported database engines"
   },
   "screenshots": [
     {
-      "path": "images/studio-split-view.png",
+      "path": "images/studio-split-view.webp",
       "alt": "Datanoa Studio split view with PostgreSQL SQL console, interactive data grid, multi-cell selection aggregates, and JSON value inspector",
       "caption": "Split View with SQL Console, Interactive Data Grid, and JSON Inspector",
       "theme": "dark"
     },
     {
-      "path": "images/studio-connection-modal.png",
+      "path": "images/studio-connection-modal.webp",
       "alt": "Datanoa New Database Connection modal with 8 database engines, quick URI parser, and .env and SQLite auto-discovery",
       "caption": "Connect to 8 database engines with URI parsing and .env/.db auto-discovery",
       "theme": "dark"
     },
     {
-      "path": "images/schema-designer.png",
+      "path": "images/schema-designer.webp",
       "alt": "Datanoa Visual Table Structure Designer showing staged column edits, data type combobox, foreign keys, indexes, and live migration SQL preview",
       "caption": "Visual table structure designer with live DDL migration preview",
       "theme": "dark"
     },
     {
-      "path": "images/studio-light-theme.png",
+      "path": "images/studio-light-theme.webp",
       "alt": "Datanoa Studio in light theme with horizontal top table bar, pinned columns, and instant find highlighting",
       "caption": "Light theme support with pinned columns and instant filter/find",
       "theme": "light"
     },
     {
-      "path": "images/side-panel-explorer.png",
+      "path": "images/side-panel-explorer.webp",
       "alt": "Datanoa Side Panel showing schema explorer tree, interactive data grid with live aggregates, and quick SQL runner",
       "caption": "Docked Side Panel explorer, data grid, and quick SQL runner",
       "theme": "dark"

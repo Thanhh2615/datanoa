@@ -227,7 +227,7 @@ describe('Tier 1 Feature Coverage: Features F12 - F14 (Panel, Visual Checks, Edi
         lastError:
           'Failed postgres://admin:supersecret@db.internal:5432/prod Bearer eyJhbGciOiJIUzI1NiJ9 10.0.1.42 D:\\prod.db /var/lib/pg/secret.conf',
       })
-      expect(md).toContain('Datanoa v1.0.2')
+      expect(md).toContain('Datanoa v1.0.3')
       expect(md).toContain('v1.2')
       expect(md).toContain('Win32')
       expect(md).not.toContain('supersecret')
@@ -303,13 +303,40 @@ describe('Tier 1 Feature Coverage: Features F12 - F14 (Panel, Visual Checks, Edi
       const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
 
       expect(manifest.cover).toBeDefined()
-      expect(manifest.cover.path).toBe('images/cover.png')
+      expect(manifest.cover.path).toBe('images/cover.webp')
       expect(manifest.cover.alt.length).toBeGreaterThan(10)
       expect(Array.isArray(manifest.screenshots)).toBe(true)
       expect(manifest.screenshots.length).toBeGreaterThanOrEqual(4)
     })
 
-    it('F13-T02: Validate cover and all screenshot PNG files exist, are 1600x1000, and fit Orca size limits', () => {
+    it('F13-T02: Validate cover and all screenshot WebP files exist, are 1600x1000, and fit Orca image limits', () => {
+      const readWebpDimensions = (buf: Buffer, relPath: string): { width: number; height: number } => {
+        if (buf.subarray(0, 4).toString('ascii') !== 'RIFF' || buf.subarray(8, 12).toString('ascii') !== 'WEBP') {
+          throw new Error(`Expected RIFF/WEBP header for ${relPath}`)
+        }
+        const chunk = buf.subarray(12, 16).toString('ascii')
+        if (chunk === 'VP8X') {
+          return {
+            width: 1 + (buf[24] | (buf[25] << 8) | (buf[26] << 16)),
+            height: 1 + (buf[27] | (buf[28] << 8) | (buf[29] << 16)),
+          }
+        }
+        if (chunk === 'VP8L') {
+          const bits = buf.readUInt32LE(21)
+          return {
+            width: (bits & 0x3fff) + 1,
+            height: ((bits >> 14) & 0x3fff) + 1,
+          }
+        }
+        if (chunk === 'VP8 ') {
+          return {
+            width: buf.readUInt16LE(26) & 0x3fff,
+            height: buf.readUInt16LE(28) & 0x3fff,
+          }
+        }
+        throw new Error(`Unsupported WebP chunk "${chunk}" in ${relPath}`)
+      }
+
       const manifestPath = path.join(projectRoot, 'orca-plugin.json')
       const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
       const imagePaths: string[] = [
@@ -317,19 +344,43 @@ describe('Tier 1 Feature Coverage: Features F12 - F14 (Panel, Visual Checks, Edi
         ...manifest.screenshots.map((s: { path: string }) => s.path),
       ]
 
-      let totalBytes = 0
+      let totalImageBytes = 0
       for (const relPath of imagePaths) {
+        expect(relPath.endsWith('.webp'), `Expected .webp asset: ${relPath}`).toBe(true)
         const fullPath = path.join(projectRoot, relPath)
         expect(fs.existsSync(fullPath), `Missing image: ${relPath}`).toBe(true)
         const buf = fs.readFileSync(fullPath)
-        totalBytes += buf.length
-        const width = buf.readUInt32BE(16)
-        const height = buf.readUInt32BE(20)
+        totalImageBytes += buf.length
+        const { width, height } = readWebpDimensions(buf, relPath)
         expect(width).toBe(1600)
         expect(height).toBe(1000)
         expect(buf.length).toBeLessThanOrEqual(relPath === manifest.cover.path ? 1024 * 1024 : 1536 * 1024)
       }
-      expect(totalBytes).toBeLessThanOrEqual(8 * 1024 * 1024)
+      expect(totalImageBytes).toBeLessThanOrEqual(8 * 1024 * 1024)
+    })
+
+    it('F13-T02b: Keep total packaged plugin size below 5,000,000 bytes (Orca directory size review compliance)', () => {
+      const IGNORED_DIRS = new Set(['.git', '.orca', 'node_modules', '.datanoa'])
+      const sumPluginBytes = (dir: string): number => {
+        let bytes = 0
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          if (entry.isDirectory()) {
+            if (IGNORED_DIRS.has(entry.name)) continue
+            bytes += sumPluginBytes(path.join(dir, entry.name))
+            continue
+          }
+          if (entry.isFile() && !entry.name.endsWith('.log')) {
+            bytes += fs.statSync(path.join(dir, entry.name)).size
+          }
+        }
+        return bytes
+      }
+
+      const totalPluginBytes = sumPluginBytes(projectRoot)
+      expect(
+        totalPluginBytes,
+        `Total plugin size (${totalPluginBytes} B) must stay below 5,000,000 B to clear Orca directory size review`
+      ).toBeLessThan(5_000_000)
     })
 
     it('F13-T03: Validate panel.css and panel.html dark/light token parity', () => {

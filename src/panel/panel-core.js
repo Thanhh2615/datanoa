@@ -8,7 +8,7 @@
  * - Privacy-safe Feedback / Bug Report Markdown & GitHub Issue URL builders
  */
 
-export const DATANOA_VERSION = '1.0.2'
+export const DATANOA_VERSION = '1.0.3'
 export const DATANOA_GITHUB_ISSUES_URL = 'https://github.com/Thanhh2615/datanoa/issues/new'
 
 export const ENGINES = [

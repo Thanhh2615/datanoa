@@ -1,6 +1,6 @@
 {
   "name": "datanoa",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "All-in-one database client and SQL studio for Orca (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, Turso/LibSQL)",
   "private": true,
   "type": "module",

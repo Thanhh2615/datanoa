@@ -297,12 +297,12 @@ export default _default
 
 async function bundleCodeMirror() {
   const code = `
-export * from '@codemirror/state';
-export * from '@codemirror/view';
-export * from '@codemirror/commands';
-export * from '@codemirror/language';
-export * from '@codemirror/autocomplete';
-export * from '@codemirror/lang-sql';
+export { EditorState, EditorSelection, Compartment } from '@codemirror/state';
+export { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter } from '@codemirror/view';
+export { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
+export { HighlightStyle, syntaxHighlighting, LanguageSupport, StreamLanguage } from '@codemirror/language';
+export { autocompletion, completionKeymap } from '@codemirror/autocomplete';
+export { sql, SQLite, PostgreSQL, MySQL, MariaSQL, schemaCompletionSource } from '@codemirror/lang-sql';
 export { tags } from '@lezer/highlight';
 `
 
@@ -329,12 +329,12 @@ export { tags } from '@lezer/highlight';
 
   // Emit companion TypeScript declaration
   const dtsContent = `
-export * from '@codemirror/state';
-export * from '@codemirror/view';
-export * from '@codemirror/commands';
-export * from '@codemirror/language';
-export * from '@codemirror/autocomplete';
-export * from '@codemirror/lang-sql';
+export { EditorState, EditorSelection, Compartment, type Extension } from '@codemirror/state';
+export { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter } from '@codemirror/view';
+export { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
+export { HighlightStyle, syntaxHighlighting, LanguageSupport, StreamLanguage } from '@codemirror/language';
+export { autocompletion, completionKeymap } from '@codemirror/autocomplete';
+export { sql, SQLite, PostgreSQL, MySQL, MariaSQL, schemaCompletionSource, type SQLDialect } from '@codemirror/lang-sql';
 export { tags } from '@lezer/highlight';
 `
   fs.writeFileSync(path.join(vendorDir, 'codemirror.d.ts'), dtsContent.trim() + '\n', 'utf8')
