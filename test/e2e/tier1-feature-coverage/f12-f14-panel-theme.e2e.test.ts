@@ -227,7 +227,7 @@ describe('Tier 1 Feature Coverage: Features F12 - F14 (Panel, Visual Checks, Edi
         lastError:
           'Failed postgres://admin:supersecret@db.internal:5432/prod Bearer eyJhbGciOiJIUzI1NiJ9 10.0.1.42 D:\\prod.db /var/lib/pg/secret.conf',
       })
-      expect(md).toContain('Datanoa v1.0.1')
+      expect(md).toContain('Datanoa v1.0.2')
       expect(md).toContain('v1.2')
       expect(md).toContain('Win32')
       expect(md).not.toContain('supersecret')

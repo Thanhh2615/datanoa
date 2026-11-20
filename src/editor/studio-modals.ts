@@ -137,7 +137,7 @@ export function buildStudioDiagnosticSummary(ctx: {
   lastQueryErrorText?: string
 }): string {
   const lines: string[] = [
-    'Datanoa v1.0.1',
+    'Datanoa v1.0.2',
     `Orca API: ${detectOrcaApiVersion()}`,
     'Surface: Fullscreen Studio',
     `Active Engine: ${ctx.activeDriver ?? 'none'}`,

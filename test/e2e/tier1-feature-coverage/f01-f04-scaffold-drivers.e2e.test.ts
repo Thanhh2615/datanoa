@@ -169,6 +169,36 @@ describe('Tier 1 Feature Coverage: Features F1 - F4 (Scaffold, Protocol, Dialect
         expect(content.match(/new\s+Function\s*\(/g), `${relPath} must not contain new Function()`).toBeNull()
       }
     })
+
+    it('TC-F1-06: Worker Vendor Bundles Preserve UTF-8 Tables (Orca Directory Scanner Compliance)', async () => {
+      const workerVendorFiles = ['vendor/pg.js', 'vendor/mysql2.js']
+
+      for (const relPath of workerVendorFiles) {
+        const fullPath = path.join(projectRoot, relPath)
+        const content = fs.readFileSync(fullPath, 'utf8')
+        const hexEscapeRuns = content.match(/(?:\\x[0-9a-fA-F]{2}){16,}/g) ?? []
+        const unicodeEscapeRuns = content.match(/(?:\\u[0-9a-fA-F]{4}){16,}/g) ?? []
+
+        expect(
+          hexEscapeRuns.length,
+          `${relPath} must not contain long \\xNN runs (build with esbuild charset: 'utf8')`
+        ).toBe(0)
+        expect(
+          unicodeEscapeRuns.length,
+          `${relPath} must not contain long \\uNNNN runs (build with esbuild charset: 'utf8')`
+        ).toBe(0)
+      }
+
+      const [pgVendor, mysqlVendor] = await Promise.all([
+        import('../../../vendor/pg.js'),
+        import('../../../vendor/mysql2.js'),
+      ])
+      expect(typeof pgVendor.Client).toBe('function')
+      expect(typeof pgVendor.Pool).toBe('function')
+      expect(typeof mysqlVendor.createConnection).toBe('function')
+      expect(typeof mysqlVendor.createPool).toBe('function')
+      expect(mysqlVendor.Charsets).toBeDefined()
+    })
   })
 
   // =========================================================================

@@ -41,9 +41,10 @@ const nodeEsmBanner = {
 }
 
 /**
- * Validate bundle size and scan for prohibited dynamic code execution constructs.
+ * Validate bundle size and scan for prohibited dynamic code execution constructs
+ * as well as obfuscation-like hex/unicode escape runs in worker bundles.
  */
-function validateBundle(filePath, name) {
+function validateBundle(filePath, name, { rejectEscapedRuns = false } = {}) {
   const stat = fs.statSync(filePath)
   const size = stat.size
   const content = fs.readFileSync(filePath, 'utf8')
@@ -70,7 +71,25 @@ function validateBundle(filePath, name) {
     )
   }
 
-  console.log(`[bundle-drivers] ${name}: Validated OK (< 1 MiB, 0 eval, 0 new Function).`)
+  if (rejectEscapedRuns) {
+    const hexRuns = content.match(/(?:\\x[0-9a-fA-F]{2}){16,}/g)
+    if (hexRuns) {
+      throw new Error(
+        `[FAIL] ${name} contains ${hexRuns.length} long \\xNN escape runs (set esbuild charset: 'utf8')!`
+      )
+    }
+    const unicodeRuns = content.match(/(?:\\u[0-9a-fA-F]{4}){16,}/g)
+    if (unicodeRuns) {
+      throw new Error(
+        `[FAIL] ${name} contains ${unicodeRuns.length} long \\uNNNN escape runs (set esbuild charset: 'utf8')!`
+      )
+    }
+  }
+
+  const escapeSummary = rejectEscapedRuns ? ', 0 escaped runs' : ''
+  console.log(
+    `[bundle-drivers] ${name}: Validated OK (< 1 MiB, 0 eval, 0 new Function${escapeSummary}).`
+  )
 }
 
 async function bundlePostgres() {
@@ -126,12 +145,15 @@ export default pg;
     outfile,
     external: ['pg-native', 'pg-cloudflare'],
     minify: true,
+    // Keep non-ASCII text as UTF-8 so Node ESM worker bundles never emit long \xNN / \uNNNN runs
+    // that trigger Orca plugin directory obfuscation review (see oscarbotteri/orca-db-studio#68).
+    charset: 'utf8',
     treeShaking: true,
     legalComments: 'none',
     banner: nodeEsmBanner,
   })
 
-  validateBundle(outfile, 'vendor/pg.js')
+  validateBundle(outfile, 'vendor/pg.js', { rejectEscapedRuns: true })
 
   // Emit companion TypeScript declaration
   const dtsContent = `
@@ -250,12 +272,15 @@ export default mysql;
     outfile,
     plugins: [mockAwsSslPlugin],
     minify: true,
+    // Keep non-ASCII text as UTF-8 so iconv-lite codepage tables inside mysql2 stay literal UTF-8
+    // instead of long \xNN / \uNNNN escape runs that trigger Orca directory under-review (code).
+    charset: 'utf8',
     treeShaking: true,
     legalComments: 'none',
     banner: nodeEsmBanner,
   })
 
-  validateBundle(outfile, 'vendor/mysql2.js')
+  validateBundle(outfile, 'vendor/mysql2.js', { rejectEscapedRuns: true })
 
   // Emit companion TypeScript declaration
   const dtsContent = `
@@ -294,6 +319,8 @@ export { tags } from '@lezer/highlight';
     target: ['es2022'],
     outfile,
     minify: true,
+    // Keep browser frame bundle ASCII (no iconv codepage tables; safe across HTML/iframe contexts).
+    charset: 'ascii',
     treeShaking: true,
     legalComments: 'none',
   })
