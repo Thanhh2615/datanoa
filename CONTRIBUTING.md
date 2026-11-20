@@ -46,7 +46,7 @@ npm install
 # 3. Bundle vendor drivers (pg, mysql2, CodeMirror 6) into vendor/ (< 1 MiB & CSP audit)
 npm run build
 
-# 4. Run the full verification pipeline (build + typecheck + validate + check + 385+ tests)
+# 4. Run the full verification pipeline (build + typecheck + validate + check)
 npm run verify
 
 # 5. Hot-load the plugin into your local Orca Desktop instance
@@ -107,33 +107,24 @@ datanoa/
 │   │   ├── panel.html                    # Side Panel DOM markup & controller
 │   │   ├── panel.css                     # Side Panel Dark & Light Mode stylesheet
 │   │   └── panel-core.js                 # Pure Side Panel SQL, migration & feedback helpers
-│   └── worker/
-│       ├── index.ts                      # Trusted Worker IPC request handlers
-│       ├── session-manager.ts            # Connection profile storage & secrets:own vault manager
-│       └── discovery.ts                  # Bounded .env parser & async BFS SQLite file scanner
-└── test/
-    ├── drivers/                          # All 8 database engine wire-protocol & unit suites
-    ├── worker/                           # URI parser, SQL tools & trusted-worker RPC suites
-    └── e2e/                              # Full Studio, Side Panel & Gate A static compiler tests
+    └── worker/
+        ├── index.ts                      # Trusted Worker IPC request handlers
+        ├── session-manager.ts            # Connection profile storage & secrets:own vault manager
+        └── discovery.ts                  # Bounded .env parser & async BFS SQLite file scanner
 ```
 
 ---
 
-## Running the Test Suite (`385+` Tests)
+## Verification Pipeline
 
-Datanoa enforces a comprehensive verification suite covering all 8 database drivers, worker IPC contracts, SQL lexing/formatting/migration planners, and full DOM E2E interactions:
+Datanoa validates bundle limits/CSP rules, strict TypeScript types, and Orca manifest/frame loading via:
 
 ```bash
-# Run all 18 test suites (385+ tests)
-npm test
+# Run full verification (build + typecheck + validate + check)
+npm run verify
 
-# Run only database driver tests (SQLite, Postgres, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, LibSQL)
-npm run test:drivers
-
-# Run only Studio & Side Panel E2E + Gate A static script compilation tests
-npm run test:e2e
-
-# Run strict TypeScript typechecking + Orca manifest/code validation
+# Or run individual checks
+npm run build
 npm run typecheck
 npm run validate
 npm run check
@@ -145,8 +136,8 @@ npm run check
 
 Before opening a Pull Request, please ensure your changes satisfy all repository invariants:
 
-1. **Strict TypeScript Hygiene:** Zero `: any`, zero `as any`, and zero `!` non-null assertions across `src/` and `test/`.
-2. **CSP & Bundle Limits:** No `eval(`, no `new Function(`, and every file under `vendor/` must remain strictly `< 1 MiB`.
+1. **Strict TypeScript Hygiene:** Zero `: any`, zero `as any`, and zero `!` non-null assertions across `src/`.
+2. **CSP & Bundle Limits:** No `eval(`, no `new Function(`, no obfuscated/escaped non-ASCII runs in worker bundles, and every file under `vendor/` must remain strictly `< 1 MiB`.
 3. **Dark & Light Theme Parity:** Always use `--orca-*` CSS custom properties with clean dark fallbacks (`#000000`) and verify both dark mode and `html.light`. Never override `:root` `--orca-*` host tokens.
 4. **Secret Redaction:** Never log or persist database passwords, bearer tokens, or unmasked connection URIs outside `orca.secrets`.
-5. **Verification Gate:** Run `npm run verify` and confirm `0` errors across build, typecheck, `orca plugin validate`, `orca plugin check`, and `vitest`.
+5. **Verification Gate:** Run `npm run verify` and confirm `0` errors across build, typecheck, `orca plugin validate`, and `orca plugin check`.

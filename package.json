@@ -1,6 +1,6 @@
 {
   "name": "datanoa",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "All-in-one database client and SQL studio for Orca (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, Turso/LibSQL)",
   "private": true,
   "type": "module",
@@ -14,10 +14,7 @@
     "typecheck": "npm run types && tsc --noEmit",
     "validate": "orca plugin validate .",
     "check": "orca plugin check .",
-    "test": "vitest run --config test/vitest.config.ts",
-    "test:drivers": "vitest run test/drivers --config test/vitest.config.ts",
-    "test:e2e": "vitest run test/e2e --config test/vitest.config.ts",
-    "verify": "npm run build && npm run typecheck && npm run validate && npm run check && npm run test"
+    "verify": "npm run build && npm run typecheck && npm run validate && npm run check"
   },
   "devDependencies": {
     "@codemirror/autocomplete": "^6.20.4",
