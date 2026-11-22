@@ -71,8 +71,8 @@ export const EDITOR_GRID_STYLE = `
   .datanoa-filter-input {
     flex: 1 1 110px;
     min-width: 80px;
-    height: 23px;
-    padding: 0 7px;
+    height: 24px;
+    padding: 0 8px;
     border-radius: 4px;
     border: 1px solid var(--input-border);
     background: var(--input-bg);
@@ -90,12 +90,18 @@ export const EDITOR_GRID_STYLE = `
     border-color: var(--info);
   }
 
+  .datanoa-filter-input:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+    background: var(--surface);
+  }
+
   .datanoa-client-search {
     width: 150px;
     flex: 0 1 180px;
     min-width: 110px;
-    height: 23px;
-    padding: 0 7px;
+    height: 24px;
+    padding: 0 8px;
     border-radius: 4px;
     border: 1px solid var(--input-border);
     background: var(--input-bg);
@@ -206,9 +212,10 @@ export const EDITOR_GRID_STYLE = `
   .datanoa-th.datanoa-th-rownum {
     position: sticky;
     left: 0;
-    z-index: 15;
+    z-index: 16;
     text-align: right;
     color: var(--muted-dim);
+    border-right: 1px solid var(--border-strong);
     cursor: pointer;
   }
 
@@ -228,7 +235,8 @@ export const EDITOR_GRID_STYLE = `
     background: color-mix(in srgb, var(--info) 8%, var(--card));
   }
 
-  html.light .datanoa-th.datanoa-th-selected {
+  html.light .datanoa-th.datanoa-th-selected,
+  body.light .datanoa-th.datanoa-th-selected {
     color: var(--info);
     background: color-mix(in srgb, var(--info) 9%, var(--card));
   }
@@ -265,6 +273,7 @@ export const EDITOR_GRID_STYLE = `
     opacity: 0.9;
   }
 
+  .datanoa-col-filter-btn,
   .datanoa-col-select-btn {
     display: inline-flex;
     align-items: center;
@@ -282,16 +291,65 @@ export const EDITOR_GRID_STYLE = `
     transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
   }
 
+  .datanoa-th:hover .datanoa-col-filter-btn,
+  .datanoa-col-filter-btn.active,
+  .datanoa-col-filter-btn:focus-visible,
   .datanoa-th:hover .datanoa-col-select-btn,
   .datanoa-th.datanoa-th-selected .datanoa-col-select-btn,
   .datanoa-col-select-btn:focus-visible {
     opacity: 1;
   }
 
+  .datanoa-col-filter-btn:hover,
   .datanoa-col-select-btn:hover {
     background: var(--hover);
     border-color: var(--border-strong);
     color: var(--info);
+  }
+
+  .datanoa-col-filter-btn.active {
+    color: var(--info);
+    background: color-mix(in srgb, var(--info) 14%, transparent);
+    border-color: color-mix(in srgb, var(--info) 38%, transparent);
+  }
+
+  .datanoa-col-filter-popover {
+    position: fixed;
+    z-index: 10050;
+    width: 230px;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    background: var(--card);
+    color: var(--text);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    box-shadow: var(--menu-shadow);
+    font-size: 12px;
+  }
+
+  .datanoa-col-filter-title {
+    font-weight: 600;
+    font-size: 11.5px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .datanoa-col-filter-select,
+  .datanoa-col-filter-input {
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .datanoa-col-filter-actions {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    justify-content: flex-end;
+    margin-top: 2px;
   }
 
   .datanoa-th.datanoa-th-selected .datanoa-col-select-btn {
@@ -361,7 +419,8 @@ export const EDITOR_GRID_STYLE = `
     background: rgba(255, 255, 255, 0.02);
   }
 
-  html.light .datanoa-tr.datanoa-tr-even {
+  html.light .datanoa-tr.datanoa-tr-even,
+  body.light .datanoa-tr.datanoa-tr-even {
     background: rgba(15, 23, 42, 0.02);
   }
 
@@ -373,7 +432,8 @@ export const EDITOR_GRID_STYLE = `
     background: rgba(255, 255, 255, 0.028);
   }
 
-  html.light .datanoa-tr.datanoa-row-selected {
+  html.light .datanoa-tr.datanoa-row-selected,
+  body.light .datanoa-tr.datanoa-row-selected {
     background: rgba(15, 23, 42, 0.03);
   }
 
@@ -428,7 +488,8 @@ export const EDITOR_GRID_STYLE = `
     outline-offset: -1px;
   }
 
-  html.light .datanoa-td.datanoa-cell-in-range.datanoa-cell-selected {
+  html.light .datanoa-td.datanoa-cell-in-range.datanoa-cell-selected,
+  body.light .datanoa-td.datanoa-cell-in-range.datanoa-cell-selected {
     background: rgba(3, 105, 161, 0.03);
     outline: 1px solid rgba(3, 105, 161, 0.55);
   }
@@ -508,7 +569,9 @@ export const EDITOR_GRID_STYLE = `
   .datanoa-td.datanoa-col-pinned.datanoa-cell-selected,
   .datanoa-td.datanoa-col-pinned.datanoa-cell-in-range.datanoa-cell-selected,
   html.light .datanoa-td.datanoa-col-pinned.datanoa-cell-selected,
-  html.light .datanoa-td.datanoa-col-pinned.datanoa-cell-in-range.datanoa-cell-selected {
+  html.light .datanoa-td.datanoa-col-pinned.datanoa-cell-in-range.datanoa-cell-selected,
+  body.light .datanoa-td.datanoa-col-pinned.datanoa-cell-selected,
+  body.light .datanoa-td.datanoa-col-pinned.datanoa-cell-in-range.datanoa-cell-selected {
     background: color-mix(in srgb, var(--info) 12%, var(--bg));
   }
 
@@ -557,7 +620,8 @@ export const EDITOR_GRID_STYLE = `
     box-shadow: 3px 0 6px -2px rgba(0, 0, 0, 0.35);
   }
 
-  html.light .datanoa-col-pinned-last {
+  html.light .datanoa-col-pinned-last,
+  body.light .datanoa-col-pinned-last {
     box-shadow: 3px 0 6px -2px rgba(15, 23, 42, 0.14);
   }
 
@@ -565,7 +629,8 @@ export const EDITOR_GRID_STYLE = `
     box-shadow: var(--sel-t), var(--sel-r), var(--sel-b), var(--sel-l), 3px 0 6px -2px rgba(0, 0, 0, 0.35);
   }
 
-  html.light .datanoa-td.datanoa-cell-in-range.datanoa-col-pinned-last {
+  html.light .datanoa-td.datanoa-cell-in-range.datanoa-col-pinned-last,
+  body.light .datanoa-td.datanoa-cell-in-range.datanoa-col-pinned-last {
     box-shadow: var(--sel-t), var(--sel-r), var(--sel-b), var(--sel-l), 3px 0 6px -2px rgba(15, 23, 42, 0.14);
   }
 
@@ -622,7 +687,7 @@ export const EDITOR_GRID_STYLE = `
     background: var(--surface);
     user-select: none;
     cursor: pointer;
-    border-right: 1px solid var(--border);
+    border-right: 1px solid var(--border-strong);
     border-bottom: 1px solid var(--border);
     box-sizing: border-box;
   }
@@ -645,7 +710,9 @@ export const EDITOR_GRID_STYLE = `
   }
 
   html.light .datanoa-td-rownum.row-selected,
-  html.light .datanoa-tr.datanoa-row-selected .datanoa-td-rownum.row-selected {
+  html.light .datanoa-tr.datanoa-row-selected .datanoa-td-rownum.row-selected,
+  body.light .datanoa-td-rownum.row-selected,
+  body.light .datanoa-tr.datanoa-row-selected .datanoa-td-rownum.row-selected {
     color: var(--info);
     background: color-mix(in srgb, var(--info) 12%, var(--surface));
   }
@@ -797,8 +864,10 @@ export const EDITOR_GRID_STYLE = `
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 8px;
     width: 100%;
-    padding: 5px 9px;
+    min-width: 0;
+    padding: 6px 9px;
     border: 0;
     border-radius: 4px;
     background: transparent;
@@ -851,7 +920,8 @@ export const EDITOR_GRID_STYLE = `
     color: var(--text);
   }
 
-  html.light .datanoa-query-banner.success {
+  html.light .datanoa-query-banner.success,
+  body.light .datanoa-query-banner.success {
     background: rgba(22, 163, 74, 0.07);
     border-color: rgba(22, 163, 74, 0.25);
     border-left: 3px solid var(--ok);
@@ -864,7 +934,8 @@ export const EDITOR_GRID_STYLE = `
     color: var(--text);
   }
 
-  html.light .datanoa-query-banner.error {
+  html.light .datanoa-query-banner.error,
+  body.light .datanoa-query-banner.error {
     background: rgba(220, 38, 38, 0.06);
     border-color: rgba(220, 38, 38, 0.25);
     border-left: 3px solid var(--danger);
@@ -1083,8 +1154,8 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-filter-clear-btn {
-    height: 23px;
-    min-width: 23px;
+    height: 24px;
+    min-width: 24px;
     padding: 0 6px;
     border-radius: 4px;
     border: 1px solid var(--btn-border);

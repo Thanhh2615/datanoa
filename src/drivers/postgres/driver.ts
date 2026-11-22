@@ -20,13 +20,18 @@ import type {
   IDatabaseSession,
   PreviewChangesResult,
   QueryResult,
+  QueryResultSet,
   SchemaObject,
+  SchemaObjectKind,
   TableBrowseResult,
   TableDetails,
+  TransactionState,
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
-import { DatabaseDriverError } from '../common/driver'
+import { DatabaseDriverError, runDriverConnectionTest } from '../common/driver'
+import type { DriverTlsOptions } from '../common/tls-and-tunnel'
+import { resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
 import {
   assembleTableBrowseResult,
   buildBatchStatements,
@@ -35,30 +40,87 @@ import {
 } from '../common/update-builder'
 import {
   TableDetailsCache,
+  collectAndAssembleSchemaDdl,
+  introspectPostgresObjectDdl,
   introspectPostgresObjects,
+  introspectPostgresSchemaDependencies,
+  introspectPostgresSchemas,
   introspectPostgresTableDetails,
 } from '../common/schema'
+import type { SchemaDependencyEdge } from '../common/schema'
 import {
   containsDdlStatement,
   reconstructTableDdl,
   splitSqlStatements,
 } from '../common/sql-tools'
+import { compactSql, stripLeadingSqlComments } from '../common/sql-lexer'
 
-// Preserve DATE as 'YYYY-MM-DD' string without UTC timezone offset corruption
+// Preserve DATE/TIME/TIMESTAMP/INTERVAL as canonical text without JS Date TZ distortion or microsecond truncation
 if (types && typeof types.setTypeParser === 'function') {
-  types.setTypeParser(1082, (val: string) => val)
+  const preserveText = (val: string): string => val
+  for (const oid of [1082, 1083, 1266, 1114, 1184, 1186]) {
+    types.setTypeParser(oid, preserveText)
+  }
+}
+
+const PG_OID_TYPE_NAMES: Readonly<Record<number, string>> = {
+  16: 'bool',
+  17: 'bytea',
+  20: 'int8',
+  21: 'int2',
+  23: 'int4',
+  25: 'text',
+  26: 'oid',
+  114: 'json',
+  142: 'xml',
+  700: 'float4',
+  701: 'float8',
+  790: 'money',
+  869: 'inet',
+  1000: '_bool',
+  1005: '_int2',
+  1007: '_int4',
+  1009: '_text',
+  1016: '_int8',
+  1042: 'bpchar',
+  1043: 'varchar',
+  1082: 'date',
+  1083: 'time',
+  1114: 'timestamp',
+  1184: 'timestamptz',
+  1186: 'interval',
+  1266: 'timetz',
+  1560: 'bit',
+  1562: 'varbit',
+  1700: 'numeric',
+  2950: 'uuid',
+  3802: 'jsonb',
+  3904: 'int4range',
+  3910: 'tstzrange',
+  3912: 'daterange',
+}
+
+interface PgLease {
+  readonly client: PoolClient
+  readonly pid: number
+  released: boolean
+  release(destroy?: boolean): void
 }
 
 interface ActivePgQuery {
-  client: PoolClient
-  pid: number
+  lease: PgLease
   startTime: number
   cancelled: boolean
-  released: boolean
+}
+
+interface ActiveBatch {
+  lease: PgLease
+  commitSent: boolean
 }
 
 interface PgRawResult {
-  fields?: Array<{ name: string; dataTypeID: number }>
+  command?: string
+  fields?: Array<{ name: string; dataTypeID: number; tableID?: number }>
   rows?: Array<unknown[] | Record<string, unknown>>
   rowCount?: number | null
 }
@@ -76,6 +138,11 @@ function attachPoolErrorHandler(pool: Pool): void {
       // Prevent unhandled idle-client pool 'error' events from crashing the worker process
     })
   }
+}
+
+function isPgSqlStateError(err: unknown): boolean {
+  const code = extractErrorCode(err)
+  return /^[0-9A-Z]{5}$/.test(code)
 }
 
 function attachClientErrorGuard(client: PoolClient): {
@@ -115,6 +182,31 @@ function destroyPgClientStream(client: PoolClient): void {
   }
 }
 
+function createPgLease(client: PoolClient): PgLease {
+  // Capture the release callback of THIS borrow; pg-pool reassigns client.release on
+  // every acquire, so reading the mutable property later could release a later borrow.
+  const releaseOnce = client.release.bind(client)
+  const pid = (client as unknown as { processID?: number }).processID ?? 0
+  const lease: PgLease = {
+    client,
+    pid,
+    released: false,
+    release(destroy = false) {
+      if (lease.released) return
+      lease.released = true
+      try {
+        if (destroy) {
+          destroyPgClientStream(client)
+        }
+        releaseOnce(destroy)
+      } catch {
+        // Ignore release failures on already-ended clients
+      }
+    },
+  }
+  return lease
+}
+
 function parsePgQueryResult(
   res: PgRawResult,
   maxRows: number
@@ -131,7 +223,7 @@ function parsePgQueryResult(
 
   const columns = fields.map((f) => ({
     name: f.name,
-    type: String(f.dataTypeID),
+    type: PG_OID_TYPE_NAMES[f.dataTypeID] ?? String(f.dataTypeID),
   }))
 
   const rawRows = res.rows || []
@@ -176,6 +268,12 @@ function extractErrorCode(err: unknown): string {
   return ''
 }
 
+const POSTGRES_CATALOG_FALLBACK_CODES = new Set(['42501', '42P01', '42703'])
+
+function isPostgresCatalogUnavailableError(err: unknown): boolean {
+  return POSTGRES_CATALOG_FALLBACK_CODES.has(extractErrorCode(err))
+}
+
 /**
  * Formats PostgreSQL / SCRAM driver errors into clear, actionable guidance.
  */
@@ -210,8 +308,19 @@ export class PostgresSession implements IDatabaseSession {
   private poolerFallbackAttempted = false
   private poolerFallbackPromise: Promise<Pool> | null = null
   private readonly activeQueries = new Map<string, ActivePgQuery>()
+  private readonly activeBatches = new Map<PgLease, ActiveBatch>()
   private readonly tableDetailsCache = new TableDetailsCache()
+  private readonly oidTableCache = new Map<number, { schema: string; table: string }>()
   private isClosed = false
+  private txLease: PgLease | null = null
+  private txClientBroken = false
+  private txAborted = false
+  private txClientErrorHandler: ((...args: unknown[]) => void) | null = null
+  private txOpChain: Promise<void> = Promise.resolve()
+  private readonly closeWaiters = new Set<() => void>()
+  private autoCommit = true
+  private statementCount = 0
+  private txStartedAt: number | undefined
 
   constructor(pool: Pool, profile: ConnectionProfile, baseConfig?: PoolConfig) {
     this.pool = pool
@@ -224,6 +333,112 @@ export class PostgresSession implements IDatabaseSession {
 
   isAlive(): boolean {
     return !this.isClosed
+  }
+
+  private get txClient(): PoolClient | null {
+    return this.txLease ? this.txLease.client : null
+  }
+
+  private runExclusiveTxOp<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.txOpChain
+    let release: (() => void) | undefined
+    this.txOpChain = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    return prev.then(fn).finally(() => {
+      if (release) release()
+    })
+  }
+
+  private acquireLease(): Promise<PgLease> {
+    return this.withPoolFallback((pool) => this.connectLease(pool))
+  }
+
+  private connectLease(pool: Pool): Promise<PgLease> {
+    if (this.isClosed) {
+      return Promise.reject(
+        new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      )
+    }
+    let abandoned = false
+    const raw = pool.connect()
+    return new Promise<PgLease>((resolve, reject) => {
+      const onClose = (): void => {
+        abandoned = true
+        reject(new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType))
+      }
+      this.closeWaiters.add(onClose)
+      raw.then(
+        (client) => {
+          this.closeWaiters.delete(onClose)
+          const lease = createPgLease(client)
+          if (abandoned || this.isClosed) {
+            // Client arrived after close: hand it straight back to the ending pool
+            lease.release(true)
+            return
+          }
+          resolve(lease)
+        },
+        (err) => {
+          this.closeWaiters.delete(onClose)
+          reject(err)
+        }
+      )
+    })
+  }
+
+  private detachTxClientErrorHandler(): void {
+    const client = this.txClient
+    const handler = this.txClientErrorHandler
+    this.txClientErrorHandler = null
+    if (!client || !handler) return
+    const emitter = client as unknown as {
+      removeListener?: (event: string, listener: (...args: unknown[]) => void) => void
+      off?: (event: string, listener: (...args: unknown[]) => void) => void
+    }
+    try {
+      if (typeof emitter.removeListener === 'function') {
+        emitter.removeListener('error', handler)
+      } else if (typeof emitter.off === 'function') {
+        emitter.off('error', handler)
+      }
+    } catch {
+      // Ignore listener cleanup failures
+    }
+  }
+
+  private pinTxClient(lease: PgLease): void {
+    this.detachTxClientErrorHandler()
+    this.txLease = lease
+    this.txClientBroken = false
+    this.txAborted = false
+    const client = lease.client
+    const handler = (..._args: unknown[]): void => {
+      this.txClientBroken = true
+    }
+    const emitter = client as unknown as {
+      on?: (event: string, listener: (...args: unknown[]) => void) => void
+    }
+    if (typeof emitter.on === 'function') {
+      emitter.on('error', handler)
+      this.txClientErrorHandler = handler
+    }
+  }
+
+  private clearPinnedTxClient(): void {
+    this.detachTxClientErrorHandler()
+    this.txLease = null
+    this.txClientBroken = false
+    this.txAborted = false
+    this.statementCount = 0
+    this.txStartedAt = undefined
+  }
+
+  private discardBrokenPinnedClient(): void {
+    const lease = this.txLease
+    if (lease === null || !this.txClientBroken) return
+    this.clearPinnedTxClient()
+    lease.release(true)
   }
 
   private isSupabaseDirectNetworkFailure(err: unknown): boolean {
@@ -333,7 +548,12 @@ export class PostgresSession implements IDatabaseSession {
       return { ok: false, message: 'Session is closed' }
     }
     try {
-      const client = await this.withPoolFallback((pool) => pool.connect())
+      const lease = await this.acquireLease()
+      if (this.isClosed) {
+        lease.release(true)
+        return { ok: false, message: 'Session is closed' }
+      }
+      const client = lease.client
       const errorGuard = attachClientErrorGuard(client)
       let failed = false
       try {
@@ -350,11 +570,7 @@ export class PostgresSession implements IDatabaseSession {
         throw err
       } finally {
         errorGuard.cleanup()
-        if (failed || errorGuard.hasError()) {
-          client.release(true)
-        } else {
-          client.release()
-        }
+        lease.release(failed || errorGuard.hasError())
       }
     } catch (err: unknown) {
       return {
@@ -369,23 +585,51 @@ export class PostgresSession implements IDatabaseSession {
     if (this.isClosed) return
     this.isClosed = true
 
-    // Cancel active queries and destroy checked-out clients so pool.end() never hangs
+    // Wake checkout waiters promptly; pg-pool otherwise holds them until its timeout
+    const waiters = Array.from(this.closeWaiters)
+    this.closeWaiters.clear()
+    for (const reject of waiters) {
+      try {
+        reject()
+      } catch {
+        // Ignore waiter rejection failures
+      }
+    }
+
+    // Cancel/destroy active queries FIRST so pool.end() never hangs behind them
     const activeEntries = Array.from(this.activeQueries.values())
     this.activeQueries.clear()
+    const hadActiveQuery = activeEntries.length > 0
     for (const active of activeEntries) {
       active.cancelled = true
-      if (active.pid > 0 && this.activeConfig) {
-        void this.sendCancelBackend(active.pid).catch(() => {})
+      if (active.lease.pid > 0 && this.activeConfig) {
+        void this.sendCancelBackend(active.lease.pid).catch(() => {})
       }
-      if (!active.released) {
-        active.released = true
+      active.lease.release(true)
+    }
+
+    // Abort batches still before COMMIT so a lock-blocked statement cannot outlive close.
+    // A batch whose COMMIT already reached the provider keeps its real result; close waits.
+    for (const batch of this.activeBatches.values()) {
+      if (!batch.commitSent) {
+        batch.lease.release(true)
+      }
+    }
+
+    const lease = this.txLease
+    if (lease !== null) {
+      const txBatch = this.activeBatches.get(lease)
+      const shouldDestroy =
+        hadActiveQuery || this.txClientBroken || (txBatch !== undefined && !txBatch.commitSent)
+      this.clearPinnedTxClient()
+      if (!shouldDestroy) {
         try {
-          destroyPgClientStream(active.client)
-          active.client.release(true)
+          await lease.client.query('ROLLBACK')
         } catch {
-          // Ignore errors when destroying already-ended clients
+          // Ignore rollback error on close
         }
       }
+      lease.release(true)
     }
 
     await this.pool.end().catch(() => {})
@@ -396,6 +640,85 @@ export class PostgresSession implements IDatabaseSession {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
     }
     return introspectPostgresObjects(this.queryExecutor, schema || 'public')
+  }
+
+  async listSchemas(): Promise<{ schemas: string[]; defaultSchema: string }> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    return introspectPostgresSchemas(this.queryExecutor)
+  }
+
+  async getObjectDdl(name: string, kind: SchemaObjectKind, schema?: string): Promise<string> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    return this.introspectObjectDdl(name, kind, schema || 'public')
+  }
+
+  private async introspectObjectDdl(
+    name: string,
+    kind: SchemaObjectKind,
+    targetSchema: string,
+    sourceDatabase?: string
+  ): Promise<string> {
+    if (kind === 'table') {
+      return this.getDdl(name, targetSchema)
+    }
+    return introspectPostgresObjectDdl(
+      this.queryExecutor,
+      name,
+      kind,
+      targetSchema,
+      sourceDatabase === undefined ? undefined : { sourceDatabase }
+    )
+  }
+
+  private async readCurrentDatabaseName(): Promise<string> {
+    const rows = await this.queryExecutor('SELECT current_database() AS db;')
+    const value = rows[0]?.db
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new DatabaseDriverError(
+        'Could not read current database name for CockroachDB schema export',
+        'CATALOG_ERROR',
+        this.driverType
+      )
+    }
+    return value
+  }
+
+  async exportSchemaDdl(schema?: string): Promise<{ ddl: string; objectCount: number }> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    const targetSchema = schema || 'public'
+    const objects = await this.listObjects(targetSchema)
+    const needsPortableViews =
+      this.driverType === 'cockroachdb' &&
+      objects.some((object) => object.kind === 'view' || object.kind === 'materialized_view')
+    const sourceDatabase = needsPortableViews ? await this.readCurrentDatabaseName() : undefined
+    let dependencies: SchemaDependencyEdge[] | undefined
+    if (this.driverType === 'postgres') {
+      // Ordering hint only: a restricted/missing catalog falls back to the
+      // previous kind-grouped ordering instead of failing the export.
+      try {
+        dependencies = await introspectPostgresSchemaDependencies(
+          this.queryExecutor,
+          targetSchema
+        )
+      } catch (err: unknown) {
+        if (!isPostgresCatalogUnavailableError(err)) throw err
+        dependencies = undefined
+      }
+    }
+    return collectAndAssembleSchemaDdl({
+      dialect: this.driverType,
+      schemaName: targetSchema,
+      objects,
+      getObjectDdl: (object) =>
+        this.introspectObjectDdl(object.name, object.kind, targetSchema, sourceDatabase),
+      dependencies,
+    })
   }
 
   async getTableDetails(table: string, schema?: string): Promise<TableDetails> {
@@ -417,6 +740,75 @@ export class PostgresSession implements IDatabaseSession {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
     }
     const schema = params.schema || 'public'
+
+    if (!this.autoCommit || this.txLease !== null) {
+      return this.runExclusiveTxOp(async () => {
+        if (this.isClosed) {
+          throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+        }
+        this.discardBrokenPinnedClient()
+        if (!this.autoCommit && this.txClient === null) {
+          await this.beginTransactionLocked()
+        }
+        const lease = this.txLease ?? (await this.acquireLease())
+        const isPinned = this.txLease === lease
+        const client = lease.client
+        const errorGuard = isPinned ? null : attachClientErrorGuard(client)
+        let failed = false
+        try {
+          let details = this.tableDetailsCache.get(schema, 'public', params.table)
+          if (!details) {
+            const txExecutor = async (qSql: string, qParams?: unknown[]) => {
+              const res = (await client.query(qSql, qParams)) as unknown as PgRawResult
+              return Array.isArray(res?.rows) ? (res.rows as Record<string, unknown>[]) : []
+            }
+            details = await introspectPostgresTableDetails(txExecutor, params.table, schema)
+            this.tableDetailsCache.set(schema, 'public', params.table, details)
+          }
+
+          const { sql, countSql, params: queryParams } = buildSelectPageSql({
+            driver: this.driverType,
+            table: params.table,
+            schema,
+            page: params.page,
+            pageSize: params.pageSize,
+            sortColumn: params.sortColumn,
+            sortDirection: params.sortDirection,
+            primaryKey: details.primaryKey,
+            whereClause: params.whereClause,
+            orderByClause: params.orderByClause,
+          })
+
+          const countQuery: { text: string; values: unknown[]; queryMode: 'extended' } = {
+            text: countSql,
+            values: [],
+            queryMode: 'extended',
+          }
+          const countRes = await client.query(countQuery)
+          const dataRes = await client.query(sql, queryParams)
+
+          return assembleTableBrowseResult({
+            tableDetails: details,
+            rows: dataRes.rows,
+            countRow: countRes.rows[0] || { total: 0 },
+            page: params.page,
+            pageSize: params.pageSize,
+          })
+        } catch (err) {
+          failed = true
+          if (isPinned && errorGuard === null && !this.txClientBroken && isPgSqlStateError(err)) {
+            this.txAborted = true
+          }
+          throw err
+        } finally {
+          if (errorGuard) {
+            errorGuard.cleanup()
+            lease.release(failed || errorGuard.hasError())
+          }
+        }
+      })
+    }
+
     const details = await this.getTableDetails(params.table, schema)
 
     const { sql, countSql, params: queryParams } = buildSelectPageSql({
@@ -455,6 +847,13 @@ export class PostgresSession implements IDatabaseSession {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
     }
     const schema = params.schema || 'public'
+    const originalColumnType = this.tableDetailsCache.findColumnType(
+      schema,
+      'public',
+      params.table,
+      params.column,
+      params.columnType
+    )
     const { sql, params: updateParams } = buildUpdateSql({
       driver: this.driverType,
       table: params.table,
@@ -463,7 +862,51 @@ export class PostgresSession implements IDatabaseSession {
       newValue: params.newValue,
       primaryKeys: params.primaryKeys,
       originalValue: params.originalValue,
+      originalColumnType,
     })
+
+    const pinnedResult = await this.runExclusiveTxOp(async (): Promise<UpdateCellResult | null> => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      this.discardBrokenPinnedClient()
+      if (!this.autoCommit && this.txClient === null) {
+        await this.beginTransactionLocked()
+      }
+      if (this.txLease === null) {
+        return null
+      }
+      let res: { rowCount?: number | null; rows: Record<string, unknown>[] }
+      try {
+        res = (await this.txLease.client.query(`${sql} RETURNING *;`, updateParams)) as {
+          rowCount?: number | null
+          rows: Record<string, unknown>[]
+        }
+      } catch (err) {
+        if (!this.txClientBroken && isPgSqlStateError(err)) {
+          this.txAborted = true
+        }
+        throw err
+      }
+      const affectedRows = res.rowCount ?? 0
+      if (affectedRows === 0) {
+        throw new DatabaseDriverError(
+          'Record was modified or deleted by another session (optimistic lock conflict)',
+          'conflict',
+          this.driverType
+        )
+      }
+      this.statementCount++
+      this.tableDetailsCache.clear()
+      return {
+        ok: true,
+        affectedRows,
+        updatedRecord: res.rows[0],
+      }
+    })
+    if (pinnedResult !== null) {
+      return pinnedResult
+    }
 
     const res = await this.withPoolFallback((pool) =>
       pool.query(`${sql} RETURNING *;`, updateParams)
@@ -499,8 +942,56 @@ export class PostgresSession implements IDatabaseSession {
       inserts: params.inserts,
       updates: params.updates,
       deletes: params.deletes,
+      columnTypes: this.tableDetailsCache.resolveColumnTypes(
+        schema,
+        'public',
+        params.table,
+        params.columnTypes
+      ),
     })
     return { statements: batch.previewStatements }
+  }
+
+  private async resolveSourceTableFromFields(
+    client: PoolClient,
+    fields: PgRawResult['fields']
+  ): Promise<{ schema: string; table: string } | undefined> {
+    if (!Array.isArray(fields) || fields.length === 0) return undefined
+    const uniqueOids = new Set<number>()
+    for (const f of fields) {
+      if (typeof f.tableID === 'number' && Number.isInteger(f.tableID) && f.tableID > 0) {
+        uniqueOids.add(f.tableID)
+      }
+    }
+    if (uniqueOids.size !== 1) return undefined
+    const [oid] = Array.from(uniqueOids)
+    const cached = this.oidTableCache.get(oid)
+    if (cached) return cached
+
+    const sql =
+      'SELECT n.nspname AS schema_name, c.relname AS table_name FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = $1'
+    try {
+      const txStatus = (client as unknown as { _txStatus?: string | null })._txStatus
+      if (this.txAborted || txStatus === 'E') {
+        // Aborted transaction: skip enrichment rather than borrow a nested connection
+        return undefined
+      }
+      // Resolve on the current client so a busy pool cannot deadlock on enrichment
+      const res = (await client.query(sql, [oid])) as unknown as PgRawResult
+      const row = Array.isArray(res?.rows) ? res.rows[0] : undefined
+      if (row && !Array.isArray(row)) {
+        const schema = typeof row.schema_name === 'string' ? row.schema_name : ''
+        const table = typeof row.table_name === 'string' ? row.table_name : ''
+        if (schema && table) {
+          const resolved = { schema, table }
+          this.oidTableCache.set(oid, resolved)
+          return resolved
+        }
+      }
+    } catch {
+      // Non-fatal catalog lookup failure; fall back to conservative read-only handling
+    }
+    return undefined
   }
 
   async applyChanges(params: ApplyChangesParams): Promise<ApplyChangesResult> {
@@ -515,18 +1006,120 @@ export class PostgresSession implements IDatabaseSession {
       inserts: params.inserts,
       updates: params.updates,
       deletes: params.deletes,
+      columnTypes: this.tableDetailsCache.resolveColumnTypes(
+        schema,
+        'public',
+        params.table,
+        params.columnTypes
+      ),
     })
     if (batch.all.length === 0) {
       return { ok: true, inserted: 0, updated: 0, deleted: 0, statements: [] }
     }
 
-    const client = await this.withPoolFallback((pool) => pool.connect())
+    const pinnedResult = await this.runExclusiveTxOp(async (): Promise<ApplyChangesResult | null> => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      this.discardBrokenPinnedClient()
+      if (!this.autoCommit && this.txClient === null) {
+        await this.beginTransactionLocked()
+      }
+      if (this.txClient === null) {
+        return null
+      }
+      const lease = this.txLease
+      if (lease === null) {
+        return null
+      }
+      const client = lease.client
+      const batchEntry: ActiveBatch = { lease, commitSent: false }
+      this.activeBatches.set(lease, batchEntry)
+      try {
+        await client.query('SAVEPOINT datanoa_apply_changes')
+        let deleted = 0
+        for (const stmt of batch.deletes) {
+          const res = await client.query(stmt.sql, stmt.params)
+          const count = res.rowCount ?? 0
+          if (count === 0) {
+            throw new DatabaseDriverError(
+              'Record was modified or deleted by another session (optimistic lock conflict)',
+              'conflict',
+              this.driverType
+            )
+          }
+          deleted += count
+        }
+
+        let updated = 0
+        for (const stmt of batch.updates) {
+          const res = await client.query(stmt.sql, stmt.params)
+          const count = res.rowCount ?? 0
+          if (count === 0) {
+            throw new DatabaseDriverError(
+              'Record was modified or deleted by another session (optimistic lock conflict)',
+              'conflict',
+              this.driverType
+            )
+          }
+          updated += count
+        }
+
+        let inserted = 0
+        for (const stmt of batch.chunkedInserts) {
+          const res = await client.query(stmt.sql, stmt.params)
+          inserted += res.rowCount ?? stmt.rowCount
+        }
+
+        await client.query('RELEASE SAVEPOINT datanoa_apply_changes')
+        this.statementCount += batch.deletes.length + batch.updates.length + batch.chunkedInserts.length
+        this.tableDetailsCache.clear()
+        return {
+          ok: true,
+          inserted,
+          updated,
+          deleted,
+          statements: batch.previewStatements,
+        }
+      } catch (err) {
+        if (!lease.released && !this.isClosed) {
+          try {
+            await client.query('ROLLBACK TO SAVEPOINT datanoa_apply_changes')
+            await client.query('RELEASE SAVEPOINT datanoa_apply_changes')
+          } catch (rbErr) {
+            if (!this.txClientBroken && isPgSqlStateError(rbErr)) {
+              this.txAborted = true
+            }
+          }
+        } else if (!this.txClientBroken && isPgSqlStateError(err)) {
+          this.txAborted = true
+        }
+        throw err
+      } finally {
+        this.activeBatches.delete(lease)
+      }
+    })
+    if (pinnedResult !== null) {
+      return pinnedResult
+    }
+
+    const lease = await this.acquireLease()
+    if (this.isClosed) {
+      lease.release(true)
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    const client = lease.client
     const errorGuard = attachClientErrorGuard(client)
+    const batchEntry: ActiveBatch = { lease, commitSent: false }
+    this.activeBatches.set(lease, batchEntry)
     let shouldDestroyClient = false
     try {
       await client.query('BEGIN')
       let deleted = 0
       for (const stmt of batch.deletes) {
+        if (this.isClosed) {
+          throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+        }
         const res = await client.query(stmt.sql, stmt.params)
         const count = res.rowCount ?? 0
         if (count === 0) {
@@ -541,6 +1134,9 @@ export class PostgresSession implements IDatabaseSession {
 
       let updated = 0
       for (const stmt of batch.updates) {
+        if (this.isClosed) {
+          throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+        }
         const res = await client.query(stmt.sql, stmt.params)
         const count = res.rowCount ?? 0
         if (count === 0) {
@@ -554,11 +1150,20 @@ export class PostgresSession implements IDatabaseSession {
       }
 
       let inserted = 0
-      for (const stmt of batch.inserts) {
+      for (const stmt of batch.chunkedInserts) {
+        if (this.isClosed) {
+          throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+        }
         const res = await client.query(stmt.sql, stmt.params)
-        inserted += res.rowCount ?? 1
+        inserted += res.rowCount ?? stmt.rowCount
       }
 
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      // Mark COMMIT as dispatched in the same synchronous turn as the query so a
+      // later close keeps the provider result instead of aborting a committed batch.
+      batchEntry.commitSent = true
       await client.query('COMMIT')
       this.tableDetailsCache.clear()
       return {
@@ -569,19 +1174,22 @@ export class PostgresSession implements IDatabaseSession {
         statements: batch.previewStatements,
       }
     } catch (err) {
-      try {
-        await client.query('ROLLBACK')
-      } catch {
+      if (batchEntry.commitSent) {
+        // COMMIT already reached the provider: keep its real outcome, never infer rollback
+      } else if (lease.released || this.isClosed) {
         shouldDestroyClient = true
+      } else {
+        try {
+          await client.query('ROLLBACK')
+        } catch {
+          shouldDestroyClient = true
+        }
       }
       throw err
     } finally {
+      this.activeBatches.delete(lease)
       errorGuard.cleanup()
-      if (shouldDestroyClient || errorGuard.hasError()) {
-        client.release(true)
-      } else {
-        client.release()
-      }
+      lease.release(shouldDestroyClient || errorGuard.hasError())
     }
   }
 
@@ -598,92 +1206,221 @@ export class PostgresSession implements IDatabaseSession {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
     }
-    const client = await this.withPoolFallback((pool) => pool.connect())
-    const errorGuard = attachClientErrorGuard(client)
-    const startTime = performance.now()
 
-    const activeEntry: ActivePgQuery = {
-      client,
-      pid: (client as unknown as { processID?: number }).processID ?? 0,
-      startTime,
-      cancelled: false,
-      released: false,
-    }
-    this.activeQueries.set(queryId, activeEntry)
+    const stmts = splitSqlStatements(sql, this.driverType).map((s) => s.text)
+    const execList = stmts.length <= 1 ? [sql] : stmts
+    const startsManualTx = execList.some((s) =>
+      /^(?:BEGIN|START\s+TRANSACTION)\b/i.test(stripLeadingSqlComments(s.trim(), this.driverType).trim())
+    )
+    const needsTxLock = !this.autoCommit || this.txClient !== null || startsManualTx
 
-    let shouldDestroyClient = false
-    try {
-      const stmts = splitSqlStatements(sql, this.driverType).map((s) => s.text)
-      let totalAffectedRows = 0
-      let lastSelect: Omit<QueryResult, 'executionTimeMs'> | null = null
-
-      const execList = stmts.length <= 1 ? [sql] : stmts
-      for (const stmtSql of execList) {
-        if (activeEntry.cancelled || this.isClosed) {
-          shouldDestroyClient = true
-          throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', this.driverType)
-        }
-        const res = (await client.query({
-          text: stmtSql,
-          rowMode: 'array',
-        })) as unknown as PgRawResult
-        const parsed = parsePgQueryResult(res, maxRows)
-        if (parsed.isSelect) {
-          lastSelect = parsed.result
-        } else if (execList.length === 1) {
-          totalAffectedRows = parsed.affectedRows
-        } else {
-          totalAffectedRows += parsed.affectedRows
-        }
+    const executeRun = async (): Promise<QueryResult> => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      if (this.txClient !== null && this.txClientBroken) {
+        this.discardBrokenPinnedClient()
+      }
+      if (!this.autoCommit && this.txClient === null) {
+        await this.beginTransactionLocked()
       }
 
-      const executionTimeMs = Math.round(performance.now() - startTime)
-      return lastSelect
-        ? { ...lastSelect, executionTimeMs }
-        : {
-            columns: [],
-            rows: [],
-            rowCount: 0,
-            affectedRows: totalAffectedRows,
-            executionTimeMs,
-            truncated: false,
-            isSelect: false,
+      const isPinned = this.txLease !== null
+      const lease = this.txLease ?? (await this.acquireLease())
+      const client = lease.client
+      if (this.isClosed) {
+        lease.release(true)
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      const errorGuard = attachClientErrorGuard(client)
+      const startTime = performance.now()
+
+      const activeEntry: ActivePgQuery = {
+        lease,
+        startTime,
+        cancelled: false,
+      }
+      this.activeQueries.set(queryId, activeEntry)
+
+      let shouldDestroyClient = false
+      try {
+        let totalAffectedRows = 0
+        let lastSelect: Omit<QueryResult, 'executionTimeMs'> | null = null
+        const collectedSets: QueryResultSet[] = []
+
+        for (let execIndex = 0; execIndex < execList.length; execIndex++) {
+          const stmtSql = execList[execIndex]
+          if (activeEntry.cancelled || this.isClosed) {
+            shouldDestroyClient = true
+            throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', this.driverType)
           }
-    } catch (err) {
-      shouldDestroyClient = true
-      throw err
-    } finally {
-      if (containsDdlStatement(sql, this.driverType)) {
-        this.tableDetailsCache.clear()
-      }
-      this.activeQueries.delete(queryId)
+          const trimmedStmt = stmtSql.trim()
+          const normalizedStmt = stripLeadingSqlComments(trimmedStmt, this.driverType).trim()
+          const isStandaloneBegin = /^(?:BEGIN|START\s+TRANSACTION)\b/i.test(normalizedStmt)
+          if (isStandaloneBegin && this.txClient === null) {
+            this.pinTxClient(lease)
+          }
 
-      // Guard against leaking IDLE IN TRANSACTION clients back to the pool
-      const txStatus = (client as unknown as { _txStatus?: string | null })._txStatus
-      if (
-        !shouldDestroyClient &&
-        !activeEntry.cancelled &&
-        !activeEntry.released &&
-        !errorGuard.hasError() &&
-        (txStatus === 'T' || txStatus === 'E')
-      ) {
-        try {
-          await client.query('ROLLBACK')
-        } catch {
+          const res = (await client.query({
+            text: stmtSql,
+            rowMode: 'array',
+          })) as unknown as PgRawResult
+          if (this.isClosed && this.txClient !== client) {
+            shouldDestroyClient = true
+            throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+          }
+
+          const isCommit = /^(?:COMMIT|END(?:\s+TRANSACTION)?)\b/i.test(normalizedStmt)
+          const isRollback = /^ROLLBACK\b(?!\s+TO\b)/i.test(normalizedStmt)
+          const isAndChain = /\bAND\s+CHAIN\b/i.test(normalizedStmt)
+          const txStatus = (client as unknown as { _txStatus?: string | null })._txStatus
+          const commandTag = typeof res?.command === 'string' ? res.command.toUpperCase() : ''
+
+          const parsed = parsePgQueryResult(res, maxRows)
+          if (parsed.isSelect) {
+            const sourceTable = await this.resolveSourceTableFromFields(client, res.fields)
+            const enrichedResult: Omit<QueryResult, 'executionTimeMs'> = sourceTable
+              ? { ...parsed.result, sourceTable }
+              : parsed.result
+            lastSelect = enrichedResult
+            collectedSets.push({
+              index: execIndex,
+              sqlPreview: compactSql(trimmedStmt),
+              columns: enrichedResult.columns,
+              rows: enrichedResult.rows,
+              rowCount: enrichedResult.rowCount,
+              truncated: enrichedResult.truncated,
+              isSelect: true,
+              ...(sourceTable ? { sourceTable } : {}),
+            })
+          } else if (execList.length === 1) {
+            totalAffectedRows = parsed.affectedRows
+            collectedSets.push({
+              index: execIndex,
+              sqlPreview: compactSql(trimmedStmt),
+              columns: [{ name: 'affected_rows', type: 'INTEGER' }],
+              rows: [[parsed.affectedRows]],
+              rowCount: 1,
+              affectedRows: parsed.affectedRows,
+              truncated: false,
+              isSelect: false,
+            })
+          } else {
+            totalAffectedRows += parsed.affectedRows
+            collectedSets.push({
+              index: execIndex,
+              sqlPreview: compactSql(trimmedStmt),
+              columns: [{ name: 'affected_rows', type: 'INTEGER' }],
+              rows: [[parsed.affectedRows]],
+              rowCount: 1,
+              affectedRows: parsed.affectedRows,
+              truncated: false,
+              isSelect: false,
+            })
+          }
+
+          if (this.txClient === client) {
+            if (!isStandaloneBegin) {
+              this.statementCount++
+            }
+            if (/^ROLLBACK\s+TO\s+(?:SAVEPOINT\s+)?/i.test(normalizedStmt)) {
+              this.txAborted = false
+            }
+            if (isCommit || isRollback) {
+              const staysInTx = isAndChain || txStatus === 'T' || txStatus === 'E'
+              if (staysInTx) {
+                this.statementCount = 0
+                this.txStartedAt = Date.now()
+                this.txAborted = txStatus === 'E'
+              } else {
+                // Defer release until execList completes so trailing statements still run safely
+                this.clearPinnedTxClient()
+              }
+            }
+          }
+
+          if (isCommit && !isRollback && commandTag === 'ROLLBACK') {
+            throw new DatabaseDriverError(
+              'Transaction was in an aborted state due to an earlier error and was rolled back by PostgreSQL instead of committed.',
+              'TX_ABORTED_ROLLBACK',
+              this.driverType
+            )
+          }
+        }
+
+        const executionTimeMs = Math.round(performance.now() - startTime)
+        return lastSelect
+          ? {
+              ...lastSelect,
+              affectedRows: totalAffectedRows,
+              ...(collectedSets.length > 1 ? { resultSets: collectedSets } : {}),
+              executionTimeMs,
+            }
+          : {
+              columns: [],
+              rows: [],
+              rowCount: 0,
+              affectedRows: totalAffectedRows,
+              executionTimeMs,
+              truncated: false,
+              isSelect: false,
+              ...(collectedSets.length > 1 ? { resultSets: collectedSets } : {}),
+            }
+      } catch (err) {
+        if (this.txClient === client && (errorGuard.hasError() || this.txClientBroken)) {
+          shouldDestroyClient = true
+          this.clearPinnedTxClient()
+        } else if (
+          this.txClient === client &&
+          !this.txClientBroken &&
+          !activeEntry.cancelled &&
+          isPgSqlStateError(err)
+        ) {
+          this.txAborted = true
+        } else if (!isPinned) {
           shouldDestroyClient = true
         }
-      }
+        throw err
+      } finally {
+        if (containsDdlStatement(sql, this.driverType)) {
+          this.tableDetailsCache.clear()
+          this.oidTableCache.clear()
+        }
+        this.activeQueries.delete(queryId)
 
-      errorGuard.cleanup()
-      if (!activeEntry.released) {
-        activeEntry.released = true
-        if (shouldDestroyClient || activeEntry.cancelled || errorGuard.hasError()) {
-          client.release(true)
+        const currentlyPinned = this.txClient === client
+        if (currentlyPinned) {
+          errorGuard.cleanup()
+          if (shouldDestroyClient || activeEntry.cancelled || errorGuard.hasError() || this.txClientBroken) {
+            this.clearPinnedTxClient()
+            lease.release(true)
+          }
         } else {
-          client.release()
+          // Always detach the error listener, even when close already released the lease
+          errorGuard.cleanup()
+          if (!lease.released) {
+            // Guard against leaking IDLE IN TRANSACTION clients back to the pool
+            const txStatus = (client as unknown as { _txStatus?: string | null })._txStatus
+            if (
+              !shouldDestroyClient &&
+              !activeEntry.cancelled &&
+              !errorGuard.hasError() &&
+              (txStatus === 'T' || txStatus === 'E')
+            ) {
+              try {
+                await client.query('ROLLBACK')
+              } catch {
+                shouldDestroyClient = true
+              }
+            }
+
+            lease.release(shouldDestroyClient || activeEntry.cancelled || errorGuard.hasError())
+          }
         }
       }
     }
+
+    return needsTxLock ? this.runExclusiveTxOp(executeRun) : executeRun()
   }
 
   async cancelQuery(queryId: string): Promise<{ ok: boolean }> {
@@ -696,8 +1433,139 @@ export class PostgresSession implements IDatabaseSession {
     }
 
     active.cancelled = true
-    const ok = await this.sendCancelBackend(active.pid)
+    const ok = await this.sendCancelBackend(active.lease.pid)
     return { ok }
+  }
+
+  getTransactionState(): TransactionState {
+    const txStatus = (this.txClient as unknown as { _txStatus?: string | null } | null)?._txStatus
+    const aborted = this.txClient !== null && (this.txAborted || txStatus === 'E')
+    return {
+      active: this.txClient !== null,
+      autoCommit: this.autoCommit,
+      statementCount: this.statementCount,
+      startedAt: this.txStartedAt,
+      supported: true,
+      ...(aborted ? { aborted: true } : {}),
+    }
+  }
+
+  async setAutoCommit(enabled: boolean): Promise<TransactionState> {
+    return this.runExclusiveTxOp(async () => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      this.discardBrokenPinnedClient()
+      if (enabled) {
+        if (this.txClient !== null) {
+          throw new DatabaseDriverError(
+            'Commit or rollback the active transaction before switching to Auto-Commit',
+            'TX_ACTIVE',
+            this.driverType
+          )
+        }
+        this.autoCommit = true
+      } else {
+        this.autoCommit = false
+      }
+      return this.getTransactionState()
+    })
+  }
+
+  private async beginTransactionLocked(): Promise<TransactionState> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    this.discardBrokenPinnedClient()
+    if (this.txClient !== null) {
+      throw new DatabaseDriverError('Transaction is already active', 'TX_ALREADY_ACTIVE', this.driverType)
+    }
+    const lease = await this.acquireLease()
+    if (this.isClosed) {
+      lease.release(true)
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    try {
+      await lease.client.query('BEGIN')
+      if (this.isClosed) {
+        lease.release(true)
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      this.pinTxClient(lease)
+      this.statementCount = 0
+      this.txStartedAt = Date.now()
+      return this.getTransactionState()
+    } catch (err) {
+      lease.release(true)
+      throw err
+    }
+  }
+
+  async beginTransaction(): Promise<TransactionState> {
+    return this.runExclusiveTxOp(() => this.beginTransactionLocked())
+  }
+
+  async commitTransaction(): Promise<TransactionState> {
+    return this.runExclusiveTxOp(async () => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      const lease = this.txLease
+      if (lease === null) {
+        throw new DatabaseDriverError('Cannot commit: no active transaction', 'NO_ACTIVE_TX', this.driverType)
+      }
+      const client = lease.client
+      const broken = this.txClientBroken
+      this.clearPinnedTxClient()
+      try {
+        if (broken) {
+          lease.release(true)
+          throw new DatabaseDriverError(
+            'Transaction connection was lost before commit; changes were rolled back.',
+            'TX_CONNECTION_LOST',
+            this.driverType
+          )
+        }
+        const res = (await client.query('COMMIT')) as unknown as PgRawResult
+        lease.release(false)
+        if (typeof res?.command === 'string' && res.command.toUpperCase() === 'ROLLBACK') {
+          throw new DatabaseDriverError(
+            'Transaction was in an aborted state due to an earlier error and was rolled back by PostgreSQL instead of committed.',
+            'TX_ABORTED_ROLLBACK',
+            this.driverType
+          )
+        }
+        return this.getTransactionState()
+      } catch (err) {
+        lease.release(true)
+        throw err
+      }
+    })
+  }
+
+  async rollbackTransaction(): Promise<TransactionState> {
+    return this.runExclusiveTxOp(async () => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      const lease = this.txLease
+      if (lease === null) {
+        throw new DatabaseDriverError('Cannot rollback: no active transaction', 'NO_ACTIVE_TX', this.driverType)
+      }
+      const client = lease.client
+      const broken = this.txClientBroken
+      this.clearPinnedTxClient()
+      try {
+        if (!broken) {
+          await client.query('ROLLBACK')
+        }
+        lease.release(broken)
+        return this.getTransactionState()
+      } catch (err) {
+        lease.release(true)
+        throw err
+      }
+    })
   }
 }
 
@@ -764,7 +1632,7 @@ export async function resolveSupabasePoolerConfig(
       host: poolerHost,
       port: 5432,
       user: poolerUser,
-      ssl: { rejectUnauthorized: false },
+      ssl: baseConfig.ssl,
       connectionTimeoutMillis: 6000,
     }
     const probePool = new Pool(candidateConfig)
@@ -805,7 +1673,7 @@ export async function resolveSupabasePoolerConfig(
     host: candidateHosts[0],
     port: 5432,
     user: poolerUser,
-    ssl: { rejectUnauthorized: false },
+    ssl: baseConfig.ssl,
   }
 }
 
@@ -816,15 +1684,42 @@ export class PostgresDriver implements IDatabaseDriver {
     this.type = type
   }
 
-  async createSession(profile: ConnectionProfile, password?: string): Promise<IDatabaseSession> {
+  async createSession(
+    profile: ConnectionProfile,
+    password?: string,
+    extraSecrets?: DriverTlsOptions
+  ): Promise<IDatabaseSession> {
     const effectiveDriver: PostgresEngineType =
       profile.driver === 'cockroachdb' ? 'cockroachdb' : this.type
     const isCockroach = effectiveDriver === 'cockroachdb'
     const host = (profile.host || 'localhost').trim()
-    const useSsl =
-      profile.ssl !== undefined
-        ? Boolean(profile.ssl)
-        : isCockroach || isCloudDatabaseHost(host)
+    const tlsOverride = await resolveEffectiveTlsOptions(
+      profile,
+      extraSecrets,
+      extraSecrets?.tlsServername
+    )
+    let sslConfig: PoolConfig['ssl']
+    if (tlsOverride === false) {
+      // Explicit sslMode: 'disable' — never fall back to auto-SSL
+      sslConfig = undefined
+    } else if (tlsOverride) {
+      sslConfig = tlsOverride
+    } else {
+      const useSsl =
+        profile.ssl !== undefined
+          ? Boolean(profile.ssl)
+          : isCockroach || isCloudDatabaseHost(host)
+      sslConfig = useSsl ? { rejectUnauthorized: false } : undefined
+    }
+
+    const rawOptions =
+      typeof profile.options === 'string' && profile.options.trim().length > 0
+        ? profile.options.trim()
+        : undefined
+    const effectiveOptions =
+      profile.readOnly && (!rawOptions || !/\bdefault_transaction_read_only\s*=/i.test(rawOptions))
+        ? `${rawOptions ? `${rawOptions} ` : ''}-c default_transaction_read_only=on`
+        : rawOptions
 
     const baseConfig: PoolConfig = {
       host,
@@ -835,10 +1730,8 @@ export class PostgresDriver implements IDatabaseDriver {
       max: 5,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 10000,
-      ssl: useSsl ? { rejectUnauthorized: false } : undefined,
-      ...(typeof profile.options === 'string' && profile.options.trim().length > 0
-        ? { options: profile.options.trim() }
-        : {}),
+      ssl: sslConfig,
+      ...(effectiveOptions ? { options: effectiveOptions } : {}),
     }
 
     const pool = new Pool(baseConfig)
@@ -848,18 +1741,12 @@ export class PostgresDriver implements IDatabaseDriver {
 
   async testConnection(
     profile: ConnectionProfile,
-    password?: string
+    password?: string,
+    extraSecrets?: DriverTlsOptions
   ): Promise<{ ok: boolean; message?: string }> {
-    let session: IDatabaseSession | null = null
-    try {
-      session = await this.createSession(profile, password)
-      return await session.test()
-    } catch (err: unknown) {
-      return { ok: false, message: formatPostgresError(err, this.type, profile) }
-    } finally {
-      if (session) {
-        await session.close().catch(() => {})
-      }
-    }
+    return runDriverConnectionTest(
+      () => this.createSession(profile, password, extraSecrets),
+      (err) => formatPostgresError(err, this.type, profile)
+    )
   }
 }

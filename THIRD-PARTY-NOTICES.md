@@ -15,8 +15,9 @@ Datanoa incorporates or bundles the following open-source software components. E
 | `@codemirror/language` | 6.13.1 | MIT | Marijn Haverbeke and contributors |
 | `@codemirror/autocomplete` | 6.20.4 | MIT | Marijn Haverbeke and contributors |
 | `@codemirror/commands` | 6.11.1 | MIT | Marijn Haverbeke and contributors |
+| `@codemirror/search` | 6.7.2 | MIT | Marijn Haverbeke and contributors |
 | `@lezer/highlight` | 1.2.5 | MIT | Marijn Haverbeke and contributors |
-| Geist Variable Font (`assets/fonts/Geist-Variable.woff2`) | Variable | SIL Open Font License 1.1 (OFL-1.1) | Vercel Inc. (bundled via Orca Desktop) |
+| Geist Variable Font (`src/assets/geist-font.js`) | Variable | SIL Open Font License 1.1 (OFL-1.1) | Vercel Inc. (bundled via Orca Desktop) |
 
 ---
 
@@ -72,7 +73,7 @@ SOFTWARE.
 
 ---
 
-## CodeMirror 6 & Lezer (`@codemirror/view`, `@codemirror/state`, `@codemirror/lang-sql`, `@codemirror/language`, `@codemirror/autocomplete`, `@codemirror/commands`, `@lezer/highlight`)
+## CodeMirror 6 & Lezer (`@codemirror/view`, `@codemirror/state`, `@codemirror/lang-sql`, `@codemirror/language`, `@codemirror/autocomplete`, `@codemirror/commands`, `@codemirror/search`, `@lezer/highlight`)
 
 MIT License
 
@@ -98,7 +99,7 @@ SOFTWARE.
 
 ---
 
-## Geist Variable Font (`assets/fonts/Geist-Variable.woff2` / `src/assets/geist-font.ts`)
+## Geist Variable Font (`src/assets/geist-font.js`)
 
 Copyright 2023 Vercel Inc. (https://vercel.com/font), bundled via Orca Desktop.
 

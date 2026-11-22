@@ -351,6 +351,9 @@ export function normalizeTableDetailsForDraft(details: TableDetails): TableDetai
     column: fk.column,
     referencedTable: fk.referencedTable || '',
     referencedColumn: fk.referencedColumn || 'id',
+    ...(fk.referencedSchema ? { referencedSchema: fk.referencedSchema } : {}),
+    ...(fk.onDelete ? { onDelete: fk.onDelete } : {}),
+    ...(fk.onUpdate ? { onUpdate: fk.onUpdate } : {}),
   }))
 
   return {

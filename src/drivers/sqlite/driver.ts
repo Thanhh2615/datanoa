@@ -9,23 +9,29 @@ import type {
   IDatabaseSession,
   PreviewChangesResult,
   QueryResult,
+  QueryResultSet,
   SchemaObject,
+  SchemaObjectKind,
   TableBrowseResult,
   TableDetails,
+  TransactionState,
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
-import { DatabaseDriverError } from '../common/driver'
+import { DatabaseDriverError, runDriverConnectionTest } from '../common/driver'
 import {
   assembleTableBrowseResult,
   buildBatchStatements,
+  buildSelectByPrimaryKeySql,
   buildSelectPageSql,
   buildUpdateSql,
-  quoteIdentifier,
 } from '../common/update-builder'
 import {
   TableDetailsCache,
+  collectAndAssembleSchemaDdl,
+  introspectSqliteObjectDdl,
   introspectSqliteObjects,
+  introspectSqliteSchemas,
   introspectSqliteTableDetails,
 } from '../common/schema'
 import {
@@ -50,6 +56,7 @@ interface WorkerResponseMessage {
   ok: boolean
   data?: unknown
   error?: { message?: string; code?: string }
+  txState?: TransactionState
 }
 
 interface WorkerQueryPayload {
@@ -59,6 +66,7 @@ interface WorkerQueryPayload {
   rowCount: number
   affectedRows?: number
   truncated: boolean
+  resultSets?: QueryResultSet[]
 }
 
 function extractSqliteErrMessage(err: unknown, fallback: string): string {
@@ -82,6 +90,12 @@ export class SqliteSession implements IDatabaseSession {
   private serializedState?: Uint8Array
   private txChain: Promise<void> = Promise.resolve()
   private readonly tableDetailsCache = new TableDetailsCache()
+  private txState: TransactionState = {
+    active: false,
+    autoCommit: true,
+    statementCount: 0,
+    supported: true,
+  }
 
   constructor(profile: ConnectionProfile) {
     this.profile = profile
@@ -105,6 +119,9 @@ export class SqliteSession implements IDatabaseSession {
 
     currentWorker.on('message', (res: WorkerResponseMessage) => {
       if (!res.id) return
+      if (res.txState) {
+        this.txState = res.txState
+      }
 
       const pending = this.pendingRequests.get(res.id)
       if (pending) {
@@ -231,6 +248,12 @@ export class SqliteSession implements IDatabaseSession {
       }
 
       this.isClosed = true
+      this.txState = {
+        active: false,
+        autoCommit: true,
+        statementCount: 0,
+        supported: true,
+      }
       const workerToTerminate = this.worker
       this.worker = null
       if (workerToTerminate) {
@@ -259,6 +282,37 @@ export class SqliteSession implements IDatabaseSession {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'sqlite')
     }
     return introspectSqliteObjects(this.queryExecutor, schema || 'main')
+  }
+
+  async listSchemas(): Promise<{ schemas: string[]; defaultSchema: string }> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'sqlite')
+    }
+    return introspectSqliteSchemas(this.queryExecutor)
+  }
+
+  async getObjectDdl(name: string, kind: SchemaObjectKind, schema?: string): Promise<string> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'sqlite')
+    }
+    if (kind === 'table' || kind === 'view') {
+      return this.getDdl(name, schema)
+    }
+    return introspectSqliteObjectDdl(this.queryExecutor, name, kind, schema || 'main')
+  }
+
+  async exportSchemaDdl(schema?: string): Promise<{ ddl: string; objectCount: number }> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'sqlite')
+    }
+    const targetSchema = (schema || 'main').trim() || 'main'
+    const objects = await this.listObjects(targetSchema)
+    return collectAndAssembleSchemaDdl({
+      dialect: 'sqlite',
+      schemaName: targetSchema,
+      objects,
+      getObjectDdl: (object) => this.getObjectDdl(object.name, object.kind, targetSchema),
+    })
   }
 
   async getTableDetails(table: string, schema?: string): Promise<TableDetails> {
@@ -313,6 +367,13 @@ export class SqliteSession implements IDatabaseSession {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'sqlite')
     }
+    const originalColumnType = this.tableDetailsCache.findColumnType(
+      params.schema,
+      'main',
+      params.table,
+      params.column,
+      params.columnType
+    )
     const { sql, params: updateParams } = buildUpdateSql({
       driver: 'sqlite',
       table: params.table,
@@ -321,6 +382,7 @@ export class SqliteSession implements IDatabaseSession {
       newValue: params.newValue,
       primaryKeys: params.primaryKeys,
       originalValue: params.originalValue,
+      originalColumnType,
     })
 
     const runRes = await this.sendToWorker<{ changes: number }>('run', {
@@ -337,25 +399,21 @@ export class SqliteSession implements IDatabaseSession {
     }
 
     // Retrieve updated record safely via primary keys (handling NULL PKs and edited PK columns)
-    const whereParts: string[] = []
-    const pkValues: unknown[] = []
-    for (const [pkCol, rawPkVal] of Object.entries(params.primaryKeys)) {
-      const effectivePkVal = pkCol === params.column ? params.newValue : rawPkVal
-      if (effectivePkVal === null || effectivePkVal === undefined) {
-        whereParts.push(`${quoteIdentifier('sqlite', pkCol)} IS NULL`)
-      } else {
-        whereParts.push(`${quoteIdentifier('sqlite', pkCol)} = ?`)
-        pkValues.push(effectivePkVal)
-      }
-    }
+    const reloadQuery = buildSelectByPrimaryKeySql({
+      driver: 'sqlite',
+      table: params.table,
+      schema: params.schema,
+      primaryKeys: params.primaryKeys,
+      editedColumn: params.column,
+      newValue: params.newValue,
+    })
 
     let updatedRecord: Record<string, unknown> | undefined
-    if (whereParts.length > 0) {
-      const selectSql = `SELECT * FROM ${quoteIdentifier('sqlite', params.table, params.schema)} WHERE ${whereParts.join(' AND ')}`
+    if (reloadQuery) {
       updatedRecord =
         (await this.sendToWorker<Record<string, unknown> | undefined>('get', {
-          sql: selectSql,
-          params: pkValues,
+          sql: reloadQuery.sql,
+          params: reloadQuery.params,
         })) || undefined
     }
 
@@ -390,6 +448,12 @@ export class SqliteSession implements IDatabaseSession {
       inserts: params.inserts,
       updates: params.updates,
       deletes: params.deletes,
+      columnTypes: this.tableDetailsCache.resolveColumnTypes(
+        params.schema,
+        'main',
+        params.table,
+        params.columnTypes
+      ),
     })
     return { statements: batch.previewStatements }
   }
@@ -405,6 +469,12 @@ export class SqliteSession implements IDatabaseSession {
       inserts: params.inserts,
       updates: params.updates,
       deletes: params.deletes,
+      columnTypes: this.tableDetailsCache.resolveColumnTypes(
+        params.schema,
+        'main',
+        params.table,
+        params.columnTypes
+      ),
     })
     if (batch.all.length === 0) {
       return { ok: true, inserted: 0, updated: 0, deleted: 0, statements: [] }
@@ -417,12 +487,16 @@ export class SqliteSession implements IDatabaseSession {
         inserted: number
         updated: number
         deleted: number
+        txState?: TransactionState
       }>('applyBatch', {
         deletes: batch.deletes.map((s) => ({ sql: s.sql, params: s.params })),
         updates: batch.updates.map((s) => ({ sql: s.sql, params: s.params })),
         inserts: batch.inserts.map((s) => ({ sql: s.sql, params: s.params })),
       })
 
+      if (result.txState) {
+        this.txState = result.txState
+      }
       this.tableDetailsCache.clear()
       return {
         ok: true,
@@ -487,13 +561,25 @@ export class SqliteSession implements IDatabaseSession {
     const queryPromise = new Promise<QueryResult>((resolve, reject) => {
       this.pendingRequests.set(reqId, {
         resolve: (rawData) => {
-          const data = rawData as WorkerQueryPayload
+          const data = rawData as WorkerQueryPayload & { txState?: TransactionState }
+          if (data.txState) {
+            this.txState = data.txState
+          }
           this.activeQueries.delete(queryId)
           if (isDdl) {
             this.tableDetailsCache.clear()
           }
+          const payload: WorkerQueryPayload = {
+            isSelect: data.isSelect,
+            columns: data.columns,
+            rows: data.rows,
+            rowCount: data.rowCount,
+            affectedRows: data.affectedRows,
+            truncated: data.truncated,
+            ...(data.resultSets ? { resultSets: data.resultSets } : {}),
+          }
           resolve({
-            ...data,
+            ...payload,
             executionTimeMs: Math.round(performance.now() - start),
           })
         },
@@ -562,6 +648,12 @@ export class SqliteSession implements IDatabaseSession {
       if (this.isClosed || this.closingPromise) {
         return { ok: true }
       }
+      this.txState = {
+        active: false,
+        autoCommit: true,
+        statementCount: 0,
+        supported: true,
+      }
       let spawnedWorker: Worker | null = null
       try {
         spawnedWorker = this.spawnWorker()
@@ -588,6 +680,46 @@ export class SqliteSession implements IDatabaseSession {
       }
     }
   }
+
+  getTransactionState(): TransactionState {
+    return { ...this.txState }
+  }
+
+  async beginTransaction(): Promise<TransactionState> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'sqlite')
+    }
+    const state = await this.sendToWorker<TransactionState>('txBegin')
+    this.txState = state
+    return { ...this.txState }
+  }
+
+  async commitTransaction(): Promise<TransactionState> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'sqlite')
+    }
+    const state = await this.sendToWorker<TransactionState>('txCommit')
+    this.txState = state
+    return { ...this.txState }
+  }
+
+  async rollbackTransaction(): Promise<TransactionState> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'sqlite')
+    }
+    const state = await this.sendToWorker<TransactionState>('txRollback')
+    this.txState = state
+    return { ...this.txState }
+  }
+
+  async setAutoCommit(enabled: boolean): Promise<TransactionState> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'sqlite')
+    }
+    const state = await this.sendToWorker<TransactionState>('txSetAutoCommit', { enabled })
+    this.txState = state
+    return { ...this.txState }
+  }
 }
 
 export class SqliteDriver implements IDatabaseDriver {
@@ -608,16 +740,9 @@ export class SqliteDriver implements IDatabaseDriver {
     profile: ConnectionProfile,
     _secret?: string
   ): Promise<{ ok: boolean; message?: string }> {
-    let session: IDatabaseSession | null = null
-    try {
-      session = await this.createSession(profile)
-      return await session.test()
-    } catch (err: unknown) {
-      return { ok: false, message: extractSqliteErrMessage(err, 'Connection failed') }
-    } finally {
-      if (session) {
-        await session.close().catch(() => {})
-      }
-    }
+    return runDriverConnectionTest(
+      () => this.createSession(profile),
+      (err) => extractSqliteErrMessage(err, 'Connection failed')
+    )
   }
 }

@@ -24,6 +24,14 @@ import {
   tags,
   LanguageSupport,
   StreamLanguage,
+  search,
+  searchKeymap,
+  highlightSelectionMatches,
+  openSearchPanel,
+  foldGutter,
+  codeFolding,
+  foldKeymap,
+  bracketMatching,
   type Extension,
   type SQLDialect,
 } from '../../vendor/codemirror.js'
@@ -156,6 +164,7 @@ export function resolveSqlDialect(dialect: SqlDialectType = 'sqlite'): SQLDialec
       return MariaSQL
     case 'sqlite':
     case 'libsql':
+    case 'd1':
     case 'redis':
     default:
       return SQLite
@@ -566,11 +575,19 @@ export class SqlConsoleController {
       history(),
       autocompletion({ activateOnTyping: true, maxRenderedOptions: 40 }),
       syntaxHighlighting(OLED_HIGHLIGHT_STYLE),
+      search({ top: true }),
+      highlightSelectionMatches(),
+      foldGutter(),
+      codeFolding(),
+      bracketMatching(),
       keymap.of([
         executeAllKeyBinding,
         executeKeyBinding,
         formatSqlKeyBinding,
+        { key: 'Mod-h', run: openSearchPanel },
         ...completionKeymap,
+        ...searchKeymap,
+        ...foldKeymap,
         ...defaultKeymap,
         ...historyKeymap,
       ]),
@@ -580,7 +597,8 @@ export class SqlConsoleController {
       ),
       this.typographyCompartment.of(buildTypographyExtension(this.currentTypography)),
       docChangeListener,
-      EditorView.theme({
+      EditorView.theme(
+        {
         '&': {
           height: '100%',
           width: '100%',
@@ -649,7 +667,9 @@ export class SqlConsoleController {
           fontStyle: 'normal',
           fontSize: '12px',
         },
-      }),
+        },
+        { dark: true }
+      ),
     ]
 
     const state = EditorState.create({
@@ -757,6 +777,31 @@ export class SqlConsoleController {
   public getCaretStatementSql(dialect?: SqlDialectType): string {
     if (!this.view) return ''
     return extractCaretStatementSql(this.view.state, dialect ?? this.currentDialect)
+  }
+
+  /**
+   * Returns the current caret offset, or 0 when the editor is unavailable.
+   */
+  public getCursorOffset(): number {
+    return this.view ? this.view.state.selection.main.head : 0
+  }
+
+  /**
+   * Restores the caret offset, clamped to the current document bounds.
+   */
+  public setCursorOffset(offset: number): void {
+    if (!this.view) return
+    const pos = Math.max(0, Math.min(this.view.state.doc.length, Math.trunc(offset)))
+    this.view.dispatch({ selection: { anchor: pos } })
+  }
+
+  /**
+   * Opens the CodeMirror Find & Replace panel (Ctrl+F / Ctrl+H) when the view is mounted.
+   */
+  public openFindReplace(): void {
+    if (!this.view) return
+    this.view.focus()
+    openSearchPanel(this.view)
   }
 
   /**

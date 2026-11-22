@@ -1,6 +1,6 @@
 // src/editor/studio-modals.ts
-// Fullscreen Studio Modals: Create Table, Danger Truncate/Drop, Command Palette, Keyboard Shortcuts,
-// and Privacy-Safe In-App Feedback / Bug Report Modal
+// Fullscreen Studio Modals: Create Table, Danger Truncate/Drop, Command Palette & Keyboard Shortcuts
+// (Feedback and File Import modals live in dedicated feedback-modal.ts and import-modal.ts modules)
 
 import {
   buildCreateTableSql,
@@ -10,50 +10,61 @@ import {
 } from '../drivers/common/sql-tools.js'
 import type {
   ConnectionProfile,
-  DatabaseDriverType,
   QueryResult,
   SchemaObject,
+  SchemaObjectKind,
 } from '../protocol.js'
-import { copyTextFallback, fuzzyMatchScore, setButtonLoading } from './db-icons.js'
+import { fuzzyMatchScore, setButtonLoading } from './db-icons.js'
+import { DEFAULT_RPC_TIMEOUT_MS } from '../shared-constants.js'
 
-const DEFAULT_RPC_TIMEOUT_MS = 115_000
-const GITHUB_NEW_ISSUE_BASE_URL = 'https://github.com/Thanhh2615/datanoa/issues/new'
+export {
+  sanitizeDiagnosticErrorText,
+  buildStudioDiagnosticSummary,
+  openStudioFeedbackModal,
+  openFeedbackModal,
+  type StudioFeedbackModalContext,
+} from './feedback-modal.js'
+
+export {
+  openStudioImportModal,
+  openImportDataModal,
+  type StudioImportDataModalContext,
+} from './import-modal.js'
 
 export interface StudioModalMountContext {
   mountModal: (modalEl: HTMLElement, canClose?: () => boolean) => HTMLDivElement | null
   closeModal: () => void
 }
 
-export interface StudioCreateTableModalContext extends StudioModalMountContext {
-  activeConnection?: ConnectionProfile
-  activeConnectionId: string | null
-  activeSchema?: string
+export interface StudioRpcModalContext extends StudioModalMountContext {
   updateStatus: (stateText: string, metricsText?: string) => void
-  createElapsedTimer: (onTick: (elapsedText: string, elapsedMs: number) => void) => () => void
   requestPlugin: <T = unknown>(
     method: string,
     payload?: Record<string, unknown>,
     options?: { timeoutMs?: number }
   ) => Promise<T>
+}
+
+export interface StudioTimedRpcModalContext extends StudioRpcModalContext {
+  createElapsedTimer: (onTick: (elapsedText: string, elapsedMs: number) => void) => () => void
+}
+
+export interface StudioCreateTableModalContext extends StudioTimedRpcModalContext {
+  activeConnection?: ConnectionProfile
+  activeConnectionId: string | null
+  activeSchema?: string
   onTableCreated: (connId: string, tableName: string, schema: string | undefined, sql: string) => Promise<void>
 }
 
-export interface StudioDangerTableModalContext extends StudioModalMountContext {
+export interface StudioDangerTableModalContext extends StudioTimedRpcModalContext {
   activeConnection?: ConnectionProfile
   activeConnectionId: string | null
-  updateStatus: (stateText: string, metricsText?: string) => void
   showQueryBanner: (
     kind: 'success' | 'error',
     title: string,
     detail?: string,
     opts?: { onRetry?: () => void; showBackToTable?: boolean }
   ) => void
-  createElapsedTimer: (onTick: (elapsedText: string, elapsedMs: number) => void) => () => void
-  requestPlugin: <T = unknown>(
-    method: string,
-    payload?: Record<string, unknown>,
-    options?: { timeoutMs?: number }
-  ) => Promise<T>
   onDangerActionSucceeded: (
     connId: string,
     action: 'truncate' | 'drop',
@@ -73,83 +84,16 @@ export interface StudioCommandPaletteContext extends StudioModalMountContext {
   openConnectionModal: (editProfile?: ConnectionProfile) => void
   formatSqlInConsole: () => void
   openCreateTableModal: () => void
+  openImportDataModal?: () => void
+  openExportSchemaDdl?: () => void
+  openDriverManagerModal?: () => void
   setSidebarCollapsed: (collapsed: boolean, persist?: boolean) => void
   switchMode: (mode: 'split' | 'grid' | 'sql' | 'inspector') => void
   toggleQueryHistory: () => Promise<void>
   handleRefreshAction: () => Promise<void>
   openShortcutsModal: () => void
   openFeedbackModal: (initialKind?: 'bug' | 'feature') => void
-}
-
-export interface StudioFeedbackModalContext extends StudioModalMountContext {
-  activeDriver: DatabaseDriverType | null
-  activeViewMode: 'split' | 'grid' | 'sql' | 'inspector'
-  isReadOnly: boolean
-  lastQueryErrorText: string
-  updateStatus: (stateText: string, metricsText?: string) => void
-}
-
-/**
- * Strips any URI credentials, hostnames, file paths, or bearer/password tokens
- * from an error string before including it in the diagnostic block.
- */
-export function sanitizeDiagnosticErrorText(rawError: string): string {
-  const raw = String(rawError || '').trim()
-  if (!raw) return ''
-  return raw
-    .replace(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s'"<>]+/g, '<redacted-uri>')
-    .replace(/\b(?:password|passwd|pwd|user|username|token|secret|authToken|api_key|apikey)\s*[:=]\s*[^\s,;'"<>]+/gi, '<redacted-secret>')
-    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer <redacted-token>')
-    .replace(/[A-Za-z]:\\[^\s'"<>]+/g, '<redacted-path>')
-    .replace(/\/(?:Users|home|var|tmp|etc|opt|private|mnt|srv)\/[^\s'"<>]+/g, '<redacted-path>')
-    .replace(/[^\s@'"<>]+@[^\s@'"<>]+\.[^\s@'"<>]+/g, '<redacted-endpoint>')
-    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, '<redacted-ip>')
-    .replace(/\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.(?:co|com|io|net|org|dev|tech|cloud|app|local|internal|lan)(?::\d+)?\b/gi, '<redacted-host>')
-    .replace(/\s+/g, ' ')
-    .slice(0, 280)
-}
-
-function detectOrcaApiVersion(): string {
-  if (typeof window === 'undefined') return 'v1'
-  const api = (window as unknown as { orca?: { api?: { major?: number; minor?: number } } }).orca?.api
-  if (api && typeof api.major === 'number') {
-    return typeof api.minor === 'number' ? `v${api.major}.${api.minor}` : `v${api.major}`
-  }
-  return 'v1'
-}
-
-function detectRuntimePlatform(): string {
-  if (typeof navigator !== 'undefined') {
-    const navPlatform = (navigator as unknown as { userAgentData?: { platform?: string }; platform?: string })
-    const label = navPlatform.userAgentData?.platform || navPlatform.platform || ''
-    if (label.trim()) return label.trim()
-  }
-  if (typeof process !== 'undefined' && typeof process.platform === 'string') {
-    return process.platform
-  }
-  return 'unknown'
-}
-
-export function buildStudioDiagnosticSummary(ctx: {
-  activeDriver: DatabaseDriverType | null
-  activeViewMode: 'split' | 'grid' | 'sql' | 'inspector'
-  isReadOnly: boolean
-  lastQueryErrorText?: string
-}): string {
-  const lines: string[] = [
-    'Datanoa v1.0.4',
-    `Orca API: ${detectOrcaApiVersion()}`,
-    'Surface: Fullscreen Studio',
-    `Active Engine: ${ctx.activeDriver ?? 'none'}`,
-    `View Mode: ${ctx.activeViewMode}`,
-    `Read-Only: ${Boolean(ctx.isReadOnly)}`,
-    `Platform: ${detectRuntimePlatform()}`,
-  ]
-  const sanitizedErr = sanitizeDiagnosticErrorText(ctx.lastQueryErrorText || '')
-  if (sanitizedErr) {
-    lines.push(`Last Error: ${sanitizedErr}`)
-  }
-  return lines.join('\n')
+  openSavedQueriesModal?: () => void
 }
 
 export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): void {
@@ -217,9 +161,9 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
   schemaInput.className = 'datanoa-filter-input'
   schemaInput.placeholder = 'Schema (optional)'
   schemaInput.value =
-    driver !== 'sqlite' && driver !== 'libsql' ? ctx.activeSchema || '' : ''
+    driver !== 'sqlite' && driver !== 'libsql' && driver !== 'd1' ? ctx.activeSchema || '' : ''
   schemaInput.style.flex = '1'
-  if (driver === 'sqlite' || driver === 'libsql') {
+  if (driver === 'sqlite' || driver === 'libsql' || driver === 'd1') {
     schemaInput.style.display = 'none'
   }
 
@@ -427,6 +371,7 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
     })
 
     void (async () => {
+      let created = false
       try {
         await ctx.requestPlugin<QueryResult>(
           'query.run',
@@ -437,10 +382,7 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
           },
           { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
         )
-        stopTimer()
-        isCreating = false
-        ctx.closeModal()
-        await ctx.onTableCreated(connId, targetName, targetSchema, currentSql)
+        created = true
       } catch (err: unknown) {
         stopTimer()
         isCreating = false
@@ -451,6 +393,18 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
         const msg = err instanceof Error ? err.message : String(err)
         execErrBox.textContent = `Create Table failed: ${msg}`
         execErrBox.style.display = 'block'
+        return
+      }
+      if (created) {
+        stopTimer()
+        isCreating = false
+        ctx.closeModal()
+        try {
+          await ctx.onTableCreated(connId, targetName, targetSchema, currentSql)
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err)
+          ctx.updateStatus(`Table created, but refresh failed: ${msg}`)
+        }
       }
     })()
   })
@@ -583,6 +537,7 @@ export function openStudioDangerTableModal(
     })
 
     void (async () => {
+      let executed = false
       try {
         await ctx.requestPlugin<QueryResult>(
           'query.run',
@@ -593,10 +548,7 @@ export function openStudioDangerTableModal(
           },
           { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
         )
-        stopTimer()
-        isExecuting = false
-        ctx.closeModal()
-        await ctx.onDangerActionSucceeded(connId, action, item, actionTitle, sql)
+        executed = true
       } catch (err: unknown) {
         stopTimer()
         isExecuting = false
@@ -607,6 +559,18 @@ export function openStudioDangerTableModal(
         const msg = err instanceof Error ? err.message : String(err)
         execErrBox.textContent = `Execution failed: ${msg}`
         execErrBox.style.display = 'block'
+        return
+      }
+      if (executed) {
+        stopTimer()
+        isExecuting = false
+        ctx.closeModal()
+        try {
+          await ctx.onDangerActionSucceeded(connId, action, item, actionTitle, sql)
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err)
+          ctx.updateStatus(`${actionTitle} succeeded, but refresh failed: ${msg}`)
+        }
       }
     })()
   })
@@ -628,11 +592,22 @@ export function openStudioCommandPalette(ctx: StudioCommandPaletteContext): void
     run: () => void
   }
 
+  const kindCategory: Record<SchemaObjectKind, string> = {
+    table: 'Table',
+    view: 'View',
+    materialized_view: 'Mat View',
+    function: 'Function',
+    procedure: 'Procedure',
+    trigger: 'Trigger',
+    sequence: 'Sequence',
+    type: 'Type',
+  }
+
   const entries: PaletteEntry[] = []
   for (const obj of ctx.schemaObjects) {
     entries.push({
       label: obj.schema ? `${obj.schema}.${obj.name}` : obj.name,
-      category: obj.kind === 'view' ? 'View' : 'Table',
+      category: kindCategory[obj.kind] || 'Table',
       searchText: `${obj.name} ${obj.schema || ''} ${obj.kind}`,
       run: () => {
         ctx.selectSidebarObject(obj)
@@ -640,10 +615,11 @@ export function openStudioCommandPalette(ctx: StudioCommandPaletteContext): void
     })
   }
   for (const conn of ctx.connections) {
+    const folderBadge = conn.folder ? ` [${conn.folder}]` : ''
     entries.push({
-      label: `${conn.name} (${conn.driver})`,
+      label: `${conn.name} (${conn.driver})${folderBadge}`,
       category: 'Connection',
-      searchText: `${conn.name} ${conn.driver} connection`,
+      searchText: `${conn.name} ${conn.driver} connection ${conn.folder || ''} ${conn.workspaceScope || ''}`,
       run: () => {
         ctx.selectConnection(conn.id)
       },
@@ -668,6 +644,26 @@ export function openStudioCommandPalette(ctx: StudioCommandPaletteContext): void
       searchText: 'new create table',
       run: () => ctx.openCreateTableModal(),
     },
+    ...(ctx.openImportDataModal
+      ? [
+          {
+            label: 'Import CSV / JSON File...',
+            category: 'Command',
+            searchText: 'import csv tsv json ndjson file upload load rows',
+            run: () => ctx.openImportDataModal?.(),
+          },
+        ]
+      : []),
+    ...(ctx.openExportSchemaDdl
+      ? [
+          {
+            label: 'Export Full Schema DDL (.sql)...',
+            category: 'Command',
+            searchText: 'export full schema ddl sql database dump backup',
+            run: () => ctx.openExportSchemaDdl?.(),
+          },
+        ]
+      : []),
     {
       label: 'Toggle Sidebar / Horizontal Top Bar',
       category: 'Command',
@@ -706,6 +702,16 @@ export function openStudioCommandPalette(ctx: StudioCommandPaletteContext): void
         void ctx.toggleQueryHistory()
       },
     },
+    ...(ctx.openSavedQueriesModal
+      ? [
+          {
+            label: 'Saved Queries / SQL Snippets...',
+            category: 'Command',
+            searchText: 'saved queries snippets library sql bookmark insert load',
+            run: () => ctx.openSavedQueriesModal?.(),
+          },
+        ]
+      : []),
     {
       label: 'Refresh Schema',
       category: 'Command',
@@ -719,6 +725,20 @@ export function openStudioCommandPalette(ctx: StudioCommandPaletteContext): void
       category: 'Command',
       searchText: 'keyboard shortcuts help cheatsheet',
       run: () => ctx.openShortcutsModal(),
+    },
+    {
+      label: 'Toggle Light / Dark Theme',
+      category: 'Command',
+      searchText: 'toggle theme light dark appearance mode color scheme',
+      run: () => {
+        if (typeof document !== 'undefined') {
+          const isLight = !document.documentElement.classList.contains('light')
+          document.documentElement.classList.toggle('light', isLight)
+          document.documentElement.classList.toggle('dark', !isLight)
+          document.body?.classList.toggle('light', isLight)
+          document.body?.classList.toggle('dark', !isLight)
+        }
+      },
     },
     {
       label: 'Report Bug / Request Feature...',
@@ -859,6 +879,8 @@ export function openStudioShortcutsModal(ctx: StudioModalMountContext): void {
       items: [
         ['Ctrl+Enter / Cmd+Enter', 'Execute statement at caret (or selection)'],
         ['Ctrl+Shift+Enter', 'Execute all statements in console'],
+        ['Ctrl+F / Ctrl+H', 'SQL Console: find & replace'],
+        ['Ctrl+Shift+[ / ]', 'Fold / Unfold SQL block'],
         ['Shift+Alt+F', 'Format SQL in console'],
       ],
     },
@@ -867,10 +889,11 @@ export function openStudioShortcutsModal(ctx: StudioModalMountContext): void {
       items: [
         ['Arrow / Shift+Arrow', 'Navigate cells & extend rectangular selection'],
         ['Ctrl+A', 'Select all visible cells'],
-        ['Ctrl+C / Ctrl+V', 'Copy selection as TSV / Paste TSV or CSV'],
+        ['Ctrl+C / Ctrl+V', 'Copy selection as TSV / Smart Paste (overwrite + overflow, or new rows if empty)'],
+        ['Ctrl+Shift+V', 'Paste clipboard rows as new staged row(s)'],
         ['Enter / F2', 'Edit focused cell inline'],
         ['Delete / Backspace', 'Set selected cells to NULL'],
-        ['Ctrl+F', 'Find & highlight cells in grid'],
+        ['Ctrl+F', 'Data Grid: find & highlight cells'],
         ['Ctrl+S', 'Submit staged data edits or schema migration'],
         ['Ctrl+Scroll', 'Horizontal pan across wide tables'],
         ['Ctrl+Click (FK cell)', 'Jump to referenced Foreign Key row'],
@@ -918,213 +941,3 @@ export function openStudioShortcutsModal(ctx: StudioModalMountContext): void {
 }
 
 export const openShortcutsModal = openStudioShortcutsModal
-
-export function openStudioFeedbackModal(
-  ctx: StudioFeedbackModalContext,
-  initialKind: 'bug' | 'feature' = 'bug'
-): void {
-  if (typeof document === 'undefined') return
-  let kind: 'bug' | 'feature' = initialKind
-
-  const modal = document.createElement('div')
-  modal.className = 'datanoa-feedback-modal'
-
-  const head = document.createElement('div')
-  head.className = 'datanoa-modal-head'
-  const titleEl = document.createElement('span')
-  titleEl.textContent = 'Report Issue / Request Feature'
-  const closeBtn = document.createElement('button')
-  closeBtn.type = 'button'
-  closeBtn.className = 'datanoa-btn datanoa-btn-sm'
-  closeBtn.textContent = 'Close'
-  closeBtn.addEventListener('click', () => ctx.closeModal())
-  head.appendChild(titleEl)
-  head.appendChild(closeBtn)
-
-  const body = document.createElement('div')
-  body.className = 'datanoa-modal-body'
-
-  const noticeBox = document.createElement('div')
-  noticeBox.className = 'datanoa-modal-box datanoa-feedback-notice'
-  noticeBox.style.display = 'none'
-  noticeBox.setAttribute('role', 'status')
-  const showNotice = (status: 'success' | 'neutral', text: string): void => {
-    noticeBox.className = `datanoa-modal-box datanoa-feedback-notice${status === 'success' ? ' success' : ''}`
-    noticeBox.textContent = text
-    noticeBox.style.display = 'block'
-  }
-  body.appendChild(noticeBox)
-
-  // Kind Toggle: Bug Report vs Feature Request / UI Improvement
-  const kindRow = document.createElement('div')
-  kindRow.className = 'datanoa-feedback-kind-group'
-  const bugBtn = document.createElement('button')
-  bugBtn.type = 'button'
-  bugBtn.dataset.kind = 'bug'
-  bugBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-feedback-kind-btn'
-  bugBtn.textContent = 'Bug Report'
-
-  const featureBtn = document.createElement('button')
-  featureBtn.type = 'button'
-  featureBtn.dataset.kind = 'feature'
-  featureBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-feedback-kind-btn'
-  featureBtn.textContent = 'Feature Request / UI Improvement'
-
-  kindRow.appendChild(bugBtn)
-  kindRow.appendChild(featureBtn)
-  body.appendChild(kindRow)
-
-  // Summary / Title
-  const titleField = document.createElement('div')
-  titleField.className = 'datanoa-conn-field is-full'
-  const titleLabel = document.createElement('label')
-  titleLabel.textContent = 'Summary / Title'
-  const titleInput = document.createElement('input')
-  titleInput.type = 'text'
-  titleInput.className = 'datanoa-feedback-title-input datanoa-filter-input'
-  titleInput.placeholder = 'Brief summary of the bug or feature request...'
-  titleField.appendChild(titleLabel)
-  titleField.appendChild(titleInput)
-  body.appendChild(titleField)
-
-  // Details / Steps to Reproduce
-  const bodyField = document.createElement('div')
-  bodyField.className = 'datanoa-conn-field is-full'
-  const bodyLabel = document.createElement('label')
-  bodyLabel.textContent = 'Details / Steps to Reproduce'
-  const bodyTextarea = document.createElement('textarea')
-  bodyTextarea.className = 'datanoa-feedback-body-input datanoa-value-textarea'
-  bodyTextarea.rows = 5
-  bodyTextarea.placeholder = 'Steps to reproduce, expected behavior, and actual behavior...'
-  bodyField.appendChild(bodyLabel)
-  bodyField.appendChild(bodyTextarea)
-  body.appendChild(bodyField)
-
-  // Privacy-Safe Diagnostic Summary
-  const diagField = document.createElement('div')
-  diagField.className = 'datanoa-conn-field is-full'
-  const diagLabel = document.createElement('label')
-  diagLabel.textContent = 'Privacy-Safe Diagnostic Summary (no hosts, credentials, or paths)'
-  const diagPre = document.createElement('pre')
-  diagPre.className = 'datanoa-feedback-diag datanoa-modal-sql'
-  diagPre.setAttribute('contenteditable', 'true')
-  diagPre.spellcheck = false
-  diagPre.textContent = buildStudioDiagnosticSummary({
-    activeDriver: ctx.activeDriver,
-    activeViewMode: ctx.activeViewMode,
-    isReadOnly: ctx.isReadOnly,
-    lastQueryErrorText: ctx.lastQueryErrorText,
-  })
-  diagField.appendChild(diagLabel)
-  diagField.appendChild(diagPre)
-  body.appendChild(diagField)
-
-  const syncKindPresentation = (): void => {
-    const isBug = kind === 'bug'
-    bugBtn.classList.toggle('active', isBug)
-    bugBtn.classList.toggle('datanoa-btn-primary', isBug)
-    featureBtn.classList.toggle('active', !isBug)
-    featureBtn.classList.toggle('datanoa-btn-primary', !isBug)
-    bodyLabel.textContent = isBug
-      ? 'Details / Steps to Reproduce'
-      : 'Feature Description / Use Case'
-    bodyTextarea.placeholder = isBug
-      ? 'Steps to reproduce, expected behavior, and actual behavior...'
-      : 'Describe the feature or UI improvement and how it helps your workflow...'
-  }
-
-  bugBtn.addEventListener('click', () => {
-    kind = 'bug'
-    syncKindPresentation()
-  })
-  featureBtn.addEventListener('click', () => {
-    kind = 'feature'
-    syncKindPresentation()
-  })
-  syncKindPresentation()
-
-  const buildReportPayload = (): { title: string; markdownBody: string; githubUrl: string } => {
-    const rawTitle = titleInput.value.trim()
-    const prefix = kind === 'bug' ? '[Bug]' : '[Feature]'
-    const defaultTitle =
-      kind === 'bug' ? 'Fullscreen Studio issue report' : 'Studio feature request'
-    const baseTitle = rawTitle || defaultTitle
-    const title = baseTitle.startsWith('[') ? baseTitle : `${prefix} ${baseTitle}`
-    const details =
-      bodyTextarea.value.trim() ||
-      (kind === 'bug'
-        ? '_Describe the steps to reproduce and what happened._'
-        : '_Describe the proposed feature or UI improvement._')
-    const diagText = (diagPre.textContent || '').trim()
-    const sectionHeader =
-      kind === 'bug' ? '### Steps to Reproduce / Details' : '### Feature Request / Details'
-    const markdownBody = `${sectionHeader}\n${details}\n\n### Environment Diagnostics\n\`\`\`text\n${diagText}\n\`\`\``
-    const templateParam = kind === 'bug' ? 'bug_report.yml' : 'feature_request.yml'
-    const labelParam = kind === 'bug' ? 'bug' : 'enhancement'
-    const githubUrl = `${GITHUB_NEW_ISSUE_BASE_URL}?template=${templateParam}&labels=${labelParam}&title=${encodeURIComponent(title)}&body=${encodeURIComponent(markdownBody)}`
-    return { title, markdownBody, githubUrl }
-  }
-
-  const actions = document.createElement('div')
-  actions.className = 'datanoa-modal-actions'
-
-  const cancelBtn = document.createElement('button')
-  cancelBtn.type = 'button'
-  cancelBtn.className = 'datanoa-btn datanoa-btn-sm'
-  cancelBtn.textContent = 'Cancel'
-  cancelBtn.addEventListener('click', () => ctx.closeModal())
-
-  const copyBtn = document.createElement('button')
-  copyBtn.type = 'button'
-  copyBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-feedback-copy-btn'
-  copyBtn.textContent = 'Copy Report'
-  copyBtn.addEventListener('click', () => {
-    const { title, markdownBody } = buildReportPayload()
-    const fullMarkdown = `## ${title}\n\n${markdownBody}`
-    copyTextFallback(fullMarkdown, copyBtn)
-    showNotice('success', 'Copied full Markdown report to clipboard.')
-    ctx.updateStatus('Copied feedback report to clipboard')
-  })
-
-  const githubBtn = document.createElement('button')
-  githubBtn.type = 'button'
-  githubBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-btn-primary datanoa-feedback-github-btn'
-  githubBtn.textContent = 'Open on GitHub Issues ↗'
-  githubBtn.addEventListener('click', () => {
-    const { title, markdownBody, githubUrl } = buildReportPayload()
-    const fullMarkdown = `## ${title}\n\n${markdownBody}`
-    copyTextFallback(fullMarkdown)
-    const openExternalFn =
-      typeof window !== 'undefined'
-        ? (
-            window as unknown as {
-              orca?: { shell?: { openExternal?: (url: string) => unknown } }
-            }
-          ).orca?.shell?.openExternal
-        : undefined
-    if (typeof openExternalFn === 'function') {
-      try {
-        void Promise.resolve(openExternalFn(githubUrl)).catch(() => {})
-      } catch {
-        // Fallback already copied to clipboard
-      }
-    }
-    showNotice(
-      'success',
-      'Report copied to clipboard and prepared for GitHub Issues (github.com/Thanhh2615/datanoa/issues).'
-    )
-    ctx.updateStatus('Opened GitHub Issues & copied report to clipboard')
-  })
-
-  actions.appendChild(cancelBtn)
-  actions.appendChild(copyBtn)
-  actions.appendChild(githubBtn)
-
-  modal.appendChild(head)
-  modal.appendChild(body)
-  modal.appendChild(actions)
-  ctx.mountModal(modal)
-  titleInput.focus?.()
-}
-
-export const openFeedbackModal = openStudioFeedbackModal

@@ -4,7 +4,7 @@
   "id": "datanoa",
   "publisher": "thanhh2615",
   "name": "Datanoa Studio",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "license": "MIT",
   "author": {
     "name": "Thanhh2615",
@@ -15,41 +15,41 @@
   "icon": "assets/icon.png",
   "cover": {
     "path": "images/cover.webp",
-    "alt": "Datanoa Studio database client for Orca showing SQL editor, interactive data grid, schema explorer, and 8 supported database engines"
+    "alt": "Datanoa Studio database client for Orca with multi-tab SQL editor, interactive data grid, schema explorer, 9 built-in engines, and BYOD local drivers"
   },
   "screenshots": [
     {
       "path": "images/studio-split-view.webp",
-      "alt": "Datanoa Studio split view with PostgreSQL SQL console, interactive data grid, multi-cell selection aggregates, and JSON value inspector",
-      "caption": "Split View with SQL Console, Interactive Data Grid, and JSON Inspector",
+      "alt": "Datanoa Studio split view with multi-tab PostgreSQL SQL console, manual transactions, interactive data grid with Smart Paste, and JSON inspector",
+      "caption": "Multi-tab SQL Console, Manual Transactions, Data Grid, and JSON Inspector",
       "theme": "dark"
     },
     {
       "path": "images/studio-connection-modal.webp",
-      "alt": "Datanoa New Database Connection modal with 8 database engines, quick URI parser, and .env and SQLite auto-discovery",
-      "caption": "Connect to 8 database engines with URI parsing and .env/.db auto-discovery",
+      "alt": "Datanoa Connection Manager with 9 built-in engines including Cloudflare D1, BYOD local drivers, SSH tunnels, TLS/mTLS, folders, and .env/.db discovery",
+      "caption": "9 built-in engines, BYOD local drivers, SSH tunnels, TLS/mTLS, and URI/.env auto-detect",
       "theme": "dark"
     },
     {
       "path": "images/schema-designer.webp",
-      "alt": "Datanoa Visual Table Structure Designer showing staged column edits, data type combobox, foreign keys, indexes, and live migration SQL preview",
+      "alt": "Datanoa Visual Table Structure Designer showing staged column edits, dialect data type combobox, foreign keys, indexes, and live migration SQL preview",
       "caption": "Visual table structure designer with live DDL migration preview",
       "theme": "dark"
     },
     {
       "path": "images/studio-light-theme.webp",
-      "alt": "Datanoa Studio in light theme with horizontal top table bar, pinned columns, and instant find highlighting",
-      "caption": "Light theme support with pinned columns and instant filter/find",
+      "alt": "Datanoa Studio in light theme with horizontal top table bar, grouped All (N) object popover, pinned columns, and instant find highlighting",
+      "caption": "Light theme with horizontal top table bar, pinned columns, and instant find",
       "theme": "light"
     },
     {
       "path": "images/side-panel-explorer.webp",
-      "alt": "Datanoa Side Panel showing schema explorer tree, interactive data grid with live aggregates, and quick SQL runner",
-      "caption": "Docked Side Panel explorer, data grid, and quick SQL runner",
+      "alt": "Datanoa Side Panel showing schema explorer tree with folders, virtualized data grid with Smart Copy & Paste and live aggregates, and quick SQL runner",
+      "caption": "Docked Side Panel explorer, data grid with Smart Paste, and quick SQL runner",
       "theme": "dark"
     }
   ],
-  "description": "All-in-one database client and SQL studio for Orca. Browse tables, edit data inline, design schemas, and run queries across SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, and Turso/LibSQL.",
+  "description": "All-in-one database client and SQL studio for Orca. Browse multi-schema objects, edit data inline, paste spreadsheets, import CSV/JSON, design schemas, run multi-tab SQL with bind params and manual transactions over SSH/TLS across 9 built-in engines (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, Turso/LibSQL, Cloudflare D1) plus SHA-256-verified local BYOD drivers.",
   "engines": {
     "orca": ">=1.4.248"
   },

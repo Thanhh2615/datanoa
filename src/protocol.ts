@@ -1,9 +1,24 @@
-// D:\orca-custom-extensions\datanoa\src\protocol.ts
+// src/protocol.ts
 // Type-safe IPC request-response and event protocol for Datanoa DB Studio
 
-export type DatabaseDriverType = 'sqlite' | 'postgres' | 'mysql' | 'mariadb' | 'cockroachdb' | 'clickhouse' | 'redis' | 'libsql'
+export type DatabaseDriverType =
+  | 'sqlite'
+  | 'postgres'
+  | 'mysql'
+  | 'mariadb'
+  | 'cockroachdb'
+  | 'clickhouse'
+  | 'redis'
+  | 'libsql'
+  | 'd1'
 
 export type ConnectionColorTag = 'none' | 'dev' | 'staging' | 'prod'
+
+/** TLS negotiation mode for TCP engines (`auto` keeps legacy profile.ssl / cloud auto-SSL behaviour) */
+export type SslMode = 'auto' | 'disable' | 'require' | 'verify-ca' | 'verify-full'
+
+/** SSH bastion authentication method (non-interactive; OS `ssh -N -L`) */
+export type SshAuthMethod = 'agent' | 'key' | 'password'
 
 export interface ConnectionProfile {
   id: string
@@ -20,14 +35,49 @@ export interface ConnectionProfile {
   url?: string
   redisDb?: number
   hasAuthToken?: boolean
+  /** Cloudflare D1 REST account identifier (never the API token). */
+  d1AccountId?: string
+  /** Cloudflare D1 database identifier. */
+  d1DatabaseId?: string
   colorTag?: ConnectionColorTag
   options?: string
+  /** Optional user-defined folder / group label (trimmed, max 64 chars). */
+  folder?: string
+  /** Optional workspace scope key this connection is pinned to (max 260 chars). */
+  workspaceScope?: string
+  // --- Custom CA / Client Cert (mTLS) ---
+  sslMode?: SslMode
+  sslCaPath?: string
+  sslCertPath?: string
+  sslKeyPath?: string
+  hasSslKeyPassphrase?: boolean
+  sslRejectUnauthorized?: boolean
+  // --- SSH Tunnel (bastion) ---
+  sshEnabled?: boolean
+  sshHost?: string
+  sshPort?: number
+  sshUser?: string
+  sshAuthMethod?: SshAuthMethod
+  sshPrivateKeyPath?: string
+  hasSshPassphrase?: boolean
+  hasSshPassword?: boolean
 }
+
+export type SchemaObjectKind =
+  | 'table'
+  | 'view'
+  | 'materialized_view'
+  | 'function'
+  | 'procedure'
+  | 'trigger'
+  | 'sequence'
+  | 'type'
 
 export interface SchemaObject {
   name: string
   schema: string
-  kind: 'table' | 'view'
+  kind: SchemaObjectKind
+  detail?: string
 }
 
 export interface ColumnInfo {
@@ -53,6 +103,9 @@ export interface ForeignKeyInfo {
   column: string
   referencedTable: string
   referencedColumn: string
+  onDelete?: string
+  onUpdate?: string
+  referencedSchema?: string
 }
 
 export interface TableDetails {
@@ -64,6 +117,17 @@ export interface TableDetails {
   indexes: IndexInfo[]
   foreignKeys: ForeignKeyInfo[]
   ddl?: string
+}
+
+export interface SavedQueryEntry {
+  id: string
+  name: string
+  sql: string
+  description?: string
+  dialect?: DatabaseDriverType
+  tags?: string[]
+  createdAt: number
+  updatedAt: number
 }
 
 export interface QueryHistoryEntry {
@@ -92,6 +156,23 @@ export interface DataChangesInput {
   deletes?: Record<string, unknown>[]
 }
 
+export interface QueryResultSourceTable {
+  table: string
+  schema?: string
+}
+
+export interface QueryResultSet {
+  index: number
+  sqlPreview?: string
+  columns: { name: string; type: string }[]
+  rows: unknown[][]
+  rowCount: number
+  affectedRows?: number
+  truncated: boolean
+  isSelect: boolean
+  sourceTable?: QueryResultSourceTable
+}
+
 export interface QueryResult {
   columns: { name: string; type: string }[]
   rows: unknown[][]
@@ -100,6 +181,8 @@ export interface QueryResult {
   executionTimeMs: number
   truncated: boolean
   isSelect: boolean
+  sourceTable?: QueryResultSourceTable
+  resultSets?: QueryResultSet[]
 }
 
 export interface TableBrowseResult {
@@ -112,56 +195,54 @@ export interface TableBrowseResult {
   canEdit: boolean
 }
 
+export interface TransactionState {
+  active: boolean
+  autoCommit: boolean
+  statementCount: number
+  startedAt?: number
+  supported: boolean
+  reason?: string
+  aborted?: boolean
+}
+
 /** Storage key for persisting saved connections */
 export const SAVED_CONNECTIONS_STORAGE_KEY = 'datanoa.savedConnections'
 
 /** Storage key for active connection */
 export const ACTIVE_CONNECTION_STORAGE_KEY = 'datanoa.activeConnectionId'
 
-export interface PluginRequests {
+interface DatanoaPluginRequests {
   'connections.list': {
     input?: Record<string, never>
     output: ConnectionProfile[]
-    params: Record<string, never>
-    response: ConnectionProfile[]
   }
   'connection.save': {
     input: {
       profile: ConnectionProfile
       password?: string
       authToken?: string
+      sslKeyPassphrase?: string
+      sshPassphrase?: string
+      sshPassword?: string
       sourceConnectionId?: string
     }
     output: { ok: boolean; id: string }
-    params: {
-      profile: ConnectionProfile
-      password?: string
-      authToken?: string
-      sourceConnectionId?: string
-    }
-    response: { ok: boolean; id: string }
   }
   'connection.delete': {
     input: { id: string }
     output: { ok: boolean }
-    params: { id: string }
-    response: { ok: boolean }
   }
   'connection.test': {
     input: {
       profile: ConnectionProfile
       password?: string
       authToken?: string
+      sslKeyPassphrase?: string
+      sshPassphrase?: string
+      sshPassword?: string
       sourceConnectionId?: string
     }
     output: { ok: boolean; message?: string }
-    params: {
-      profile: ConnectionProfile
-      password?: string
-      authToken?: string
-      sourceConnectionId?: string
-    }
-    response: { ok: boolean; message?: string }
   }
   'connection.parseUri': {
     input: { uri: string }
@@ -173,27 +254,26 @@ export interface PluginRequests {
       placeholderPassword?: boolean
       error?: string
     }
-    params: { uri: string }
-    response: {
-      ok: boolean
-      profile?: Partial<ConnectionProfile>
-      password?: string
-      authToken?: string
-      placeholderPassword?: boolean
-      error?: string
-    }
   }
   'schema.listObjects': {
     input: { connectionId: string; schema?: string }
     output: SchemaObject[]
-    params: { connectionId: string; schema?: string }
-    response: SchemaObject[]
   }
   'schema.tableDetails': {
     input: { connectionId: string; table: string; schema?: string }
     output: TableDetails
-    params: { connectionId: string; table: string; schema?: string }
-    response: TableDetails
+  }
+  'schema.listSchemas': {
+    input: { connectionId: string }
+    output: { schemas: string[]; defaultSchema: string }
+  }
+  'schema.getObjectDdl': {
+    input: { connectionId: string; name: string; kind: SchemaObjectKind; schema?: string }
+    output: { ddl: string }
+  }
+  'schema.exportSchemaDdl': {
+    input: { connectionId: string; schema?: string }
+    output: { ddl: string; objectCount: number; fileName: string }
   }
   'data.fetchPage': {
     input: {
@@ -208,18 +288,6 @@ export interface PluginRequests {
       orderByClause?: string
     }
     output: TableBrowseResult
-    params: {
-      connectionId: string
-      table: string
-      schema?: string
-      page: number
-      pageSize: number
-      sortColumn?: string
-      sortDirection?: 'ASC' | 'DESC'
-      whereClause?: string
-      orderByClause?: string
-    }
-    response: TableBrowseResult
   }
   'data.updateCell': {
     input: {
@@ -232,16 +300,6 @@ export interface PluginRequests {
       originalValue?: unknown
     }
     output: { ok: boolean; affectedRows: number; updatedRecord?: Record<string, unknown> }
-    params: {
-      connectionId: string
-      table: string
-      schema?: string
-      primaryKeys: Record<string, unknown>
-      column: string
-      newValue: unknown
-      originalValue?: unknown
-    }
-    response: { ok: boolean; affectedRows: number; updatedRecord?: Record<string, unknown> }
   }
   'query.run': {
     input: {
@@ -251,46 +309,22 @@ export interface PluginRequests {
       maxRows?: number
     }
     output: QueryResult
-    params: {
-      connectionId: string
-      queryId: string
-      sql: string
-      maxRows?: number
-    }
-    response: QueryResult
   }
   'query.cancel': {
     input: { queryId: string }
     output: { ok: boolean }
-    params: { queryId: string }
-    response: { ok: boolean }
   }
   'sqlite.scanFolder': {
     input: { folderPath?: string }
     output: { files: { name: string; filePath: string; sizeBytes: number; sizeLabel: string }[] }
-    params: { folderPath?: string }
-    response: { files: { name: string; filePath: string; sizeBytes: number; sizeLabel: string }[] }
   }
   'studio.open': {
     input: { connectionId?: string; table?: string; schema?: string; sql?: string }
     output: { ok: boolean; path?: string; message?: string }
-    params: { connectionId?: string; table?: string; schema?: string; sql?: string }
-    response: { ok: boolean; path?: string; message?: string }
   }
   'workspace.detectConnections': {
     input: { folderPath?: string }
     output: {
-      sqliteFiles: { name: string; filePath: string; sizeBytes: number; sizeLabel: string }[]
-      envConnections: {
-        envKey: string
-        sourceFile: string
-        driver: DatabaseDriverType
-        name: string
-        uri: string
-      }[]
-    }
-    params: { folderPath?: string }
-    response: {
       sqliteFiles: { name: string; filePath: string; sizeBytes: number; sizeLabel: string }[]
       envConnections: {
         envKey: string
@@ -310,48 +344,214 @@ export interface PluginRequests {
       deleted: number
       statements: string[]
     }
-    params: DataChangesInput
-    response: {
-      ok: boolean
-      inserted: number
-      updated: number
-      deleted: number
-      statements: string[]
-    }
   }
   'data.previewChanges': {
     input: DataChangesInput
     output: { statements: string[] }
-    params: DataChangesInput
-    response: { statements: string[] }
   }
   'schema.generateDdl': {
     input: { connectionId: string; table: string; schema?: string }
     output: { ddl: string }
-    params: { connectionId: string; table: string; schema?: string }
-    response: { ddl: string }
   }
   'query.explain': {
     input: { connectionId: string; sql: string; queryId?: string }
     output: QueryResult
-    params: { connectionId: string; sql: string; queryId?: string }
-    response: QueryResult
   }
   'query.history.list': {
     input: { limit?: number } | undefined
     output: { entries: QueryHistoryEntry[] }
-    params: { limit?: number } | undefined
-    response: { entries: QueryHistoryEntry[] }
   }
   'query.history.clear': {
     input?: Record<string, never>
     output: { ok: boolean }
-    params: Record<string, never>
-    response: { ok: boolean }
+  }
+  'queries.saved.list': {
+    input?: Record<string, never>
+    output: { entries: SavedQueryEntry[] }
+  }
+  'queries.saved.save': {
+    input: {
+      id?: string
+      name: string
+      sql: string
+      description?: string
+      dialect?: DatabaseDriverType
+      tags?: string[]
+    }
+    output: { ok: boolean; entry: SavedQueryEntry }
+  }
+  'queries.saved.delete': {
+    input: { id: string }
+    output: { ok: boolean }
+  }
+  'tx.status': {
+    input: { connectionId: string }
+    output: TransactionState
+  }
+  'tx.begin': {
+    input: { connectionId: string }
+    output: TransactionState
+  }
+  'tx.commit': {
+    input: { connectionId: string }
+    output: TransactionState
+  }
+  'tx.rollback': {
+    input: { connectionId: string }
+    output: TransactionState
+  }
+  'tx.setAutoCommit': {
+    input: { connectionId: string; enabled: boolean }
+    output: TransactionState
+  }
+  'drivers.list': {
+    input?: Record<string, never>
+    output: { drivers: DriverRegistryItem[] }
+  }
+  'drivers.inspectLocal': {
+    input: { driverId: string; localPath: string }
+    output: DriverInspectResult
+  }
+  'drivers.configureLocal': {
+    input: { driverId: string; localPath: string; name?: string; trustedSha256: string }
+    output: { ok: boolean; item: DriverRegistryItem }
+  }
+  'drivers.verify': {
+    input: { driverId: string; trustedSha256?: string }
+    output: DriverVerifyResult
+  }
+  'drivers.removeLocal': {
+    input: { driverId: string }
+    output: { ok: boolean }
+  }
+  'drivers.defaultPaths': {
+    input?: Record<string, never>
+    output: {
+      baseDir: string
+      platform: string
+      paths: Record<string, string>
+      templates?: Record<string, string>
+    }
+  }
+  'drivers.setupLocal': {
+    input: {
+      driverId: string
+      localPath: string
+      runNpmInstall?: boolean
+      autoTrust?: boolean
+    }
+    output: {
+      ok: boolean
+      dirPath: string
+      entryPath: string
+      wroteCanonicalEntry?: boolean
+      installedPackage?: string
+      inspect: DriverInspectResult
+      item?: DriverRegistryItem
+    }
+  }
+  'fs.pickFile': {
+    input?: { title?: string; filter?: string; initialDir?: string }
+    output: { ok: boolean; path?: string; cancelled?: boolean }
+  }
+  'fs.pickFolder': {
+    input?: { title?: string; initialDir?: string }
+    output: { ok: boolean; path?: string; cancelled?: boolean }
+  }
+  'workspace.listScopes': {
+    input?: Record<string, never>
+    output: {
+      currentScopeId: string
+      currentScopeLabel: string
+      workspaces: Array<{
+        id: string
+        name: string
+        branch?: string
+        path?: string
+        projectFolder: string
+        label: string
+        isCurrent: boolean
+      }>
+    }
+  }
+  'ui.getSessionSnapshot': {
+    input: { surface?: 'panel' | 'studio' }
+    output: {
+      viewState: Record<string, unknown> | null
+      dataCache: Record<string, unknown> | null
+      updatedAt: number
+    }
+  }
+  'ui.saveSessionSnapshot': {
+    input: {
+      surface?: 'panel' | 'studio'
+      viewState?: Record<string, unknown> | null
+      dataCache?: Record<string, unknown> | null
+    }
+    output: { ok: true; updatedAt: number }
   }
 }
 
-export interface PluginPanelEvents {
+type WithLegacyRequestAliases<T extends { output: unknown }> = T &
+  (T extends { input: infer I }
+    ? { params: I }
+    : T extends { input?: infer I }
+      ? { params?: Exclude<I, undefined> }
+      : { params?: never }) & {
+    response: T['output']
+  }
+
+export type PluginRequests = {
+  [K in keyof DatanoaPluginRequests]: WithLegacyRequestAliases<DatanoaPluginRequests[K]>
+}
+
+export type DriverRegistryCategory = 'builtin' | 'local-byod'
+export type DriverRegistryStatus = 'builtin' | 'local-verified' | 'local-error' | 'not-configured'
+
+export interface DriverInspectResult {
+  ok: boolean
+  driverId: string
+  localPath: string
+  resolvedEntry: string
+  sha256: string
+  byteLength: number
+  scopeNote: string
+}
+
+export interface DriverRegistryItem {
+  id: string
+  name: string
+  description: string
+  category: DriverRegistryCategory
+  transport: string
+  packaging: string
+  status: DriverRegistryStatus
+  localPath?: string
+  resolvedEntry?: string
+  sha256?: string
+  verifiedAt?: number
+  error?: string
+}
+
+export interface PersistedLocalDriverConfig {
+  id: string
+  name?: string
+  localPath: string
+  resolvedEntry: string
+  sha256: string
+  verifiedAt: number
+}
+
+export interface DriverVerifyResult {
+  ok: boolean
+  sha256Changed: boolean
+  requiresTrust?: boolean
+  pendingSha256?: string
+  item: DriverRegistryItem
+  message: string
+}
+
+interface DatanoaPluginPanelEvents {
   'connections.changed': { count: number }
   'data.cellUpdated': {
     connectionId?: string
@@ -361,6 +561,8 @@ export interface PluginPanelEvents {
     column: string
   }
 }
+
+export type PluginPanelEvents = DatanoaPluginPanelEvents
 
 /**
  * Recursively converts any payload into a strict Orca JsonValue:
@@ -410,152 +612,8 @@ export function sanitizeJsonPayload<T>(value: T): T {
 
 declare module 'orca' {
   // eslint-disable-next-line @typescript-eslint/no-empty-interface
-  interface PluginRequests {
-    'connections.list': {
-      input?: Record<string, never>
-      output: ConnectionProfile[]
-    }
-    'connection.save': {
-      input: {
-        profile: ConnectionProfile
-        password?: string
-        authToken?: string
-        sourceConnectionId?: string
-      }
-      output: { ok: boolean; id: string }
-    }
-    'connection.delete': {
-      input: { id: string }
-      output: { ok: boolean }
-    }
-    'connection.test': {
-      input: {
-        profile: ConnectionProfile
-        password?: string
-        authToken?: string
-        sourceConnectionId?: string
-      }
-      output: { ok: boolean; message?: string }
-    }
-    'connection.parseUri': {
-      input: { uri: string }
-      output: {
-        ok: boolean
-        profile?: Partial<ConnectionProfile>
-        password?: string
-        authToken?: string
-        placeholderPassword?: boolean
-        error?: string
-      }
-    }
-    'schema.listObjects': {
-      input: { connectionId: string; schema?: string }
-      output: SchemaObject[]
-    }
-    'schema.tableDetails': {
-      input: { connectionId: string; table: string; schema?: string }
-      output: TableDetails
-    }
-    'data.fetchPage': {
-      input: {
-        connectionId: string
-        table: string
-        schema?: string
-        page: number
-        pageSize: number
-        sortColumn?: string
-        sortDirection?: 'ASC' | 'DESC'
-        whereClause?: string
-        orderByClause?: string
-      }
-      output: TableBrowseResult
-    }
-    'data.updateCell': {
-      input: {
-        connectionId: string
-        table: string
-        schema?: string
-        primaryKeys: Record<string, unknown>
-        column: string
-        newValue: unknown
-        originalValue?: unknown
-      }
-      output: { ok: boolean; affectedRows: number; updatedRecord?: Record<string, unknown> }
-    }
-    'query.run': {
-      input: {
-        connectionId: string
-        queryId: string
-        sql: string
-        maxRows?: number
-      }
-      output: QueryResult
-    }
-    'query.cancel': {
-      input: { queryId: string }
-      output: { ok: boolean }
-    }
-    'sqlite.scanFolder': {
-      input: { folderPath?: string }
-      output: { files: { name: string; filePath: string; sizeBytes: number; sizeLabel: string }[] }
-    }
-    'studio.open': {
-      input: { connectionId?: string; table?: string; schema?: string; sql?: string }
-      output: { ok: boolean; path?: string; message?: string }
-    }
-    'workspace.detectConnections': {
-      input: { folderPath?: string }
-      output: {
-        sqliteFiles: { name: string; filePath: string; sizeBytes: number; sizeLabel: string }[]
-        envConnections: {
-          envKey: string
-          sourceFile: string
-          driver: DatabaseDriverType
-          name: string
-          uri: string
-        }[]
-      }
-    }
-    'data.applyChanges': {
-      input: DataChangesInput
-      output: {
-        ok: boolean
-        inserted: number
-        updated: number
-        deleted: number
-        statements: string[]
-      }
-    }
-    'data.previewChanges': {
-      input: DataChangesInput
-      output: { statements: string[] }
-    }
-    'schema.generateDdl': {
-      input: { connectionId: string; table: string; schema?: string }
-      output: { ddl: string }
-    }
-    'query.explain': {
-      input: { connectionId: string; sql: string; queryId?: string }
-      output: QueryResult
-    }
-    'query.history.list': {
-      input: { limit?: number } | undefined
-      output: { entries: QueryHistoryEntry[] }
-    }
-    'query.history.clear': {
-      input?: Record<string, never>
-      output: { ok: boolean }
-    }
-  }
+  interface PluginRequests extends DatanoaPluginRequests {}
 
-  interface PluginPanelEvents {
-    'connections.changed': { count: number }
-    'data.cellUpdated': {
-      connectionId?: string
-      schema?: string
-      table: string
-      primaryKeys: Record<string, unknown>
-      column: string
-    }
-  }
+  // eslint-disable-next-line @typescript-eslint/no-empty-interface
+  interface PluginPanelEvents extends DatanoaPluginPanelEvents {}
 }

@@ -3,6 +3,7 @@ import type {
   DatabaseDriverType,
   ForeignKeyInfo,
   IndexInfo,
+  SchemaObjectKind,
   TableDetails,
 } from '../../protocol'
 import { quoteIdentForDialect, quoteTableReference } from './sql-lexer.js'
@@ -15,7 +16,7 @@ function buildQualifiedTableForDdl(
   const trimmedSchema = schema.trim()
   const omitSchema =
     !trimmedSchema ||
-    ((dialect === 'sqlite' || dialect === 'libsql') && trimmedSchema.toLowerCase() === 'main')
+    ((dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1') && trimmedSchema.toLowerCase() === 'main')
   return omitSchema
     ? quoteIdentForDialect(name, dialect)
     : `${quoteIdentForDialect(trimmedSchema, dialect)}.${quoteIdentForDialect(name, dialect)}`
@@ -46,6 +47,87 @@ function resolveColumnTypeForDisplay(col: ColumnInfo, dialect?: DatabaseDriverTy
   return nativeTrimmed || typeTrimmed || 'TEXT'
 }
 
+interface GroupedForeignKeyInput {
+  constraintName?: string
+  column: string
+  referencedTable: string
+  referencedSchema?: string
+  referencedColumn: string
+  onDelete?: string
+  onUpdate?: string
+}
+
+function formatGroupedForeignKeyLines(
+  fks: GroupedForeignKeyInput[],
+  dialect: DatabaseDriverType,
+  fallbackTableForName: string,
+  indent = '  ',
+  forceConstraintName = false
+): string[] {
+  interface FkGroup {
+    constraintName?: string
+    referencedTable: string
+    referencedSchema?: string
+    cols: string[]
+    refCols: string[]
+    seenPairs: Set<string>
+    onDelete?: ReferentialAction
+    onUpdate?: ReferentialAction
+  }
+  const groups: FkGroup[] = []
+  const byKey = new Map<string, FkGroup>()
+
+  for (const fk of fks) {
+    const col = (fk.column || '').trim()
+    const refTable = (fk.referencedTable || '').trim()
+    const refCol = (fk.referencedColumn || '').trim()
+    if (!col || !refTable || !refCol) continue
+    const cname = (fk.constraintName || '').trim()
+    const groupKey = `${cname}\u0000${fk.referencedSchema || ''}\u0000${refTable}`
+    let group = byKey.get(groupKey)
+    if (!group) {
+      group = {
+        constraintName: cname || undefined,
+        referencedTable: refTable,
+        referencedSchema: fk.referencedSchema,
+        cols: [],
+        refCols: [],
+        seenPairs: new Set<string>(),
+        onDelete: fk.onDelete ? sanitizeReferentialAction(fk.onDelete) : undefined,
+        onUpdate: fk.onUpdate ? sanitizeReferentialAction(fk.onUpdate) : undefined,
+      }
+      byKey.set(groupKey, group)
+      groups.push(group)
+    }
+    const pairKey = `${col}\u0000${refCol}`
+    if (!group.seenPairs.has(pairKey)) {
+      group.seenPairs.add(pairKey)
+      group.cols.push(col)
+      group.refCols.push(refCol)
+    }
+  }
+
+  return groups.map((g) => {
+    const localColsSql = g.cols.map((c) => quoteIdentForDialect(c, dialect)).join(', ')
+    const targetColsSql = g.refCols.map((c) => quoteIdentForDialect(c, dialect)).join(', ')
+    const refTableSql = g.referencedSchema
+      ? qualifyAlterTarget(g.referencedTable, g.referencedSchema, dialect)
+      : quoteTableReference(g.referencedTable, dialect)
+    const effectiveName =
+      g.constraintName ||
+      `fk_${fallbackTableForName}_${g.cols[0]}_${g.referencedTable}`.replace(/[^A-Za-z0-9_]/g, '_')
+    const constraintPrefix =
+      g.constraintName || forceConstraintName || g.cols.length > 1
+        ? `CONSTRAINT ${quoteIdentForDialect(effectiveName, dialect)} `
+        : ''
+    const onDeleteClause =
+      g.onDelete && g.onDelete !== 'NO ACTION' ? ` ON DELETE ${g.onDelete}` : ''
+    const onUpdateClause =
+      g.onUpdate && g.onUpdate !== 'NO ACTION' ? ` ON UPDATE ${g.onUpdate}` : ''
+    return `${indent}${constraintPrefix}FOREIGN KEY (${localColsSql}) REFERENCES ${refTableSql} (${targetColsSql})${onDeleteClause}${onUpdateClause}`
+  })
+}
+
 /**
  * Reconstructs a dialect-appropriate CREATE TABLE DDL script including PK, FK, and CREATE [UNIQUE] INDEX statements.
  */
@@ -56,7 +138,7 @@ export function reconstructTableDdl(details: TableDetails, dialect: DatabaseDriv
       ? details.primaryKey
       : details.columns.filter((c) => c.isPrimaryKey).map((c) => c.name)
 
-  const isSqliteDialect = dialect === 'sqlite' || dialect === 'libsql'
+  const isSqliteDialect = dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1'
   const isMysqlDialect = dialect === 'mysql' || dialect === 'mariadb'
   const isPgDialect = dialect === 'postgres' || dialect === 'cockroachdb'
 
@@ -118,15 +200,7 @@ export function reconstructTableDdl(details: TableDetails, dialect: DatabaseDriv
     bodyLines.push(`  PRIMARY KEY (${quotedPks})`)
   }
 
-  for (const fk of details.foreignKeys) {
-    const refTable = quoteTableReference(fk.referencedTable, dialect)
-    const colRef = quoteIdentForDialect(fk.column, dialect)
-    const targetRef = quoteIdentForDialect(fk.referencedColumn, dialect)
-    const constraintPrefix = fk.constraintName
-      ? `CONSTRAINT ${quoteIdentForDialect(fk.constraintName, dialect)} `
-      : ''
-    bodyLines.push(`  ${constraintPrefix}FOREIGN KEY (${colRef}) REFERENCES ${refTable} (${targetRef})`)
-  }
+  bodyLines.push(...formatGroupedForeignKeyLines(details.foreignKeys, dialect, details.name, '  '))
 
   const createTableStmt =
     bodyLines.length > 0
@@ -506,7 +580,7 @@ function qualifyAlterTarget(
   if (
     schema &&
     schema.trim().length > 0 &&
-    !((dialect === 'sqlite' || dialect === 'libsql') && schema === 'main') &&
+    !((dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1') && schema === 'main') &&
     schema !== 'public' &&
     dialect !== 'redis'
   ) {
@@ -542,7 +616,7 @@ export function buildAlterTableSql(
       if (rawDef.length > 0) {
         const normalizedDef = normalizeSqlDefaultExpression(rawDef, rawType)
         defaultClause = ` DEFAULT ${normalizedDef}`
-      } else if (!isNullable && (dialect === 'sqlite' || dialect === 'libsql')) {
+      } else if (!isNullable && (dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1')) {
         // SQLite requires a DEFAULT value when adding a NOT NULL column to an existing table
         defaultClause = /INT|REAL|FLOAT|NUMERIC|DECIMAL|BOOL/i.test(rawType)
           ? ' DEFAULT 0'
@@ -671,7 +745,8 @@ export function buildAlterTableSql(
         dialect === 'postgres' ||
         dialect === 'cockroachdb' ||
         dialect === 'sqlite' ||
-        dialect === 'libsql'
+        dialect === 'libsql' ||
+        dialect === 'd1'
       ) {
         const qualifiedIdx = qualifyAlterTarget(idxName, action.schema, dialect)
         return `DROP INDEX ${qualifiedIdx};`
@@ -753,8 +828,8 @@ export function createInitialTableDraft(details: TableDetails): TableStructureDr
         column: fk.column,
         foreignTable: refTable,
         foreignColumn: refCol,
-        onDelete: 'NO ACTION',
-        onUpdate: 'NO ACTION',
+        onDelete: sanitizeReferentialAction(fk.onDelete),
+        onUpdate: sanitizeReferentialAction(fk.onUpdate),
         status: 'existing',
       }
     }
@@ -865,7 +940,7 @@ export function countTableStructureChanges(draft: TableStructureDraft): number {
 
 function buildSqliteTableRebuildStatements(
   draft: TableStructureDraft,
-  dialect: 'sqlite' | 'libsql'
+  dialect: 'sqlite' | 'libsql' | 'd1'
 ): string[] {
   const origTable = draft.originalTableName.trim()
   const finalTable = (draft.tableName || origTable).trim()
@@ -928,17 +1003,24 @@ function buildSqliteTableRebuildStatements(
     if (!col || !refTable || !refCol) {
       throw new Error('Foreign key requires local column, target table, and target column.')
     }
-    const fkName =
-      (fk.constraintName || '').trim() ||
-      `fk_${finalTable}_${col}_${refTable}`.replace(/[^A-Za-z0-9_]/g, '_')
-    const onDelete = sanitizeReferentialAction(fk.onDelete)
-    const onUpdate = sanitizeReferentialAction(fk.onUpdate)
-    const onDeleteClause = onDelete !== 'NO ACTION' ? ` ON DELETE ${onDelete}` : ''
-    const onUpdateClause = onUpdate !== 'NO ACTION' ? ` ON UPDATE ${onUpdate}` : ''
-    colDefs.push(
-      `CONSTRAINT ${quoteIdentForDialect(fkName, dialect)} FOREIGN KEY (${quoteIdentForDialect(col, dialect)}) REFERENCES ${quoteIdentForDialect(refTable, dialect)} (${quoteIdentForDialect(refCol, dialect)})${onDeleteClause}${onUpdateClause}`
-    )
   }
+  colDefs.push(
+    ...formatGroupedForeignKeyLines(
+      activeFks.map((fk) => ({
+        constraintName: fk.constraintName,
+        column: fk.column,
+        referencedTable: fk.foreignTable,
+        referencedSchema: fk.foreignSchema,
+        referencedColumn: fk.foreignColumn,
+        onDelete: fk.onDelete,
+        onUpdate: fk.onUpdate,
+      })),
+      dialect,
+      finalTable,
+      '',
+      true
+    )
+  )
 
   const tempTableName = `__datanoa_new_${origTable.replace(/[^A-Za-z0-9_]/g, '_')}`
   const qualifiedOrig = qualifyAlterTarget(origTable, draft.schema, dialect)
@@ -947,7 +1029,7 @@ function buildSqliteTableRebuildStatements(
 
   const stmts: string[] = [
     'PRAGMA foreign_keys = OFF;',
-    'BEGIN IMMEDIATE;',
+    ...(dialect === 'd1' ? [] : ['BEGIN IMMEDIATE;']),
     `CREATE TABLE ${qualifiedTemp} (\n  ${colDefs.join(',\n  ')}\n);`,
   ]
 
@@ -1012,7 +1094,9 @@ function buildSqliteTableRebuildStatements(
     )
   }
 
-  stmts.push('COMMIT;')
+  if (dialect !== 'd1') {
+    stmts.push('COMMIT;')
+  }
   stmts.push('PRAGMA foreign_keys = ON;')
   return stmts
 }
@@ -1054,7 +1138,7 @@ export function buildTableMigrationSql(
   }
 
   // Check if SQLite/LibSQL requires full 12-step atomic rebuild
-  if ((dialect === 'sqlite' || dialect === 'libsql') && requiresSqliteTableRebuild(draft)) {
+  if ((dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1') && requiresSqliteTableRebuild(draft)) {
     return buildSqliteTableRebuildStatements(draft, dialect)
   }
 
@@ -1356,7 +1440,7 @@ export function validateTableStructureDraft(
       changeSummaries.push(
         `+ Add column "${cleanName || '(unnamed)'}" ${col.dataType || 'TEXT'}${col.nullable ? '' : ' NOT NULL'}${defSummary}`
       )
-      if (!col.nullable && rawDef.length === 0 && (dialect === 'sqlite' || dialect === 'libsql')) {
+      if (!col.nullable && rawDef.length === 0 && (dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1')) {
         warnings.push(`Adding NOT NULL column "${cleanName}" without default auto-fills '' / 0 on SQLite.`)
       }
     } else if (isDraftColumnDirty(col)) {
@@ -1447,7 +1531,7 @@ export function validateTableStructureDraft(
   }
 
   const isRebuild =
-    (dialect === 'sqlite' || dialect === 'libsql') &&
+    (dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1') &&
     countTableStructureChanges(draft) > 0 &&
     requiresSqliteTableRebuild(draft)
 
@@ -1527,7 +1611,7 @@ export function buildCreateTableSql(
     }
   })
 
-  const isSqlite = dialect === 'sqlite' || dialect === 'libsql'
+  const isSqlite = dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1'
   const isMysql = dialect === 'mysql' || dialect === 'mariadb'
   const isPg = dialect === 'postgres' || dialect === 'cockroachdb'
   const isClickHouse = dialect === 'clickhouse'
@@ -1609,7 +1693,7 @@ export function buildTruncateTableSql(
     throw new Error('Schema name contains invalid characters.')
   }
   const qualified = qualifyAlterTarget(tableName, schemaName || undefined, dialect)
-  if (dialect === 'sqlite' || dialect === 'libsql') {
+  if (dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1') {
     return `DELETE FROM ${qualified};`
   }
   return `TRUNCATE TABLE ${qualified};`
@@ -1620,7 +1704,7 @@ export function buildTruncateTableSql(
  */
 export function buildDropTableSql(
   table: string,
-  kind: 'table' | 'view',
+  kind: SchemaObjectKind,
   dialect: DatabaseDriverType,
   schema?: string,
   ifExists = false

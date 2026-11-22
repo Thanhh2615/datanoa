@@ -6,6 +6,8 @@ import type {
   DatabaseDriverType,
   ForeignKeyInfo,
   IndexInfo,
+  SchemaObject,
+  SchemaObjectKind,
   TableDetails,
 } from '../protocol.js'
 import {
@@ -15,12 +17,10 @@ import {
   type ReferentialAction,
   type TableMigrationPlan,
   type TableStructureDraft,
-  buildTableMigrationSql,
   countTableStructureChanges,
   createInitialTableDraft,
   isDraftColumnDirty,
   reconstructTableDdl,
-  splitSqlStatements,
   validateTableStructureDraft,
 } from '../drivers/common/sql-tools.js'
 
@@ -54,6 +54,7 @@ export interface SchemaInspectorOptions {
   referenceTables?: string[]
   onInsertDdl?: (ddl: string) => void
   onCopyDdl?: (ddl: string) => void
+  onOpenDdlInConsole?: (ddl: string) => void
   onApplyMigration?: (
     statements: string[],
     draft: TableStructureDraft
@@ -65,6 +66,8 @@ export interface SchemaInspectorOptions {
 export class SchemaInspectorView {
   private container: HTMLElement
   private currentDetails: TableDetails | null = null
+  private readOnlyObject: SchemaObject | null = null
+  private readOnlyObjectDdl = ''
   private currentDialect: DatabaseDriverType = 'sqlite'
   private readOnly = false
   private referenceTables: string[] = []
@@ -90,6 +93,7 @@ export class SchemaInspectorView {
   private seqCounter = 1
   private onInsertDdl?: (ddl: string) => void
   private onCopyDdl?: (ddl: string) => void
+  private onOpenDdlInConsole?: (ddl: string) => void
   private onApplyMigration?: (
     statements: string[],
     draft: TableStructureDraft
@@ -120,6 +124,7 @@ export class SchemaInspectorView {
     if (options.referenceTables) this.referenceTables = [...options.referenceTables]
     this.onInsertDdl = options.onInsertDdl
     this.onCopyDdl = options.onCopyDdl
+    this.onOpenDdlInConsole = options.onOpenDdlInConsole
     this.onApplyMigration = options.onApplyMigration
     this.onDropTable = options.onDropTable
     this.onTruncateTable = options.onTruncateTable
@@ -415,6 +420,8 @@ export class SchemaInspectorView {
       this.closeComboPopover()
       this.scrollBodyEl = null
       this.currentDetails = null
+      this.readOnlyObject = null
+      this.readOnlyObjectDdl = ''
       this.draft = null
     }
     this.render()
@@ -428,6 +435,8 @@ export class SchemaInspectorView {
     this.closeConfirmModal(true)
     this.closeComboPopover()
     this.scrollBodyEl = null
+    this.readOnlyObject = null
+    this.readOnlyObjectDdl = ''
     this.render()
   }
 
@@ -437,9 +446,34 @@ export class SchemaInspectorView {
     this.loadingTableName = ''
     this.errorMessage = null
     this.onRetryLoad = undefined
+    this.readOnlyObject = null
+    this.readOnlyObjectDdl = ''
     this.currentDetails = details
     this.draft = createInitialTableDraft(normalizeTableDetailsForDraft(details))
     this.initDraftColumnRefs(this.draft)
+    this.showMigrationPreview = false
+    this.closeConfirmModal(true)
+    this.closeComboPopover()
+    this.scrollBodyEl = null
+    this.render()
+  }
+
+  public setReadOnlyObjectDdl(
+    obj: SchemaObject,
+    ddl: string,
+    dialect: DatabaseDriverType
+  ): void {
+    this.currentDialect = dialect
+    this.readOnlyObject = { ...obj }
+    this.readOnlyObjectDdl = ddl || ''
+    this.isLoading = false
+    this.loadingTableName = ''
+    this.errorMessage = null
+    this.onRetryLoad = undefined
+    this.currentDetails = null
+    this.draft = null
+    this.indexColRefsById.clear()
+    this.fkColIdById.clear()
     this.showMigrationPreview = false
     this.closeConfirmModal(true)
     this.closeComboPopover()
@@ -789,6 +823,8 @@ export class SchemaInspectorView {
     this.onRetryLoad = undefined
     this.scrollBodyEl = null
     this.currentDetails = null
+    this.readOnlyObject = null
+    this.readOnlyObjectDdl = ''
     this.draft = null
     this.indexColRefsById.clear()
     this.fkColIdById.clear()
@@ -1066,6 +1102,10 @@ export class SchemaInspectorView {
 
       scrollBody.appendChild(errCard)
       this.container.appendChild(scrollBody)
+      return
+    }
+    if (this.readOnlyObject) {
+      this.renderReadOnlyObjectDdl()
       return
     }
     if (!this.currentDetails) {
@@ -2257,6 +2297,120 @@ export class SchemaInspectorView {
     parentEl.appendChild(section)
   }
 
+  private readOnlyKindLabel(kind: SchemaObjectKind): string {
+    const labels: Record<SchemaObjectKind, string> = {
+      table: 'TABLE',
+      view: 'VIEW',
+      materialized_view: 'MAT VIEW',
+      function: 'FUNCTION',
+      procedure: 'PROCEDURE',
+      trigger: 'TRIGGER',
+      sequence: 'SEQUENCE',
+      type: 'TYPE',
+    }
+    return labels[kind] || kind.toUpperCase()
+  }
+
+  private renderReadOnlyObjectDdl(): void {
+    const obj = this.readOnlyObject
+    if (!obj) return
+    const ddlText = this.readOnlyObjectDdl
+
+    const topZone = document.createElement('div')
+    topZone.className = 'datanoa-inspector-top-zone'
+
+    const headerEl = document.createElement('div')
+    headerEl.className = 'datanoa-inspector-header'
+
+    const titleEl = document.createElement('div')
+    titleEl.className = 'datanoa-inspector-title-group'
+
+    if (obj.schema) {
+      const schemaSpan = document.createElement('span')
+      schemaSpan.className = 'datanoa-badge datanoa-object-schema-badge'
+      schemaSpan.textContent = obj.schema
+      titleEl.appendChild(schemaSpan)
+    }
+
+    const nameSpan = document.createElement('span')
+    nameSpan.className = 'datanoa-inspector-title'
+    nameSpan.textContent = obj.name
+    titleEl.appendChild(nameSpan)
+
+    const kindBadge = document.createElement('span')
+    kindBadge.className = `datanoa-badge datanoa-object-kind-badge datanoa-kind-${obj.kind}`
+    kindBadge.textContent = this.readOnlyKindLabel(obj.kind)
+    titleEl.appendChild(kindBadge)
+
+    if (obj.detail) {
+      const detailPill = document.createElement('span')
+      detailPill.className = 'datanoa-badge datanoa-object-detail-pill'
+      detailPill.title = obj.detail
+      detailPill.textContent = obj.detail
+      titleEl.appendChild(detailPill)
+    }
+
+    const headerRight = document.createElement('div')
+    headerRight.className = 'datanoa-ddl-actions'
+
+    const copyBtn = document.createElement('button')
+    copyBtn.type = 'button'
+    copyBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-copy-ddl-btn'
+    copyBtn.textContent = 'Copy DDL'
+    copyBtn.addEventListener?.('click', () => {
+      this.copyTextToClipboard(ddlText)
+      copyBtn.textContent = 'Copied!'
+      setTimeout(() => {
+        copyBtn.textContent = 'Copy DDL'
+      }, 1400)
+    })
+    headerRight.appendChild(copyBtn)
+
+    if (this.onOpenDdlInConsole) {
+      const openBtn = document.createElement('button')
+      openBtn.type = 'button'
+      openBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-open-ddl-console-btn'
+      openBtn.textContent = 'Open in SQL Console'
+      openBtn.addEventListener?.('click', () => {
+        this.onOpenDdlInConsole?.(ddlText)
+      })
+      headerRight.appendChild(openBtn)
+    }
+
+    headerEl.appendChild(titleEl)
+    headerEl.appendChild(headerRight)
+    topZone.appendChild(headerEl)
+    this.container.appendChild(topZone)
+
+    const scrollBody = document.createElement('div')
+    scrollBody.className = 'datanoa-inspector-scroll-body'
+    this.scrollBodyEl = scrollBody
+    scrollBody.addEventListener?.('scroll', () => {
+      this.closeComboPopover()
+    })
+
+    const ddlCard = document.createElement('div')
+    ddlCard.className = 'datanoa-ddl-card datanoa-readonly-object-ddl-card'
+
+    const ddlHeader = document.createElement('div')
+    ddlHeader.className = 'datanoa-ddl-header'
+    const ddlTitle = document.createElement('span')
+    ddlTitle.textContent = 'DDL Definition'
+    ddlHeader.appendChild(ddlTitle)
+
+    const ddlPre = document.createElement('pre')
+    ddlPre.className = 'datanoa-ddl-pre'
+    const ddlCode = document.createElement('code')
+    appendFormattedDdl(ddlCode, ddlText)
+    ddlPre.appendChild(ddlCode)
+    this.bindHorizontalWheel(ddlPre)
+
+    ddlCard.appendChild(ddlHeader)
+    ddlCard.appendChild(ddlPre)
+    scrollBody.appendChild(ddlCard)
+    this.container.appendChild(scrollBody)
+  }
+
   public destroy(): void {
     this.clearWheelListeners()
     this.stopMigrationTimer()
@@ -2266,6 +2420,8 @@ export class SchemaInspectorView {
     this.scrollBodyEl = null
     this.container.innerHTML = ''
     this.currentDetails = null
+    this.readOnlyObject = null
+    this.readOnlyObjectDdl = ''
     this.draft = null
     this.indexColRefsById.clear()
     this.fkColIdById.clear()

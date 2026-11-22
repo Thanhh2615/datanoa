@@ -11,18 +11,71 @@ import type {
   PreviewChangesResult,
   QueryResult,
   SchemaObject,
+  SchemaObjectKind,
   TableBrowseResult,
   TableDetails,
+  TransactionState,
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
-import { DatabaseDriverError } from '../common/driver'
+import {
+  DatabaseDriverError,
+  createUnsupportedTransactionError,
+  createUnsupportedTransactionState,
+  runDriverConnectionTest,
+} from '../common/driver'
+import type { DriverTlsOptions } from '../common/tls-and-tunnel'
+import { resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
 import { assembleTableBrowseResult } from '../common/update-builder'
+
+const REDIS_UNSUPPORTED_TX_REASON =
+  'Redis does not support interactive multi-statement transactions'
 
 const MAX_SCAN_KEYS = 2000
 const MAX_SCAN_ITERATIONS = 500
 const MAX_SCAN_DURATION_MS = 5000
 const HYDRATE_CHUNK_SIZE = 250
+
+const REDIS_READONLY_COMMANDS: ReadonlySet<string> = new Set([
+  'GET', 'MGET', 'STRLEN', 'GETRANGE', 'SUBSTR', 'EXISTS', 'TYPE', 'TTL', 'PTTL',
+  'EXPIRETIME', 'PEXPIRETIME', 'KEYS', 'SCAN',
+  'HGET', 'HMGET', 'HGETALL', 'HKEYS', 'HVALS', 'HLEN', 'HEXISTS', 'HSCAN', 'HRANDFIELD',
+  'LRANGE', 'LLEN', 'LINDEX', 'LPOS',
+  'SMEMBERS', 'SCARD', 'SISMEMBER', 'SMISMEMBER', 'SSCAN', 'SRANDMEMBER', 'SDIFF', 'SINTER', 'SUNION',
+  'ZRANGE', 'ZREVRANGE', 'ZRANGEBYSCORE', 'ZREVRANGEBYSCORE', 'ZRANGEBYLEX', 'ZCARD',
+  'ZCOUNT', 'ZLEXCOUNT', 'ZSCORE', 'ZMSCORE', 'ZRANK', 'ZREVRANK', 'ZSCAN',
+  'XLEN', 'XRANGE', 'XREVRANGE', 'DBSIZE', 'INFO', 'PING', 'ECHO', 'TIME', 'SELECT',
+  'RANDOMKEY', 'DUMP', 'BITCOUNT', 'BITPOS', 'GETBIT', 'PFCOUNT',
+  'GEOPOS', 'GEODIST', 'GEOHASH', 'GEOSEARCH',
+  'JSON.GET', 'JSON.MGET', 'JSON.TYPE', 'JSON.STRLEN', 'JSON.ARRLEN', 'JSON.OBJKEYS', 'JSON.OBJLEN',
+  'FT.SEARCH', 'FT.AGGREGATE', 'FT.INFO', 'FT._LIST',
+])
+
+const REDIS_READONLY_SUBCOMMANDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['CONFIG', new Set(['GET'])],
+  ['CLIENT', new Set(['LIST', 'INFO', 'ID', 'GETNAME'])],
+  ['ACL', new Set(['WHOAMI', 'LIST', 'USERS', 'GETUSER', 'CAT', 'DRYRUN'])],
+  ['SLOWLOG', new Set(['GET', 'LEN'])],
+  ['CLUSTER', new Set(['INFO', 'NODES', 'SLOTS', 'SHARDS', 'COUNTKEYSINSLOT', 'GETKEYSINSLOT'])],
+  ['XINFO', new Set(['STREAM', 'GROUPS', 'CONSUMERS', 'HELP'])],
+  ['MEMORY', new Set(['USAGE', 'STATS', 'MALLOC-STATS', 'DOCTOR'])],
+  ['OBJECT', new Set(['ENCODING', 'FREQ', 'IDLETIME', 'REFCOUNT'])],
+  ['SCRIPT', new Set(['EXISTS'])],
+])
+
+function isReadOnlyRedisCommand(args: readonly string[]): boolean {
+  const cmd = (args[0] || '').toUpperCase()
+  if (!cmd) return false
+  if (REDIS_READONLY_COMMANDS.has(cmd)) return true
+  if (cmd === 'COMMAND') {
+    const sub = (args[1] || '').toUpperCase()
+    return sub === '' || sub === 'COUNT' || sub === 'INFO' || sub === 'LIST' || sub === 'GETKEYS'
+  }
+  const allowedSubs = REDIS_READONLY_SUBCOMMANDS.get(cmd)
+  if (!allowedSubs) return false
+  const sub = (args[1] || '').toUpperCase()
+  return allowedSubs.has(sub)
+}
 
 const REDIS_COLUMNS: ColumnInfo[] = [
   {
@@ -267,6 +320,7 @@ class RespSocketClient {
     port: number
     ssl: boolean
     timeoutMs?: number
+    tlsOptions?: tls.ConnectionOptions
   }): Promise<RespSocketClient> {
     const timeoutMs = options.timeoutMs ?? 10000
     const socket = await new Promise<net.Socket>((resolve, reject) => {
@@ -278,6 +332,8 @@ class RespSocketClient {
       if (!net.isIP(options.host)) {
         tlsOpts.servername = options.host
       }
+      // Custom CA / client certs (mTLS) and SNI of the real remote host override the defaults
+      Object.assign(tlsOpts, options.tlsOptions)
 
       const sock: net.Socket = options.ssl
         ? tls.connect(tlsOpts)
@@ -548,26 +604,33 @@ function buildKeyMatcher(whereClause?: string): ((key: string) => boolean) | nul
 function formatRedisStructureValue(type: string, raw: unknown): string | null {
   if (raw === null || raw === undefined) return null
   if (type === 'string') return String(raw)
+  const payload =
+    (type === 'hash' || type === 'set') &&
+    Array.isArray(raw) &&
+    raw.length === 2 &&
+    Array.isArray(raw[1])
+      ? raw[1]
+      : raw
   if (type === 'hash') {
-    if (Array.isArray(raw)) {
+    if (Array.isArray(payload)) {
       const obj: Record<string, unknown> = {}
-      for (let i = 0; i + 1 < raw.length; i += 2) {
-        obj[String(raw[i])] = raw[i + 1]
+      for (let i = 0; i + 1 < payload.length; i += 2) {
+        obj[String(payload[i])] = payload[i + 1]
       }
       return JSON.stringify(obj)
     }
-    if (typeof raw === 'object') return JSON.stringify(raw)
+    if (typeof payload === 'object') return JSON.stringify(payload)
   }
-  if (type === 'zset' && Array.isArray(raw)) {
+  if (type === 'zset' && Array.isArray(payload)) {
     const entries: Array<{ member: string; score: string }> = []
-    for (let i = 0; i + 1 < raw.length; i += 2) {
-      entries.push({ member: String(raw[i]), score: String(raw[i + 1]) })
+    for (let i = 0; i + 1 < payload.length; i += 2) {
+      entries.push({ member: String(payload[i]), score: String(payload[i + 1]) })
     }
     return JSON.stringify(entries)
   }
-  if (Array.isArray(raw)) return JSON.stringify(raw)
-  if (typeof raw === 'object') return JSON.stringify(raw)
-  return String(raw)
+  if (Array.isArray(payload)) return JSON.stringify(payload)
+  if (typeof payload === 'object') return JSON.stringify(payload)
+  return String(payload)
 }
 
 function serializeRespValue(value: unknown): unknown {
@@ -600,6 +663,14 @@ interface ActiveRedisQuery {
   reject: (err: DatabaseDriverError) => void
 }
 
+/** TLS is on when explicitly overridden on, or when custom certs/mode resolved (override object) */
+export function shouldUseRedisTls(
+  tlsOverride: false | tls.ConnectionOptions | undefined,
+  ssl: boolean
+): boolean {
+  return tlsOverride === false ? false : tlsOverride ? true : ssl
+}
+
 export class RedisSession implements IDatabaseSession {
   readonly driverType = 'redis' as const
   readonly profile: ConnectionProfile
@@ -609,13 +680,27 @@ export class RedisSession implements IDatabaseSession {
   private readonly activeQueries = new Map<string, ActiveRedisQuery>()
   private isClosed = false
 
-  constructor(profile: ConnectionProfile, secret?: string) {
+  private readonly extraSecrets?: DriverTlsOptions
+  private tlsOptionsPromise: Promise<false | tls.ConnectionOptions | undefined> | null = null
+
+  constructor(profile: ConnectionProfile, secret?: string, extraSecrets?: DriverTlsOptions) {
     this.profile = profile
     this.secret = secret
+    this.extraSecrets = extraSecrets
   }
 
   isAlive(): boolean {
     return !this.isClosed
+  }
+
+  private assertWritable(): void {
+    if (this.profile.readOnly) {
+      throw new DatabaseDriverError(
+        'Connection is read-only. Write operations are disabled.',
+        'READ_ONLY',
+        'redis'
+      )
+    }
   }
 
   private resolveConnectionTarget(): {
@@ -656,7 +741,17 @@ export class RedisSession implements IDatabaseSession {
 
   private async openAuthenticatedClient(): Promise<RespSocketClient> {
     const { host, port, ssl, dbIndex } = this.resolveConnectionTarget()
-    const client = await RespSocketClient.connect({ host, port, ssl })
+    if (!this.tlsOptionsPromise) {
+      this.tlsOptionsPromise = resolveEffectiveTlsOptions(
+        this.profile,
+        this.extraSecrets,
+        this.extraSecrets?.tlsServername
+      )
+    }
+    const tlsOverride = await this.tlsOptionsPromise
+    const useTls = shouldUseRedisTls(tlsOverride, ssl)
+    const tlsOptions = tlsOverride === false ? undefined : tlsOverride
+    const client = await RespSocketClient.connect({ host, port, ssl: useTls, tlsOptions })
     try {
       if (this.secret && this.secret.length > 0) {
         const username = this.profile.user?.trim()
@@ -824,6 +919,46 @@ export class RedisSession implements IDatabaseSession {
     return objects
   }
 
+  async listSchemas(): Promise<{ schemas: string[]; defaultSchema: string }> {
+    const label = this.getDbSchemaLabel()
+    return { schemas: [label], defaultSchema: label }
+  }
+
+  async getObjectDdl(name: string, kind: SchemaObjectKind, schema?: string): Promise<string> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'redis')
+    }
+    if (kind !== 'table') {
+      return `# Redis exposes virtual key namespaces only; no ${kind} DDL exists for "${name}".`
+    }
+    return this.getDdl(name, schema)
+  }
+
+  async exportSchemaDdl(schema?: string): Promise<{ ddl: string; objectCount: number }> {
+    const label = schema || this.getDbSchemaLabel()
+    let keyCount = 0
+    if (!this.isClosed) {
+      try {
+        const client = await this.getClient()
+        const dbSize = await client.sendCommand(['DBSIZE'])
+        const parsed = Number(dbSize)
+        keyCount = Number.isFinite(parsed) ? parsed : 0
+      } catch {
+        keyCount = 0
+      }
+    }
+    const lines = [
+      '-- Datanoa Full Schema DDL Export',
+      '-- Dialect: redis',
+      `-- Schema: ${label}`,
+      '',
+      '# Redis is a schema-less key/value store: no executable DDL is generated.',
+      `# Keyspace size: ${keyCount} key(s).`,
+      '# Use DUMP/RESTORE or logical application migrations for data export.',
+    ]
+    return { ddl: `${lines.join('\n')}\n`, objectCount: 0 }
+  }
+
   async getTableDetails(table: string, schema?: string): Promise<TableDetails> {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'redis')
@@ -875,13 +1010,13 @@ export class RedisSession implements IDatabaseSession {
           valCmds.push(['GET', key])
         } else if (keyType === 'hash') {
           valCmdIndices.push(i)
-          valCmds.push(['HGETALL', key])
+          valCmds.push(['HSCAN', key, 0, 'COUNT', 20])
         } else if (keyType === 'list') {
           valCmdIndices.push(i)
           valCmds.push(['LRANGE', key, 0, 20])
         } else if (keyType === 'set') {
           valCmdIndices.push(i)
-          valCmds.push(['SMEMBERS', key])
+          valCmds.push(['SSCAN', key, 0, 'COUNT', 20])
         } else if (keyType === 'zset') {
           valCmdIndices.push(i)
           valCmds.push(['ZRANGE', key, 0, 20, 'WITHSCORES'])
@@ -1071,10 +1206,52 @@ export class RedisSession implements IDatabaseSession {
     }
   }
 
+  private async runKeepTtlAwarePipeline(
+    client: {
+      sendPipeline(cmds: Array<Array<string | number>>): Promise<unknown[]>
+      sendCommand(args: Array<string | number>): Promise<unknown>
+    },
+    cmds: Array<Array<string | number>>
+  ): Promise<unknown[]> {
+    try {
+      return await client.sendPipeline(cmds)
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      const hasKeepTtl = cmds.some(
+        (c) =>
+          String(c[0] ?? '').toUpperCase() === 'SET' &&
+          String(c[3] ?? '').toUpperCase() === 'KEEPTTL'
+      )
+      if (!hasKeepTtl || !/syntax/i.test(msg)) {
+        throw err
+      }
+      // Redis < 6.0 rejects SET ... KEEPTTL; preserve existing TTL via PTTL + SET ... PX
+      const replies: unknown[] = []
+      for (const cmd of cmds) {
+        const isSetKeepTtl =
+          String(cmd[0] ?? '').toUpperCase() === 'SET' &&
+          String(cmd[3] ?? '').toUpperCase() === 'KEEPTTL'
+        if (isSetKeepTtl) {
+          const pttlRaw = await client.sendCommand(['PTTL', String(cmd[1])])
+          const pttl = Number(pttlRaw)
+          if (Number.isFinite(pttl) && pttl > 0) {
+            replies.push(await client.sendCommand(['SET', cmd[1], cmd[2], 'PX', Math.floor(pttl)]))
+          } else {
+            replies.push(await client.sendCommand(['SET', cmd[1], cmd[2]]))
+          }
+        } else {
+          replies.push(await client.sendCommand(cmd))
+        }
+      }
+      return replies
+    }
+  }
+
   async updateCell(params: UpdateCellParams): Promise<UpdateCellResult> {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'redis')
     }
+    this.assertWritable()
     const key = String(params.primaryKeys?.key ?? '')
     if (key.length === 0) {
       throw new DatabaseDriverError('Primary key "key" is required for Redis updates', 'invalid_params', 'redis')
@@ -1091,7 +1268,7 @@ export class RedisSession implements IDatabaseSession {
     } else {
       const { commands } = await this.buildValueWriteCommands(key, params.newValue)
       if (commands.length > 0) {
-        await client.sendPipeline(commands)
+        await this.runKeepTtlAwarePipeline(client, commands)
       }
     }
 
@@ -1163,6 +1340,7 @@ export class RedisSession implements IDatabaseSession {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'redis')
     }
+    this.assertWritable()
     const preview = await this.previewChanges(params)
     const client = await this.getClient()
 
@@ -1210,7 +1388,7 @@ export class RedisSession implements IDatabaseSession {
       }
     }
 
-    const replies = await client.sendPipeline(cmds)
+    const replies = await this.runKeepTtlAwarePipeline(client, cmds)
     let deleted = 0
     let updated = 0
     let inserted = 0
@@ -1267,6 +1445,13 @@ export class RedisSession implements IDatabaseSession {
     const parsedCommands = tokenizeRedisCommandScript(commandText)
     if (parsedCommands.length === 0) {
       throw new DatabaseDriverError('Redis command cannot be empty', 'invalid_params', 'redis')
+    }
+    if (this.profile.readOnly && parsedCommands.some((cmd) => !isReadOnlyRedisCommand(cmd))) {
+      throw new DatabaseDriverError(
+        'Connection is read-only. Write operations are disabled.',
+        'READ_ONLY',
+        'redis'
+      )
     }
 
     const start = performance.now()
@@ -1446,34 +1631,52 @@ export class RedisSession implements IDatabaseSession {
     active.reject(new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'redis'))
     return { ok: true }
   }
+
+  getTransactionState(): TransactionState {
+    return createUnsupportedTransactionState(REDIS_UNSUPPORTED_TX_REASON)
+  }
+
+  async beginTransaction(): Promise<TransactionState> {
+    throw createUnsupportedTransactionError('redis', REDIS_UNSUPPORTED_TX_REASON)
+  }
+
+  async commitTransaction(): Promise<TransactionState> {
+    throw createUnsupportedTransactionError('redis', REDIS_UNSUPPORTED_TX_REASON)
+  }
+
+  async rollbackTransaction(): Promise<TransactionState> {
+    throw createUnsupportedTransactionError('redis', REDIS_UNSUPPORTED_TX_REASON)
+  }
+
+  async setAutoCommit(enabled: boolean): Promise<TransactionState> {
+    if (!enabled) {
+      throw createUnsupportedTransactionError('redis', REDIS_UNSUPPORTED_TX_REASON)
+    }
+    return this.getTransactionState()
+  }
 }
 
 export class RedisDriver implements IDatabaseDriver {
   readonly type = 'redis' as const
 
-  async createSession(profile: ConnectionProfile, secret?: string): Promise<IDatabaseSession> {
-    const session = new RedisSession(profile, secret)
+  async createSession(
+    profile: ConnectionProfile,
+    secret?: string,
+    extraSecrets?: DriverTlsOptions
+  ): Promise<IDatabaseSession> {
+    const session = new RedisSession(profile, secret, extraSecrets)
     await session.init()
     return session
   }
 
   async testConnection(
     profile: ConnectionProfile,
-    secret?: string
+    secret?: string,
+    extraSecrets?: DriverTlsOptions
   ): Promise<{ ok: boolean; message?: string }> {
-    let session: IDatabaseSession | null = null
-    try {
-      session = await this.createSession(profile, secret)
-      return await session.test()
-    } catch (err: unknown) {
-      return {
-        ok: false,
-        message: err instanceof Error ? err.message : 'Redis connection failed',
-      }
-    } finally {
-      if (session) {
-        await session.close().catch(() => {})
-      }
-    }
+    return runDriverConnectionTest(
+      () => this.createSession(profile, secret, extraSecrets),
+      (err) => (err instanceof Error ? err.message : 'Redis connection failed')
+    )
   }
 }

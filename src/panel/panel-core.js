@@ -8,7 +8,7 @@
  * - Privacy-safe Feedback / Bug Report Markdown & GitHub Issue URL builders
  */
 
-export const DATANOA_VERSION = '1.0.4'
+export const DATANOA_VERSION = '1.1.0'
 export const DATANOA_GITHUB_ISSUES_URL = 'https://github.com/Thanhh2615/datanoa/issues/new'
 
 export const ENGINES = [
@@ -20,6 +20,10 @@ export const ENGINES = [
   { id: 'clickhouse', label: 'ClickHouse', defaultPort: 8123, supportsSsl: true, defaultDb: 'default', defaultUser: 'default' },
   { id: 'redis', label: 'Redis', defaultPort: 6379, supportsSsl: true, defaultDb: '0', defaultUser: '' },
   { id: 'libsql', label: 'LibSQL', defaultPort: 443, supportsSsl: true, defaultDb: 'turso', defaultUser: '' },
+  { id: 'mssql', label: 'SQL Server', defaultPort: 1433, supportsSsl: true, defaultDb: 'master', defaultUser: 'sa' },
+  { id: 'oracle', label: 'Oracle', defaultPort: 1521, supportsSsl: true, defaultDb: 'FREEPDB1', defaultUser: 'system' },
+  { id: 'mongodb', label: 'MongoDB', defaultPort: 27017, supportsSsl: true, defaultDb: 'admin', defaultUser: 'admin' },
+  { id: 'custom', label: 'Custom BYOD', defaultPort: 5432, supportsSsl: true, defaultDb: 'default', defaultUser: 'admin' },
 ]
 
 export const ENGINE_BY_ID = Object.fromEntries(ENGINES.map((e) => [e.id, e]))
@@ -177,7 +181,9 @@ export function quoteIdent(ident, driver) {
 
 export function quoteTableRef(tableName, schemaName, driver) {
   const s = String(schemaName || '').trim()
-  const omit = !s || ((driver === 'sqlite' || driver === 'libsql') && s.toLowerCase() === 'main')
+  const omit =
+    !s ||
+    ((driver === 'sqlite' || driver === 'libsql' || driver === 'd1') && s.toLowerCase() === 'main')
   return omit ? quoteIdent(tableName, driver) : `${quoteIdent(s, driver)}.${quoteIdent(tableName, driver)}`
 }
 
@@ -530,14 +536,20 @@ export function formatSelectionAsOutput(
     return hasNull ? '(NULL)' : ''
   }
   if (format === 'tsv') {
+    const escTsv = (text) =>
+      text.includes('\t') || text.includes('"') || text.includes('\n') || text.includes('\r')
+        ? `"${text.replace(/"/g, '""')}"`
+        : text
+    const isSinglePlainCell = !includeHeaders && rowSet.length === 1 && colSet.length === 1
     const lines = []
-    if (includeHeaders) lines.push(colNames.join('\t'))
+    if (includeHeaders) lines.push(colNames.map(escTsv).join('\t'))
     for (const r of rowSet) {
       const cells = colSet.map((c) => {
         if (!coordKeySet.has(`${r}:${c}`)) return ''
         const v = readVal(r, c)
         if (v === null || v === undefined) return ''
-        return typeof v === 'object' ? JSON.stringify(v) : String(v).replace(/\t|\r|\n/g, ' ')
+        const str = typeof v === 'object' ? JSON.stringify(v) : String(v)
+        return isSinglePlainCell ? str : escTsv(str)
       })
       lines.push(cells.join('\t'))
     }
@@ -787,26 +799,112 @@ export function formatPanelSql(sql, driver) {
   return out.trim()
 }
 
-export function parsePanelDelimitedText(text) {
-  const raw = String(text ?? '')
-  if (!raw) return []
-  let inDetectQuotes = false
-  let delim = ','
-  for (let k = 0; k < raw.length; k++) {
-    const c = raw[k]
-    if (c === '"') {
-      if (inDetectQuotes && raw[k + 1] === '"') {
-        k++
-        continue
-      }
-      inDetectQuotes = !inDetectQuotes
-      continue
-    }
-    if (!inDetectQuotes && c === '\t') {
-      delim = '\t'
-      break
+function looksLikePanelJsonLiteral(trimmed) {
+  if (
+    (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+    (trimmed.startsWith('[') && trimmed.endsWith(']'))
+  ) {
+    try {
+      const parsed = JSON.parse(trimmed)
+      return parsed !== null && typeof parsed === 'object'
+    } catch {
+      return false
     }
   }
+  return false
+}
+
+function detectPanelClipboardDelimiter(raw) {
+  const trimmed = raw.trim()
+  if (looksLikePanelJsonLiteral(trimmed)) {
+    return '\t'
+  }
+
+  let inQuotes = false
+  let atFieldStart = true
+  let hasQuotedCommaBoundary = false
+  const lineCommaCounts = []
+  let currentCommas = 0
+  let currentLineHasChars = false
+
+  for (let k = 0; k < raw.length; k++) {
+    const c = raw[k]
+    if (inQuotes) {
+      if (c === '"') {
+        if (raw[k + 1] === '"') {
+          k++
+          continue
+        }
+        inQuotes = false
+        if (raw[k + 1] === ',') {
+          hasQuotedCommaBoundary = true
+        }
+        continue
+      }
+      continue
+    }
+
+    if (atFieldStart && c === '"') {
+      inQuotes = true
+      atFieldStart = false
+      currentLineHasChars = true
+      continue
+    }
+
+    if (c === '\t') {
+      return '\t'
+    }
+
+    if (c === ',') {
+      currentCommas++
+      atFieldStart = true
+      currentLineHasChars = true
+      continue
+    }
+
+    if (c === '\r' || c === '\n') {
+      if (currentLineHasChars) {
+        lineCommaCounts.push(currentCommas)
+      }
+      currentCommas = 0
+      currentLineHasChars = false
+      atFieldStart = true
+      if (c === '\r' && raw[k + 1] === '\n') k++
+      continue
+    }
+
+    atFieldStart = false
+    currentLineHasChars = true
+  }
+
+  if (currentLineHasChars) {
+    lineCommaCounts.push(currentCommas)
+  }
+
+  if (lineCommaCounts.length === 0) return '\t'
+  if (lineCommaCounts.length >= 2) {
+    const first = lineCommaCounts[0]
+    if (first >= 1 && lineCommaCounts.every((count) => count === first)) {
+      return ','
+    }
+    return '\t'
+  }
+  if (hasQuotedCommaBoundary && lineCommaCounts[0] >= 1) {
+    return ','
+  }
+  return '\t'
+}
+
+export function parsePanelDelimitedText(text, options = {}) {
+  const raw = String(text ?? '')
+  if (!raw) return []
+  if (!options?.delimiter) {
+    const trimmed = raw.trim()
+    if (looksLikePanelJsonLiteral(trimmed)) {
+      return [[trimmed]]
+    }
+  }
+  const delim = options?.delimiter || detectPanelClipboardDelimiter(raw)
   const rows = []
   let row = []
   let field = ''
@@ -863,6 +961,264 @@ export function parsePanelDelimitedText(text) {
 
 export const parseDelimitedClipboard = parsePanelDelimitedText
 
+function isPanelAutoOrGeneratedCol(col) {
+  return Boolean(col && (col.isAutoIncrement === true || col.isGenerated === true))
+}
+
+function detectPanelHeaderColMapping(firstRow, allColumns, rowCount, explicitHasHeaders) {
+  if (rowCount < 2 || !Array.isArray(firstRow) || firstRow.length === 0) return null
+  const lookup = new Map()
+  allColumns.forEach((col, idx) => lookup.set(String(col.name || '').trim().toLowerCase(), idx))
+  const mapped = []
+  for (const cell of firstRow) {
+    if (typeof cell !== 'string') return null
+    const key = cell.trim().toLowerCase()
+    if (!key) return null
+    const idx = lookup.get(key)
+    if (idx === undefined) return null
+    mapped.push(idx)
+  }
+  if (mapped.length === 1 && !explicitHasHeaders) return null
+  return mapped
+}
+
+function resolvePanelSourceHeaderMapping(sourceHeaders, clipWidth, allColumns) {
+  if (!Array.isArray(sourceHeaders) || sourceHeaders.length === 0 || sourceHeaders.length < clipWidth) {
+    return null
+  }
+  const lookup = new Map()
+  allColumns.forEach((col, idx) => lookup.set(String(col.name || '').trim().toLowerCase(), idx))
+  const mapped = []
+  for (let i = 0; i < sourceHeaders.length; i++) {
+    const idx = lookup.get(String(sourceHeaders[i] || '').trim().toLowerCase())
+    if (idx === undefined) return null
+    mapped.push(idx)
+  }
+  if (!mapped.some((idx) => !isPanelAutoOrGeneratedCol(allColumns[idx]))) {
+    return null
+  }
+  return mapped
+}
+
+export function planPanelGridPaste(input) {
+  const {
+    matrix,
+    hasSelection,
+    selectionBBox,
+    selectedCellCount,
+    existingRowCount,
+    visibleColIndices,
+    allColumns,
+    forceNewRows,
+    explicitHasHeaders = false,
+    sourceHeaders,
+  } = input
+
+  if (!Array.isArray(matrix) || matrix.length === 0 || !visibleColIndices?.length || !allColumns?.length) {
+    return {
+      mode: 'empty',
+      hadHeaders: false,
+      overwrites: [],
+      inserts: [],
+      startVisRow: 0,
+      startVisCol: 0,
+    }
+  }
+
+  const headerColMapping = detectPanelHeaderColMapping(
+    matrix[0],
+    allColumns,
+    matrix.length,
+    Boolean(explicitHasHeaders)
+  )
+  const hadHeaders = headerColMapping !== null
+  const dataRows = hadHeaders ? matrix.slice(1) : matrix
+  if (dataRows.length === 0) {
+    return {
+      mode: 'empty',
+      hadHeaders,
+      overwrites: [],
+      inserts: [],
+      startVisRow: 0,
+      startVisCol: 0,
+    }
+  }
+
+  const visColPosByModelIdx = new Map()
+  visibleColIndices.forEach((modelColIdx, visIdx) => visColPosByModelIdx.set(modelColIdx, visIdx))
+
+  let maxClipCols = 0
+  for (const row of dataRows) {
+    if (row.length > maxClipCols) maxClipCols = row.length
+  }
+
+  const isSingleScalar = dataRows.length === 1 && dataRows[0].length === 1
+  if (
+    !forceNewRows &&
+    hasSelection &&
+    existingRowCount > 0 &&
+    !hadHeaders &&
+    isSingleScalar &&
+    selectedCellCount > 1
+  ) {
+    return {
+      mode: 'fill',
+      hadHeaders: false,
+      fillValue: dataRows[0][0],
+      overwrites: [],
+      inserts: [],
+      startVisRow: selectionBBox?.startRow ?? 0,
+      startVisCol: selectionBBox?.startCol ?? 0,
+    }
+  }
+
+  const buildInsertCells = (rowCells, colResolver) => {
+    const cells = []
+    for (let dc = 0; dc < rowCells.length; dc++) {
+      const target = colResolver(dc)
+      if (!target) continue
+      const col = allColumns[target.modelColIdx]
+      if (!col || isPanelAutoOrGeneratedCol(col)) continue
+      cells.push({
+        modelColIdx: target.modelColIdx,
+        visColIdx: target.visColIdx,
+        rawValue: rowCells[dc],
+      })
+    }
+    return cells
+  }
+
+  if (!hasSelection || !selectionBBox || forceNewRows || existingRowCount <= 0) {
+    let insertColResolver
+    if (headerColMapping) {
+      insertColResolver = (dc) => {
+        const modelColIdx = headerColMapping[dc]
+        if (modelColIdx === undefined || modelColIdx < 0 || modelColIdx >= allColumns.length) {
+          return null
+        }
+        return { modelColIdx, visColIdx: visColPosByModelIdx.get(modelColIdx) ?? -1 }
+      }
+    } else {
+      const anchorCol =
+        hasSelection && selectionBBox && maxClipCols < visibleColIndices.length
+          ? Math.max(0, selectionBBox.startCol)
+          : 0
+      const canUseSourceMapping =
+        !hasSelection ||
+        !selectionBBox ||
+        (forceNewRows && anchorCol === 0 && maxClipCols < visibleColIndices.length)
+      const sourceMapping = canUseSourceMapping
+        ? resolvePanelSourceHeaderMapping(sourceHeaders, maxClipCols, allColumns)
+        : null
+
+      if (sourceMapping) {
+        insertColResolver = (dc) => {
+          const modelColIdx = sourceMapping[dc]
+          if (modelColIdx === undefined || modelColIdx < 0 || modelColIdx >= allColumns.length) {
+            return null
+          }
+          return { modelColIdx, visColIdx: visColPosByModelIdx.get(modelColIdx) ?? -1 }
+        }
+      } else {
+        const writableVisibleCols = visibleColIndices.filter(
+          (modelColIdx) => !isPanelAutoOrGeneratedCol(allColumns[modelColIdx])
+        )
+        const shouldSkipLeadingAuto =
+          anchorCol === 0 &&
+          maxClipCols < visibleColIndices.length &&
+          writableVisibleCols.length > 0 &&
+          isPanelAutoOrGeneratedCol(allColumns[visibleColIndices[0]])
+        if (shouldSkipLeadingAuto) {
+          insertColResolver = (dc) => {
+            const modelColIdx = writableVisibleCols[dc]
+            if (modelColIdx === undefined) return null
+            return { modelColIdx, visColIdx: visColPosByModelIdx.get(modelColIdx) ?? -1 }
+          }
+        } else {
+          insertColResolver = (dc) => {
+            const visColIdx = anchorCol + dc
+            const modelColIdx = visibleColIndices[visColIdx]
+            if (modelColIdx === undefined) return null
+            return { modelColIdx, visColIdx }
+          }
+        }
+      }
+    }
+
+    const inserts = dataRows.map((rowCells) => ({
+      cells: buildInsertCells(rowCells, insertColResolver),
+    }))
+    return {
+      mode: 'insert',
+      hadHeaders,
+      overwrites: [],
+      inserts,
+      startVisRow: existingRowCount,
+      startVisCol: 0,
+    }
+  }
+
+  const startVisRow = Math.max(0, selectionBBox.startRow)
+  const effectiveStartCol = headerColMapping
+    ? 0
+    : maxClipCols >= visibleColIndices.length
+      ? 0
+      : Math.max(0, selectionBBox.startCol)
+
+  const resolveColumn = (dc) => {
+    if (headerColMapping) {
+      const modelColIdx = headerColMapping[dc]
+      if (modelColIdx === undefined || modelColIdx < 0 || modelColIdx >= allColumns.length) {
+        return null
+      }
+      return { modelColIdx, visColIdx: visColPosByModelIdx.get(modelColIdx) ?? -1 }
+    }
+    const visColIdx = effectiveStartCol + dc
+    const modelColIdx = visibleColIndices[visColIdx]
+    if (modelColIdx === undefined) return null
+    return { modelColIdx, visColIdx }
+  }
+
+  const overwrites = []
+  const inserts = []
+
+  for (let dr = 0; dr < dataRows.length; dr++) {
+    const targetVisRow = startVisRow + dr
+    const rowCells = dataRows[dr]
+    if (targetVisRow < existingRowCount) {
+      const cells = []
+      for (let dc = 0; dc < rowCells.length; dc++) {
+        const target = resolveColumn(dc)
+        if (!target) continue
+        cells.push({
+          modelColIdx: target.modelColIdx,
+          visColIdx: target.visColIdx,
+          rawValue: rowCells[dc],
+        })
+      }
+      overwrites.push({ targetVisRow, cells })
+    } else {
+      inserts.push({ cells: buildInsertCells(rowCells, resolveColumn) })
+    }
+  }
+
+  const mode =
+    overwrites.length > 0 && inserts.length > 0
+      ? 'overwrite-and-insert'
+      : overwrites.length > 0
+        ? 'overwrite'
+        : 'insert'
+
+  return {
+    mode,
+    hadHeaders,
+    overwrites,
+    inserts,
+    startVisRow,
+    startVisCol: effectiveStartCol,
+  }
+}
+
 export function normalizeCellRange(r1, c1, r2, c2) {
   return {
     r1: Math.min(r1, r2),
@@ -899,7 +1255,7 @@ export function subtractColFromRange(range, c) {
 }
 
 export function isNumericSqlType(colType) {
-  return /\b(?:INT|INTEGER|BIGINT|SMALLINT|TINYINT|MEDIUMINT|REAL|FLOAT|DOUBLE|DECIMAL|NUMERIC|NUMBER)\b/i.test(
+  return /\b(?:INT|INTEGER|BIGINT|SMALLINT|TINYINT|MEDIUMINT|INT2|INT4|INT8|UINT8|UINT16|UINT32|UINT64|FLOAT4|FLOAT8|REAL|FLOAT|DOUBLE|DECIMAL|NUMERIC|NUMBER|SERIAL|BIGSERIAL|SMALLSERIAL)\b/i.test(
     String(colType || '')
   )
 }
@@ -908,14 +1264,24 @@ export function isBooleanSqlType(colType) {
   return /\b(?:BOOL|BOOLEAN)\b/i.test(String(colType || ''))
 }
 
+export function isEmptyAsNullNonTextSqlType(colType) {
+  return /\b(?:DATE|TIME|TIMESTAMP|TIMESTAMPTZ|DATETIME|YEAR|UUID|GUID|JSON|JSONB|INET|CIDR|MACADDR|BYTEA|BLOB|BINARY|VARBINARY|INTERVAL)\b/i.test(
+    String(colType || '')
+  )
+}
+
 export function coerceTypedCellInput(typed, originalValue, colType, nullable = true, options = {}) {
   const rawStr = String(typed ?? '')
   const trimmed = rawStr.trim()
   const isNumericCol = typeof originalValue === 'number' || isNumericSqlType(colType)
   const isBoolCol = typeof originalValue === 'boolean' || isBooleanSqlType(colType)
+  const isOtherNonTextCol = isEmptyAsNullNonTextSqlType(colType)
 
+  if (trimmed === '' && (isNumericCol || isBoolCol || isOtherNonTextCol)) {
+    return null
+  }
   if (trimmed.toUpperCase() === 'NULL' && nullable !== false) {
-    if (options.allowNullKeyword || isNumericCol || isBoolCol) {
+    if (options.allowNullKeyword || isNumericCol || isBoolCol || isOtherNonTextCol) {
       return null
     }
   }
@@ -924,9 +1290,11 @@ export function coerceTypedCellInput(typed, originalValue, colType, nullable = t
     if (/^false$/i.test(trimmed)) return false
   }
   if (isNumericCol) {
-    if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+    if (/^[+-]?\d+(?:\.\d+)?$/.test(trimmed)) {
       const num = Number(trimmed)
       if (trimmed.includes('.')) {
+        const decDigits = trimmed.replace(/^[+-]?0+(?=\d)/, '').replace('.', '')
+        if (decDigits.length > 15) return trimmed
         if (Number.isFinite(num)) return num
       } else if (Number.isSafeInteger(num)) {
         return num
@@ -1113,7 +1481,7 @@ export function buildCreateTableSql(tableName, cols, driver, schema) {
 export function buildTruncateOrDropSql(action, obj, driver) {
   const qTable = quoteTableRef(obj.name, obj.schema, driver)
   if (action === 'truncate') {
-    if (driver === 'sqlite' || driver === 'libsql') {
+    if (driver === 'sqlite' || driver === 'libsql' || driver === 'd1') {
       return `DELETE FROM ${qTable};`
     }
     return `TRUNCATE TABLE ${qTable};`
@@ -1457,8 +1825,6 @@ export function requiresPanelSqliteRebuild(draft) {
   const hasFkChg = draft.foreignKeys.some((fk) => fk.status === 'new' || fk.status === 'deleted')
   return hasDefChange || hasNewPk || hasDropPk || hasDropIdxCol || hasFkChg
 }
-
-export const panelRequiresSqliteRebuild = requiresPanelSqliteRebuild
 
 export function buildPanelMigrationSql(draft, driver) {
   if (!draft || driver === 'redis') return []

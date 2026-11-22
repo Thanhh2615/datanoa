@@ -1,4 +1,5 @@
 import type { ConnectionProfile, DatabaseDriverType } from '../../protocol'
+import { BUILTIN_ENGINE_CATALOG } from './engine-catalog'
 
 export type EngineKind = 'file' | 'sql' | 'kv' | 'http'
 
@@ -20,16 +21,23 @@ export interface ParsedConnectionUri {
   error?: string
 }
 
-export const ENGINE_CATALOG: readonly EngineMetadata[] = [
-  { id: 'sqlite', label: 'SQLite', shortLabel: 'SQLite', defaultPort: 0, supportsSsl: false, kind: 'file' },
-  { id: 'postgres', label: 'PostgreSQL', shortLabel: 'Postgres', defaultPort: 5432, supportsSsl: true, kind: 'sql' },
-  { id: 'mysql', label: 'MySQL', shortLabel: 'MySQL', defaultPort: 3306, supportsSsl: true, kind: 'sql' },
-  { id: 'mariadb', label: 'MariaDB', shortLabel: 'MariaDB', defaultPort: 3306, supportsSsl: true, kind: 'sql' },
-  { id: 'cockroachdb', label: 'CockroachDB', shortLabel: 'Cockroach', defaultPort: 26257, supportsSsl: true, kind: 'sql' },
-  { id: 'clickhouse', label: 'ClickHouse', shortLabel: 'ClickHouse', defaultPort: 8123, supportsSsl: true, kind: 'http' },
-  { id: 'redis', label: 'Redis', shortLabel: 'Redis', defaultPort: 6379, supportsSsl: true, kind: 'kv' },
-  { id: 'libsql', label: 'Turso / LibSQL', shortLabel: 'LibSQL', defaultPort: 443, supportsSsl: true, kind: 'http' },
-] as const
+export const ENGINE_CATALOG: readonly EngineMetadata[] = BUILTIN_ENGINE_CATALOG.map(
+  (engine) => ({
+    id: engine.id,
+    label: engine.label,
+    shortLabel: engine.shortLabel,
+    defaultPort: engine.defaultPort ?? 0,
+    supportsSsl: engine.supportsTlsConfig,
+    kind:
+      engine.transport === 'local-file'
+        ? 'file'
+        : engine.transport === 'http'
+          ? 'http'
+          : engine.isSql
+            ? 'sql'
+            : 'kv',
+  })
+)
 
 export const SUPPORTED_DRIVERS: readonly DatabaseDriverType[] = ENGINE_CATALOG.map((engine) => engine.id)
 
@@ -281,7 +289,7 @@ function buildHttpOrigin(protocol: 'http' | 'https', hostname: string, port: num
 }
 
 interface SqlUriSpec {
-  readonly driver: 'postgres' | 'cockroachdb' | 'mysql' | 'mariadb'
+  readonly driver: DatabaseDriverType
   readonly defaultPort: number
   readonly defaultDatabase: string
   readonly defaultSsl: boolean
@@ -294,6 +302,11 @@ const SQL_URI_SPECS: Readonly<Record<string, SqlUriSpec>> = {
   cockroach: { driver: 'cockroachdb', defaultPort: 26257, defaultDatabase: 'defaultdb', defaultSsl: true },
   mysql: { driver: 'mysql', defaultPort: 3306, defaultDatabase: '', defaultSsl: false },
   mariadb: { driver: 'mariadb', defaultPort: 3306, defaultDatabase: '', defaultSsl: false },
+  mssql: { driver: 'mssql' as DatabaseDriverType, defaultPort: 1433, defaultDatabase: 'master', defaultSsl: false },
+  sqlserver: { driver: 'mssql' as DatabaseDriverType, defaultPort: 1433, defaultDatabase: 'master', defaultSsl: false },
+  oracle: { driver: 'oracle' as DatabaseDriverType, defaultPort: 1521, defaultDatabase: 'FREEPDB1', defaultSsl: false },
+  mongodb: { driver: 'mongodb' as DatabaseDriverType, defaultPort: 27017, defaultDatabase: 'admin', defaultSsl: false },
+  'mongodb+srv': { driver: 'mongodb' as DatabaseDriverType, defaultPort: 27017, defaultDatabase: 'admin', defaultSsl: true },
 }
 
 function parseSqlNetworkUri(
@@ -467,6 +480,138 @@ function parseLibsqlUri(url: URL): ParsedConnectionUri {
   )
 }
 
+const D1_ENDPOINT_CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/
+const SENSITIVE_URL_QUERY_PARAM_RE =
+  /^(?:token|auth_?token|api_?key|key|secret|password|pwd|access_?token|bearer)$/i
+
+function isD1LoopbackHostname(hostname: string): boolean {
+  const host = hostname.trim().toLowerCase()
+  if (host === 'localhost' || host === '[::1]' || host === '::1') return true
+  if (!/^127(?:\.\d{1,3}){3}$/.test(host)) return false
+  return host.split('.').every((part) => Number(part) <= 255)
+}
+
+export function isD1HttpLoopbackEndpoint(rawUrl: string): boolean {
+  const trimmed = rawUrl.trim()
+  if (!trimmed) return false
+  try {
+    const parsed = new URL(trimmed)
+    return parsed.protocol === 'http:' && isD1LoopbackHostname(parsed.hostname)
+  } catch {
+    return false
+  }
+}
+
+export function validateD1EndpointUrl(
+  rawUrl: string,
+  options?: { hasAuthToken?: boolean }
+): { ok: true; url: string } | { ok: false; error: string } {
+  const trimmed = rawUrl.trim()
+  if (!trimmed) {
+    return { ok: false, error: 'Cloudflare D1 endpoint URL cannot be empty.' }
+  }
+  if (D1_ENDPOINT_CONTROL_CHARS_RE.test(trimmed)) {
+    return { ok: false, error: 'Cloudflare D1 endpoint URL must not contain control characters.' }
+  }
+  let parsed: URL
+  try {
+    parsed = new URL(trimmed)
+  } catch {
+    return { ok: false, error: 'Cloudflare D1 endpoint URL is not a valid absolute URL.' }
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return {
+      ok: false,
+      error: `Unsupported Cloudflare D1 endpoint scheme "${parsed.protocol}" — only http(s) is allowed.`,
+    }
+  }
+  if (parsed.username || parsed.password) {
+    return {
+      ok: false,
+      error:
+        'Cloudflare D1 endpoint URL must not contain embedded credentials; store the API token in Secrets.',
+    }
+  }
+  for (const key of parsed.searchParams.keys()) {
+    if (SENSITIVE_URL_QUERY_PARAM_RE.test(key)) {
+      return {
+        ok: false,
+        error: `Cloudflare D1 endpoint URL must not include credential query parameter "${key}"; store the API token in Secrets.`,
+      }
+    }
+  }
+  if (parsed.protocol === 'http:') {
+    if (!isD1LoopbackHostname(parsed.hostname)) {
+      return {
+        ok: false,
+        error:
+          'Cloudflare D1 endpoint URL must use HTTPS; plain HTTP is only allowed for localhost, 127.0.0.0/8, or [::1].',
+      }
+    }
+    if (options?.hasAuthToken) {
+      return {
+        ok: false,
+        error:
+          'Cloudflare D1 endpoint URL cannot send an API token over plain HTTP; use HTTPS or remove the token for localhost/loopback emulators.',
+      }
+    }
+  }
+  return { ok: true, url: trimmed }
+}
+
+export function scrubUrlCredentials(rawUrl: string): string | undefined {
+  const trimmed = rawUrl.trim()
+  if (!trimmed) return undefined
+  try {
+    const parsed = new URL(trimmed)
+    parsed.username = ''
+    parsed.password = ''
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      if (SENSITIVE_URL_QUERY_PARAM_RE.test(key)) {
+        parsed.searchParams.delete(key)
+      }
+    }
+    return parsed.toString()
+  } catch {
+    return undefined
+  }
+}
+
+function parseD1Uri(url: URL): ParsedConnectionUri {
+  const accountId = decodeUriPart(url.hostname)
+  const databaseId = decodeUriPart(url.pathname.replace(/^\/+/, '').replace(/\/+$/, ''))
+  if (!accountId) {
+    return { ok: false, error: 'Cloudflare D1 URI must include an account ID (d1://account/database).' }
+  }
+  if (!databaseId) {
+    return { ok: false, error: 'Cloudflare D1 URI must include a database ID (d1://account/database).' }
+  }
+  const tokenRaw =
+    url.searchParams.get('token') ??
+    url.searchParams.get('authToken') ??
+    url.searchParams.get('auth_token')
+  const authToken = tokenRaw && tokenRaw.length > 0 ? tokenRaw : undefined
+  const endpoint = (url.searchParams.get('endpoint') ?? '').trim()
+  const profile: Partial<ConnectionProfile> = {
+    driver: 'd1',
+    name: databaseId,
+    database: databaseId,
+    d1AccountId: accountId,
+    d1DatabaseId: databaseId,
+    ssl: true,
+  }
+  if (endpoint) {
+    const validated = validateD1EndpointUrl(endpoint, {
+      hasAuthToken: Boolean(authToken && authToken.trim().length > 0),
+    })
+    if (!validated.ok) {
+      return { ok: false, error: validated.error }
+    }
+    profile.url = validated.url
+  }
+  return buildSuccessResult(profile, { authToken })
+}
+
 function extractBasename(filePath: string): string {
   if (filePath === ':memory:') return ':memory:'
   const normalized = filePath.replace(/\\/g, '/').replace(/\/+$/, '')
@@ -549,6 +694,10 @@ export function parseConnectionUri(rawUri: string): ParsedConnectionUri {
 
   if (scheme === 'libsql') {
     return parseLibsqlUri(url)
+  }
+
+  if (scheme === 'd1' || scheme === 'd1+http' || scheme === 'd1+https') {
+    return parseD1Uri(url)
   }
 
   if (scheme === 'http' || scheme === 'https') {

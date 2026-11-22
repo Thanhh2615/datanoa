@@ -13,24 +13,34 @@ import type {
   IDatabaseSession,
   PreviewChangesResult,
   QueryResult,
+  QueryResultSet,
   SchemaObject,
+  SchemaObjectKind,
   TableBrowseResult,
   TableDetails,
+  TransactionState,
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
-import { DatabaseDriverError } from '../common/driver'
+import { DatabaseDriverError, runDriverConnectionTest } from '../common/driver'
+import * as net from 'node:net'
+import * as tls from 'node:tls'
+import type { DriverTlsOptions } from '../common/tls-and-tunnel'
+import { resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
 import {
   assembleTableBrowseResult,
   buildBatchStatements,
+  buildSelectByPrimaryKeySql,
   buildSelectPageSql,
   buildUpdateSql,
-  quoteIdentifier,
   quoteQualifiedTable,
 } from '../common/update-builder'
 import {
   TableDetailsCache,
+  collectAndAssembleSchemaDdl,
+  introspectMysqlObjectDdl,
   introspectMysqlObjects,
+  introspectMysqlSchemas,
   introspectMysqlTableDetails,
 } from '../common/schema'
 import {
@@ -38,10 +48,33 @@ import {
   reconstructTableDdl,
   splitSqlStatements,
 } from '../common/sql-tools'
+import { compactSql, stripLeadingSqlComments } from '../common/sql-lexer'
+
+const MYSQL_SERVER_STATUS_IN_TRANS = 0x0001
+const MYSQL_SERVER_STATUS_AUTOCOMMIT = 0x0002
+const MYSQL_TYPE_BIT = 16
 
 interface MysqlResultHeaderLike {
   affectedRows?: number
   insertId?: number
+  serverStatus?: number
+}
+
+function extractServerStatus(res: unknown): number | undefined {
+  if (res && typeof res === 'object' && 'serverStatus' in res) {
+    const val = (res as MysqlResultHeaderLike).serverStatus
+    if (typeof val === 'number' && Number.isFinite(val)) return val
+  }
+  return undefined
+}
+
+function isMysqlImplicitCommitStatement(normalizedSql: string): boolean {
+  if (/^(?:CREATE|DROP)\s+TEMPORARY\s+TABLE\b/i.test(normalizedSql)) {
+    return false
+  }
+  return /^(?:CREATE|ALTER|DROP|TRUNCATE|RENAME|LOCK\s+TABLES|UNLOCK\s+TABLES|LOAD\s+DATA|ANALYZE|OPTIMIZE|REPAIR|FLUSH|RESET|SET\s+AUTOCOMMIT\s*=\s*(?:1|ON|TRUE))\b/i.test(
+    normalizedSql
+  )
 }
 
 interface MysqlQueryObject {
@@ -49,8 +82,18 @@ interface MysqlQueryObject {
   rowsAsArray?: boolean
 }
 
+interface MysqlTlsStreamLike {
+  getPeerCertificate?: () => tls.PeerCertificate
+}
+
+interface MysqlInternalConnectionLike {
+  stream?: MysqlTlsStreamLike
+}
+
 export interface MysqlConnectionLike {
   threadId?: number
+  stream?: MysqlTlsStreamLike
+  connection?: MysqlInternalConnectionLike
   query(sql: string | MysqlQueryObject, params?: unknown[]): Promise<[unknown, unknown]>
   beginTransaction(): Promise<void>
   commit(): Promise<void>
@@ -77,6 +120,47 @@ interface ActiveMysqlQuery {
 interface MysqlFieldPacketLike {
   name: string
   columnType?: number
+  columnLength?: number
+}
+
+function decodeMysqlBitValue(val: unknown, columnLength?: number): unknown {
+  if (val === null || val === undefined || !(val instanceof Uint8Array)) {
+    return val
+  }
+  if (val.length === 0) return '0'
+  let bits = ''
+  for (let i = 0; i < val.length; i++) {
+    bits += val[i].toString(2).padStart(8, '0')
+  }
+  const bitWidth =
+    typeof columnLength === 'number' && Number.isInteger(columnLength) && columnLength > 0
+      ? Math.min(bits.length, columnLength)
+      : bits.length
+  const trimmed = bits.slice(-bitWidth)
+  if (bitWidth === 1) {
+    return trimmed
+  }
+  return `b'${trimmed}'`
+}
+
+function decodeMysqlRecordRows(
+  rows: Record<string, unknown>[],
+  fields: unknown
+): Record<string, unknown>[] {
+  if (!Array.isArray(fields) || fields.length === 0 || rows.length === 0) {
+    return rows
+  }
+  const bitFields = (fields as MysqlFieldPacketLike[]).filter((f) => f.columnType === MYSQL_TYPE_BIT)
+  if (bitFields.length === 0) return rows
+  return rows.map((row) => {
+    const out = { ...row }
+    for (const bf of bitFields) {
+      if (Object.prototype.hasOwnProperty.call(out, bf.name)) {
+        out[bf.name] = decodeMysqlBitValue(out[bf.name], bf.columnLength)
+      }
+    }
+    return out
+  })
 }
 
 function extractMysqlErrorMessage(err: unknown, fallback: string): string {
@@ -87,6 +171,42 @@ function extractMysqlErrorMessage(err: unknown, fallback: string): string {
     if (typeof val === 'string' && val) return val
   }
   return fallback
+}
+
+function extractMysqlErrorCode(err: unknown): string {
+  if (err && typeof err === 'object' && 'code' in err) {
+    const val = Reflect.get(err, 'code')
+    return typeof val === 'string' ? val : String(val ?? '')
+  }
+  return ''
+}
+
+const FATAL_MYSQL_ERROR_CODES = new Set([
+  'PROTOCOL_CONNECTION_LOST',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EPIPE',
+  'PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR',
+  'ENOTCONN',
+  'ER_SERVER_SHUTDOWN',
+  'CR_SERVER_GONE_ERROR',
+  'CR_SERVER_LOST',
+  'ER_CLIENT_INTERACTION_TIMEOUT',
+])
+
+const FATAL_MYSQL_ERRNOS = new Set([1053, 2006, 2013, 4031])
+
+function isFatalMysqlConnectionError(err: unknown): boolean {
+  if (FATAL_MYSQL_ERROR_CODES.has(extractMysqlErrorCode(err).toUpperCase())) {
+    return true
+  }
+  if (err && typeof err === 'object' && 'errno' in err) {
+    const errno = Number(Reflect.get(err, 'errno'))
+    if (Number.isInteger(errno) && FATAL_MYSQL_ERRNOS.has(errno)) {
+      return true
+    }
+  }
+  return false
 }
 
 function extractAffectedRows(res: unknown, fallback = 0): number {
@@ -124,7 +244,8 @@ function parseMysqlQueryResult(
     }
   }
 
-  const columns = (fields as MysqlFieldPacketLike[]).map((f) => ({
+  const fieldPackets = fields as MysqlFieldPacketLike[]
+  const columns = fieldPackets.map((f) => ({
     name: f.name,
     type: resolveMysqlColumnTypeName(f.columnType),
   }))
@@ -136,7 +257,12 @@ function parseMysqlQueryResult(
 
   // Supports native rowsAsArray: true AND object-row mocks
   const resultRows: unknown[][] = slicedRows.map((r) =>
-    Array.isArray(r) ? r : columns.map((c) => r[c.name])
+    columns.map((c, idx) => {
+      const rawVal = Array.isArray(r) ? r[idx] : r[c.name]
+      return fieldPackets[idx]?.columnType === MYSQL_TYPE_BIT
+        ? decodeMysqlBitValue(rawVal, fieldPackets[idx]?.columnLength)
+        : rawVal
+    })
   )
 
   return {
@@ -158,23 +284,121 @@ export class MysqlSession implements IDatabaseSession {
   readonly profile: ConnectionProfile
   private readonly pool: MysqlPoolLike
   private readonly cancelConnOptions?: ConnectionOptions
+  private readonly verifyIpIdentity?: string
+  private readonly verifiedIdentityConns = new WeakSet<MysqlConnectionLike>()
+  private readonly readOnlyAppliedConns = new WeakSet<MysqlConnectionLike>()
   private readonly activeQueries = new Map<string, ActiveMysqlQuery>()
   private readonly tableDetailsCache = new TableDetailsCache()
   private isClosed = false
+  private txConn: MysqlConnectionLike | null = null
+  private txOpChain: Promise<void> = Promise.resolve()
+  private readonly releasedConns = new WeakSet<MysqlConnectionLike>()
+  private autoCommit = true
+  private statementCount = 0
+  private txStartedAt: number | undefined
 
   constructor(
     pool: MysqlPoolLike,
     profile: ConnectionProfile,
-    cancelConnOptions?: ConnectionOptions
+    cancelConnOptions?: ConnectionOptions,
+    verifyIpIdentity?: string
   ) {
     this.pool = pool
     this.profile = profile
     this.cancelConnOptions = cancelConnOptions
+    this.verifyIpIdentity = verifyIpIdentity
     this.driverType = profile.driver === 'mariadb' ? 'mariadb' : 'mysql'
+  }
+
+  private verifyConnectionIdentityIfNeeded(conn: MysqlConnectionLike): void {
+    if (!this.verifyIpIdentity || this.verifiedIdentityConns.has(conn)) {
+      return
+    }
+    const stream = conn.connection?.stream ?? conn.stream
+    if (!stream || typeof stream.getPeerCertificate !== 'function') {
+      return
+    }
+    const peerCert = stream.getPeerCertificate()
+    if (!peerCert || Object.keys(peerCert).length === 0) {
+      this.safeReleaseConn(conn, true)
+      throw new DatabaseDriverError(
+        `TLS verify-full failed for ${this.verifyIpIdentity}: server did not present a peer certificate`,
+        'TLS_IDENTITY_MISMATCH',
+        this.driverType
+      )
+    }
+    const identityErr = tls.checkServerIdentity(this.verifyIpIdentity, peerCert)
+    if (identityErr) {
+      this.safeReleaseConn(conn, true)
+      throw new DatabaseDriverError(
+        `TLS verify-full failed for ${this.verifyIpIdentity}: ${identityErr.message}`,
+        'TLS_IDENTITY_MISMATCH',
+        this.driverType
+      )
+    }
+    this.verifiedIdentityConns.add(conn)
+  }
+
+  private async acquireConnection(): Promise<MysqlConnectionLike> {
+    const conn = await this.pool.getConnection()
+    this.verifyConnectionIdentityIfNeeded(conn)
+    if (this.profile.readOnly && !this.readOnlyAppliedConns.has(conn)) {
+      try {
+        await conn.query('SET SESSION TRANSACTION READ ONLY')
+        this.readOnlyAppliedConns.add(conn)
+      } catch (err) {
+        this.safeReleaseConn(conn, true)
+        throw err
+      }
+    }
+    return conn
+  }
+
+  private async poolQuery(sql: string, params?: unknown[]): Promise<[unknown, unknown]> {
+    if (this.verifyIpIdentity || this.profile.readOnly) {
+      const conn = await this.acquireConnection()
+      try {
+        return await conn.query(sql, params)
+      } finally {
+        this.safeReleaseConn(conn, false)
+      }
+    }
+    return await this.pool.query(sql, params)
   }
 
   isAlive(): boolean {
     return !this.isClosed
+  }
+
+  private runExclusiveTxOp<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.txOpChain
+    let release: (() => void) | undefined
+    this.txOpChain = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    return prev.then(fn).finally(() => {
+      if (release) release()
+    })
+  }
+
+  private safeReleaseConn(conn: MysqlConnectionLike, destroy: boolean): void {
+    if (this.releasedConns.has(conn)) return
+    this.releasedConns.add(conn)
+    try {
+      if (destroy && typeof conn.destroy === 'function') {
+        conn.destroy()
+      } else {
+        conn.release()
+      }
+    } catch {
+      // Ignore release failures on already-closed connections
+    }
+  }
+
+  private clearPinnedTxConn(): void {
+    this.txConn = null
+    this.statementCount = 0
+    this.txStartedAt = undefined
   }
 
   private readonly queryExecutor = async (
@@ -184,7 +408,7 @@ export class MysqlSession implements IDatabaseSession {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
     }
-    const [rows] = await this.pool.query(sql, params)
+    const [rows] = await this.poolQuery(sql, params)
     return asRecordRows(rows)
   }
 
@@ -199,6 +423,7 @@ export class MysqlSession implements IDatabaseSession {
           ...this.cancelConnOptions,
           connectTimeout: 5000,
         })) as unknown as MysqlConnectionLike
+        this.verifyConnectionIdentityIfNeeded(killConn)
         await killConn.query(`KILL QUERY ${threadId};`)
         return true
       } catch {
@@ -216,7 +441,7 @@ export class MysqlSession implements IDatabaseSession {
       }
     }
     try {
-      await this.pool.query(`KILL QUERY ${threadId};`)
+      await this.poolQuery(`KILL QUERY ${threadId};`)
       return true
     } catch {
       return false
@@ -228,7 +453,7 @@ export class MysqlSession implements IDatabaseSession {
       return { ok: false, message: 'Session is closed' }
     }
     try {
-      const conn = await this.pool.getConnection()
+      const conn = await this.acquireConnection()
       let failed = false
       try {
         await conn.query('SELECT 1 AS ok;')
@@ -265,8 +490,10 @@ export class MysqlSession implements IDatabaseSession {
     if (this.isClosed) return
     this.isClosed = true
 
+    // Cancel/destroy active queries FIRST so pool.end() never hangs behind them
     const activeEntries = Array.from(this.activeQueries.values())
     this.activeQueries.clear()
+    const hadActiveQuery = activeEntries.length > 0
     for (const active of activeEntries) {
       active.cancelled = true
       if (Number.isInteger(active.threadId) && active.threadId > 0 && this.cancelConnOptions) {
@@ -274,16 +501,21 @@ export class MysqlSession implements IDatabaseSession {
       }
       if (!active.released) {
         active.released = true
+        this.safeReleaseConn(active.conn, true)
+      }
+    }
+
+    const conn = this.txConn
+    if (conn !== null) {
+      this.clearPinnedTxConn()
+      if (!hadActiveQuery) {
         try {
-          if (typeof active.conn.destroy === 'function') {
-            active.conn.destroy()
-          } else {
-            active.conn.release()
-          }
+          await conn.rollback()
         } catch {
-          // Ignore errors on already-closed connections
+          // Ignore rollback error on close
         }
       }
+      this.safeReleaseConn(conn, true)
     }
 
     await this.pool.end().catch(() => {})
@@ -295,6 +527,39 @@ export class MysqlSession implements IDatabaseSession {
     }
     const targetSchema = schema !== undefined ? schema : this.profile.database || ''
     return introspectMysqlObjects(this.queryExecutor, targetSchema)
+  }
+
+  async listSchemas(): Promise<{ schemas: string[]; defaultSchema: string }> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    return introspectMysqlSchemas(this.queryExecutor, this.profile.database || '')
+  }
+
+  async getObjectDdl(name: string, kind: SchemaObjectKind, schema?: string): Promise<string> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    const targetSchema = schema || this.profile.database || ''
+    if (kind === 'table') {
+      return this.getDdl(name, targetSchema)
+    }
+    return introspectMysqlObjectDdl(this.queryExecutor, name, kind, targetSchema)
+  }
+
+  async exportSchemaDdl(schema?: string): Promise<{ ddl: string; objectCount: number }> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    const targetSchema = schema || this.profile.database || ''
+    const objects = await this.listObjects(targetSchema)
+    return collectAndAssembleSchemaDdl({
+      dialect: this.driverType,
+      schemaName: targetSchema,
+      objects,
+      getObjectDdl: (object) =>
+        this.getObjectDdl(object.name, object.kind, object.schema || targetSchema),
+    })
   }
 
   async getTableDetails(table: string, schema?: string): Promise<TableDetails> {
@@ -316,7 +581,66 @@ export class MysqlSession implements IDatabaseSession {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
     }
+    const defaultSchema = this.profile.database || ''
     const targetSchema = params.schema || this.profile.database
+
+    if (!this.autoCommit || this.txConn !== null) {
+      return this.runExclusiveTxOp(async () => {
+        if (this.isClosed) {
+          throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+        }
+        if (!this.autoCommit && this.txConn === null) {
+          await this.beginTransactionLocked()
+        }
+        const conn = this.txConn ?? (await this.acquireConnection())
+        const isPinned = this.txConn === conn
+        let failed = false
+        try {
+          const effectiveSchema = targetSchema || defaultSchema
+          let details = this.tableDetailsCache.get(effectiveSchema, defaultSchema, params.table)
+          if (!details) {
+            const txExecutor = async (qSql: string, qParams?: unknown[]) => {
+              const [rows] = await conn.query(qSql, qParams)
+              return asRecordRows(rows)
+            }
+            details = await introspectMysqlTableDetails(txExecutor, params.table, effectiveSchema)
+            this.tableDetailsCache.set(effectiveSchema, defaultSchema, params.table, details)
+          }
+
+          const { sql, countSql, params: queryParams } = buildSelectPageSql({
+            driver: this.driverType,
+            table: params.table,
+            schema: targetSchema,
+            page: params.page,
+            pageSize: params.pageSize,
+            sortColumn: params.sortColumn,
+            sortDirection: params.sortDirection,
+            primaryKey: details.primaryKey,
+            whereClause: params.whereClause,
+            orderByClause: params.orderByClause,
+          })
+
+          const [countRows] = await conn.query(countSql)
+          const [dataRows, dataFields] = await conn.query(sql, queryParams)
+
+          return assembleTableBrowseResult({
+            tableDetails: details,
+            rows: decodeMysqlRecordRows(asRecordRows(dataRows), dataFields),
+            countRow: asRecordRows(countRows)[0] || { total: 0 },
+            page: params.page,
+            pageSize: params.pageSize,
+          })
+        } catch (err) {
+          failed = true
+          throw err
+        } finally {
+          if (!isPinned) {
+            this.safeReleaseConn(conn, failed)
+          }
+        }
+      })
+    }
+
     const details = await this.getTableDetails(params.table, targetSchema)
 
     const { sql, countSql, params: queryParams } = buildSelectPageSql({
@@ -332,12 +656,12 @@ export class MysqlSession implements IDatabaseSession {
       orderByClause: params.orderByClause,
     })
 
-    const [countRows] = await this.pool.query(countSql)
-    const [dataRows] = await this.pool.query(sql, queryParams)
+    const [countRows] = await this.poolQuery(countSql)
+    const [dataRows, dataFields] = await this.poolQuery(sql, queryParams)
 
     return assembleTableBrowseResult({
       tableDetails: details,
-      rows: asRecordRows(dataRows),
+      rows: decodeMysqlRecordRows(asRecordRows(dataRows), dataFields),
       countRow: asRecordRows(countRows)[0] || { total: 0 },
       page: params.page,
       pageSize: params.pageSize,
@@ -348,7 +672,15 @@ export class MysqlSession implements IDatabaseSession {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
     }
+    const defaultSchema = this.profile.database || ''
     const targetSchema = params.schema || this.profile.database
+    const originalColumnType = this.tableDetailsCache.findColumnType(
+      targetSchema || defaultSchema,
+      defaultSchema,
+      params.table,
+      params.column,
+      params.columnType
+    )
     const { sql, params: updateParams } = buildUpdateSql({
       driver: this.driverType,
       table: params.table,
@@ -357,9 +689,58 @@ export class MysqlSession implements IDatabaseSession {
       newValue: params.newValue,
       primaryKeys: params.primaryKeys,
       originalValue: params.originalValue,
+      originalColumnType,
     })
 
-    const [res] = await this.pool.query(sql, updateParams)
+    const reloadQuery = buildSelectByPrimaryKeySql({
+      driver: this.driverType,
+      table: params.table,
+      schema: targetSchema,
+      primaryKeys: params.primaryKeys,
+      editedColumn: params.column,
+      newValue: params.newValue,
+    })
+    const selectSql = reloadQuery ? `${reloadQuery.sql} LIMIT 1;` : null
+    const pkValues = reloadQuery?.params ?? []
+
+    const pinnedResult = await this.runExclusiveTxOp(async (): Promise<UpdateCellResult | null> => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      if (!this.autoCommit && this.txConn === null) {
+        await this.beginTransactionLocked()
+      }
+      if (this.txConn === null) {
+        return null
+      }
+      const conn = this.txConn
+      const [res] = await conn.query(sql, updateParams)
+      const affectedRows = extractAffectedRows(res, 0)
+      if (affectedRows === 0) {
+        throw new DatabaseDriverError(
+          'Record was modified or deleted by another session (optimistic lock conflict)',
+          'conflict',
+          this.driverType
+        )
+      }
+      this.statementCount++
+      let updatedRecord: Record<string, unknown> | undefined
+      if (selectSql) {
+        const [selRows, selFields] = await conn.query(selectSql, pkValues)
+        updatedRecord = decodeMysqlRecordRows(asRecordRows(selRows), selFields)[0]
+      }
+      this.tableDetailsCache.clear()
+      return {
+        ok: true,
+        affectedRows,
+        updatedRecord,
+      }
+    })
+    if (pinnedResult !== null) {
+      return pinnedResult
+    }
+
+    const [res] = await this.poolQuery(sql, updateParams)
     const affectedRows = extractAffectedRows(res, 0)
 
     if (affectedRows === 0) {
@@ -370,23 +751,10 @@ export class MysqlSession implements IDatabaseSession {
       )
     }
 
-    const whereParts: string[] = []
-    const pkValues: unknown[] = []
-    for (const [pkCol, rawPkVal] of Object.entries(params.primaryKeys)) {
-      const effectivePkVal = pkCol === params.column ? params.newValue : rawPkVal
-      if (effectivePkVal === null || effectivePkVal === undefined) {
-        whereParts.push(`${quoteIdentifier(this.driverType, pkCol)} IS NULL`)
-      } else {
-        whereParts.push(`${quoteIdentifier(this.driverType, pkCol)} = ?`)
-        pkValues.push(effectivePkVal)
-      }
-    }
-
     let updatedRecord: Record<string, unknown> | undefined
-    if (whereParts.length > 0) {
-      const selectSql = `SELECT * FROM ${quoteQualifiedTable(params.table, targetSchema, this.driverType)} WHERE ${whereParts.join(' AND ')} LIMIT 1;`
-      const [selRows] = await this.pool.query(selectSql, pkValues)
-      updatedRecord = asRecordRows(selRows)[0]
+    if (selectSql) {
+      const [selRows, selFields] = await this.poolQuery(selectSql, pkValues)
+      updatedRecord = decodeMysqlRecordRows(asRecordRows(selRows), selFields)[0]
     }
 
     this.tableDetailsCache.clear()
@@ -410,6 +778,12 @@ export class MysqlSession implements IDatabaseSession {
       inserts: params.inserts,
       updates: params.updates,
       deletes: params.deletes,
+      columnTypes: this.tableDetailsCache.resolveColumnTypes(
+        targetSchema,
+        this.profile.database || '',
+        params.table,
+        params.columnTypes
+      ),
     })
     return { statements: batch.previewStatements }
   }
@@ -426,12 +800,88 @@ export class MysqlSession implements IDatabaseSession {
       inserts: params.inserts,
       updates: params.updates,
       deletes: params.deletes,
+      columnTypes: this.tableDetailsCache.resolveColumnTypes(
+        targetSchema,
+        this.profile.database || '',
+        params.table,
+        params.columnTypes
+      ),
     })
     if (batch.all.length === 0) {
       return { ok: true, inserted: 0, updated: 0, deleted: 0, statements: [] }
     }
 
-    const conn = await this.pool.getConnection()
+    const pinnedResult = await this.runExclusiveTxOp(async (): Promise<ApplyChangesResult | null> => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      if (!this.autoCommit && this.txConn === null) {
+        await this.beginTransactionLocked()
+      }
+      if (this.txConn === null) {
+        return null
+      }
+      const conn = this.txConn
+      await conn.query('SAVEPOINT datanoa_apply_changes;')
+      try {
+        let deleted = 0
+        for (const stmt of batch.deletes) {
+          const [res] = await conn.query(stmt.sql, stmt.params)
+          const count = extractAffectedRows(res, 0)
+          if (count === 0) {
+            throw new DatabaseDriverError(
+              'Record was modified or deleted by another session (optimistic lock conflict)',
+              'conflict',
+              this.driverType
+            )
+          }
+          deleted += count
+        }
+
+        let updated = 0
+        for (const stmt of batch.updates) {
+          const [res] = await conn.query(stmt.sql, stmt.params)
+          const count = extractAffectedRows(res, 0)
+          if (count === 0) {
+            throw new DatabaseDriverError(
+              'Record was modified or deleted by another session (optimistic lock conflict)',
+              'conflict',
+              this.driverType
+            )
+          }
+          updated += count
+        }
+
+        let inserted = 0
+        for (const stmt of batch.chunkedInserts) {
+          const [res] = await conn.query(stmt.sql, stmt.params)
+          inserted += extractAffectedRows(res, stmt.rowCount)
+        }
+
+        await conn.query('RELEASE SAVEPOINT datanoa_apply_changes;')
+        this.statementCount += batch.deletes.length + batch.updates.length + batch.chunkedInserts.length
+        this.tableDetailsCache.clear()
+        return {
+          ok: true,
+          inserted,
+          updated,
+          deleted,
+          statements: batch.previewStatements,
+        }
+      } catch (err) {
+        try {
+          await conn.query('ROLLBACK TO SAVEPOINT datanoa_apply_changes;')
+        } catch {
+          // Ignore savepoint rollback error
+        }
+        throw err
+      }
+    })
+    if (pinnedResult !== null) {
+      return pinnedResult
+    }
+
+    const conn = await this.acquireConnection()
     let shouldDestroy = false
     try {
       await conn.beginTransaction()
@@ -464,9 +914,9 @@ export class MysqlSession implements IDatabaseSession {
       }
 
       let inserted = 0
-      for (const stmt of batch.inserts) {
+      for (const stmt of batch.chunkedInserts) {
         const [res] = await conn.query(stmt.sql, stmt.params)
-        inserted += extractAffectedRows(res, 1)
+        inserted += extractAffectedRows(res, stmt.rowCount)
       }
 
       await conn.commit()
@@ -499,7 +949,7 @@ export class MysqlSession implements IDatabaseSession {
     const qTable = quoteQualifiedTable(table, targetSchema, this.driverType)
 
     try {
-      const [rows] = await this.pool.query(`SHOW CREATE TABLE ${qTable};`)
+      const [rows] = await this.poolQuery(`SHOW CREATE TABLE ${qTable};`)
       const row = asRecordRows(rows)[0]
       if (row) {
         const rawCreate =
@@ -524,70 +974,204 @@ export class MysqlSession implements IDatabaseSession {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
     }
-    const conn = await this.pool.getConnection()
-    const startTime = performance.now()
 
-    const activeEntry: ActiveMysqlQuery = {
-      conn,
-      threadId: typeof conn.threadId === 'number' ? conn.threadId : 0,
-      startTime,
-      cancelled: false,
-      released: false,
-    }
-    this.activeQueries.set(queryId, activeEntry)
+    const stmts = splitSqlStatements(sql, this.driverType).map((s) => s.text)
+    const execList = stmts.length <= 1 ? [sql] : stmts
+    const startsManualTx = execList.some((s) =>
+      /^(?:BEGIN|START\s+TRANSACTION)\b/i.test(stripLeadingSqlComments(s.trim(), this.driverType).trim())
+    )
+    const needsTxLock = !this.autoCommit || this.txConn !== null || startsManualTx
 
-    let shouldDestroy = false
-    try {
-      const stmts = splitSqlStatements(sql, this.driverType).map((s) => s.text)
-      let totalAffectedRows = 0
-      let lastSelect: Omit<QueryResult, 'executionTimeMs'> | null = null
-
-      const execList = stmts.length <= 1 ? [sql] : stmts
-      for (const stmtSql of execList) {
-        if (activeEntry.cancelled || this.isClosed) {
-          shouldDestroy = true
-          throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', this.driverType)
-        }
-        const [rows, fields] = await conn.query({ sql: stmtSql, rowsAsArray: true })
-        const parsed = parseMysqlQueryResult(rows, fields, maxRows)
-        if (parsed.isSelect) {
-          lastSelect = parsed.result
-        } else if (execList.length === 1) {
-          totalAffectedRows = parsed.affectedRows
-        } else {
-          totalAffectedRows += parsed.affectedRows
-        }
+    const executeRun = async (): Promise<QueryResult> => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      if (!this.autoCommit && this.txConn === null) {
+        await this.beginTransactionLocked()
       }
 
-      const executionTimeMs = Math.round(performance.now() - startTime)
-      return lastSelect
-        ? { ...lastSelect, executionTimeMs }
-        : {
-            columns: [],
-            rows: [],
-            rowCount: 0,
-            affectedRows: totalAffectedRows,
-            executionTimeMs,
-            truncated: false,
-            isSelect: false,
+      const conn = this.txConn ?? (await this.acquireConnection())
+      if (this.isClosed) {
+        this.safeReleaseConn(conn, true)
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      const startTime = performance.now()
+
+      const activeEntry: ActiveMysqlQuery = {
+        conn,
+        threadId: typeof conn.threadId === 'number' ? conn.threadId : 0,
+        startTime,
+        cancelled: false,
+        released: false,
+      }
+      this.activeQueries.set(queryId, activeEntry)
+
+      let shouldDestroy = false
+      let txEndedInRun = false
+      let lastServerStatus: number | undefined
+      try {
+        let totalAffectedRows = 0
+        let lastSelect: Omit<QueryResult, 'executionTimeMs'> | null = null
+        const collectedSets: QueryResultSet[] = []
+
+        for (let execIndex = 0; execIndex < execList.length; execIndex++) {
+          const stmtSql = execList[execIndex]
+          if (activeEntry.cancelled || this.isClosed) {
+            shouldDestroy = true
+            throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', this.driverType)
           }
-    } catch (err) {
-      shouldDestroy = true
-      throw err
-    } finally {
-      if (containsDdlStatement(sql, this.driverType)) {
-        this.tableDetailsCache.clear()
-      }
-      this.activeQueries.delete(queryId)
-      if (!activeEntry.released) {
-        activeEntry.released = true
-        if ((shouldDestroy || activeEntry.cancelled) && typeof conn.destroy === 'function') {
-          conn.destroy()
-        } else {
-          conn.release()
+          const trimmedStmt = stmtSql.trim()
+          const normalizedStmt = stripLeadingSqlComments(trimmedStmt, this.driverType).trim()
+          const isStandaloneBegin = /^(?:BEGIN|START\s+TRANSACTION)\b/i.test(normalizedStmt)
+
+          // If an earlier statement in this script ended the TX (e.g. DDL implicit commit) while in Manual TX mode,
+          // start a fresh transaction before running subsequent statements so DML never silently auto-commits.
+          if (txEndedInRun && !this.autoCommit && this.txConn === null && !isStandaloneBegin) {
+            await conn.beginTransaction()
+            this.txConn = conn
+            this.statementCount = 0
+            this.txStartedAt = Date.now()
+            txEndedInRun = false
+          }
+
+          if (isStandaloneBegin && this.txConn === null) {
+            this.txConn = conn
+            this.statementCount = 0
+            this.txStartedAt = Date.now()
+            txEndedInRun = false
+          }
+
+          const [rows, fields] = await conn.query({ sql: stmtSql, rowsAsArray: true })
+          const serverStatus = extractServerStatus(rows)
+          if (serverStatus !== undefined) {
+            lastServerStatus = serverStatus
+          }
+          if (this.isClosed && this.txConn !== conn) {
+            shouldDestroy = true
+            throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+          }
+          const parsed = parseMysqlQueryResult(rows, fields, maxRows)
+          if (parsed.isSelect) {
+            lastSelect = parsed.result
+            collectedSets.push({
+              index: execIndex,
+              sqlPreview: compactSql(trimmedStmt),
+              columns: parsed.result.columns,
+              rows: parsed.result.rows,
+              rowCount: parsed.result.rowCount,
+              truncated: parsed.result.truncated,
+              isSelect: true,
+            })
+          } else if (execList.length === 1) {
+            totalAffectedRows = parsed.affectedRows
+            collectedSets.push({
+              index: execIndex,
+              sqlPreview: compactSql(trimmedStmt),
+              columns: [{ name: 'affected_rows', type: 'INTEGER' }],
+              rows: [[parsed.affectedRows]],
+              rowCount: 1,
+              affectedRows: parsed.affectedRows,
+              truncated: false,
+              isSelect: false,
+            })
+          } else {
+            totalAffectedRows += parsed.affectedRows
+            collectedSets.push({
+              index: execIndex,
+              sqlPreview: compactSql(trimmedStmt),
+              columns: [{ name: 'affected_rows', type: 'INTEGER' }],
+              rows: [[parsed.affectedRows]],
+              rowCount: 1,
+              affectedRows: parsed.affectedRows,
+              truncated: false,
+              isSelect: false,
+            })
+          }
+
+          if (this.txConn === conn) {
+            if (!isStandaloneBegin) {
+              this.statementCount++
+            }
+            const isCommit = /^COMMIT\b/i.test(normalizedStmt)
+            const isRollback = /^ROLLBACK\b(?!\s+TO\b)/i.test(normalizedStmt)
+            const isAndChain = /\bAND\s+CHAIN\b/i.test(normalizedStmt)
+            if (isCommit || isRollback) {
+              const stillInTx =
+                serverStatus !== undefined
+                  ? (serverStatus & MYSQL_SERVER_STATUS_IN_TRANS) !== 0
+                  : isAndChain
+              if (stillInTx) {
+                this.statementCount = 0
+                this.txStartedAt = Date.now()
+              } else {
+                // Defer release until execList completes so trailing statements still run safely
+                this.clearPinnedTxConn()
+                txEndedInRun = true
+              }
+            } else if (!isStandaloneBegin) {
+              const endedImplicitly =
+                (serverStatus !== undefined && (serverStatus & MYSQL_SERVER_STATUS_IN_TRANS) === 0) ||
+                (serverStatus === undefined && isMysqlImplicitCommitStatement(normalizedStmt))
+              if (endedImplicitly) {
+                this.clearPinnedTxConn()
+                txEndedInRun = true
+              }
+            }
+          }
+        }
+
+        const executionTimeMs = Math.round(performance.now() - startTime)
+        return lastSelect
+          ? {
+              ...lastSelect,
+              affectedRows: totalAffectedRows,
+              ...(collectedSets.length > 1 ? { resultSets: collectedSets } : {}),
+              executionTimeMs,
+            }
+          : {
+              columns: [],
+              rows: [],
+              rowCount: 0,
+              affectedRows: totalAffectedRows,
+              executionTimeMs,
+              truncated: false,
+              isSelect: false,
+              ...(collectedSets.length > 1 ? { resultSets: collectedSets } : {}),
+            }
+      } catch (err) {
+        const fatal = activeEntry.cancelled || isFatalMysqlConnectionError(err)
+        if (fatal) {
+          shouldDestroy = true
+          if (this.txConn === conn) {
+            this.clearPinnedTxConn()
+          }
+        }
+        throw err
+      } finally {
+        if (containsDdlStatement(sql, this.driverType)) {
+          this.tableDetailsCache.clear()
+        }
+        this.activeQueries.delete(queryId)
+
+        const currentlyPinned = this.txConn === conn
+        if (currentlyPinned) {
+          if (shouldDestroy || activeEntry.cancelled) {
+            this.clearPinnedTxConn()
+            activeEntry.released = true
+            this.safeReleaseConn(conn, true)
+          }
+        } else if (!activeEntry.released) {
+          const dirtyTxState =
+            lastServerStatus !== undefined &&
+            ((lastServerStatus & MYSQL_SERVER_STATUS_IN_TRANS) !== 0 ||
+              (lastServerStatus & MYSQL_SERVER_STATUS_AUTOCOMMIT) === 0)
+          activeEntry.released = true
+          this.safeReleaseConn(conn, shouldDestroy || activeEntry.cancelled || dirtyTxState)
         }
       }
     }
+
+    return needsTxLock ? this.runExclusiveTxOp(executeRun) : executeRun()
   }
 
   async cancelQuery(queryId: string): Promise<{ ok: boolean }> {
@@ -603,6 +1187,127 @@ export class MysqlSession implements IDatabaseSession {
     const ok = await this.sendKillQuery(active.threadId)
     return { ok }
   }
+
+  getTransactionState(): TransactionState {
+    return {
+      active: this.txConn !== null,
+      autoCommit: this.autoCommit,
+      statementCount: this.statementCount,
+      startedAt: this.txStartedAt,
+      supported: true,
+    }
+  }
+
+  async setAutoCommit(enabled: boolean): Promise<TransactionState> {
+    return this.runExclusiveTxOp(async () => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      if (enabled) {
+        if (this.txConn !== null) {
+          throw new DatabaseDriverError(
+            'Commit or rollback the active transaction before switching to Auto-Commit',
+            'TX_ACTIVE',
+            this.driverType
+          )
+        }
+        this.autoCommit = true
+      } else {
+        this.autoCommit = false
+      }
+      return this.getTransactionState()
+    })
+  }
+
+  private async beginTransactionLocked(): Promise<TransactionState> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    if (this.txConn !== null) {
+      throw new DatabaseDriverError('Transaction is already active', 'TX_ALREADY_ACTIVE', this.driverType)
+    }
+    const conn = await this.acquireConnection()
+    if (this.isClosed) {
+      this.safeReleaseConn(conn, true)
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    try {
+      await conn.beginTransaction()
+      if (this.isClosed) {
+        this.safeReleaseConn(conn, true)
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      this.txConn = conn
+      this.statementCount = 0
+      this.txStartedAt = Date.now()
+      return this.getTransactionState()
+    } catch (err) {
+      this.safeReleaseConn(conn, true)
+      throw err
+    }
+  }
+
+  async beginTransaction(): Promise<TransactionState> {
+    return this.runExclusiveTxOp(() => this.beginTransactionLocked())
+  }
+
+  async commitTransaction(): Promise<TransactionState> {
+    return this.runExclusiveTxOp(async () => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      if (this.txConn === null) {
+        throw new DatabaseDriverError('Cannot commit: no active transaction', 'NO_ACTIVE_TX', this.driverType)
+      }
+      const conn = this.txConn
+      this.clearPinnedTxConn()
+      try {
+        await conn.commit()
+        this.safeReleaseConn(conn, false)
+        return this.getTransactionState()
+      } catch (err) {
+        this.safeReleaseConn(conn, true)
+        throw err
+      }
+    })
+  }
+
+  async rollbackTransaction(): Promise<TransactionState> {
+    return this.runExclusiveTxOp(async () => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      if (this.txConn === null) {
+        throw new DatabaseDriverError('Cannot rollback: no active transaction', 'NO_ACTIVE_TX', this.driverType)
+      }
+      const conn = this.txConn
+      this.clearPinnedTxConn()
+      try {
+        await conn.rollback()
+        this.safeReleaseConn(conn, false)
+        return this.getTransactionState()
+      } catch (err) {
+        this.safeReleaseConn(conn, true)
+        throw err
+      }
+    })
+  }
+}
+
+/** Narrow node TLS PEM values (always read as strings here) to mysql2's SslOptions shape */
+function toMysqlPem(value: unknown): string | string[] | Buffer | Buffer[] | undefined {
+  if (value === undefined) return undefined
+  if (typeof value === 'string' || Buffer.isBuffer(value)) return value
+  const items = Array.isArray(value) ? value : [value]
+  const strings: string[] = []
+  const buffers: Buffer[] = []
+  for (const item of items) {
+    if (typeof item === 'string') strings.push(item)
+    else if (Buffer.isBuffer(item)) buffers.push(item)
+  }
+  if (strings.length === items.length) return strings
+  if (buffers.length === items.length) return buffers
+  return strings.length > 0 ? strings[0] : buffers[0]
 }
 
 export class MysqlDriver implements IDatabaseDriver {
@@ -612,27 +1317,71 @@ export class MysqlDriver implements IDatabaseDriver {
     this.type = type
   }
 
-  async createSession(profile: ConnectionProfile, password?: string): Promise<IDatabaseSession> {
+  async createSession(
+    profile: ConnectionProfile,
+    password?: string,
+    extraSecrets?: DriverTlsOptions
+  ): Promise<IDatabaseSession> {
     const effectiveDriver: MysqlEngineType =
       profile.driver === 'mariadb' ? 'mariadb' : this.type
-    const host = (profile.host || 'localhost').trim()
-    const useSsl =
-      profile.ssl !== undefined ? Boolean(profile.ssl) : isCloudDatabaseHost(host)
-
-    const sslConfig = useSsl ? { rejectUnauthorized: false } : undefined
-    const cancelConnOptions: ConnectionOptions = {
-      host,
-      port: profile.port || 3306,
+    const tunnelHost = (profile.host || 'localhost').trim()
+    const tunnelPort = profile.port || 3306
+    const remoteServername =
+      typeof extraSecrets?.tlsServername === 'string' ? extraSecrets.tlsServername.trim() : ''
+    const useTunnelStream = remoteServername.length > 0 && remoteServername !== tunnelHost
+    const effectiveHost = useTunnelStream ? remoteServername : tunnelHost
+    const tunnelStreamFactory = useTunnelStream
+      ? (): net.Socket => net.connect({ host: tunnelHost, port: tunnelPort })
+      : undefined
+    const tlsOverride = await resolveEffectiveTlsOptions(
+      profile,
+      extraSecrets,
+      extraSecrets?.tlsServername
+    )
+    let sslConfig: ConnectionOptions['ssl']
+    if (tlsOverride === false) {
+      // Explicit sslMode: 'disable' — never fall back to auto-SSL
+      sslConfig = undefined
+    } else if (tlsOverride) {
+      // mysql2's SslOptions omits node:tls identity hooks; keep them for verify-full
+      const sslOptions: Exclude<ConnectionOptions['ssl'], string> & {
+        servername?: string
+        checkServerIdentity?: typeof tls.checkServerIdentity
+      } = {
+        ca: toMysqlPem(tlsOverride.ca),
+        cert: toMysqlPem(tlsOverride.cert),
+        key: toMysqlPem(tlsOverride.key),
+        passphrase: tlsOverride.passphrase,
+        rejectUnauthorized: tlsOverride.rejectUnauthorized,
+        servername: tlsOverride.servername,
+        checkServerIdentity: tlsOverride.checkServerIdentity,
+        // mysql2 derives SNI & checkServerIdentity strictly from config.host; keeping config.host
+        // as the real remote hostname (with a tunnel stream factory) enforces verify-full over SSH.
+        verifyIdentity:
+          profile.sslMode === 'verify-full' ||
+          ((profile.sslMode === undefined || profile.sslMode === 'auto') &&
+            tlsOverride.rejectUnauthorized !== false),
+      }
+      sslConfig = sslOptions
+    } else {
+      const useSsl =
+        profile.ssl !== undefined ? Boolean(profile.ssl) : isCloudDatabaseHost(effectiveHost)
+      sslConfig = useSsl ? { rejectUnauthorized: false } : undefined
+    }
+    const cancelConnOptions = {
+      host: effectiveHost,
+      port: tunnelPort,
       database: profile.database || undefined,
       user: profile.user,
       password,
       connectTimeout: 5000,
       ssl: sslConfig,
-    }
+      ...(tunnelStreamFactory ? { stream: tunnelStreamFactory } : {}),
+    } as ConnectionOptions
 
-    const options: PoolOptions = {
-      host,
-      port: profile.port || 3306,
+    const options = {
+      host: effectiveHost,
+      port: tunnelPort,
       database: profile.database || undefined,
       user: profile.user,
       password,
@@ -645,26 +1394,30 @@ export class MysqlDriver implements IDatabaseDriver {
       dateStrings: true,
       flags: ['+FOUND_ROWS'],
       ssl: sslConfig,
-    }
+      ...(tunnelStreamFactory ? { stream: tunnelStreamFactory } : {}),
+    } as PoolOptions
 
+    const verifyIpIdentity =
+      profile.sslMode === 'verify-full' && net.isIP(effectiveHost) !== 0
+        ? effectiveHost
+        : undefined
     const pool = mysqlPromise.createPool(options) as unknown as MysqlPoolLike
-    return new MysqlSession(pool, { ...profile, driver: effectiveDriver }, cancelConnOptions)
+    return new MysqlSession(
+      pool,
+      { ...profile, driver: effectiveDriver },
+      cancelConnOptions,
+      verifyIpIdentity
+    )
   }
 
   async testConnection(
     profile: ConnectionProfile,
-    password?: string
+    password?: string,
+    extraSecrets?: DriverTlsOptions
   ): Promise<{ ok: boolean; message?: string }> {
-    let session: IDatabaseSession | null = null
-    try {
-      session = await this.createSession(profile, password)
-      return await session.test()
-    } catch (err: unknown) {
-      return { ok: false, message: extractMysqlErrorMessage(err, 'Connection failed') }
-    } finally {
-      if (session) {
-        await session.close().catch(() => {})
-      }
-    }
+    return runDriverConnectionTest(
+      () => this.createSession(profile, password, extraSecrets),
+      (err) => extractMysqlErrorMessage(err, 'Connection failed')
+    )
   }
 }

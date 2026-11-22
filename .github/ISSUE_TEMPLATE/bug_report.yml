@@ -31,6 +31,8 @@ body:
         - ClickHouse
         - Redis
         - LibSQL / Turso
+        - Cloudflare D1
+        - Local Custom Driver (BYOD)
         - Multiple / General UI
     validations:
       required: true

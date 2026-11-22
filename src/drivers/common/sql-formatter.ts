@@ -88,6 +88,16 @@ function formatSqlInsertRows(
     .join('\n')
 }
 
+function isBlobLikeExportValue(value: unknown): boolean {
+  if (value === null || value === undefined) return false
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return true
+  if (typeof value === 'string' && /^\[BLOB\s+\d+\s*B\]$/i.test(value.trim())) return true
+  if (typeof value === 'object' && 'type' in value && (value as { type?: unknown }).type === 'Buffer') {
+    return true
+  }
+  return false
+}
+
 function formatSqlUpdateRows(
   columns: string[],
   rows: Record<string, unknown>[],
@@ -97,30 +107,40 @@ function formatSqlUpdateRows(
 ): string {
   if (columns.length === 0 || rows.length === 0) return ''
   const qTable = quoteTableReference(tableName, dialect)
-  const pkCols =
-    primaryKeys && primaryKeys.length > 0 ? primaryKeys : [columns[0]]
+  const explicitPks = primaryKeys && primaryKeys.length > 0 ? primaryKeys : null
+  const hasExplicitPk = explicitPks !== null
+  const pkCols = explicitPks ?? columns
   const pkSet = new Set(pkCols)
-  const nonPkCols = columns.filter((c) => !pkSet.has(c))
+  const nonPkCols = hasExplicitPk ? columns.filter((c) => !pkSet.has(c)) : columns
   const setCols = nonPkCols.length > 0 ? nonPkCols : columns
 
-  return rows
-    .map((row) => {
-      const setSql = setCols
-        .map((c) => `${quoteIdentForDialect(c, dialect)} = ${formatSqlLiteral(row[c], dialect)}`)
-        .join(', ')
-      const whereSql = pkCols
-        .map((pk) => {
-          const qPk = quoteIdentForDialect(pk, dialect)
-          const pkVal = row[pk]
-          if (pkVal === null || pkVal === undefined) {
-            return `${qPk} IS NULL`
-          }
-          return `${qPk} = ${formatSqlLiteral(pkVal, dialect)}`
-        })
-        .join(' AND ')
-      return `UPDATE ${qTable} SET ${setSql} WHERE ${whereSql};`
-    })
-    .join('\n')
+  const statements = rows.map((row) => {
+    const setSql = setCols
+      .map((c) => `${quoteIdentForDialect(c, dialect)} = ${formatSqlLiteral(row[c], dialect)}`)
+      .join(', ')
+    const effectiveWhereCols = hasExplicitPk
+      ? pkCols
+      : (() => {
+          const nonBlob = pkCols.filter((c) => !isBlobLikeExportValue(row[c]))
+          return nonBlob.length > 0 ? nonBlob : pkCols
+        })()
+    const whereSql = effectiveWhereCols
+      .map((pk) => {
+        const qPk = quoteIdentForDialect(pk, dialect)
+        const pkVal = row[pk]
+        if (pkVal === null || pkVal === undefined) {
+          return `${qPk} IS NULL`
+        }
+        return `${qPk} = ${formatSqlLiteral(pkVal, dialect)}`
+      })
+      .join(' AND ')
+    return `UPDATE ${qTable} SET ${setSql} WHERE ${whereSql};`
+  })
+
+  if (!hasExplicitPk) {
+    return `-- WARNING: Table has no primary key; matching all non-BLOB columns.\n${statements.join('\n')}`
+  }
+  return statements.join('\n')
 }
 
 /**
@@ -249,10 +269,18 @@ export function formatCellMatrixExport(
   if ((format === 'tsv-headers' || format === 'csv') && headers.length > 0) {
     lines.push(headers.map((h) => escapeDelimitedField(h, delimiter)).join(delimiter))
   }
+  const isSingleCellPlainTsv =
+    format === 'tsv' && matrix.length === 1 && matrix[0]?.length === 1
   for (const row of matrix) {
     lines.push(
       row
-        .map((cell) => escapeDelimitedField(formatTabularCellText(cell, ''), delimiter))
+        .map((cell) => {
+          const text = formatTabularCellText(cell, '')
+          if (isSingleCellPlainTsv) {
+            return text
+          }
+          return escapeDelimitedField(text, delimiter)
+        })
         .join(delimiter)
     )
   }

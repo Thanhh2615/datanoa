@@ -1,7 +1,7 @@
 {
   "name": "datanoa",
-  "version": "1.0.4",
-  "description": "All-in-one database client and SQL studio for Orca (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, Turso/LibSQL)",
+  "version": "1.1.0",
+  "description": "All-in-one database client and SQL studio for Orca (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, Turso/LibSQL, Cloudflare D1 + BYOD custom drivers)",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -10,17 +10,19 @@
   },
   "scripts": {
     "build": "node build/bundle-drivers.mjs",
+    "size": "node build/check-package-size.mjs",
     "types": "orca plugin types .",
     "typecheck": "npm run types && tsc --noEmit",
     "validate": "orca plugin validate .",
     "check": "orca plugin check .",
-    "verify": "npm run build && npm run typecheck && npm run validate && npm run check"
+    "verify": "npm run build && npm run size && npm run typecheck && npm run validate && npm run check"
   },
   "devDependencies": {
     "@codemirror/autocomplete": "^6.20.4",
     "@codemirror/commands": "^6.11.1",
     "@codemirror/lang-sql": "^6.10.0",
     "@codemirror/language": "^6.13.1",
+    "@codemirror/search": "^6.7.2",
     "@codemirror/state": "^6.7.6",
     "@codemirror/view": "^6.43.15",
     "@lezer/highlight": "^1.2.5",

@@ -2,28 +2,21 @@
 // Datanoa Studio Editor: Full-Screen JetBrains DataGrip Custom Editor for .sql and .datanoa files
 // Theme variables bound from Orca host: var(--orca-background), var(--orca-foreground), var(--orca-primary), var(--orca-border)
 
-import { DATANOA_LOGO_DATA_URI } from '../assets/logo.js'
 import {
   buildAlterTableSql,
-  buildCreateTableSql,
-  buildDropTableSql,
   buildQuickFilterPredicate,
   buildTableMigrationSql,
-  buildTruncateTableSql,
   containsDdlStatement,
   countTableStructureChanges,
   createInitialTableDraft,
   formatSql,
   normalizeSqlDefaultExpression,
-  quoteIdentForDialect,
   sanitizeFilterClause,
   validateTableStructureDraft,
   type AlterTableAction,
-  type CreateTableColumnDraft,
   type DraftColumnItem,
   type DraftForeignKeyItem,
   type DraftIndexItem,
-  type ExportFormat,
   type ReferentialAction,
   type TableMigrationPlan,
   type TableStructureDraft,
@@ -84,6 +77,11 @@ import {
   fuzzyMatchScore,
   extractQueriedTableName,
   copyTextFallback,
+  enhanceStudioCollapsibleSelect,
+  syncStudioSelectTooltip,
+  bindStudioSelectTooltipsInRoot,
+  isStudioCollapsibleDropdownOpen,
+  closeActiveStudioCollapsibleDropdown,
   type StudioEngineMeta,
   type ConnectionEngineMeta,
 } from './db-icons.js'
@@ -100,6 +98,10 @@ import {
   type WorkspaceDetectResponse,
 } from './connection-modal.js'
 import {
+  openStudioDriverManagerModal,
+  openDriverManagerModal,
+} from './driver-manager-modal.js'
+import {
   openStudioCreateTableModal,
   openCreateTableModal,
   openStudioDangerTableModal,
@@ -110,21 +112,114 @@ import {
   openShortcutsModal,
   openStudioFeedbackModal,
   openFeedbackModal,
+  openStudioImportModal,
+  openImportDataModal,
   sanitizeDiagnosticErrorText,
   buildStudioDiagnosticSummary,
+  type StudioImportDataModalContext,
 } from './studio-modals.js'
+import {
+  decodeImportBytes,
+  detectImportFormat,
+  detectImportDelimiter,
+  parseDelimitedImportText,
+  parseImportText,
+  parseImportBytes,
+  autoMapImportColumns,
+  validateImportMapping,
+  coerceImportCellValue,
+  buildMappedImportRecords,
+  buildImportPreviewSql,
+} from './data-import.js'
+import {
+  ConsoleTabsManager,
+  type SqlConsoleTabState,
+  type PersistedConsoleTabsState,
+} from './console-tabs.js'
+import {
+  extractSqlParameters,
+  coerceBindParamValue,
+  bindSqlParameters,
+  type DetectedSqlParam,
+  type BindParamInput,
+  type BindParamValueType,
+} from './sql-params.js'
+import {
+  openStudioBindParamsModal,
+  type StudioBindParamsModalContext,
+} from './bind-params-modal.js'
+import {
+  analyzeDangerousSql,
+  type DangerousSqlFinding,
+  type DangerousSqlKind,
+} from './sql-safety.js'
+import {
+  openStudioDangerSqlModal,
+  type StudioDangerSqlModalContext,
+} from './danger-sql-modal.js'
+import {
+  openStudioSavedQueriesModal,
+  openSavedQueriesModal,
+  type StudioSavedQueriesModalContext,
+} from './saved-queries-modal.js'
+import {
+  analyzeEditableSelectQuery,
+  type EditableSelectAnalysis,
+} from './select-editability.js'
+import {
+  buildColumnHeaderPredicate,
+  injectSqlColumnFilter,
+  type ColumnHeaderFilterOp,
+} from './sql-column-filter.js'
+import { TransactionToolbarController } from './transaction-toolbar.js'
+import { ValueInspectorController } from './value-inspector.js'
+import { QueryHistoryDrawerController } from './query-history-drawer.js'
+import {
+  STUDIO_VIEW_STATE_STORAGE_KEY,
+  parseDatanoaDocument,
+  composeDatanoaDocument,
+  upsertDatanoaMetadataHeader,
+  readLocalStudioViewState,
+  writeStudioViewStateSnapshot,
+  readLocalStudioWarmCache,
+  writeLocalStudioWarmCache,
+  syncInitialThemeFromHost as detectInitialThemeFromHost,
+  type DocumentSessionLike,
+  type TableColumnConfig,
+  type StudioPersistedViewState,
+  type StudioWarmCacheSnapshot,
+} from './document-meta.js'
+import {
+  populateExportDropdownOptions,
+  executeStudioExportAction,
+} from './studio-export.js'
+import { createStudioDomTree } from './studio-dom.js'
+import {
+  isTabularObjectKind,
+  formatQualifiedSqlTable,
+  buildSqlTemplateForObject,
+  createSidebarContextMenu,
+  renderStudioSidebarSkeleton,
+  renderStudioTopbarObjects,
+  renderStudioTopbarObjectsPopover,
+  renderStudioSidebarList,
+} from './studio-sidebar.js'
+import { mountStudioColumnsPopover } from './studio-columns-popover.js'
+import { splitSqlStatements } from '../drivers/common/sql-lexer.js'
+export { analyzeEditableSelectQuery, type EditableSelectAnalysis }
 import {
   ACTIVE_CONNECTION_STORAGE_KEY,
   sanitizeJsonPayload,
-  type ConnectionColorTag,
+  type ColumnInfo,
   type ConnectionProfile,
   type DatabaseDriverType,
-  type QueryHistoryEntry,
   type QueryResult,
   type TableBrowseResult,
   type TableDetails,
   type SchemaObject,
+  type SchemaObjectKind,
 } from '../protocol.js'
+import { DEFAULT_RPC_TIMEOUT_MS } from '../shared-constants.js'
 
 const BASE_EDITOR_TOKENS = `
   :root {
@@ -202,6 +297,19 @@ export {
   openShortcutsModal,
   openStudioFeedbackModal,
   openFeedbackModal,
+  openStudioImportModal,
+  openImportDataModal,
+  decodeImportBytes,
+  detectImportFormat,
+  detectImportDelimiter,
+  parseDelimitedImportText,
+  parseImportText,
+  parseImportBytes,
+  autoMapImportColumns,
+  validateImportMapping,
+  coerceImportCellValue,
+  buildMappedImportRecords,
+  buildImportPreviewSql,
   sanitizeDiagnosticErrorText,
   buildStudioDiagnosticSummary,
   buildAlterTableSql,
@@ -213,6 +321,7 @@ export {
   type StudioEngineMeta,
   type ConnectionEngineMeta,
   type StudioConnectionModalContext,
+  type StudioImportDataModalContext,
   type ConnectionSubmission,
   type ParseUriResponse,
   type DiscoveredSqliteFile,
@@ -224,84 +333,25 @@ export {
   type DraftIndexItem,
   type DraftForeignKeyItem,
   type ReferentialAction,
-}
-
-interface DocumentSessionLike {
-  value?: unknown
-  readOnly?: boolean
-  change?: (next: string) => void
-  onReplace?: (handler: (next: unknown) => void) => { dispose(): void } | void
-  dispose?: () => void
-}
-
-interface ParsedDatanoaDocument {
-  metadataLines: string[]
-  cleanSql: string
-  connectionId?: string
-  table?: string
-  schema?: string
-}
-
-function parseDatanoaDocument(docText: string): ParsedDatanoaDocument {
-  const lines = docText.split('\n')
-  const metadataLines: string[] = []
-  let connectionId: string | undefined
-  let table: string | undefined
-  let schema: string | undefined
-
-  let i = 0
-  while (i < lines.length) {
-    const rawLine = lines[i].replace(/\r$/, '')
-    const match = /^--\s*datanoa:\s*(.+)$/i.exec(rawLine)
-    if (!match) break
-
-    metadataLines.push(rawLine)
-    const pairs = match[1].trim()
-    const kv = /^([A-Za-z0-9_]+)=(.*)$/.exec(pairs)
-    if (kv) {
-      const key = kv[1].toLowerCase()
-      const val = kv[2].trim()
-      if (key === 'connectionid' && val) connectionId = val
-      else if (key === 'table' && val) table = val
-      else if (key === 'schema' && val) schema = val
-    }
-    i++
-  }
-
-  const cleanSql = lines.slice(i).join('\n')
-  return {
-    metadataLines,
-    cleanSql,
-    connectionId,
-    table,
-    schema,
-  }
-}
-
-const STUDIO_VIEW_STATE_STORAGE_KEY = 'datanoa.studioViewState'
-const DEFAULT_RPC_TIMEOUT_MS = 115_000
-
-interface TableColumnConfig {
-  hidden: string[]
-  pinned: string[]
-}
-
-interface StudioPersistedViewState {
-  activeViewMode?: 'split' | 'grid' | 'sql' | 'inspector'
-  activeConnectionId?: string | null
-  activeTable?: string | null
-  activeSchema?: string
-  currentPage?: number
-  pageSize?: number
-  activeWhereClause?: string
-  activeOrderByClause?: string
-  clientFilter?: string
-  filterQuery?: string
-  isTransposed?: boolean
-  sidebarCollapsed?: boolean
-  customSqlPanePx?: number | null
-  sqlDraft?: string
-  columnConfigByTable?: Record<string, TableColumnConfig>
+  ConsoleTabsManager,
+  type SqlConsoleTabState,
+  type PersistedConsoleTabsState,
+  extractSqlParameters,
+  coerceBindParamValue,
+  bindSqlParameters,
+  type DetectedSqlParam,
+  type BindParamInput,
+  type BindParamValueType,
+  openStudioBindParamsModal,
+  type StudioBindParamsModalContext,
+  analyzeDangerousSql,
+  type DangerousSqlFinding,
+  type DangerousSqlKind,
+  openStudioDangerSqlModal,
+  type StudioDangerSqlModalContext,
+  openStudioSavedQueriesModal,
+  openSavedQueriesModal,
+  type StudioSavedQueriesModalContext,
 }
 
 export class DatanoaStudioEditor {
@@ -325,13 +375,14 @@ export class DatanoaStudioEditor {
   private formatSqlBtn: HTMLButtonElement | null = null
   private cancelQueryBtn: HTMLButtonElement | null = null
   private historyBtn: HTMLButtonElement | null = null
+  private readonly txToolbar: TransactionToolbarController
+  private readonly valueInspector: ValueInspectorController
+  private readonly queryHistoryDrawer: QueryHistoryDrawerController
   private refreshBtn: HTMLButtonElement | null = null
   private historyDrawerEl: HTMLDivElement | null = null
   private historySearchEl: HTMLInputElement | null = null
   private clearHistoryBtn: HTMLButtonElement | null = null
   private historyListEl: HTMLDivElement | null = null
-  private cachedHistoryEntries: QueryHistoryEntry[] = []
-  private historySearchQuery = ''
 
   private sidebarListEl: HTMLDivElement | null = null
   private searchInputEl: HTMLInputElement | null = null
@@ -340,6 +391,12 @@ export class DatanoaStudioEditor {
   private mainViewEl: HTMLDivElement | null = null
   private sqlToolbarEl: HTMLDivElement | null = null
   private sqlAreaEl: HTMLDivElement | null = null
+  private consoleTabs = new ConsoleTabsManager()
+  private consoleTabsBarEl: HTMLDivElement | null = null
+  private resultSetsBarEl: HTMLDivElement | null = null
+  private activeQueryResult: QueryResult | null = null
+  private activeResultSetIndex = 0
+  private rememberedBindParams: Record<string, BindParamInput> = {}
   private splitResizerEl: HTMLDivElement | null = null
   private sidebarContextMenuEl: HTMLDivElement | null = null
   private gridSubbarEl: HTMLDivElement | null = null
@@ -378,23 +435,20 @@ export class DatanoaStudioEditor {
   private revertBtn: HTMLButtonElement | null = null
   private transposeBtn: HTMLButtonElement | null = null
   private columnsBtn: HTMLButtonElement | null = null
+  private importDataBtn: HTMLButtonElement | null = null
+  private importModalOpenSeq = 0
   private exportSelectEl: HTMLSelectElement | null = null
   private batchModeBtn: HTMLButtonElement | null = null
   private editTableBtn: HTMLButtonElement | null = null
   private isRestoringViewState = false
+  private hasRestoredBootState = false
   private restoredPageOnBoot: number | null = null
+  private pendingScrollState: { sidebarTop?: number; gridTop?: number; gridLeft?: number } | null = null
 
   private dmlPreviewEl: HTMLDivElement | null = null
   private dmlApplyBtn: HTMLButtonElement | null = null
   private dmlPreviewPreEl: HTMLPreElement | null = null
-
-  private valueInspectorEl: HTMLDivElement | null = null
-  private valueInspectorTitleEl: HTMLSpanElement | null = null
-  private valueNullBadgeEl: HTMLSpanElement | null = null
-  private valueInspectorStatusEl: HTMLDivElement | null = null
-  private valueInspectorTextEl: HTMLTextAreaElement | null = null
-  private valueApplyBtn: HTMLButtonElement | null = null
-  private valueNullBtn: HTMLButtonElement | null = null
+  private lastPreviewDmlText = ''
 
   private statusStateEl: HTMLSpanElement | null = null
   private statusSelectionEl: HTMLButtonElement | null = null
@@ -415,8 +469,18 @@ export class DatanoaStudioEditor {
   private connections: ConnectionProfile[] = []
   private schemaObjects: SchemaObject[] = []
   private filterQuery = ''
+  private availableSchemas: string[] = []
+  private selectedSchema: string | undefined = undefined
+  private defaultSchema: string | undefined = undefined
+  private schemaSelectEl: HTMLSelectElement | null = null
+  private exportDdlBtn: HTMLButtonElement | null = null
+  private collapsedSidebarGroups = new Set<SchemaObjectKind>()
+  private collapsedTopbarGroups = new Set<SchemaObjectKind>()
+  private isExportingSchemaDdl = false
   private activeConnectionId: string | null = null
   private activeTable: string | null = null
+  private activeObjectKind: SchemaObjectKind | null = null
+  private activeReadOnlyObject: SchemaObject | null = null
   private activeSchema: string | undefined = undefined
   private lastLoadedTableKey: string | null = null
   private activeWhereClause: string | undefined = undefined
@@ -441,13 +505,18 @@ export class DatanoaStudioEditor {
     blur: () => void
   } | null = null
   private splitResizeRafId: number | null = null
+  private scrollRestoreRafId: number | null = null
+  private isDestroyed = false
+  private lastPageData: TableBrowseResult | null = null
+  private pendingBootDataCache: StudioWarmCacheSnapshot | null = null
+  private hasWarmBootHydrated = false
+  private warmBootUpdatedAt = 0
   private introspectToken = 0
   private gridViewSeq = 0
   private tableLoadToken = 0
   private schemaLoadToken = 0
   private querySeq = 0
   private connectionsSeq = 0
-  private historySeq = 0
   private dmlPreviewSeq = 0
   private countRowsSeq = 0
   private cancelledQueryIds = new Set<string>()
@@ -459,7 +528,6 @@ export class DatanoaStudioEditor {
   private isCancellingQuery = false
   private isRefreshingSchema = false
   private isPreviewingDml = false
-  private isSavingCell = false
   private isClearingHistory = false
   private schemaMap: Record<string, string[]> = {}
   private tableDetailsCache = new Map<string, TableDetails>()
@@ -472,11 +540,20 @@ export class DatanoaStudioEditor {
   private activeTimerStops = new Set<() => void>()
   private suppressDocSync = false
   private isShowingSqlResult = false
+  private currentWorkspaceScope = ''
+  private activeExecutedSql = ''
+  private activeEditableStmtSql = ''
+  private editableSqlTarget: {
+    table: string
+    schema?: string
+    primaryKey: string[]
+    columns: ColumnInfo[]
+    originTabId?: string
+    originResultSetIndex?: number
+    originConnectionId?: string
+  } | null = null
   private activeQueryId: string | null = null
   private currentCanEdit = false
-  private selectedCell: SelectedCellInfo | null = null
-  private isInspectorOpen = false
-  private isHistoryOpen = false
   private sidebarCollapsed = false
   private sidebarToggleBtn: HTMLButtonElement | null = null
   private tableTopbarEl: HTMLDivElement | null = null
@@ -493,6 +570,58 @@ export class DatanoaStudioEditor {
   private lastInspectorLoadedKey = ''
 
   constructor() {
+    this.txToolbar = new TransactionToolbarController({
+      getActiveConnectionId: () => this.activeConnectionId,
+      getActiveConnection: () => this.getActiveConnection(),
+      isReadOnly: () => this.isActiveConnectionReadOnly(),
+      isQueryRunning: () => this.activeQueryId !== null,
+      isShowingSqlResult: () => this.isShowingSqlResult,
+      getActiveTable: () => this.activeTable,
+      getCurrentPage: () => this.currentPage,
+      requestPlugin: (method, payload, options) => this.requestPlugin(method, payload, options),
+      reloadTableData: (connId, table, page) => {
+        void this.loadTableData(connId, table, page)
+      },
+      showErrorBanner: (title, detail) => {
+        this.showQueryBanner('error', title, detail)
+      },
+      updateStatus: (stateText) => {
+        this.updateStatus(stateText)
+      },
+    })
+    this.valueInspector = new ValueInspectorController({
+      getInspectButton: () => this.inspectCellBtn,
+      getDataGrid: () => this.dataGrid,
+      getActiveTarget: () => {
+        const editable = this.resolveEditableTargetTable()
+        return {
+          connectionId: this.activeConnectionId,
+          table: editable?.table ?? this.activeTable,
+          schema: editable?.schema ?? this.activeSchema,
+          page: this.currentPage,
+          viewSeq: this.gridViewSeq,
+          isShowingSqlResult: this.isShowingSqlResult,
+        }
+      },
+      updateCell: (params) => this.handleUpdateCell(params),
+      reloadTableData: (connId, table, page) => this.loadTableData(connId, table, page),
+      updateStatus: (stateText) => this.updateStatus(stateText),
+    })
+    this.queryHistoryDrawer = new QueryHistoryDrawerController({
+      getDrawerEl: () => this.historyDrawerEl,
+      getListEl: () => this.historyListEl,
+      getToggleBtn: () => this.historyBtn,
+      setSqlText: (sql) => {
+        this.sqlConsole?.setText(sql)
+        this.sqlConsole?.focus()
+      },
+      insertSqlText: (sql) => {
+        this.sqlConsole?.insertText(sql)
+        this.sqlConsole?.focus()
+      },
+      requestPlugin: (method, payload, options) => this.requestPlugin(method, payload, options),
+      updateStatus: (stateText) => this.updateStatus(stateText),
+    })
     this.injectStyles()
     this.syncInitialThemeFromHost()
     this.buildDOM()
@@ -527,15 +656,7 @@ export class DatanoaStudioEditor {
   }
 
   private readLocalStudioViewState(): StudioPersistedViewState | null {
-    if (typeof window === 'undefined') return null
-    try {
-      const raw = window.localStorage?.getItem(STUDIO_VIEW_STATE_STORAGE_KEY)
-      if (!raw) return null
-      const parsed = JSON.parse(raw) as StudioPersistedViewState
-      return parsed && typeof parsed === 'object' ? parsed : null
-    } catch {
-      return null
-    }
+    return readLocalStudioViewState()
   }
 
   private applyRestoredStudioViewState(saved: StudioPersistedViewState | null): void {
@@ -550,6 +671,7 @@ export class DatanoaStudioEditor {
         this.pageSize = Number(saved.pageSize)
         if (this.pageSizeSelectEl) {
           this.pageSizeSelectEl.value = String(this.pageSize)
+          syncStudioSelectTooltip(this.pageSizeSelectEl, 'Rows per page')
         }
       }
       if (saved.customSqlPanePx && Number.isFinite(saved.customSqlPanePx) && saved.customSqlPanePx >= 80) {
@@ -609,6 +731,24 @@ export class DatanoaStudioEditor {
           this.suppressDocSync = false
         }
       }
+      if (
+        saved.consoleTabs &&
+        Array.isArray(saved.consoleTabs.tabs) &&
+        saved.consoleTabs.tabs.length > 0 &&
+        !this.documentSession
+      ) {
+        this.consoleTabs = new ConsoleTabsManager(saved.consoleTabs)
+        const savedTab = this.consoleTabs.getActiveTab()
+        this.suppressDocSync = true
+        try {
+          this.sqlConsole?.setText(savedTab.sql)
+        } finally {
+          this.suppressDocSync = false
+        }
+      } else if (typeof saved.sqlDraft === 'string') {
+        this.consoleTabs.updateActiveSql(saved.sqlDraft)
+      }
+      this.renderConsoleTabs()
       if (saved.columnConfigByTable && typeof saved.columnConfigByTable === 'object') {
         const nextMap: Record<string, TableColumnConfig> = {}
         for (const [k, v] of Object.entries(saved.columnConfigByTable)) {
@@ -632,6 +772,30 @@ export class DatanoaStudioEditor {
       } else if (this.customSqlPanePx !== null) {
         this.applyClampedSplitPaneHeight()
       }
+      if (saved.scrollState && typeof saved.scrollState === 'object') {
+        this.pendingScrollState = saved.scrollState
+        const sc = saved.scrollState
+        const restoreScroll = () => {
+          this.scrollRestoreRafId = null
+          if (this.isDestroyed) return
+          if (this.sidebarListEl && typeof sc.sidebarTop === 'number' && sc.sidebarTop > 0) {
+            this.sidebarListEl.scrollTop = sc.sidebarTop
+          }
+          const gridScrollEl = this.gridAreaEl?.querySelector('.datanoa-grid-container')
+          if (gridScrollEl instanceof HTMLElement) {
+            if (typeof sc.gridTop === 'number' && sc.gridTop > 0) gridScrollEl.scrollTop = sc.gridTop
+            if (typeof sc.gridLeft === 'number' && sc.gridLeft > 0) gridScrollEl.scrollLeft = sc.gridLeft
+          }
+        }
+        if (typeof requestAnimationFrame === 'function') {
+          if (this.scrollRestoreRafId !== null && typeof cancelAnimationFrame === 'function') {
+            cancelAnimationFrame(this.scrollRestoreRafId)
+          }
+          this.scrollRestoreRafId = requestAnimationFrame(restoreScroll)
+        } else {
+          restoreScroll()
+        }
+      }
       if (this.customSqlPanePx !== null && typeof requestAnimationFrame === 'function') {
         requestAnimationFrame(() => {
           this.applyClampedSplitPaneHeight()
@@ -643,10 +807,164 @@ export class DatanoaStudioEditor {
     }
   }
 
+  private static readonly WARM_CACHE_FRESH_MS = 60_000
+
+  private isWarmCacheFresh(updatedAt?: number): boolean {
+    if (!updatedAt || !Number.isFinite(updatedAt)) return false
+    return Date.now() - updatedAt < DatanoaStudioEditor.WARM_CACHE_FRESH_MS
+  }
+
+  private doesWarmPageCacheMatchCurrentQuery(cache: StudioWarmCacheSnapshot | null): boolean {
+    if (!cache?.pageData) return false
+    if (this.activeTable && cache.activeTable && cache.activeTable !== this.activeTable) return false
+    if (
+      this.activeSchema &&
+      cache.activeSchema &&
+      cache.activeSchema !== this.activeSchema
+    ) {
+      return false
+    }
+    if ((cache.whereClause || '') !== (this.activeWhereClause || '')) return false
+    if ((cache.orderByClause || '') !== (this.activeOrderByClause || '')) return false
+    if (cache.page && cache.page !== this.currentPage) return false
+    if (cache.pageSize && cache.pageSize !== this.pageSize) return false
+    return true
+  }
+
+  private hydrateWarmCacheIntoDom(warm: StudioWarmCacheSnapshot): boolean {
+    const conns = Array.isArray(warm.connections) ? warm.connections : []
+    const targetConnId = this.pendingDocConnectionId || this.activeConnectionId || warm.activeConnectionId || null
+    if (!targetConnId || conns.length === 0) return false
+    if (warm.activeConnectionId && warm.activeConnectionId !== targetConnId) return false
+    const matchedConn = conns.find((c) => c.id === targetConnId)
+    if (!matchedConn) return false
+
+    this.connections = conns
+    this.activeConnectionId = targetConnId
+    this.pendingBootDataCache = warm
+    this.warmBootUpdatedAt = Number.isFinite(warm.updatedAt) ? warm.updatedAt : 0
+
+    if (Array.isArray(warm.availableSchemas)) {
+      this.availableSchemas = warm.availableSchemas.filter((s) => typeof s === 'string' && s.length > 0)
+    }
+    if (typeof warm.defaultSchema === 'string' && warm.defaultSchema) {
+      this.defaultSchema = warm.defaultSchema
+    }
+    if (typeof warm.selectedSchema === 'string' && warm.selectedSchema) {
+      this.selectedSchema = warm.selectedSchema
+    }
+    if (Array.isArray(warm.schemaObjects)) {
+      this.schemaObjects = warm.schemaObjects
+    }
+    if (warm.schemaMap && typeof warm.schemaMap === 'object') {
+      this.schemaMap = warm.schemaMap
+      this.sqlConsole?.updateSchema(this.schemaMap, this.activeTable || undefined)
+    }
+    if (!this.activeTable && warm.activeTable) {
+      this.activeTable = warm.activeTable
+    }
+    if (!this.activeSchema && warm.activeSchema) {
+      this.activeSchema = warm.activeSchema
+    }
+    if (warm.activeObjectKind) {
+      this.activeObjectKind = warm.activeObjectKind
+    }
+    if (warm.activeReadOnlyObject) {
+      this.activeReadOnlyObject = warm.activeReadOnlyObject
+    }
+
+    this.populateConnectionSelectDom(targetConnId)
+    this.applyActiveConnectionPresentation(matchedConn)
+    this.updateSchemaSwitcherDisplay()
+    this.isIntrospectingSchema = false
+    this.renderSidebarObjects()
+
+    let hydratedGrid = false
+    let isTruncatedWarmPage = false
+    if (warm.isShowingSqlResult && warm.lastSqlResult) {
+      this.isShowingSqlResult = true
+      this.applyActiveQueryResult(warm.lastSqlResult)
+      const cachedRes = warm.lastSqlResult
+      const rowCount = cachedRes.rowCount ?? (cachedRes.rows ? cachedRes.rows.length : 0)
+      this.currentPage = 1
+      this.totalRows = rowCount
+      this.currentPageRowCount = cachedRes.rows ? cachedRes.rows.length : 0
+      if (this.gridSubbarTitleEl) {
+        this.gridSubbarTitleEl.textContent = cachedRes.isSelect
+          ? `SQL Result · ${cachedRes.columns?.length ?? 0} cols`
+          : `Executed · ${cachedRes.affectedRows ?? 0} affected`
+      }
+      if (this.gridPageInfoEl) {
+        const rowLabel = `${rowCount} ${rowCount === 1 ? 'row' : 'rows'}`
+        this.gridPageInfoEl.textContent = cachedRes.truncated ? `${rowLabel} (truncated)` : rowLabel
+      }
+      this.updateStatus('Ready', `${rowCount} rows`)
+      hydratedGrid = true
+    } else if (this.doesWarmPageCacheMatchCurrentQuery(warm) && warm.pageData) {
+      const cachedPage = warm.pageData
+      const readOnly = Boolean(matchedConn.readOnly)
+      this.lastPageData = cachedPage
+      this.lastLoadedTableKey = `${targetConnId}:${this.activeSchema || ''}:${this.activeTable || ''}`
+      this.currentPage = cachedPage.page || this.currentPage || 1
+      this.totalRows = cachedPage.totalRows || 0
+      this.currentPageRowCount = Array.isArray(cachedPage.rows) ? cachedPage.rows.length : 0
+      const expectedPageRows = Math.min(
+        Math.max(0, this.totalRows - (this.currentPage - 1) * this.pageSize),
+        this.pageSize
+      )
+      isTruncatedWarmPage = this.currentPageRowCount < expectedPageRows
+      this.currentCanEdit = Boolean(cachedPage.canEdit) && !readOnly
+      this.dataGrid?.setContextMeta(
+        this.activeTable || '',
+        matchedConn.driver || 'sqlite',
+        targetConnId,
+        this.activeSchema || ''
+      )
+      const cachedKey = `${targetConnId}:${this.activeSchema || ''}:${this.activeTable || ''}`
+      const savedColCfg = this.columnConfigByTable[cachedKey]
+      if (savedColCfg) {
+        this.dataGrid?.setColumnConfig({ ...savedColCfg })
+      }
+      this.dataGrid?.setData({ ...cachedPage, canEdit: this.currentCanEdit })
+      const totalPages = Math.max(1, Math.ceil(this.totalRows / this.pageSize))
+      if (this.gridSubbarTitleEl && this.activeTable) {
+        this.gridSubbarTitleEl.textContent = readOnly
+          ? `${this.activeTable} · ${cachedPage.columns.length} cols · RO`
+          : `${this.activeTable} · ${cachedPage.columns.length} cols`
+      }
+      if (this.gridPageInfoEl) {
+        this.gridPageInfoEl.textContent = `Page ${this.currentPage} / ${totalPages} (${this.totalRows} rows)`
+      }
+      this.updateStatus(this.activeTable ? `Ready · ${this.activeTable}` : 'Ready', `${this.totalRows} rows`)
+      hydratedGrid = true
+    }
+
+    this.updatePaginationButtons()
+    this.updateExportDropdownOptions()
+    this.consumePendingScrollState()
+
+    if (hydratedGrid && this.schemaObjects.length > 0) {
+      this.hasWarmBootHydrated = true
+      if (this.isWarmCacheFresh(this.warmBootUpdatedAt) && !isTruncatedWarmPage) {
+        this.hasLoadedActiveConnection = true
+        this.pendingDocConnectionId = null
+        this.pendingDocTable = null
+        this.pendingDocSchema = undefined
+        this.pendingBootDataCache = null
+      }
+      return true
+    }
+    return false
+  }
+
   private restoreStudioViewStateFromLocal(): void {
     const saved = this.readLocalStudioViewState()
     if (saved) {
       this.applyRestoredStudioViewState(saved)
+    }
+    const warm = readLocalStudioWarmCache()
+    if (warm) {
+      this.hydrateWarmCacheIntoDom(warm)
     }
   }
 
@@ -667,8 +985,19 @@ export class DatanoaStudioEditor {
     this.sqlAreaEl.style.flex = `0 0 ${clamped}px`
   }
 
+  private utf8ByteLength(value: unknown): number {
+    try {
+      const json = JSON.stringify(value) || ''
+      return typeof TextEncoder === 'function'
+        ? new TextEncoder().encode(json).length
+        : json.length * 2
+    } catch {
+      return Infinity
+    }
+  }
+
   private writeStudioViewStateNow(): void {
-    if (this.isRestoringViewState || typeof window === 'undefined') return
+    if (this.isRestoringViewState || this.isDestroyed || typeof window === 'undefined') return
     const snapshot: StudioPersistedViewState = {
       activeViewMode: this.activeViewMode,
       activeConnectionId: this.activeConnectionId,
@@ -684,29 +1013,134 @@ export class DatanoaStudioEditor {
       sidebarCollapsed: this.sidebarCollapsed,
       customSqlPanePx: this.customSqlPanePx,
       sqlDraft: this.sqlConsole?.getText() || '',
+      consoleTabs: this.consoleTabs.toPersistedState(),
       columnConfigByTable: this.columnConfigByTable,
+      scrollState: (() => {
+        const gridScrollEl = this.gridAreaEl?.querySelector('.datanoa-grid-container')
+        return {
+          sidebarTop: this.sidebarListEl ? Math.round(this.sidebarListEl.scrollTop) : 0,
+          gridTop: gridScrollEl instanceof HTMLElement ? Math.round(gridScrollEl.scrollTop) : 0,
+          gridLeft: gridScrollEl instanceof HTMLElement ? Math.round(gridScrollEl.scrollLeft) : 0,
+        }
+      })(),
     }
-    try {
-      window.localStorage?.setItem(STUDIO_VIEW_STATE_STORAGE_KEY, JSON.stringify(snapshot))
-    } catch {
-      // Ignore storage quota errors
-    }
-    try {
-      if (typeof window.orca?.storage?.set === 'function') {
-        void Promise.resolve(
-          window.orca.storage.set(
-            STUDIO_VIEW_STATE_STORAGE_KEY,
-            sanitizeJsonPayload(snapshot) as unknown as Record<string, string | number | boolean | null>
-          )
-        ).catch(() => {})
+    writeStudioViewStateSnapshot(snapshot)
+    const workerViewState: StudioPersistedViewState = { ...snapshot }
+    if (this.utf8ByteLength(workerViewState) > 200_000) {
+      delete workerViewState.consoleTabs
+      delete workerViewState.columnConfigByTable
+      if (typeof workerViewState.sqlDraft === 'string' && workerViewState.sqlDraft.length > 16_000) {
+        workerViewState.sqlDraft = workerViewState.sqlDraft.slice(0, 16_000)
       }
+    }
+    try {
+      void this.requestPlugin('ui.saveSessionSnapshot', {
+        surface: 'studio',
+        viewState: workerViewState,
+      }).catch(() => {})
     } catch {
-      // Ignore host storage write errors
+      // Ignore worker session save failure in minimal test contexts
+    }
+  }
+
+  private consumePendingScrollState(): void {
+    if (!this.pendingScrollState || this.isDestroyed) return
+    const sc = this.pendingScrollState
+    this.pendingScrollState = null
+    const applyRestoredScroll = () => {
+      this.scrollRestoreRafId = null
+      if (this.isDestroyed) return
+      if (this.sidebarListEl && typeof sc.sidebarTop === 'number' && sc.sidebarTop > 0) {
+        this.sidebarListEl.scrollTop = sc.sidebarTop
+      }
+      if (typeof sc.gridLeft === 'number' && sc.gridLeft > 0) {
+        this.dataGrid?.setScrollLeft(sc.gridLeft)
+      }
+      const gridScrollEl = this.gridAreaEl?.querySelector('.datanoa-grid-container')
+      if (gridScrollEl instanceof HTMLElement) {
+        if (typeof sc.gridTop === 'number' && sc.gridTop > 0) gridScrollEl.scrollTop = sc.gridTop
+        if (typeof sc.gridLeft === 'number' && sc.gridLeft > 0) gridScrollEl.scrollLeft = sc.gridLeft
+      }
+    }
+    if (typeof requestAnimationFrame === 'function') {
+      if (this.scrollRestoreRafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(this.scrollRestoreRafId)
+      }
+      this.scrollRestoreRafId = requestAnimationFrame(applyRestoredScroll)
+    } else {
+      applyRestoredScroll()
+    }
+  }
+
+  private saveStudioDataCache(): void {
+    if (this.isDestroyed || typeof window === 'undefined') return
+    try {
+      const cachedSchemaObjs = Array.isArray(this.schemaObjects)
+        ? this.schemaObjects.slice(0, 400)
+        : []
+      const now = Date.now()
+      const cachePayload: StudioWarmCacheSnapshot = {
+        updatedAt: now,
+        connections: this.connections,
+        activeConnectionId: this.activeConnectionId || null,
+        activeTable: this.activeTable || null,
+        activeSchema: this.activeSchema || '',
+        activeObjectKind: this.activeObjectKind || null,
+        activeReadOnlyObject: this.activeReadOnlyObject || null,
+        availableSchemas: this.availableSchemas.slice(0, 100),
+        defaultSchema: this.defaultSchema || '',
+        selectedSchema: this.selectedSchema || '',
+        isShowingSqlResult: this.isShowingSqlResult,
+        whereClause: this.activeWhereClause || '',
+        orderByClause: this.activeOrderByClause || '',
+        page: this.currentPage,
+        pageSize: this.pageSize,
+        schemaMap: this.utf8ByteLength(this.schemaMap) < 40_000 ? this.schemaMap : null,
+        schemaObjects: this.utf8ByteLength(cachedSchemaObjs) < 120_000 ? cachedSchemaObjs : null,
+        pageData: null,
+        lastSqlResult: null,
+      }
+      if (!this.isShowingSqlResult && this.lastPageData) {
+        const candidate = {
+          ...this.lastPageData,
+          rows: Array.isArray(this.lastPageData.rows)
+            ? this.lastPageData.rows.slice(0, 200)
+            : [],
+        }
+        if (this.utf8ByteLength(candidate) < 360_000) {
+          cachePayload.pageData = candidate
+        }
+      }
+      if (this.isShowingSqlResult && this.activeQueryResult) {
+        const candidate = {
+          ...this.activeQueryResult,
+          rows: Array.isArray(this.activeQueryResult.rows)
+            ? this.activeQueryResult.rows.slice(0, 200)
+            : [],
+        }
+        if (this.utf8ByteLength(candidate) < 360_000) {
+          cachePayload.lastSqlResult = candidate
+        }
+      }
+      writeLocalStudioWarmCache(cachePayload)
+
+      const workerPayload: Record<string, unknown> = { ...cachePayload }
+      delete workerPayload.connections
+      if (this.utf8ByteLength(workerPayload) > 450_000) {
+        workerPayload.pageData = null
+        workerPayload.lastSqlResult = null
+      }
+      void this.requestPlugin('ui.saveSessionSnapshot', {
+        surface: 'studio',
+        dataCache: workerPayload,
+      }).catch(() => {})
+    } catch {
+      // Ignore worker dataCache persistence errors
     }
   }
 
   private saveStudioViewState(immediate = true): void {
-    if (this.isRestoringViewState || typeof window === 'undefined') return
+    if (this.isRestoringViewState || this.isDestroyed || typeof window === 'undefined') return
     if (this.saveViewStateTimer !== null) {
       clearTimeout(this.saveViewStateTimer)
       this.saveViewStateTimer = null
@@ -725,8 +1159,8 @@ export class DatanoaStudioEditor {
     if (this.saveViewStateTimer !== null) {
       clearTimeout(this.saveViewStateTimer)
       this.saveViewStateTimer = null
-      this.writeStudioViewStateNow()
     }
+    this.writeStudioViewStateNow()
   }
 
   private cancelClientSearchDebounce(): void {
@@ -768,35 +1202,7 @@ export class DatanoaStudioEditor {
   }
 
   private syncInitialThemeFromHost(): void {
-    if (typeof document === 'undefined') return
-    if (
-      document.documentElement.classList.contains('light') ||
-      document.documentElement.classList.contains('dark')
-    ) {
-      return
-    }
-    try {
-      const probe = document.createElement('div')
-      probe.style.position = 'absolute'
-      probe.style.visibility = 'hidden'
-      probe.style.background = 'var(--orca-background, #000000)'
-      document.body.appendChild(probe)
-      const bg = getComputedStyle(probe).backgroundColor
-      probe.remove()
-      const parts = bg.match(/[\d.]+/g)
-      if (!parts || (parts.length > 3 && Number(parts[3]) === 0)) return
-      const toLin = (c: number) => {
-        const s = c / 255
-        return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4
-      }
-      const lum =
-        0.2126 * toLin(Number(parts[0])) +
-        0.7152 * toLin(Number(parts[1])) +
-        0.0722 * toLin(Number(parts[2]))
-      document.documentElement.classList.toggle('light', lum > 0.45)
-    } catch {
-      // Non-browser environment
-    }
+    detectInitialThemeFromHost()
   }
 
   private applyHostTypography(typography?: Partial<EditorTypography> | null): void {
@@ -820,63 +1226,105 @@ export class DatanoaStudioEditor {
   private buildDOM(): void {
     if (typeof document === 'undefined') return
 
-    this.rootEl = document.createElement('div')
-    this.rootEl.className = 'datanoa-editor-root'
+    const valueInspectorEl = this.valueInspector.buildElement()
+    const dom = createStudioDomTree(
+      this.pageSize,
+      (parent) => this.buildTransactionToolbar(parent),
+      valueInspectorEl
+    )
 
-    // 1. Top Studio Header Toolbar
-    const toolbar = document.createElement('div')
-    toolbar.className = 'datanoa-toolbar'
+    this.rootEl = dom.rootEl
+    this.sidebarEl = dom.sidebarEl
+    this.sidebarToggleBtn = dom.sidebarToggleBtn
+    this.connLogoEl = dom.connLogoEl
+    this.connSelectEl = dom.connSelectEl
+    this.envPillEl = dom.envPillEl
+    this.roBadgeEl = dom.roBadgeEl
+    this.addConnBtn = dom.addConnBtn
+    this.editConnBtn = dom.editConnBtn
+    this.cautionStripEl = dom.cautionStripEl
+    this.runBtn = dom.runBtn
+    this.runAllBtn = dom.runAllBtn
+    this.explainBtn = dom.explainBtn
+    this.formatSqlBtn = dom.formatSqlBtn
+    this.cancelQueryBtn = dom.cancelQueryBtn
+    this.historyBtn = dom.historyBtn
+    this.refreshBtn = dom.refreshBtn
+    this.sqlToolbarEl = dom.sqlToolbarEl
+    this.tabButtons = dom.tabButtons
+    this.searchInputEl = dom.searchInputEl
+    this.newTableBtn = dom.newTableBtn
+    this.schemaSelectEl = dom.schemaSelectEl
+    this.exportDdlBtn = dom.exportDdlBtn
+    this.sidebarListEl = dom.sidebarListEl
+    this.mainViewEl = dom.mainViewEl
+    this.tableTopbarEl = dom.tableTopbarEl
+    this.topbarFilterInputEl = dom.topbarFilterInputEl
+    this.topbarCountEl = dom.topbarCountEl
+    this.topbarTrackEl = dom.topbarTrackEl
+    this.topbarAllBtn = dom.topbarAllBtn
+    this.topbarNewTableBtn = dom.topbarNewTableBtn
+    this.sqlAreaEl = dom.sqlAreaEl
+    this.consoleTabsBarEl = dom.consoleTabsBarEl
+    this.splitResizerEl = dom.splitResizerEl
+    this.historyDrawerEl = dom.historyDrawerEl
+    this.historySearchEl = dom.historySearchEl
+    this.clearHistoryBtn = dom.clearHistoryBtn
+    this.historyListEl = dom.historyListEl
+    this.gridSubbarEl = dom.gridSubbarEl
+    this.gridSubbarTitleEl = dom.gridSubbarTitleEl
+    this.addRowBtn = dom.addRowBtn
+    this.delRowBtn = dom.delRowBtn
+    this.cloneRowBtn = dom.cloneRowBtn
+    this.inspectCellBtn = dom.inspectCellBtn
+    this.dmlPreviewBtn = dom.dmlPreviewBtn
+    this.submitBtn = dom.submitBtn
+    this.revertBtn = dom.revertBtn
+    this.transposeBtn = dom.transposeBtn
+    this.columnsBtn = dom.columnsBtn
+    this.editTableBtn = dom.editTableBtn
+    this.importDataBtn = dom.importDataBtn
+    this.exportSelectEl = dom.exportSelectEl
+    this.batchModeBtn = dom.batchModeBtn
+    this.prevBtn = dom.prevBtn
+    this.gridPageInfoEl = dom.gridPageInfoEl
+    this.nextBtn = dom.nextBtn
+    this.pageSizeSelectEl = dom.pageSizeSelectEl
+    this.gridToolbarEl = dom.gridToolbarEl
+    this.whereInputEl = dom.whereInputEl
+    this.orderByInputEl = dom.orderByInputEl
+    this.filterBtn = dom.filterBtn
+    this.clearFilterBtn = dom.clearFilterBtn
+    this.searchModeBtn = dom.searchModeBtn
+    this.clientSearchEl = dom.clientSearchEl
+    this.findCountEl = dom.findCountEl
+    this.findPrevBtn = dom.findPrevBtn
+    this.findNextBtn = dom.findNextBtn
+    this.dmlPreviewEl = dom.dmlPreviewEl
+    this.dmlApplyBtn = dom.dmlApplyBtn
+    this.dmlPreviewPreEl = dom.dmlPreviewPreEl
+    this.queryBannerEl = dom.queryBannerEl
+    this.queryBannerTitleEl = dom.queryBannerTitleEl
+    this.queryBannerDetailEl = dom.queryBannerDetailEl
+    this.queryBannerRetryBtn = dom.queryBannerRetryBtn
+    this.queryBannerBackBtn = dom.queryBannerBackBtn
+    this.queryBannerCopyBtn = dom.queryBannerCopyBtn
+    this.queryBannerReportBtn = dom.queryBannerReportBtn
+    this.gridAreaEl = dom.gridAreaEl
+    this.resultSetsBarEl = dom.resultSetsBarEl
+    this.inspectorAreaEl = dom.inspectorAreaEl
+    this.statusStateEl = dom.statusStateEl
+    this.statusSelectionEl = dom.statusSelectionEl
+    this.shortcutHintEl = dom.shortcutHintEl
+    this.statusMetricsEl = dom.statusMetricsEl
+    this.shortcutsBtn = dom.shortcutsBtn
+    this.feedbackBtn = dom.feedbackBtn
 
-    const sidebarToggleBtn = document.createElement('button')
-    sidebarToggleBtn.type = 'button'
-    sidebarToggleBtn.className = 'datanoa-btn datanoa-sidebar-toggle'
-    sidebarToggleBtn.title = 'Switch Table Explorer Mode (Left Sidebar ↔ Top Horizontal Bar)'
-    sidebarToggleBtn.setAttribute('aria-label', 'Switch Table Explorer Mode')
-    const menuSvg = createSvgElement('svg', {
-      width: '14',
-      height: '14',
-      viewBox: '0 0 24 24',
-      fill: 'none',
-      stroke: 'currentColor',
-      'stroke-width': '2',
-      'stroke-linecap': 'round',
-      'aria-hidden': 'true',
-    })
-    menuSvg.appendChild(createSvgElement('line', { x1: '3', y1: '6', x2: '21', y2: '6' }))
-    menuSvg.appendChild(createSvgElement('line', { x1: '3', y1: '12', x2: '21', y2: '12' }))
-    menuSvg.appendChild(createSvgElement('line', { x1: '3', y1: '18', x2: '21', y2: '18' }))
-    sidebarToggleBtn.appendChild(menuSvg)
-    sidebarToggleBtn.addEventListener('click', () => {
+    // Wire toolbar & header controls
+    dom.sidebarToggleBtn.addEventListener('click', () => {
       this.setSidebarCollapsed(!this.sidebarCollapsed, true)
     })
-    this.sidebarToggleBtn = sidebarToggleBtn
-
-    const brandPill = document.createElement('div')
-    brandPill.className = 'datanoa-brand-pill'
-    const brandLogo = document.createElement('img')
-    brandLogo.className = 'datanoa-brand-logo'
-    brandLogo.src = DATANOA_LOGO_DATA_URI
-    brandLogo.alt = 'Datanoa'
-    const brandText = document.createElement('span')
-    brandText.textContent = 'Datanoa Studio'
-    brandPill.appendChild(brandLogo)
-    brandPill.appendChild(brandText)
-
-    const connCluster = document.createElement('div')
-    connCluster.className = 'datanoa-conn-cluster'
-
-    this.connLogoEl = document.createElement('span')
-    this.connLogoEl.className = 'datanoa-db-logo'
-    this.connLogoEl.appendChild(createDbLogoSvg('sqlite'))
-
-    this.connSelectEl = document.createElement('select')
-    this.connSelectEl.className = 'datanoa-select'
-    this.connSelectEl.setAttribute('aria-label', 'Active Database Connection')
-    const defaultOpt = document.createElement('option')
-    defaultOpt.value = ''
-    defaultOpt.textContent = 'Select Connection...'
-    this.connSelectEl.appendChild(defaultOpt)
-    this.connSelectEl.addEventListener('change', () => {
+    dom.connSelectEl.addEventListener('change', () => {
       const nextId = this.connSelectEl?.value || null
       this.pendingDocConnectionId = null
       this.pendingDocTable = null
@@ -885,182 +1333,39 @@ export class DatanoaStudioEditor {
         this.updateMetadataHeader('connectionId', nextId)
       }
     })
-
-    this.envPillEl = document.createElement('span')
-    this.envPillEl.className = 'datanoa-env-pill'
-    this.envPillEl.style.display = 'none'
-
-    this.roBadgeEl = document.createElement('span')
-    this.roBadgeEl.className = 'datanoa-ro-badge'
-    this.roBadgeEl.textContent = 'RO'
-    this.roBadgeEl.title = 'Read-Only Connection'
-    this.roBadgeEl.style.display = 'none'
-
-    connCluster.appendChild(this.connLogoEl)
-    connCluster.appendChild(this.connSelectEl)
-    connCluster.appendChild(this.envPillEl)
-    connCluster.appendChild(this.roBadgeEl)
-
-    this.addConnBtn = document.createElement('button')
-    this.addConnBtn.type = 'button'
-    this.addConnBtn.className =
-      'datanoa-btn datanoa-btn-primary datanoa-btn-sm datanoa-add-conn-btn'
-    this.addConnBtn.textContent = '+ Connect'
-    this.addConnBtn.title = 'Add a new database connection'
-    this.addConnBtn.addEventListener('click', () => {
-      this.openConnectionModal()
-    })
-
-    this.editConnBtn = document.createElement('button')
-    this.editConnBtn.type = 'button'
-    this.editConnBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-edit-conn-btn'
-    this.editConnBtn.textContent = 'Edit'
-    this.editConnBtn.title = 'Edit active database connection'
-    this.editConnBtn.disabled = true
-    this.editConnBtn.addEventListener('click', () => {
+    dom.addConnBtn.addEventListener('click', () => this.openConnectionModal())
+    dom.editConnBtn.addEventListener('click', () => {
       const active = this.getActiveConnection()
       if (active) this.openConnectionModal(active)
     })
-
-    connCluster.appendChild(this.addConnBtn)
-    connCluster.appendChild(this.editConnBtn)
-
-    this.runBtn = document.createElement('button')
-    this.runBtn.type = 'button'
-    this.runBtn.className = 'datanoa-btn datanoa-btn-primary'
-    this.runBtn.textContent = 'Execute (Ctrl+Enter)'
-    this.runBtn.addEventListener('click', () => {
+    dom.runBtn.addEventListener('click', () => {
       void this.executeSql(false)
     })
-
-    this.runAllBtn = document.createElement('button')
-    this.runAllBtn.type = 'button'
-    this.runAllBtn.className = 'datanoa-btn'
-    this.runAllBtn.textContent = 'Execute All'
-    this.runAllBtn.title = 'Execute all SQL statements in console (Ctrl+Shift+Enter)'
-    this.runAllBtn.addEventListener('click', () => {
+    dom.runAllBtn.addEventListener('click', () => {
       void this.executeSql(true)
     })
-
-    this.explainBtn = document.createElement('button')
-    this.explainBtn.type = 'button'
-    this.explainBtn.className = 'datanoa-btn'
-    this.explainBtn.textContent = 'Explain'
-    this.explainBtn.addEventListener('click', () => {
+    dom.explainBtn.addEventListener('click', () => {
       void this.explainSql()
     })
-
-    this.formatSqlBtn = document.createElement('button')
-    this.formatSqlBtn.type = 'button'
-    this.formatSqlBtn.className = 'datanoa-btn'
-    this.formatSqlBtn.textContent = 'Format SQL'
-    this.formatSqlBtn.title = 'Format SQL in console (Shift+Alt+F)'
-    this.formatSqlBtn.addEventListener('click', () => {
-      this.formatSqlInConsole()
-    })
-
-    this.cancelQueryBtn = document.createElement('button')
-    this.cancelQueryBtn.type = 'button'
-    this.cancelQueryBtn.className = 'datanoa-btn datanoa-btn-danger'
-    this.cancelQueryBtn.textContent = 'Cancel'
-    this.cancelQueryBtn.style.display = 'none'
-    this.cancelQueryBtn.addEventListener('click', () => {
+    dom.formatSqlBtn.addEventListener('click', () => this.formatSqlInConsole())
+    dom.cancelQueryBtn.addEventListener('click', () => {
       void this.cancelActiveQuery()
     })
-
-    this.historyBtn = document.createElement('button')
-    this.historyBtn.type = 'button'
-    this.historyBtn.className = 'datanoa-btn'
-    this.historyBtn.textContent = 'Query History'
-    this.historyBtn.addEventListener('click', () => {
+    dom.historyBtn.addEventListener('click', () => {
       void this.toggleQueryHistory()
     })
-
-    this.refreshBtn = document.createElement('button')
-    this.refreshBtn.type = 'button'
-    this.refreshBtn.className = 'datanoa-btn'
-    this.refreshBtn.textContent = 'Refresh'
-    this.refreshBtn.addEventListener('click', () => {
+    dom.savedQueriesBtn.addEventListener('click', () => this.openSavedQueriesModal())
+    dom.findSqlBtn.addEventListener('click', () => this.sqlConsole?.openFindReplace())
+    dom.refreshBtn.addEventListener('click', () => {
       void this.handleRefreshAction()
     })
+    dom.tabButtons.split.addEventListener('click', () => this.switchMode('split'))
+    dom.tabButtons.grid.addEventListener('click', () => this.switchMode('grid'))
+    dom.tabButtons.sql.addEventListener('click', () => this.switchMode('sql'))
+    dom.tabButtons.inspector.addEventListener('click', () => this.switchMode('inspector'))
 
-    this.sqlToolbarEl = document.createElement('div')
-    this.sqlToolbarEl.className = 'datanoa-sql-toolbar'
-    this.sqlToolbarEl.appendChild(this.runBtn)
-    this.sqlToolbarEl.appendChild(this.runAllBtn)
-    this.sqlToolbarEl.appendChild(this.explainBtn)
-    this.sqlToolbarEl.appendChild(this.formatSqlBtn)
-    this.sqlToolbarEl.appendChild(this.cancelQueryBtn)
-    this.sqlToolbarEl.appendChild(this.historyBtn)
-
-    // Segmented Mode Tabs
-    const tabsContainer = document.createElement('div')
-    tabsContainer.className = 'datanoa-tabs'
-
-    const splitTabBtn = document.createElement('button')
-    splitTabBtn.type = 'button'
-    splitTabBtn.className = 'datanoa-tab-btn active'
-    splitTabBtn.textContent = 'Split View'
-
-    const gridTabBtn = document.createElement('button')
-    gridTabBtn.type = 'button'
-    gridTabBtn.className = 'datanoa-tab-btn'
-    gridTabBtn.textContent = 'Data Grid'
-
-    const sqlTabBtn = document.createElement('button')
-    sqlTabBtn.type = 'button'
-    sqlTabBtn.className = 'datanoa-tab-btn'
-    sqlTabBtn.textContent = 'SQL Console'
-
-    const inspectorTabBtn = document.createElement('button')
-    inspectorTabBtn.type = 'button'
-    inspectorTabBtn.className = 'datanoa-tab-btn'
-    inspectorTabBtn.textContent = 'Schema Inspector'
-
-    this.tabButtons = {
-      split: splitTabBtn,
-      grid: gridTabBtn,
-      sql: sqlTabBtn,
-      inspector: inspectorTabBtn,
-    }
-
-    splitTabBtn.addEventListener('click', () => this.switchMode('split'))
-    gridTabBtn.addEventListener('click', () => this.switchMode('grid'))
-    sqlTabBtn.addEventListener('click', () => this.switchMode('sql'))
-    inspectorTabBtn.addEventListener('click', () => this.switchMode('inspector'))
-
-    tabsContainer.appendChild(splitTabBtn)
-    tabsContainer.appendChild(gridTabBtn)
-    tabsContainer.appendChild(sqlTabBtn)
-    tabsContainer.appendChild(inspectorTabBtn)
-
-    toolbar.appendChild(sidebarToggleBtn)
-    toolbar.appendChild(brandPill)
-    toolbar.appendChild(connCluster)
-    toolbar.appendChild(this.refreshBtn)
-    toolbar.appendChild(tabsContainer)
-
-    // Caution strip for PROD / Read-Only connections
-    this.cautionStripEl = document.createElement('div')
-    this.cautionStripEl.className = 'datanoa-caution-strip'
-    this.cautionStripEl.style.display = 'none'
-
-    // 2. Three-Pane Studio Body (Left Sidebar + Center Workspace)
-    const workspaceBody = document.createElement('div')
-    workspaceBody.className = 'datanoa-workspace-body'
-
-    // Left Explorer Sidebar
-    this.sidebarEl = document.createElement('aside')
-    this.sidebarEl.className = 'datanoa-sidebar'
-
-    const sidebarHeader = document.createElement('div')
-    sidebarHeader.className = 'datanoa-sidebar-header'
-
-    this.searchInputEl = document.createElement('input')
-    this.searchInputEl.className = 'datanoa-search-input'
-    this.searchInputEl.type = 'search'
-    this.searchInputEl.placeholder = 'Filter tables & views...'
-    this.searchInputEl.addEventListener('input', () => {
+    // Wire sidebar & horizontal topbar controls
+    dom.searchInputEl.addEventListener('input', () => {
       const rawVal = this.searchInputEl?.value || ''
       this.filterQuery = rawVal.toLowerCase()
       if (this.topbarFilterInputEl && this.topbarFilterInputEl.value !== rawVal) {
@@ -1069,47 +1374,12 @@ export class DatanoaStudioEditor {
       this.renderSidebarObjects()
       this.saveStudioViewState(false)
     })
-
-    this.newTableBtn = document.createElement('button')
-    this.newTableBtn.type = 'button'
-    this.newTableBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.newTableBtn.textContent = '+ New Table'
-    this.newTableBtn.title = 'Create a new table visually'
-    this.newTableBtn.disabled = true
-    this.newTableBtn.addEventListener('click', () => {
-      this.openCreateTableModal()
+    dom.newTableBtn.addEventListener('click', () => this.openCreateTableModal())
+    dom.schemaSelectEl.addEventListener('change', () => this.handleSchemaSelectionChanged())
+    dom.exportDdlBtn.addEventListener('click', () => {
+      void this.exportFullSchemaDdl()
     })
-
-    sidebarHeader.appendChild(this.searchInputEl)
-    sidebarHeader.appendChild(this.newTableBtn)
-
-    this.sidebarListEl = document.createElement('div')
-    this.sidebarListEl.className = 'datanoa-sidebar-list'
-    this.sidebarListEl.addEventListener('scroll', () => {
-      this.closeSidebarContextMenu()
-      this.closeTopbarPopover()
-    })
-
-    this.sidebarEl.appendChild(sidebarHeader)
-    this.sidebarEl.appendChild(this.sidebarListEl)
-
-    // Main Center View
-    const mainView = document.createElement('div')
-    mainView.className = 'datanoa-main-view'
-    this.mainViewEl = mainView
-
-    // Horizontal Top Table Switcher Bar (Mode 2 when Sidebar is collapsed)
-    this.tableTopbarEl = document.createElement('div')
-    this.tableTopbarEl.className = 'datanoa-table-topbar'
-
-    const topbarFilterWrap = document.createElement('div')
-    topbarFilterWrap.className = 'datanoa-topbar-filter-wrap'
-
-    this.topbarFilterInputEl = document.createElement('input')
-    this.topbarFilterInputEl.className = 'datanoa-topbar-filter'
-    this.topbarFilterInputEl.type = 'search'
-    this.topbarFilterInputEl.placeholder = 'Filter tables...'
-    this.topbarFilterInputEl.addEventListener('input', () => {
+    dom.topbarFilterInputEl.addEventListener('input', () => {
       const rawVal = this.topbarFilterInputEl?.value || ''
       this.filterQuery = rawVal.toLowerCase()
       if (this.searchInputEl && this.searchInputEl.value !== rawVal) {
@@ -1118,28 +1388,10 @@ export class DatanoaStudioEditor {
       this.renderSidebarObjects()
       this.saveStudioViewState(false)
     })
-
-    this.topbarCountEl = document.createElement('span')
-    this.topbarCountEl.className = 'datanoa-topbar-count'
-    this.topbarCountEl.textContent = '0'
-
-    topbarFilterWrap.appendChild(this.topbarFilterInputEl)
-    topbarFilterWrap.appendChild(this.topbarCountEl)
-
-    const topbarPrevBtn = document.createElement('button')
-    topbarPrevBtn.type = 'button'
-    topbarPrevBtn.className = 'datanoa-topbar-nav-btn'
-    topbarPrevBtn.title = 'Scroll tables left'
-    topbarPrevBtn.textContent = '‹'
-    topbarPrevBtn.addEventListener('click', () => {
-      if (this.topbarTrackEl) {
-        this.topbarTrackEl.scrollLeft -= 240
-      }
+    dom.topbarPrevBtn.addEventListener('click', () => {
+      if (this.topbarTrackEl) this.topbarTrackEl.scrollLeft -= 240
     })
-
-    this.topbarTrackEl = document.createElement('div')
-    this.topbarTrackEl.className = 'datanoa-table-topbar-track'
-    this.topbarTrackEl.addEventListener(
+    dom.topbarTrackEl.addEventListener(
       'wheel',
       (e: WheelEvent) => {
         if (!this.topbarTrackEl) return
@@ -1151,282 +1403,86 @@ export class DatanoaStudioEditor {
       },
       { passive: false }
     )
-
-    const topbarNextBtn = document.createElement('button')
-    topbarNextBtn.type = 'button'
-    topbarNextBtn.className = 'datanoa-topbar-nav-btn'
-    topbarNextBtn.title = 'Scroll tables right'
-    topbarNextBtn.textContent = '›'
-    topbarNextBtn.addEventListener('click', () => {
-      if (this.topbarTrackEl) {
-        this.topbarTrackEl.scrollLeft += 240
-      }
+    dom.topbarNextBtn.addEventListener('click', () => {
+      if (this.topbarTrackEl) this.topbarTrackEl.scrollLeft += 240
     })
-
-    this.topbarAllBtn = document.createElement('button')
-    this.topbarAllBtn.type = 'button'
-    this.topbarAllBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-topbar-all-btn'
-    this.topbarAllBtn.textContent = 'All (0) ▾'
-    this.topbarAllBtn.title = 'Browse all tables & views in a dropdown list'
-    this.topbarAllBtn.addEventListener('click', (e) => {
+    dom.topbarAllBtn.addEventListener('click', (e) => {
       e.stopPropagation()
       this.toggleTopbarAllTablesPopover()
     })
+    dom.topbarNewTableBtn.addEventListener('click', () => this.openCreateTableModal())
 
-    this.topbarNewTableBtn = document.createElement('button')
-    this.topbarNewTableBtn.type = 'button'
-    this.topbarNewTableBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-topbar-new-table-btn'
-    this.topbarNewTableBtn.textContent = '+ Table'
-    this.topbarNewTableBtn.title = 'Create a new table visually'
-    this.topbarNewTableBtn.disabled = true
-    this.topbarNewTableBtn.addEventListener('click', () => {
-      this.openCreateTableModal()
+    // Wire split resizer & query history drawer
+    dom.splitResizerEl.addEventListener('mousedown', (e) => this.startSplitResize(e))
+    dom.historySearchEl.addEventListener('input', () => {
+      this.queryHistoryDrawer.setSearchQuery(this.historySearchEl?.value || '')
     })
-
-    this.tableTopbarEl.appendChild(topbarFilterWrap)
-    this.tableTopbarEl.appendChild(topbarPrevBtn)
-    this.tableTopbarEl.appendChild(this.topbarTrackEl)
-    this.tableTopbarEl.appendChild(topbarNextBtn)
-    this.tableTopbarEl.appendChild(this.topbarAllBtn)
-    this.tableTopbarEl.appendChild(this.topbarNewTableBtn)
-
-    // SQL Console Area
-    this.sqlAreaEl = document.createElement('div')
-    this.sqlAreaEl.className = 'datanoa-sql-area'
-
-    // Draggable Horizontal Split Resizer
-    this.splitResizerEl = document.createElement('div')
-    this.splitResizerEl.className = 'datanoa-split-resizer'
-    this.splitResizerEl.title = 'Drag to resize SQL Console & Data Grid'
-    this.splitResizerEl.addEventListener('mousedown', (e) => {
-      this.startSplitResize(e)
-    })
-
-    // Collapsible Query History Drawer
-    this.historyDrawerEl = document.createElement('div')
-    this.historyDrawerEl.className = 'datanoa-history-drawer'
-    this.historyDrawerEl.style.display = 'none'
-
-    const historyHead = document.createElement('div')
-    historyHead.className = 'datanoa-drawer-head'
-    const historyTitle = document.createElement('span')
-    historyTitle.textContent = 'Query History'
-
-    this.historySearchEl = document.createElement('input')
-    this.historySearchEl.type = 'search'
-    this.historySearchEl.className = 'datanoa-history-search'
-    this.historySearchEl.placeholder = 'Filter query history...'
-    this.historySearchEl.addEventListener('input', () => {
-      this.historySearchQuery = (this.historySearchEl?.value || '').trim().toLowerCase()
-      this.renderQueryHistoryList()
-    })
-
-    const historyHeadActions = document.createElement('div')
-    historyHeadActions.className = 'datanoa-btn-group'
-
-    this.clearHistoryBtn = document.createElement('button')
-    this.clearHistoryBtn.type = 'button'
-    this.clearHistoryBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.clearHistoryBtn.textContent = 'Clear'
-    this.clearHistoryBtn.addEventListener('click', () => {
+    dom.clearHistoryBtn.addEventListener('click', () => {
       void this.clearQueryHistory()
     })
-
-    const closeHistoryBtn = document.createElement('button')
-    closeHistoryBtn.type = 'button'
-    closeHistoryBtn.className = 'datanoa-btn datanoa-btn-sm'
-    closeHistoryBtn.textContent = 'Close'
-    closeHistoryBtn.addEventListener('click', () => {
-      this.isHistoryOpen = false
-      if (this.historyDrawerEl) this.historyDrawerEl.style.display = 'none'
-      this.historyBtn?.classList.remove('active')
+    dom.closeHistoryBtn.addEventListener('click', () => {
+      this.queryHistoryDrawer.close()
       this.dataGrid?.handleViewportResize()
     })
 
-    historyHeadActions.appendChild(this.historySearchEl)
-    historyHeadActions.appendChild(this.clearHistoryBtn)
-    historyHeadActions.appendChild(closeHistoryBtn)
-    historyHead.appendChild(historyTitle)
-    historyHead.appendChild(historyHeadActions)
-
-    this.historyListEl = document.createElement('div')
-    this.historyDrawerEl.appendChild(historyHead)
-    this.historyDrawerEl.appendChild(this.historyListEl)
-
-    // Grid Sub-bar (Table Summary + Primary Actions + Pagination)
-    this.gridSubbarEl = document.createElement('div')
-    this.gridSubbarEl.className = 'datanoa-grid-subbar'
-
-    const subLeft = document.createElement('div')
-    subLeft.className = 'datanoa-grid-subbar-left'
-    this.gridSubbarTitleEl = document.createElement('span')
-    this.gridSubbarTitleEl.className = 'datanoa-grid-subbar-title'
-    this.gridSubbarTitleEl.textContent = 'Select a table'
-    subLeft.appendChild(this.gridSubbarTitleEl)
-
-    const gridActions = document.createElement('div')
-    gridActions.className = 'datanoa-btn-group'
-
-    this.addRowBtn = document.createElement('button')
-    this.addRowBtn.type = 'button'
-    this.addRowBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.addRowBtn.textContent = '+ Row'
-    this.addRowBtn.disabled = true
-    this.addRowBtn.addEventListener('click', () => {
-      this.dataGrid?.addBlankRow()
-    })
-
-    this.delRowBtn = document.createElement('button')
-    this.delRowBtn.type = 'button'
-    this.delRowBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.delRowBtn.textContent = '− Row'
-    this.delRowBtn.disabled = true
-    this.delRowBtn.addEventListener('click', () => {
-      this.dataGrid?.bulkMarkRowsDeleted()
-    })
-
-    this.cloneRowBtn = document.createElement('button')
-    this.cloneRowBtn.type = 'button'
-    this.cloneRowBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.cloneRowBtn.textContent = 'Clone'
-    this.cloneRowBtn.disabled = true
-    this.cloneRowBtn.addEventListener('click', () => {
-      this.dataGrid?.bulkCloneSelectedRows()
-    })
-
-    this.inspectCellBtn = document.createElement('button')
-    this.inspectCellBtn.type = 'button'
-    this.inspectCellBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.inspectCellBtn.textContent = 'Edit Cell'
-    this.inspectCellBtn.title = 'Open Value / JSON Inspector for the selected cell'
-    this.inspectCellBtn.disabled = true
-    this.inspectCellBtn.addEventListener('click', () => {
-      this.toggleValueInspector()
-    })
-
-    this.dmlPreviewBtn = document.createElement('button')
-    this.dmlPreviewBtn.type = 'button'
-    this.dmlPreviewBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.dmlPreviewBtn.textContent = 'DML Preview'
-    this.dmlPreviewBtn.disabled = true
-    this.dmlPreviewBtn.addEventListener('click', () => {
+    // Wire grid subbar & pagination
+    dom.addRowBtn.addEventListener('click', () => this.dataGrid?.addBlankRow())
+    dom.delRowBtn.addEventListener('click', () => this.dataGrid?.bulkMarkRowsDeleted())
+    dom.cloneRowBtn.addEventListener('click', () => this.dataGrid?.bulkCloneSelectedRows())
+    dom.inspectCellBtn.addEventListener('click', () => this.toggleValueInspector())
+    dom.dmlPreviewBtn.addEventListener('click', () => {
       void this.previewStagedChanges()
     })
-
-    this.submitBtn = document.createElement('button')
-    this.submitBtn.type = 'button'
-    this.submitBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-btn-primary'
-    this.submitBtn.textContent = 'Submit [0]'
-    this.submitBtn.disabled = true
-    this.submitBtn.addEventListener('click', () => {
+    dom.submitBtn.addEventListener('click', () => {
       void this.submitStagedChanges()
     })
-
-    this.revertBtn = document.createElement('button')
-    this.revertBtn.type = 'button'
-    this.revertBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.revertBtn.textContent = 'Revert'
-    this.revertBtn.disabled = true
-    this.revertBtn.addEventListener('click', () => {
+    dom.revertBtn.addEventListener('click', () => {
       this.dataGrid?.revertAllChanges()
       if (this.dmlPreviewEl) this.dmlPreviewEl.style.display = 'none'
       this.updateStatus('Reverted staged changes')
     })
-
-    this.transposeBtn = document.createElement('button')
-    this.transposeBtn.type = 'button'
-    this.transposeBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.transposeBtn.textContent = '⇄ Transpose'
-    this.transposeBtn.addEventListener('click', () => {
+    dom.transposeBtn.addEventListener('click', () => {
       if (!this.dataGrid || !this.transposeBtn) return
       const next = !this.dataGrid.getTransposed()
       this.dataGrid.setTransposed(next)
       this.transposeBtn.classList.toggle('active', next)
       this.saveStudioViewState()
     })
-
-    this.columnsBtn = document.createElement('button')
-    this.columnsBtn.type = 'button'
-    this.columnsBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.columnsBtn.textContent = 'Columns'
-    this.columnsBtn.title = 'Toggle column visibility and pin/freeze columns'
-    this.columnsBtn.addEventListener('click', (e) => {
+    dom.columnsBtn.addEventListener('click', (e) => {
       e.stopPropagation()
       this.toggleColumnsPopover()
     })
-
-    this.editTableBtn = document.createElement('button')
-    this.editTableBtn.type = 'button'
-    this.editTableBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.editTableBtn.textContent = 'Edit Table'
-    this.editTableBtn.title = 'Open Schema Inspector & Edit Table Structure (ALTER TABLE)'
-    this.editTableBtn.addEventListener('click', () => {
+    dom.editTableBtn.addEventListener('click', () => {
+      if (this.activeObjectKind && !this.isTabularKind(this.activeObjectKind)) return
       this.switchMode('inspector')
     })
-
-    this.exportSelectEl = document.createElement('select')
-    this.exportSelectEl.className = 'datanoa-select datanoa-select-sm'
-    this.exportSelectEl.setAttribute('aria-label', 'Export Data Format')
+    dom.importDataBtn.addEventListener('click', () => {
+      void this.openImportDataModal()
+    })
     this.updateExportDropdownOptions()
-    this.exportSelectEl.addEventListener('change', () => {
+    dom.exportSelectEl.addEventListener('change', () => {
       const val = this.exportSelectEl?.value || ''
       if (!val) return
       this.handleExportAction(val)
-      if (this.exportSelectEl) this.exportSelectEl.value = ''
+      if (this.exportSelectEl) {
+        this.exportSelectEl.value = ''
+        syncStudioSelectTooltip(this.exportSelectEl, 'Export Format')
+      }
     })
-
-    gridActions.appendChild(this.addRowBtn)
-    gridActions.appendChild(this.delRowBtn)
-    gridActions.appendChild(this.cloneRowBtn)
-    gridActions.appendChild(this.inspectCellBtn)
-    gridActions.appendChild(this.dmlPreviewBtn)
-    gridActions.appendChild(this.submitBtn)
-    gridActions.appendChild(this.revertBtn)
-    gridActions.appendChild(this.transposeBtn)
-    gridActions.appendChild(this.columnsBtn)
-    gridActions.appendChild(this.editTableBtn)
-    gridActions.appendChild(this.exportSelectEl)
-
-    subLeft.appendChild(gridActions)
-
-    const subRight = document.createElement('div')
-    subRight.className = 'datanoa-grid-subbar-right'
-
-    this.batchModeBtn = document.createElement('button')
-    this.batchModeBtn.type = 'button'
-    this.batchModeBtn.className = 'datanoa-btn datanoa-btn-sm active'
-    this.batchModeBtn.textContent = 'Batch: Staged'
-    this.batchModeBtn.title = 'Toggle between Staged Batch edits and immediate Auto-Commit'
-    this.batchModeBtn.addEventListener('click', () => {
+    dom.batchModeBtn.addEventListener('click', () => {
       if (!this.dataGrid || !this.batchModeBtn) return
       const next = !this.dataGrid.isBatchMode()
       this.dataGrid.setBatchMode(next)
       this.batchModeBtn.classList.toggle('active', next)
       this.batchModeBtn.textContent = next ? 'Batch: Staged' : 'Auto-Commit'
     })
-
-    this.prevBtn = document.createElement('button')
-    this.prevBtn.type = 'button'
-    this.prevBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.prevBtn.textContent = 'Prev'
-    this.prevBtn.disabled = true
-    this.prevBtn.addEventListener('click', () => {
+    dom.prevBtn.addEventListener('click', () => {
       if (this.isShowingSqlResult || this.isTableLoading) return
       if (this.activeConnectionId && this.activeTable && this.currentPage > 1) {
         void this.loadTableData(this.activeConnectionId, this.activeTable, this.currentPage - 1)
       }
     })
-
-    this.gridPageInfoEl = document.createElement('span')
-    this.gridPageInfoEl.className = 'datanoa-page-info'
-    this.gridPageInfoEl.textContent = 'Page 1'
-
-    this.nextBtn = document.createElement('button')
-    this.nextBtn.type = 'button'
-    this.nextBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.nextBtn.textContent = 'Next'
-    this.nextBtn.disabled = true
-    this.nextBtn.addEventListener('click', () => {
+    dom.nextBtn.addEventListener('click', () => {
       if (this.isShowingSqlResult || this.isTableLoading) return
       if (
         this.activeConnectionId &&
@@ -1436,130 +1492,48 @@ export class DatanoaStudioEditor {
         void this.loadTableData(this.activeConnectionId, this.activeTable, this.currentPage + 1)
       }
     })
-
-    this.pageSizeSelectEl = document.createElement('select')
-    this.pageSizeSelectEl.className = 'datanoa-select datanoa-select-sm'
-    this.pageSizeSelectEl.setAttribute('aria-label', 'Rows per page')
-    this.pageSizeSelectEl.title = 'Rows per page'
-    const pageSizeOptions: ReadonlyArray<{ value: string; label: string }> = [
-      { value: '100', label: '100 / page' },
-      { value: '500', label: '500 / page' },
-      { value: '1000', label: '1,000 / page' },
-      { value: '5000', label: '5,000 / page' },
-      { value: '10000', label: '10,000 / page' },
-    ]
-    for (const optDef of pageSizeOptions) {
-      const opt = document.createElement('option')
-      opt.value = optDef.value
-      opt.textContent = optDef.label
-      if (optDef.value === String(this.pageSize)) {
-        opt.selected = true
-      }
-      this.pageSizeSelectEl.appendChild(opt)
-    }
-    this.pageSizeSelectEl.value = String(this.pageSize)
-    this.pageSizeSelectEl.addEventListener('change', () => {
+    dom.pageSizeSelectEl.addEventListener('change', () => {
       const nextSize = Number(this.pageSizeSelectEl?.value)
       if (!Number.isFinite(nextSize) || nextSize < 1) return
       this.pageSize = nextSize
       this.currentPage = 1
+      syncStudioSelectTooltip(this.pageSizeSelectEl, 'Rows per page')
       this.saveStudioViewState()
       if (!this.isShowingSqlResult && this.activeConnectionId && this.activeTable) {
         void this.loadTableData(this.activeConnectionId, this.activeTable, 1)
       }
     })
 
-    subRight.appendChild(this.batchModeBtn)
-    subRight.appendChild(this.pageSizeSelectEl)
-    subRight.appendChild(this.prevBtn)
-    subRight.appendChild(this.gridPageInfoEl)
-    subRight.appendChild(this.nextBtn)
-
-    this.gridSubbarEl.appendChild(subLeft)
-    this.gridSubbarEl.appendChild(subRight)
-
-    // JetBrains Data Grid Filter Toolbar
-    this.gridToolbarEl = document.createElement('div')
-    this.gridToolbarEl.className = 'datanoa-grid-toolbar'
-
-    const whereGroup = document.createElement('div')
-    whereGroup.className = 'datanoa-filter-group'
-    const whereLbl = document.createElement('span')
-    whereLbl.className = 'datanoa-filter-label'
-    whereLbl.textContent = 'WHERE'
-    this.whereInputEl = document.createElement('input')
-    this.whereInputEl.className = 'datanoa-filter-input'
-    this.whereInputEl.type = 'text'
-    this.whereInputEl.placeholder = "status = 'active' (Enter)"
-    this.whereInputEl.addEventListener('keydown', (e) => {
+    // Wire filter toolbar & find navigation
+    dom.whereInputEl.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault()
         void this.applyServerFilters()
       }
     })
-    whereGroup.appendChild(whereLbl)
-    whereGroup.appendChild(this.whereInputEl)
-
-    const orderGroup = document.createElement('div')
-    orderGroup.className = 'datanoa-filter-group'
-    const orderLbl = document.createElement('span')
-    orderLbl.className = 'datanoa-filter-label'
-    orderLbl.textContent = 'ORDER BY'
-    this.orderByInputEl = document.createElement('input')
-    this.orderByInputEl.className = 'datanoa-filter-input'
-    this.orderByInputEl.type = 'text'
-    this.orderByInputEl.placeholder = 'id DESC (Enter)'
-    this.orderByInputEl.addEventListener('keydown', (e) => {
+    dom.orderByInputEl.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault()
         void this.applyServerFilters()
       }
     })
-    orderGroup.appendChild(orderLbl)
-    orderGroup.appendChild(this.orderByInputEl)
-
-    this.filterBtn = document.createElement('button')
-    this.filterBtn.type = 'button'
-    this.filterBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.filterBtn.textContent = 'Filter'
-    this.filterBtn.addEventListener('click', () => {
+    dom.filterBtn.addEventListener('click', () => {
       void this.applyServerFilters()
     })
-
-    this.clearFilterBtn = document.createElement('button')
-    this.clearFilterBtn.type = 'button'
-    this.clearFilterBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-filter-clear-btn'
-    this.clearFilterBtn.textContent = '×'
-    this.clearFilterBtn.title = 'Clear WHERE, ORDER BY, and client column filters'
-    this.clearFilterBtn.setAttribute('aria-label', 'Clear Filters')
-    this.clearFilterBtn.addEventListener('click', () => {
+    dom.clearFilterBtn.addEventListener('click', () => {
       void this.clearAllFilters()
     })
-
-    const findNavWrap = document.createElement('div')
-    findNavWrap.className = 'datanoa-find-nav'
-
-    this.searchModeBtn = document.createElement('button')
-    this.searchModeBtn.type = 'button'
-    this.searchModeBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.searchModeBtn.textContent = 'Mode: Filter'
-    this.searchModeBtn.title = 'Toggle between Client Row Filter and Find & Highlight (Ctrl+F)'
-    this.searchModeBtn.addEventListener('click', () => {
+    dom.searchModeBtn.addEventListener('click', () => {
       this.setGridSearchMode(this.searchMode === 'filter' ? 'find' : 'filter')
     })
-
-    this.clientSearchEl = document.createElement('input')
-    this.clientSearchEl.className = 'datanoa-client-search'
-    this.clientSearchEl.type = 'search'
-    this.clientSearchEl.placeholder = 'Search rows...'
-    this.clientSearchEl.addEventListener('input', () => {
+    dom.clientSearchEl.addEventListener('input', () => {
       this.cancelClientSearchDebounce()
       this.clientSearchDebounceTimer = setTimeout(() => {
         this.clientSearchDebounceTimer = null
         this.applyClientSearchOrFind()
       }, 150)
     })
-    this.clientSearchEl.addEventListener('keydown', (e) => {
+    dom.clientSearchEl.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         if (this.searchMode === 'find') {
           e.preventDefault()
@@ -1583,365 +1557,55 @@ export class DatanoaStudioEditor {
         }
       }
     })
-
-    this.findCountEl = document.createElement('span')
-    this.findCountEl.className = 'datanoa-page-info'
-    this.findCountEl.style.display = 'none'
-    this.findCountEl.textContent = '0 / 0'
-
-    this.findPrevBtn = document.createElement('button')
-    this.findPrevBtn.type = 'button'
-    this.findPrevBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.findPrevBtn.textContent = '▲'
-    this.findPrevBtn.title = 'Previous match (Shift+Enter)'
-    this.findPrevBtn.style.display = 'none'
-    this.findPrevBtn.addEventListener('click', () => {
+    dom.findPrevBtn.addEventListener('click', () => {
       const state = this.dataGrid?.findNext(-1)
       this.updateFindCounter(state)
     })
-
-    this.findNextBtn = document.createElement('button')
-    this.findNextBtn.type = 'button'
-    this.findNextBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.findNextBtn.textContent = '▼'
-    this.findNextBtn.title = 'Next match (Enter)'
-    this.findNextBtn.style.display = 'none'
-    this.findNextBtn.addEventListener('click', () => {
+    dom.findNextBtn.addEventListener('click', () => {
       const state = this.dataGrid?.findNext(1)
       this.updateFindCounter(state)
     })
 
-    findNavWrap.appendChild(this.searchModeBtn)
-    findNavWrap.appendChild(this.clientSearchEl)
-    findNavWrap.appendChild(this.findCountEl)
-    findNavWrap.appendChild(this.findPrevBtn)
-    findNavWrap.appendChild(this.findNextBtn)
-
-    this.gridToolbarEl.appendChild(whereGroup)
-    this.gridToolbarEl.appendChild(orderGroup)
-    this.gridToolbarEl.appendChild(this.filterBtn)
-    this.gridToolbarEl.appendChild(this.clearFilterBtn)
-    this.gridToolbarEl.appendChild(findNavWrap)
-
-    // Inline DML Preview Drawer
-    this.dmlPreviewEl = document.createElement('div')
-    this.dmlPreviewEl.className = 'datanoa-dml-preview'
-    this.dmlPreviewEl.style.display = 'none'
-
-    const dmlHead = document.createElement('div')
-    dmlHead.className = 'datanoa-drawer-head'
-    const dmlHeadTitle = document.createElement('span')
-    dmlHeadTitle.textContent = 'Pending DML Preview'
-    const dmlHeadBtns = document.createElement('div')
-    dmlHeadBtns.className = 'datanoa-btn-group'
-    this.dmlApplyBtn = document.createElement('button')
-    this.dmlApplyBtn.type = 'button'
-    this.dmlApplyBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-btn-primary'
-    this.dmlApplyBtn.textContent = 'Apply'
-    this.dmlApplyBtn.addEventListener('click', () => {
+    // Wire DML preview, query banner & status bar
+    dom.dmlApplyBtn.addEventListener('click', () => {
       void this.submitStagedChanges()
     })
-    const dmlCloseBtn = document.createElement('button')
-    dmlCloseBtn.type = 'button'
-    dmlCloseBtn.className = 'datanoa-btn datanoa-btn-sm'
-    dmlCloseBtn.textContent = 'Close'
-    dmlCloseBtn.addEventListener('click', () => {
+    dom.dmlCopyBtn.addEventListener('click', () => {
+      const fullSql = this.lastPreviewDmlText || this.dmlPreviewPreEl?.textContent || ''
+      if (fullSql) {
+        copyTextFallback(fullSql)
+        this.updateStatus('Copied full DML SQL to clipboard')
+      }
+    })
+    dom.dmlCloseBtn.addEventListener('click', () => {
       if (this.dmlPreviewEl) this.dmlPreviewEl.style.display = 'none'
       this.dataGrid?.handleViewportResize()
     })
-    dmlHeadBtns.appendChild(this.dmlApplyBtn)
-    dmlHeadBtns.appendChild(dmlCloseBtn)
-    dmlHead.appendChild(dmlHeadTitle)
-    dmlHead.appendChild(dmlHeadBtns)
-
-    this.dmlPreviewPreEl = document.createElement('pre')
-    this.dmlPreviewPreEl.className = 'datanoa-dml-pre'
-    this.dmlPreviewEl.appendChild(dmlHead)
-    this.dmlPreviewEl.appendChild(this.dmlPreviewPreEl)
-
-    // Query Execution Status / Error Feedback Banner
-    this.queryBannerEl = document.createElement('div')
-    this.queryBannerEl.className = 'datanoa-query-banner'
-    this.queryBannerEl.style.display = 'none'
-
-    const bannerBody = document.createElement('div')
-    bannerBody.className = 'datanoa-query-banner-body'
-    this.queryBannerTitleEl = document.createElement('span')
-    this.queryBannerTitleEl.className = 'datanoa-query-banner-title'
-    this.queryBannerDetailEl = document.createElement('div')
-    this.queryBannerDetailEl.className = 'datanoa-query-banner-detail'
-    bannerBody.appendChild(this.queryBannerTitleEl)
-    bannerBody.appendChild(this.queryBannerDetailEl)
-
-    const bannerActions = document.createElement('div')
-    bannerActions.className = 'datanoa-query-banner-actions'
-
-    this.queryBannerRetryBtn = document.createElement('button')
-    this.queryBannerRetryBtn.type = 'button'
-    this.queryBannerRetryBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-error-retry-btn'
-    this.queryBannerRetryBtn.textContent = 'Retry'
-    this.queryBannerRetryBtn.style.display = 'none'
-    this.queryBannerRetryBtn.addEventListener('click', () => {
+    dom.queryBannerRetryBtn.addEventListener('click', () => {
       const fn = this.queryBannerRetryHandler
       if (fn) fn()
     })
-
-    this.queryBannerBackBtn = document.createElement('button')
-    this.queryBannerBackBtn.type = 'button'
-    this.queryBannerBackBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.queryBannerBackBtn.textContent = 'Back to Table'
-    this.queryBannerBackBtn.style.display = 'none'
-    this.queryBannerBackBtn.addEventListener('click', () => {
+    dom.queryBannerBackBtn.addEventListener('click', () => {
       if (this.activeConnectionId && this.activeTable) {
         void this.loadTableData(this.activeConnectionId, this.activeTable, 1)
       }
     })
-
-    this.queryBannerCopyBtn = document.createElement('button')
-    this.queryBannerCopyBtn.type = 'button'
-    this.queryBannerCopyBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.queryBannerCopyBtn.textContent = 'Copy Error'
-    this.queryBannerCopyBtn.style.display = 'none'
-    this.queryBannerCopyBtn.addEventListener('click', () => {
+    dom.queryBannerCopyBtn.addEventListener('click', () => {
       if (!this.lastQueryErrorText) return
       copyTextFallback(this.lastQueryErrorText, this.queryBannerCopyBtn)
       this.updateStatus('Copied query error to clipboard')
     })
-
-    this.queryBannerReportBtn = document.createElement('button')
-    this.queryBannerReportBtn.type = 'button'
-    this.queryBannerReportBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-report-issue-btn'
-    this.queryBannerReportBtn.textContent = 'Report Issue'
-    this.queryBannerReportBtn.title = 'Report this error on GitHub Issues'
-    this.queryBannerReportBtn.style.display = 'none'
-    this.queryBannerReportBtn.addEventListener('click', () => {
-      this.openFeedbackModal('bug')
-    })
-
-    const bannerCloseBtn = document.createElement('button')
-    bannerCloseBtn.type = 'button'
-    bannerCloseBtn.className = 'datanoa-btn datanoa-btn-sm'
-    bannerCloseBtn.textContent = 'Dismiss'
-    bannerCloseBtn.addEventListener('click', () => {
-      this.hideQueryBanner()
-    })
-
-    bannerActions.appendChild(this.queryBannerRetryBtn)
-    bannerActions.appendChild(this.queryBannerBackBtn)
-    bannerActions.appendChild(this.queryBannerCopyBtn)
-    bannerActions.appendChild(this.queryBannerReportBtn)
-    bannerActions.appendChild(bannerCloseBtn)
-    this.queryBannerEl.appendChild(bannerBody)
-    this.queryBannerEl.appendChild(bannerActions)
-
-    // Grid Area
-    this.gridAreaEl = document.createElement('div')
-    this.gridAreaEl.className = 'datanoa-grid-area'
-
-    // Collapsible Bottom Cell Value / JSON Inspector Drawer
-    this.valueInspectorEl = document.createElement('div')
-    this.valueInspectorEl.className = 'datanoa-value-inspector'
-    this.valueInspectorEl.style.display = 'none'
-
-    const valHead = document.createElement('div')
-    valHead.className = 'datanoa-drawer-head'
-    const valTitleWrap = document.createElement('div')
-    valTitleWrap.style.display = 'inline-flex'
-    valTitleWrap.style.alignItems = 'center'
-    valTitleWrap.style.gap = '6px'
-    this.valueInspectorTitleEl = document.createElement('span')
-    this.valueInspectorTitleEl.textContent = 'Value Inspector'
-    this.valueNullBadgeEl = document.createElement('span')
-    this.valueNullBadgeEl.className = 'datanoa-null-badge'
-    this.valueNullBadgeEl.textContent = 'NULL'
-    this.valueNullBadgeEl.style.display = 'none'
-    valTitleWrap.appendChild(this.valueInspectorTitleEl)
-    valTitleWrap.appendChild(this.valueNullBadgeEl)
-
-    const valActions = document.createElement('div')
-    valActions.className = 'datanoa-btn-group'
-
-    const valPrettyBtn = document.createElement('button')
-    valPrettyBtn.type = 'button'
-    valPrettyBtn.className = 'datanoa-btn datanoa-btn-sm'
-    valPrettyBtn.textContent = 'Format JSON'
-    valPrettyBtn.addEventListener('click', () => {
-      if (!this.valueInspectorTextEl) return
-      try {
-        const parsed: unknown = JSON.parse(this.valueInspectorTextEl.value)
-        this.valueInspectorTextEl.value = JSON.stringify(parsed, null, 2)
-        this.updateValueInspectorMeta(false)
-      } catch {
-        this.updateStatus('Value is not valid JSON')
-      }
-    })
-
-    const valMinifyBtn = document.createElement('button')
-    valMinifyBtn.type = 'button'
-    valMinifyBtn.className = 'datanoa-btn datanoa-btn-sm'
-    valMinifyBtn.textContent = 'Minify JSON'
-    valMinifyBtn.addEventListener('click', () => {
-      if (!this.valueInspectorTextEl) return
-      try {
-        const parsed: unknown = JSON.parse(this.valueInspectorTextEl.value)
-        this.valueInspectorTextEl.value = JSON.stringify(parsed)
-        this.updateValueInspectorMeta(false)
-      } catch {
-        this.updateStatus('Value is not valid JSON')
-      }
-    })
-
-    this.valueNullBtn = document.createElement('button')
-    this.valueNullBtn.type = 'button'
-    this.valueNullBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.valueNullBtn.textContent = 'Set NULL'
-    this.valueNullBtn.addEventListener('click', () => {
-      void this.applyValueFromInspector(true)
-    })
-
-    this.valueApplyBtn = document.createElement('button')
-    this.valueApplyBtn.type = 'button'
-    this.valueApplyBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-btn-primary'
-    this.valueApplyBtn.textContent = 'Apply'
-    this.valueApplyBtn.title = 'Apply edit (Ctrl+Enter)'
-    this.valueApplyBtn.addEventListener('click', () => {
-      void this.applyValueFromInspector(false)
-    })
-
-    const valCopyBtn = document.createElement('button')
-    valCopyBtn.type = 'button'
-    valCopyBtn.className = 'datanoa-btn datanoa-btn-sm'
-    valCopyBtn.textContent = 'Copy'
-    valCopyBtn.addEventListener('click', () => {
-      if (!this.valueInspectorTextEl) return
-      copyTextFallback(this.valueInspectorTextEl.value, valCopyBtn)
-      this.updateStatus('Copied cell value to clipboard')
-    })
-
-    const valCloseBtn = document.createElement('button')
-    valCloseBtn.type = 'button'
-    valCloseBtn.className = 'datanoa-btn datanoa-btn-sm'
-    valCloseBtn.textContent = 'Close'
-    valCloseBtn.addEventListener('click', () => {
-      this.closeValueInspector()
-    })
-
-    valActions.appendChild(valPrettyBtn)
-    valActions.appendChild(valMinifyBtn)
-    valActions.appendChild(this.valueNullBtn)
-    valActions.appendChild(this.valueApplyBtn)
-    valActions.appendChild(valCopyBtn)
-    valActions.appendChild(valCloseBtn)
-    valHead.appendChild(valTitleWrap)
-    valHead.appendChild(valActions)
-
-    const valBody = document.createElement('div')
-    valBody.className = 'datanoa-value-inspector-body'
-    this.valueInspectorTextEl = document.createElement('textarea')
-    this.valueInspectorTextEl.className = 'datanoa-value-textarea'
-    this.valueInspectorTextEl.spellcheck = false
-    this.valueInspectorTextEl.addEventListener('input', () => {
-      this.updateValueInspectorMeta(false)
-    })
-    this.valueInspectorTextEl.addEventListener('keydown', (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-        e.preventDefault()
-        void this.applyValueFromInspector(false)
-      }
-    })
-    this.valueInspectorStatusEl = document.createElement('div')
-    this.valueInspectorStatusEl.className = 'datanoa-json-status'
-    valBody.appendChild(this.valueInspectorTextEl)
-    valBody.appendChild(this.valueInspectorStatusEl)
-
-    this.valueInspectorEl.appendChild(valHead)
-    this.valueInspectorEl.appendChild(valBody)
-
-    // Schema Inspector Area (hidden by default)
-    this.inspectorAreaEl = document.createElement('div')
-    this.inspectorAreaEl.className = 'datanoa-inspector-view'
-    this.inspectorAreaEl.style.display = 'none'
-
-    mainView.appendChild(this.tableTopbarEl)
-    if (this.sqlToolbarEl) {
-      mainView.appendChild(this.sqlToolbarEl)
-    }
-    mainView.appendChild(this.sqlAreaEl)
-    mainView.appendChild(this.splitResizerEl)
-    mainView.appendChild(this.historyDrawerEl)
-    mainView.appendChild(this.gridSubbarEl)
-    mainView.appendChild(this.gridToolbarEl)
-    mainView.appendChild(this.dmlPreviewEl)
-    mainView.appendChild(this.queryBannerEl)
-    mainView.appendChild(this.gridAreaEl)
-    mainView.appendChild(this.valueInspectorEl)
-    mainView.appendChild(this.inspectorAreaEl)
-
-    workspaceBody.appendChild(this.sidebarEl)
-    workspaceBody.appendChild(mainView)
-
-    // 3. Status Bar
-    const statusBar = document.createElement('div')
-    statusBar.className = 'datanoa-status-bar'
-
-    this.statusStateEl = document.createElement('span')
-    this.statusStateEl.className = 'datanoa-status-state'
-    this.statusStateEl.textContent = 'Ready'
-
-    this.statusSelectionEl = document.createElement('button')
-    this.statusSelectionEl.type = 'button'
-    this.statusSelectionEl.className = 'datanoa-status-selection'
-    this.statusSelectionEl.style.display = 'none'
-    this.statusSelectionEl.title = 'Click to copy selection statistics to clipboard'
-    this.statusSelectionEl.addEventListener('click', () => {
+    dom.queryBannerReportBtn.addEventListener('click', () => this.openFeedbackModal('bug'))
+    dom.queryBannerCloseBtn.addEventListener('click', () => this.hideQueryBanner())
+    dom.statusSelectionEl.addEventListener('click', () => {
       const text = this.statusSelectionEl?.textContent || ''
       if (text) {
         copyTextFallback(text)
         this.updateStatus('Copied selection statistics to clipboard')
       }
     })
-
-    this.shortcutHintEl = document.createElement('span')
-    this.shortcutHintEl.className = 'datanoa-shortcut-hint'
-    this.shortcutHintEl.textContent =
-      'Ctrl + Scroll ↔ Pan · Ctrl+K Switcher · Ctrl+F Find · Shift+Alt+F Format · Ctrl+S Submit'
-
-    this.statusMetricsEl = document.createElement('span')
-    this.statusMetricsEl.className = 'datanoa-status-metrics'
-    this.statusMetricsEl.textContent = '0 rows'
-
-    this.shortcutsBtn = document.createElement('button')
-    this.shortcutsBtn.type = 'button'
-    this.shortcutsBtn.className = 'datanoa-btn datanoa-btn-sm'
-    this.shortcutsBtn.textContent = '?'
-    this.shortcutsBtn.title = 'Keyboard Shortcuts (Ctrl+/)'
-    this.shortcutsBtn.setAttribute('aria-label', 'Keyboard Shortcuts')
-    this.shortcutsBtn.addEventListener('click', () => {
-      this.openShortcutsModal()
-    })
-
-    this.feedbackBtn = document.createElement('button')
-    this.feedbackBtn.type = 'button'
-    this.feedbackBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-feedback-btn'
-    this.feedbackBtn.textContent = 'Feedback'
-    this.feedbackBtn.title = 'Report a Bug or Request a Feature on GitHub'
-    this.feedbackBtn.setAttribute('aria-label', 'Report a Bug or Request a Feature on GitHub')
-    this.feedbackBtn.addEventListener('click', () => {
-      this.openFeedbackModal()
-    })
-
-    statusBar.appendChild(this.statusStateEl)
-    statusBar.appendChild(this.statusSelectionEl)
-    statusBar.appendChild(this.shortcutHintEl)
-    statusBar.appendChild(this.statusMetricsEl)
-    statusBar.appendChild(this.shortcutsBtn)
-    statusBar.appendChild(this.feedbackBtn)
-
-    // Assemble Root
-    this.rootEl.appendChild(toolbar)
-    this.rootEl.appendChild(this.cautionStripEl)
-    this.rootEl.appendChild(workspaceBody)
-    this.rootEl.appendChild(statusBar)
+    dom.shortcutsBtn.addEventListener('click', () => this.openShortcutsModal())
+    dom.feedbackBtn.addEventListener('click', () => this.openFeedbackModal())
 
     document.body.appendChild(this.rootEl)
 
@@ -1962,11 +1626,15 @@ export class DatanoaStudioEditor {
       },
       onChange: (doc) => {
         if (!this.suppressDocSync) {
+          this.consoleTabs.updateActiveSql(doc)
           this.documentSession?.change?.(this.composeSerializedDocument(doc))
           this.saveStudioViewState(false)
         }
       },
     })
+
+    this.consoleTabs = new ConsoleTabsManager(this.sqlConsole.getText())
+    this.renderConsoleTabs()
 
     // Mount Virtualized Data Grid
     this.dataGrid = new VirtualDataGrid({
@@ -1989,6 +1657,9 @@ export class DatanoaStudioEditor {
       },
       onQuickFilter: (predicateSql, mode) => {
         void this.handleQuickFilter(predicateSql, mode)
+      },
+      onColumnHeaderFilter: (column, value, op, mode) => {
+        void this.handleColumnHeaderFilter(column, value, op, mode)
       },
       onNavigateForeignKey: (refTable, refColumn, value) => {
         void this.handleNavigateForeignKey(refTable, refColumn, value)
@@ -2020,6 +1691,13 @@ export class DatanoaStudioEditor {
       onCopyDdl: () => {
         this.updateStatus('Copied DDL to clipboard')
       },
+      onOpenDdlInConsole: (ddl) => {
+        this.sqlConsole?.insertText(ddl)
+        if (this.activeViewMode === 'grid' || this.activeViewMode === 'inspector') {
+          this.switchMode('split')
+        }
+        this.updateStatus('Opened DDL in SQL Console')
+      },
       onApplyMigration: (statements, draft) => {
         return this.handleApplyMigration(statements, draft)
       },
@@ -2039,23 +1717,11 @@ export class DatanoaStudioEditor {
   }
 
   private composeSerializedDocument(visibleSql: string): string {
-    if (this.preservedMetadataLines.length === 0) {
-      return visibleSql
-    }
-    return `${this.preservedMetadataLines.join('\n')}\n${visibleSql}`
+    return composeDatanoaDocument(this.preservedMetadataLines, visibleSql)
   }
 
   private updateMetadataHeader(key: 'connectionId' | 'table' | 'schema', value: string): void {
-    const prefix = `-- datanoa: ${key}=`
-    const idx = this.preservedMetadataLines.findIndex((l) =>
-      l.toLowerCase().startsWith(prefix.toLowerCase())
-    )
-    const nextLine = `${prefix}${value}`
-    if (idx >= 0) {
-      this.preservedMetadataLines[idx] = nextLine
-    } else {
-      this.preservedMetadataLines.push(nextLine)
-    }
+    upsertDatanoaMetadataHeader(this.preservedMetadataLines, key, value)
     if (!this.suppressDocSync && this.sqlConsole) {
       this.documentSession?.change?.(this.composeSerializedDocument(this.sqlConsole.getText()))
     }
@@ -2138,6 +1804,17 @@ export class DatanoaStudioEditor {
     }
 
     this.activeViewMode = mode
+    if (
+      (mode === 'grid' || mode === 'inspector') &&
+      this.isShowingSqlResult &&
+      this.activeQueryResult === null &&
+      this.activeConnectionId &&
+      this.activeTable
+    ) {
+      this.isShowingSqlResult = false
+      this.hideQueryBanner()
+      void this.loadTableData(this.activeConnectionId, this.activeTable, this.currentPage)
+    }
     if (this.tabButtons) {
       this.tabButtons.split.classList.toggle('active', mode === 'split')
       this.tabButtons.grid.classList.toggle('active', mode === 'grid')
@@ -2152,10 +1829,12 @@ export class DatanoaStudioEditor {
     if (this.sqlToolbarEl) {
       this.sqlToolbarEl.style.display = showSqlChrome ? 'flex' : 'none'
     }
+    if (this.consoleTabsBarEl) {
+      this.consoleTabsBarEl.style.display = showSqlChrome ? 'flex' : 'none'
+    }
+    this.renderResultSetsBar()
     if (!showSqlChrome && this.historyDrawerEl) {
-      this.historyDrawerEl.style.display = 'none'
-      this.isHistoryOpen = false
-      this.historyBtn?.classList.remove('active')
+      this.queryHistoryDrawer.close()
     }
     if (this.gridSubbarEl) {
       this.gridSubbarEl.style.display = showGridChrome ? 'flex' : 'none'
@@ -2190,9 +1869,16 @@ export class DatanoaStudioEditor {
       this.closeValueInspector()
       if (this.dmlPreviewEl) this.dmlPreviewEl.style.display = 'none'
       this.inspectorAreaEl.style.display = 'flex'
-      const targetKey = `${this.activeConnectionId || ''}:${this.activeSchema || ''}:${this.activeTable || ''}`
+      const targetKey = this.inspectorKey()
       if (this.lastInspectorLoadedKey !== targetKey) {
-        void this.loadActiveTableSchema()
+        if (this.activeObjectKind && !this.isTabularKind(this.activeObjectKind)) {
+          if (this.activeReadOnlyObject) {
+            this.lastInspectorLoadedKey = targetKey
+            void this.loadReadOnlyObjectDdl(this.activeReadOnlyObject)
+          }
+        } else {
+          void this.loadActiveTableSchema()
+        }
       }
     }
 
@@ -2237,16 +1923,38 @@ export class DatanoaStudioEditor {
       this.topbarPopoverEl.remove()
       this.topbarPopoverEl = null
     }
+    if (this.topbarAllBtn) {
+      this.topbarAllBtn.classList.remove('active')
+      this.topbarAllBtn.setAttribute('aria-expanded', 'false')
+    }
   }
 
-  private isObjectActive(name: string | undefined, schema: string | undefined): boolean {
-    if (!this.activeTable || name !== this.activeTable) return false
+  private isObjectActive(
+    name: string | undefined,
+    schema: string | undefined,
+    kind?: SchemaObjectKind
+  ): boolean {
+    if (!name) return false
+    const curKind = this.activeObjectKind
+    if (kind && curKind && kind !== curKind) return false
+    const readonly = curKind !== null && !this.isTabularKind(curKind)
+    const currentName = readonly ? this.activeReadOnlyObject?.name : this.activeTable
+    if (!currentName || name !== currentName) return false
     const curSchema = this.activeSchema || ''
     const itemSchema = schema || ''
     if (curSchema || itemSchema) {
       return curSchema === itemSchema
     }
     return true
+  }
+
+  private inspectorKey(): string {
+    const kind = this.activeObjectKind
+    const name =
+      kind && !this.isTabularKind(kind)
+        ? this.activeReadOnlyObject?.name || ''
+        : this.activeTable || ''
+    return `${this.activeConnectionId || ''}:${this.activeSchema || ''}:${kind || ''}:${name}`
   }
 
   private toggleTopbarAllTablesPopover(): void {
@@ -2256,53 +1964,56 @@ export class DatanoaStudioEditor {
     }
     if (!this.topbarAllBtn || typeof document === 'undefined' || !document.body) return
 
-    const filtered = this.schemaObjects.filter(
-      (o) => !this.filterQuery || o.name.toLowerCase().includes(this.filterQuery)
-    )
     const pop = document.createElement('div')
     pop.className = 'datanoa-topbar-popover'
 
-    if (filtered.length === 0) {
-      const empty = document.createElement('div')
-      empty.className = 'datanoa-cell-null'
-      empty.style.padding = '8px 10px'
-      empty.textContent = 'No matching tables or views'
-      pop.appendChild(empty)
-    } else {
-      for (const item of filtered) {
-        const btn = document.createElement('button')
-        btn.type = 'button'
-        const isActive = this.isObjectActive(item.name, item.schema)
-        btn.className = `datanoa-context-item${isActive ? ' active' : ''}`
-        if (isActive) {
-          btn.style.color = 'var(--info)'
-          btn.style.fontWeight = '600'
-        }
-        const nameSpan = document.createElement('span')
-        nameSpan.textContent = item.schema ? `${item.schema}.${item.name}` : item.name
-        const kindSpan = document.createElement('span')
-        kindSpan.style.fontSize = '10px'
-        kindSpan.style.color = 'var(--muted)'
-        kindSpan.textContent = item.kind === 'view' ? 'VIEW' : 'TBL'
-        btn.appendChild(nameSpan)
-        btn.appendChild(kindSpan)
-        btn.addEventListener('click', () => {
-          this.closeTopbarPopover()
-          this.selectSidebarObject(item)
-        })
-        pop.appendChild(btn)
-      }
-    }
+    const { focusSearch } = renderStudioTopbarObjectsPopover({
+      popoverEl: pop,
+      objects: this.schemaObjects,
+      initialFilterQuery: this.topbarFilterInputEl?.value || '',
+      collapsedGroups: this.collapsedTopbarGroups,
+      isObjectActive: (name, schema, kind) => this.isObjectActive(name, schema, kind),
+      onSelectObject: (item) => {
+        this.closeTopbarPopover()
+        this.activateSidebarObject(item)
+      },
+      onOpenContextMenu: (x, y, item) => {
+        this.closeTopbarPopover()
+        this.openSidebarContextMenu(x, y, item)
+      },
+      onClose: () => {
+        this.closeTopbarPopover()
+        this.topbarAllBtn?.focus?.()
+      },
+    })
 
     document.body.appendChild(pop)
     this.topbarPopoverEl = pop
+    this.topbarAllBtn.classList.add('active')
+    this.topbarAllBtn.setAttribute('aria-expanded', 'true')
 
     if (typeof this.topbarAllBtn.getBoundingClientRect === 'function') {
       const rect = this.topbarAllBtn.getBoundingClientRect()
       const vw = typeof window !== 'undefined' ? window.innerWidth || 1024 : 1024
-      const left = Math.max(8, Math.min(Math.round(rect.right - 250), vw - 258))
-      pop.style.top = `${Math.round(rect.bottom + 4)}px`
+      const vh = typeof window !== 'undefined' ? window.innerHeight || 768 : 768
+      const popWidth = Math.min(300, Math.max(220, vw - 16))
+      pop.style.width = `${popWidth}px`
+      const left = Math.max(8, Math.min(Math.round(rect.right - popWidth), vw - popWidth - 8))
       pop.style.left = `${left}px`
+
+      const spaceBelow = vh - rect.bottom - 10
+      const spaceAbove = rect.top - 10
+      if (spaceBelow < 220 && spaceAbove > spaceBelow) {
+        const maxH = Math.max(160, Math.min(380, spaceAbove))
+        pop.style.maxHeight = `${maxH}px`
+        pop.style.top = 'auto'
+        pop.style.bottom = `${Math.max(8, Math.round(vh - rect.top + 4))}px`
+      } else {
+        const maxH = Math.max(160, Math.min(380, spaceBelow))
+        pop.style.maxHeight = `${maxH}px`
+        pop.style.bottom = 'auto'
+        pop.style.top = `${Math.round(rect.bottom + 4)}px`
+      }
     }
 
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
@@ -2316,6 +2027,8 @@ export class DatanoaStudioEditor {
         window.removeEventListener('mousedown', onDocDown, true)
       }
     }
+
+    focusSearch()
   }
 
   private scrollActiveTopbarPillIntoView(): void {
@@ -2333,7 +2046,8 @@ export class DatanoaStudioEditor {
         const htmlEl = el as HTMLElement
         const tbl = htmlEl.dataset?.tableName
         const sch = htmlEl.dataset?.tableSchema
-        el.classList.toggle('active', this.isObjectActive(tbl, sch))
+        const kind = htmlEl.dataset?.objectKind as SchemaObjectKind | undefined
+        el.classList.toggle('active', this.isObjectActive(tbl, sch, kind))
       })
     }
     if (this.topbarTrackEl) {
@@ -2342,7 +2056,8 @@ export class DatanoaStudioEditor {
         const htmlEl = el as HTMLElement
         const tbl = htmlEl.dataset?.tableName
         const sch = htmlEl.dataset?.tableSchema
-        el.classList.toggle('active', this.isObjectActive(tbl, sch))
+        const kind = htmlEl.dataset?.objectKind as SchemaObjectKind | undefined
+        el.classList.toggle('active', this.isObjectActive(tbl, sch, kind))
       })
       if (this.sidebarCollapsed) {
         this.scrollActiveTopbarPillIntoView()
@@ -2356,7 +2071,10 @@ export class DatanoaStudioEditor {
 
     this.suppressDocSync = true
     try {
-      this.sqlConsole?.setText(parsed.cleanSql)
+      if (this.sqlConsole && this.sqlConsole.getText() !== parsed.cleanSql) {
+        this.sqlConsole.setText(parsed.cleanSql)
+      }
+      this.consoleTabs.updateActiveSql(parsed.cleanSql)
     } finally {
       this.suppressDocSync = false
     }
@@ -2378,10 +2096,13 @@ export class DatanoaStudioEditor {
         this.pendingDocTable = null
         this.pendingDocSchema = undefined
         this.activeTable = parsed.table
+        this.activeObjectKind = null
+        this.activeReadOnlyObject = null
         this.activeSchema =
           parsed.schema ||
           this.schemaObjects.find((o) => o.name === parsed.table)?.schema ||
           undefined
+        if (parsed.schema) this.selectedSchema = parsed.schema
         this.activeWhereClause = undefined
         this.activeOrderByClause = undefined
         this.restoredPageOnBoot = 1
@@ -2435,10 +2156,13 @@ export class DatanoaStudioEditor {
     if (parsed.table) {
       this.pendingDocTable = parsed.table
       this.activeTable = parsed.table
+      this.activeObjectKind = null
+      this.activeReadOnlyObject = null
     }
     if (parsed.schema) {
       this.pendingDocSchema = parsed.schema
       this.activeSchema = parsed.schema
+      this.selectedSchema = parsed.schema
     }
 
     if (this.connections.length > 0 && targetConnectionId) {
@@ -2505,7 +2229,54 @@ export class DatanoaStudioEditor {
       })
     }
 
+    if (typeof document !== 'undefined') {
+      track(bindStudioSelectTooltipsInRoot(document))
+    }
+
+    if (this.gridAreaEl && typeof this.gridAreaEl.addEventListener === 'function') {
+      const gridArea = this.gridAreaEl
+      const onGridAreaScroll = (e: Event) => {
+        const tgt = e.target
+        if (tgt instanceof Element && tgt.classList.contains('datanoa-grid-container')) {
+          this.saveStudioViewState(false)
+        }
+      }
+      gridArea.addEventListener('scroll', onGridAreaScroll, { passive: true, capture: true })
+      track({
+        dispose: () => {
+          gridArea.removeEventListener('scroll', onGridAreaScroll, true)
+        },
+      })
+    }
+
+    if (this.sidebarListEl && typeof this.sidebarListEl.addEventListener === 'function') {
+      const sidebarList = this.sidebarListEl
+      const onSidebarScroll = () => {
+        this.closeSidebarContextMenu()
+        this.closeTopbarPopover()
+        this.saveStudioViewState(false)
+      }
+      sidebarList.addEventListener('scroll', onSidebarScroll, { passive: true })
+      track({
+        dispose: () => {
+          sidebarList.removeEventListener('scroll', onSidebarScroll)
+        },
+      })
+    }
+
     if (typeof window !== 'undefined') {
+      const onBeforeUnload = (): void => {
+        this.flushStudioViewState()
+        this.saveStudioDataCache()
+        this.txToolbar.rollbackOnUnload()
+      }
+      window.addEventListener('beforeunload', onBeforeUnload)
+      track({
+        dispose: () => {
+          window.removeEventListener('beforeunload', onBeforeUnload)
+        },
+      })
+
       const onWindowMouseDown = (e: MouseEvent) => {
         if (
           this.sidebarContextMenuEl &&
@@ -2518,6 +2289,12 @@ export class DatanoaStudioEditor {
       }
       const onWindowKeyDown = (e: KeyboardEvent) => {
         if (e.key === 'Escape') {
+          if (isStudioCollapsibleDropdownOpen()) {
+            e.preventDefault()
+            e.stopPropagation()
+            closeActiveStudioCollapsibleDropdown()
+            return
+          }
           this.closeSidebarContextMenu()
           this.closeTopbarPopover()
           this.closeColumnsPopover()
@@ -2569,7 +2346,7 @@ export class DatanoaStudioEditor {
               this.dataGrid &&
               this.dataGrid.getStagedCount() > 0 &&
               !this.isActiveConnectionReadOnly() &&
-              !this.isShowingSqlResult &&
+              (!this.isShowingSqlResult || this.editableSqlTarget !== null) &&
               this.currentCanEdit
             ) {
               e.preventDefault()
@@ -2583,13 +2360,16 @@ export class DatanoaStudioEditor {
         }
       }
       const onWindowResize = () => {
+        closeActiveStudioCollapsibleDropdown()
+        this.closeTopbarPopover()
+        this.closeColumnsPopover()
         this.applyClampedSplitPaneHeight()
         if (this.activeViewMode !== 'inspector') {
           this.dataGrid?.handleViewportResize()
         }
       }
       const onWindowPageHide = () => {
-        this.flushStudioViewState()
+        this.saveStudioDataCache()
         this.destroy()
       }
       window.addEventListener('mousedown', onWindowMouseDown)
@@ -2635,10 +2415,27 @@ export class DatanoaStudioEditor {
     }
 
     try {
+      if (window.orca.host?.has?.('workspace.readContext')) {
+        void window.orca.host
+          .call('workspace.readContext')
+          .then((result) => {
+            if (this.isDestroyed) return
+            const scope = typeof result?.workspaceId === 'string' ? result.workspaceId.trim() : ''
+            this.currentWorkspaceScope = scope
+            if (this.connections.length > 0) this.updateConnectionSelector()
+          })
+          .catch(() => {})
+      }
+    } catch {
+      // Optional workspace context
+    }
+
+    try {
       if (window.orca.host?.has?.('editor.readTypography')) {
         void window.orca.host
           .call('editor.readTypography')
           .then((typography) => {
+            if (this.isDestroyed) return
             this.applyHostTypography(typography)
           })
           .catch(() => {})
@@ -2746,6 +2543,8 @@ export class DatanoaStudioEditor {
     if (this.topbarNewTableBtn) {
       this.topbarNewTableBtn.disabled = !canCreateTable
     }
+    this.updateSchemaSwitcherDisplay()
+    this.updateExportDdlBtnState()
     if (this.dataGrid) {
       this.dataGrid.setContextMeta(
         this.activeTable || 'table_name',
@@ -2754,21 +2553,62 @@ export class DatanoaStudioEditor {
         this.activeSchema || ''
       )
     }
-    this.updateStagedActionButtons(this.dataGrid?.getStagedCount() ?? 0)
+    this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
+  }
+
+  private isActiveObjectTable(): boolean {
+    if (!this.activeTable) return false
+    const match = this.schemaObjects.find(
+      (obj) =>
+        obj.name === this.activeTable &&
+        (!this.activeSchema || !obj.schema || obj.schema === this.activeSchema)
+    )
+    if (match) {
+      return match.kind === 'table'
+    }
+    return true
   }
 
   private updateStagedActionButtons(stagedCount: number): void {
+    const conn = this.getActiveConnection()
+    const isReadOnly = this.isActiveConnectionReadOnly()
     const canEdit =
       this.currentCanEdit &&
-      !this.isActiveConnectionReadOnly() &&
+      !isReadOnly &&
+      !this.isSubmittingChanges &&
+      (!this.isShowingSqlResult || this.editableSqlTarget !== null)
+    const canImport = Boolean(
       !this.isShowingSqlResult &&
-      !this.isSubmittingChanges
+        this.activeConnectionId &&
+        this.isActiveObjectTable() &&
+        conn &&
+        !isReadOnly &&
+        conn.driver !== 'redis' &&
+        !this.isSubmittingChanges
+    )
     if (this.addRowBtn) this.addRowBtn.disabled = !canEdit
     if (this.cloneRowBtn) this.cloneRowBtn.disabled = !canEdit
     if (this.delRowBtn) this.delRowBtn.disabled = !canEdit
+    if (this.importDataBtn) this.importDataBtn.disabled = !canImport
+    if (this.editTableBtn) {
+      const canEditTableStruct = Boolean(
+        !this.isShowingSqlResult &&
+          this.activeConnectionId &&
+          this.activeTable &&
+          this.isActiveObjectTable() &&
+          conn &&
+          conn.driver !== 'redis'
+      )
+      this.editTableBtn.disabled = !canEditTableStruct
+      this.editTableBtn.title =
+        !this.isActiveObjectTable() && this.activeTable
+          ? 'Views are read-only — inspect DDL in Schema Inspector'
+          : 'Open Schema Inspector & Edit Table Structure (ALTER TABLE)'
+    }
     if (this.submitBtn && !this.isSubmittingChanges) {
       this.submitBtn.textContent = `Submit [${stagedCount}]`
       this.submitBtn.disabled = stagedCount === 0 || !canEdit
+      this.submitBtn.classList.toggle('has-staged', stagedCount > 0 && canEdit)
     }
     if (this.dmlApplyBtn && !this.isSubmittingChanges) {
       this.dmlApplyBtn.disabled = stagedCount === 0 || !canEdit
@@ -2776,8 +2616,13 @@ export class DatanoaStudioEditor {
     if (this.revertBtn) this.revertBtn.disabled = stagedCount === 0 || this.isSubmittingChanges
     if (this.dmlPreviewBtn && !this.isPreviewingDml) {
       this.dmlPreviewBtn.disabled = stagedCount === 0 || !canEdit
+      this.dmlPreviewBtn.classList.toggle('active', stagedCount > 0 && canEdit)
     }
-    if (this.statusMetricsEl && !this.isShowingSqlResult && this.activeTable) {
+    if (
+      this.statusMetricsEl &&
+      ((this.isShowingSqlResult && this.editableSqlTarget) ||
+        (!this.isShowingSqlResult && this.activeTable))
+    ) {
       this.statusMetricsEl.textContent =
         stagedCount > 0
           ? `${this.totalRows} rows (+${stagedCount} staged)`
@@ -2814,19 +2659,48 @@ export class DatanoaStudioEditor {
   }
 
   public async refreshConnections(): Promise<void> {
-    if (typeof window === 'undefined' || !window.orca?.plugin?.request) return
+    if (this.isDestroyed || typeof window === 'undefined' || !window.orca?.plugin?.request) return
     const seq = ++this.connectionsSeq
+    const needsBootSnap = !this.hasRestoredBootState
     try {
-      const conns = await this.requestPlugin<ConnectionProfile[]>('connections.list')
-      if (seq !== this.connectionsSeq) return
+      const [conns, workerSnap] = await Promise.all([
+        this.requestPlugin<ConnectionProfile[]>('connections.list'),
+        needsBootSnap
+          ? this.requestPlugin<{
+              viewState?: StudioPersistedViewState | null
+              dataCache?: StudioWarmCacheSnapshot | null
+              updatedAt?: number
+            }>('ui.getSessionSnapshot', { surface: 'studio' }).catch(() => null)
+          : Promise.resolve(null),
+      ])
+      if (seq !== this.connectionsSeq || this.isDestroyed) return
       this.connections = conns || []
-      if (typeof window.orca?.storage?.get === 'function') {
-        if (!this.readLocalStudioViewState()) {
+      if (needsBootSnap) {
+        this.hasRestoredBootState = true
+        const hasLocalState = Boolean(this.readLocalStudioViewState())
+        let restoredFromWorker = false
+        if (workerSnap?.dataCache && typeof workerSnap.dataCache === 'object') {
+          const workerUpdatedAt =
+            (typeof workerSnap.dataCache.updatedAt === 'number' && workerSnap.dataCache.updatedAt) ||
+            (typeof workerSnap.updatedAt === 'number' && workerSnap.updatedAt) ||
+            0
+          if (!this.hasWarmBootHydrated || workerUpdatedAt > this.warmBootUpdatedAt) {
+            this.pendingBootDataCache = {
+              ...workerSnap.dataCache,
+              updatedAt: workerUpdatedAt,
+            }
+          }
+        }
+        if (!hasLocalState && workerSnap?.viewState && typeof workerSnap.viewState === 'object') {
+          this.applyRestoredStudioViewState(workerSnap.viewState)
+          restoredFromWorker = true
+        }
+        if (!hasLocalState && !restoredFromWorker && typeof window.orca?.storage?.get === 'function') {
           try {
             const hostSaved = (await window.orca.storage.get(
               STUDIO_VIEW_STATE_STORAGE_KEY
             )) as StudioPersistedViewState | null
-            if (seq !== this.connectionsSeq) return
+            if (seq !== this.connectionsSeq || this.isDestroyed) return
             if (hostSaved && typeof hostSaved === 'object') {
               this.applyRestoredStudioViewState(hostSaved)
             }
@@ -2834,6 +2708,8 @@ export class DatanoaStudioEditor {
             // Ignore host view state read errors
           }
         }
+      }
+      if (typeof window.orca?.storage?.get === 'function') {
         if (
           !this.pendingDocConnectionId &&
           !this.activeConnectionId &&
@@ -2841,7 +2717,7 @@ export class DatanoaStudioEditor {
         ) {
           try {
             const stored = await window.orca.storage.get(ACTIVE_CONNECTION_STORAGE_KEY)
-            if (seq !== this.connectionsSeq) return
+            if (seq !== this.connectionsSeq || this.isDestroyed) return
             if (typeof stored === 'string' && stored.trim().length > 0) {
               this.storedActiveConnectionId = stored.trim()
             }
@@ -2850,11 +2726,116 @@ export class DatanoaStudioEditor {
           }
         }
       }
-      if (seq !== this.connectionsSeq) return
+      if (seq !== this.connectionsSeq || this.isDestroyed) return
       this.updateConnectionSelector()
+      if (this.activeConnectionId && this.hasLoadedActiveConnection) {
+        if (
+          this.activeViewMode === 'inspector' &&
+          this.activeTable &&
+          !this.lastInspectorLoadedKey
+        ) {
+          void this.loadActiveTableSchema()
+        }
+        if (Object.keys(this.schemaMap).length === 0 && this.schemaObjects.length > 0) {
+          const seededMap: Record<string, string[]> = {}
+          for (const obj of this.schemaObjects) {
+            seededMap[obj.name] = []
+          }
+          this.schemaMap = seededMap
+          this.sqlConsole?.updateSchema(this.schemaMap, this.activeTable || undefined)
+        }
+        this.saveStudioDataCache()
+      }
     } catch {
       // Non-blocking in testing / offline environments
     }
+  }
+
+  private populateConnectionSelectDom(targetId: string | null): void {
+    const connSel = this.connSelectEl
+    if (!connSel) return
+
+    connSel.innerHTML = ''
+    const defaultOpt = document.createElement('option')
+    defaultOpt.value = ''
+    defaultOpt.textContent = 'Select Connection...'
+    connSel.appendChild(defaultOpt)
+
+    const buildOption = (conn: ConnectionProfile, withFolderLabel = false): HTMLOptionElement => {
+      const opt = document.createElement('option')
+      opt.value = conn.id
+      const envSuffix = conn.colorTag && conn.colorTag !== 'none' ? ` [${conn.colorTag.toUpperCase()}]` : ''
+      const roSuffix = conn.readOnly ? ' [RO]' : ''
+      const sshSuffix = conn.sshEnabled ? ' [SSH]' : ''
+      const folderSuffix = withFolderLabel && conn.folder ? ` [${conn.folder}]` : ''
+      const mtlsSuffix =
+        conn.sslCertPath || conn.sslKeyPath
+          ? ' [mTLS]'
+          : conn.sslCaPath ||
+              (conn.sslMode && conn.sslMode !== 'auto' && conn.sslMode !== 'disable')
+            ? ' [TLS]'
+            : ''
+      opt.textContent = `${conn.name} (${conn.driver})${envSuffix}${roSuffix}${sshSuffix}${mtlsSuffix}${folderSuffix}`
+      if (opt.dataset) {
+        opt.dataset.driver = conn.driver
+        const sub = conn.filePath || (conn.host ? `${conn.host}:${conn.port || ''}/${conn.database || ''}` : conn.database || '')
+        opt.dataset.fullTitle = `${opt.textContent}${conn.folder ? ` — Folder: ${conn.folder}` : ''}${sub ? ` — ${sub}` : ''}`
+      }
+      if (conn.id === (targetId || '')) opt.selected = true
+      return opt
+    }
+
+    const hasGrouping = this.connections.some((c) => c.folder || c.workspaceScope)
+    if (!hasGrouping) {
+      this.connections.forEach((conn) => connSel.appendChild(buildOption(conn)))
+    } else {
+      const scope = this.currentWorkspaceScope.trim()
+      const currentWorkspace: ConnectionProfile[] = []
+      const otherWorkspace: ConnectionProfile[] = []
+      const general: ConnectionProfile[] = []
+      const byFolder = new Map<string, ConnectionProfile[]>()
+
+      for (const conn of this.connections) {
+        const connScope = (conn.workspaceScope || '').trim()
+        if (connScope && scope && connScope === scope) {
+          currentWorkspace.push(conn)
+        } else if (connScope) {
+          otherWorkspace.push(conn)
+        } else if (conn.folder) {
+          const key = conn.folder
+          const list = byFolder.get(key)
+          if (list) list.push(conn)
+          else byFolder.set(key, [conn])
+        } else {
+          general.push(conn)
+        }
+      }
+
+      const appendGroup = (
+        label: string,
+        list: ConnectionProfile[],
+        withFolderLabel = false
+      ): void => {
+        if (list.length === 0) return
+        const group = document.createElement('optgroup')
+        group.label = label
+        list.forEach((conn) => group.appendChild(buildOption(conn, withFolderLabel)))
+        connSel.appendChild(group)
+      }
+
+      appendGroup('Current Workspace', currentWorkspace, true)
+      for (const folder of Array.from(byFolder.keys()).sort((a, b) => a.localeCompare(b))) {
+        appendGroup(folder, byFolder.get(folder) || [])
+      }
+      appendGroup('Other Workspaces', otherWorkspace)
+      appendGroup('General (Ungrouped)', general)
+    }
+
+    connSel.value = targetId || ''
+    enhanceStudioCollapsibleSelect(connSel, {
+      tooltipPrefix: 'Active Database Connection',
+      searchPlaceholder: 'Search connections or folders...',
+    })
   }
 
   private updateConnectionSelector(): void {
@@ -2880,27 +2861,10 @@ export class DatanoaStudioEditor {
       targetId = this.connections[0].id
     }
 
-    this.connSelectEl.innerHTML = ''
-    const defaultOpt = document.createElement('option')
-    defaultOpt.value = ''
-    defaultOpt.textContent = 'Select Connection...'
-    this.connSelectEl.appendChild(defaultOpt)
-
-    const connSel = this.connSelectEl
-    if (!connSel) return
-    this.connections.forEach((conn) => {
-      const opt = document.createElement('option')
-      opt.value = conn.id
-      const envSuffix = conn.colorTag && conn.colorTag !== 'none' ? ` [${conn.colorTag.toUpperCase()}]` : ''
-      const roSuffix = conn.readOnly ? ' [RO]' : ''
-      opt.textContent = `${conn.name} (${conn.driver})${envSuffix}${roSuffix}`
-      if (conn.id === (targetId || '')) {
-        opt.selected = true
-      }
-      connSel.appendChild(opt)
-    })
-
-    connSel.value = targetId || ''
+    this.populateConnectionSelectDom(targetId)
+    syncStudioSelectTooltip(this.schemaSelectEl, 'Active Schema')
+    syncStudioSelectTooltip(this.pageSizeSelectEl, 'Rows per page')
+    syncStudioSelectTooltip(this.exportSelectEl, 'Export Format')
     const preservePending = Boolean(
       this.pendingDocConnectionId && targetId === this.pendingDocConnectionId
     )
@@ -2911,11 +2875,17 @@ export class DatanoaStudioEditor {
     connectionId: string | null,
     preservePendingTable = false
   ): void {
+    const prevConnId = this.activeConnectionId
     const changed = connectionId !== this.activeConnectionId
+    if (changed) {
+      this.closeActiveModal()
+      this.txToolbar.resetForConnectionSwitch(prevConnId)
+    }
     this.activeConnectionId = connectionId
 
     if (this.connSelectEl) {
       this.connSelectEl.value = connectionId || ''
+      syncStudioSelectTooltip(this.connSelectEl, 'Active Database Connection')
     }
 
     if (changed && connectionId) {
@@ -2954,6 +2924,18 @@ export class DatanoaStudioEditor {
       this.currentPage = preservePendingTable && this.restoredPageOnBoot ? this.restoredPageOnBoot : 1
       this.totalRows = 0
       this.isShowingSqlResult = false
+      this.activeQueryResult = null
+      this.lastPageData = null
+      this.activeResultSetIndex = 0
+      this.editableSqlTarget = null
+      this.hideResultSetsBar()
+      if (
+        changed &&
+        (!this.pendingBootDataCache ||
+          this.pendingBootDataCache.activeConnectionId !== connectionId)
+      ) {
+        this.saveStudioDataCache()
+      }
       this.currentCanEdit = false
       if (!preservePendingTable) {
         this.activeWhereClause = undefined
@@ -2965,12 +2947,31 @@ export class DatanoaStudioEditor {
       }
       if (this.dmlPreviewEl) this.dmlPreviewEl.style.display = 'none'
       this.hideQueryBanner()
-      this.selectedCell = null
-      if (this.inspectCellBtn) this.inspectCellBtn.disabled = true
-      this.closeValueInspector()
+      this.valueInspector.clearSelection()
 
-      this.schemaObjects = []
+      const matchingBootCache =
+        connectionId &&
+        this.pendingBootDataCache &&
+        this.pendingBootDataCache.activeConnectionId === connectionId
+          ? this.pendingBootDataCache
+          : null
+
+      this.schemaObjects = Array.isArray(matchingBootCache?.schemaObjects)
+        ? matchingBootCache.schemaObjects
+        : []
       this.schemaMap = {}
+      this.availableSchemas = Array.isArray(matchingBootCache?.availableSchemas)
+        ? matchingBootCache.availableSchemas.filter((s) => typeof s === 'string' && s.length > 0)
+        : []
+      this.selectedSchema = matchingBootCache?.selectedSchema || undefined
+      this.defaultSchema = matchingBootCache?.defaultSchema || undefined
+      if (matchingBootCache?.activeObjectKind) {
+        this.activeObjectKind = matchingBootCache.activeObjectKind
+      }
+      if (matchingBootCache?.activeReadOnlyObject) {
+        this.activeReadOnlyObject = matchingBootCache.activeReadOnlyObject
+      }
+      this.updateSchemaSwitcherDisplay()
       this.tableDetailsCache.clear()
       this.inFlightTableDetails.clear()
       this.lastInspectorLoadedKey = ''
@@ -2978,7 +2979,7 @@ export class DatanoaStudioEditor {
       this.lastSelectionSummary = null
       this.updateSelectionStatusDisplay(null)
       this.sqlConsole?.updateSchema({}, '')
-      if (connectionId) {
+      if (connectionId && (!matchingBootCache || this.schemaObjects.length === 0)) {
         this.isIntrospectingSchema = true
         this.renderSidebarSkeleton()
       } else {
@@ -2987,35 +2988,124 @@ export class DatanoaStudioEditor {
       }
       this.dataGrid?.clearSortIndicator()
       this.dataGrid?.setForeignKeys([])
-      this.dataGrid?.setEmptyMessage(
-        connectionId ? 'Loading schema...' : 'Select a database connection to browse tables.'
-      )
-      this.dataGrid?.setData({
-        columns: [],
-        rows: [],
-        totalRows: 0,
-        page: 1,
-        pageSize: this.pageSize,
-        primaryKey: [],
-        canEdit: false,
-      })
+      let hydratedFromWorkerCache = false
+      let isTruncatedWorkerPage = false
+      if (matchingBootCache?.schemaMap && typeof matchingBootCache.schemaMap === 'object') {
+        this.schemaMap = matchingBootCache.schemaMap
+        this.sqlConsole?.updateSchema(this.schemaMap, this.activeTable || undefined)
+      }
+      if (matchingBootCache?.isShowingSqlResult && matchingBootCache.lastSqlResult) {
+        this.isShowingSqlResult = true
+        this.applyActiveQueryResult(matchingBootCache.lastSqlResult)
+        const cachedRes = matchingBootCache.lastSqlResult
+        const rowCount = cachedRes.rowCount ?? (cachedRes.rows ? cachedRes.rows.length : 0)
+        this.currentPage = 1
+        this.totalRows = rowCount
+        this.currentPageRowCount = cachedRes.rows ? cachedRes.rows.length : 0
+        if (this.gridSubbarTitleEl) {
+          this.gridSubbarTitleEl.textContent = cachedRes.isSelect
+            ? `SQL Result · ${cachedRes.columns?.length ?? 0} cols`
+            : `Executed · ${cachedRes.affectedRows ?? 0} affected`
+        }
+        if (this.gridPageInfoEl) {
+          const rowLabel = `${rowCount} ${rowCount === 1 ? 'row' : 'rows'}`
+          this.gridPageInfoEl.textContent = cachedRes.truncated ? `${rowLabel} (truncated)` : rowLabel
+        }
+        this.consumePendingScrollState()
+        hydratedFromWorkerCache = true
+      } else if (
+        matchingBootCache?.pageData &&
+        this.doesWarmPageCacheMatchCurrentQuery(matchingBootCache)
+      ) {
+        const cachedPage = matchingBootCache.pageData
+        const connForCache = this.connections.find((c) => c.id === connectionId)
+        const readOnly = Boolean(connForCache?.readOnly)
+        if (!this.activeTable && matchingBootCache.activeTable) {
+          this.activeTable = matchingBootCache.activeTable
+          this.activeSchema = matchingBootCache.activeSchema || undefined
+        }
+        this.lastPageData = cachedPage
+        this.lastLoadedTableKey = `${connectionId}:${this.activeSchema || ''}:${this.activeTable || ''}`
+        this.currentPage = cachedPage.page || this.currentPage || 1
+        this.totalRows = cachedPage.totalRows || 0
+        this.currentPageRowCount = Array.isArray(cachedPage.rows) ? cachedPage.rows.length : 0
+        const expectedPageRows = Math.min(
+          Math.max(0, this.totalRows - (this.currentPage - 1) * this.pageSize),
+          this.pageSize
+        )
+        isTruncatedWorkerPage = this.currentPageRowCount < expectedPageRows
+        this.currentCanEdit = Boolean(cachedPage.canEdit) && !readOnly
+        this.dataGrid?.setContextMeta(
+          this.activeTable || '',
+          connForCache?.driver || 'sqlite',
+          connectionId || '',
+          this.activeSchema || ''
+        )
+        const cachedKey = `${connectionId}:${this.activeSchema || ''}:${this.activeTable || ''}`
+        const savedColCfg = this.columnConfigByTable[cachedKey]
+        if (savedColCfg) {
+          this.dataGrid?.setColumnConfig({ ...savedColCfg })
+        }
+        this.dataGrid?.setData({ ...cachedPage, canEdit: this.currentCanEdit })
+        const totalPages = Math.max(1, Math.ceil(this.totalRows / this.pageSize))
+        if (this.gridSubbarTitleEl && this.activeTable) {
+          this.gridSubbarTitleEl.textContent = readOnly
+            ? `${this.activeTable} · ${cachedPage.columns.length} cols · RO`
+            : `${this.activeTable} · ${cachedPage.columns.length} cols`
+        }
+        if (this.gridPageInfoEl) {
+          this.gridPageInfoEl.textContent = `Page ${this.currentPage} / ${totalPages} (${this.totalRows} rows)`
+        }
+        this.consumePendingScrollState()
+        hydratedFromWorkerCache = true
+      } else {
+        this.dataGrid?.setEmptyMessage(
+          connectionId ? 'Loading schema...' : 'Select a database connection to browse tables.'
+        )
+        this.dataGrid?.setData({
+          columns: [],
+          rows: [],
+          totalRows: 0,
+          page: 1,
+          pageSize: this.pageSize,
+          primaryKey: [],
+          canEdit: false,
+        })
+        if (this.gridPageInfoEl) {
+          this.gridPageInfoEl.textContent = 'Page 1'
+        }
+        if (this.gridSubbarTitleEl) {
+          this.gridSubbarTitleEl.textContent = 'Select a table'
+        }
+      }
       this.schemaInspector?.clear()
-      if (this.gridPageInfoEl) {
-        this.gridPageInfoEl.textContent = 'Page 1'
-      }
-      if (this.gridSubbarTitleEl) {
-        this.gridSubbarTitleEl.textContent = 'Select a table'
-      }
       this.updatePaginationButtons()
       this.updateExportDropdownOptions()
+
+      if (
+        hydratedFromWorkerCache &&
+        !isTruncatedWorkerPage &&
+        this.schemaObjects.length > 0 &&
+        this.isWarmCacheFresh(matchingBootCache?.updatedAt)
+      ) {
+        this.hasLoadedActiveConnection = true
+        this.pendingDocConnectionId = null
+        this.pendingDocTable = null
+        this.pendingDocSchema = undefined
+        this.pendingBootDataCache = null
+        this.saveStudioDataCache()
+      }
     }
 
     const conn = this.getActiveConnection()
     this.applyActiveConnectionPresentation(conn)
     if (!connectionId || !conn) {
       this.hasLoadedActiveConnection = false
+      this.txToolbar.resetLocalStateAndRender()
       return
     }
+
+    void this.refreshTransactionState(conn.id)
 
     if (!this.hasLoadedActiveConnection) {
       this.hasLoadedActiveConnection = true
@@ -3033,9 +3123,250 @@ export class DatanoaStudioEditor {
     }
   }
 
+  private updateSchemaSwitcherDisplay(): void {
+    const el = this.schemaSelectEl
+    if (!el) return
+    const conn = this.getActiveConnection()
+    const isSqlEngine = Boolean(conn && conn.driver !== 'redis')
+    if (!isSqlEngine || this.availableSchemas.length === 0) {
+      el.innerHTML = ''
+      el.style.display = 'none'
+      return
+    }
+    el.innerHTML = ''
+    for (const schema of this.availableSchemas) {
+      const opt = document.createElement('option')
+      opt.value = schema
+      opt.textContent = schema
+      el.appendChild(opt)
+    }
+    const current =
+      this.selectedSchema || this.defaultSchema || this.availableSchemas[0] || ''
+    el.value = this.availableSchemas.includes(current) ? current : this.availableSchemas[0] || ''
+    el.style.display = 'block'
+    syncStudioSelectTooltip(el, 'Active Schema')
+  }
+
+  private handleSchemaSelectionChanged(): void {
+    const nextSchema = this.schemaSelectEl?.value || undefined
+    syncStudioSelectTooltip(this.schemaSelectEl, 'Active Schema')
+    this.selectedSchema = nextSchema
+    this.activeSchema = nextSchema
+    this.activeTable = null
+    this.activeObjectKind = null
+    this.activeReadOnlyObject = null
+    this.lastInspectorLoadedKey = ''
+    this.tableLoadToken++
+    this.schemaLoadToken++
+    if (this.activeConnectionId) {
+      void this.introspectSchema(this.activeConnectionId)
+    }
+  }
+
+  private updateExportDdlBtnState(): void {
+    if (!this.exportDdlBtn) return
+    const conn = this.getActiveConnection()
+    const disabled =
+      !this.activeConnectionId ||
+      !conn ||
+      conn.driver === 'redis' ||
+      this.isExportingSchemaDdl
+    this.exportDdlBtn.disabled = disabled
+    this.exportDdlBtn.title =
+      conn && conn.driver === 'redis'
+        ? 'Full schema DDL export is unavailable for Redis'
+        : 'Export full schema DDL as a .sql file'
+  }
+
+  private async exportFullSchemaDdl(): Promise<void> {
+    if (this.isExportingSchemaDdl) return
+    const conn = this.getActiveConnection()
+    if (!this.activeConnectionId || !conn || conn.driver === 'redis') {
+      this.updateStatus('Select a SQL database connection to export schema DDL')
+      return
+    }
+    const targetConnId = this.activeConnectionId
+    this.isExportingSchemaDdl = true
+    this.updateExportDdlBtnState()
+    setButtonLoading(this.exportDdlBtn, true, 'Exporting...')
+    this.updateStatus('Exporting full schema DDL...')
+    try {
+      const res = await this.requestPlugin<{
+        ddl: string
+        objectCount: number
+        fileName: string
+      }>(
+        'schema.exportSchemaDdl',
+        {
+          connectionId: targetConnId,
+          ...(this.selectedSchema ? { schema: this.selectedSchema } : {}),
+        },
+        { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
+      )
+      if (this.activeConnectionId !== targetConnId) return
+      const fileName = res.fileName || 'schema.sql'
+      const saveStatus = await downloadTextFile(res.ddl, fileName, 'text/sql;charset=utf-8')
+      if (saveStatus === 'cancelled') {
+        this.updateStatus('Schema DDL export cancelled')
+        return
+      }
+      if (saveStatus === 'failed') {
+        throw new Error('Could not save schema DDL file in this environment.')
+      }
+      const objectCount = Number.isFinite(res.objectCount) ? res.objectCount : 0
+      this.showQueryBanner(
+        'success',
+        `Exported DDL for ${objectCount} objects`,
+        `Saved ${fileName}`
+      )
+      this.updateStatus(`Exported DDL for ${objectCount} objects -> ${fileName}`)
+    } catch (err: unknown) {
+      if (this.activeConnectionId !== targetConnId) return
+      const msg = err instanceof Error ? err.message : String(err)
+      this.showQueryBanner('error', 'Failed to Export Schema DDL', msg)
+      this.updateStatus(`Schema DDL export error: ${msg}`)
+    } finally {
+      this.isExportingSchemaDdl = false
+      setButtonLoading(this.exportDdlBtn, false)
+      this.updateExportDdlBtnState()
+    }
+  }
+
+  private isTabularKind(kind: SchemaObjectKind): boolean {
+    return isTabularObjectKind(kind)
+  }
+
+  private activateSidebarObject(item: SchemaObject): void {
+    if (item.kind === 'materialized_view') {
+      this.selectReadOnlyObject(item)
+    } else if (this.isTabularKind(item.kind)) {
+      this.selectSidebarObject(item)
+    } else {
+      this.selectReadOnlyObject(item)
+    }
+  }
+
+  private selectReadOnlyObject(item: SchemaObject): void {
+    if (this.schemaInspector?.isMigrationInFlight()) {
+      this.updateStatus('Wait for active schema migration to finish')
+      return
+    }
+    this.activeObjectKind = item.kind
+    this.activeReadOnlyObject = { ...item }
+    this.activeTable = null
+    this.activeSchema = item.schema || undefined
+    this.currentPage = 1
+    this.restoredPageOnBoot = null
+    this.activeWhereClause = undefined
+    this.activeOrderByClause = undefined
+    if (this.whereInputEl) this.whereInputEl.value = ''
+    if (this.orderByInputEl) this.orderByInputEl.value = ''
+    this.hideQueryBanner()
+    this.closeValueInspector()
+    this.closeColumnsPopover()
+    this.updateSelectedTableHighlight()
+    this.sqlConsole?.updateSchema(this.schemaMap, item.name)
+    this.updateMetadataHeader('table', item.name)
+    if (item.schema) {
+      this.updateMetadataHeader('schema', item.schema)
+    }
+    this.saveStudioViewState(true)
+    this.lastInspectorLoadedKey = this.inspectorKey()
+    this.switchMode('inspector')
+    void this.loadReadOnlyObjectDdl(item)
+  }
+
+  private async loadReadOnlyObjectDdl(item: SchemaObject): Promise<void> {
+    if (!this.activeConnectionId || typeof window === 'undefined' || !window.orca?.plugin?.request) {
+      return
+    }
+    const connId = this.activeConnectionId
+    const token = ++this.schemaLoadToken
+    const driver = this.getActiveConnection()?.driver || 'sqlite'
+    this.schemaInspector?.setLoading(true, item.name)
+    try {
+      const res = await this.requestObjectDdl(item)
+      if (
+        token !== this.schemaLoadToken ||
+        this.activeConnectionId !== connId ||
+        this.activeReadOnlyObject?.name !== item.name ||
+        this.activeReadOnlyObject?.kind !== item.kind ||
+        (this.activeSchema || '') !== (item.schema || '')
+      ) {
+        return
+      }
+      this.schemaInspector?.setReadOnlyObjectDdl(item, res, driver)
+      this.lastInspectorLoadedKey = this.inspectorKey()
+      this.updateStatus(`Loaded DDL for ${item.name}`)
+    } catch (err: unknown) {
+      if (
+        token !== this.schemaLoadToken ||
+        this.activeConnectionId !== connId ||
+        this.activeReadOnlyObject?.name !== item.name ||
+        this.activeReadOnlyObject?.kind !== item.kind
+      ) {
+        return
+      }
+      const msg = err instanceof Error ? err.message : String(err)
+      this.schemaInspector?.setError(msg, () => {
+        void this.loadReadOnlyObjectDdl(item)
+      })
+      this.updateStatus(`Failed to load DDL for ${item.name}: ${msg}`)
+    }
+  }
+
+  private async requestObjectDdl(item: SchemaObject): Promise<string> {
+    if (!this.activeConnectionId) {
+      throw new Error('No active connection')
+    }
+    const res = await this.requestPlugin<{ ddl: string }>(
+      'schema.getObjectDdl',
+      {
+        connectionId: this.activeConnectionId,
+        name: item.name,
+        kind: item.kind,
+        ...(item.schema ? { schema: item.schema } : {}),
+      },
+      { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
+    )
+    return res.ddl || ''
+  }
+
+  private async copyObjectDdl(item: SchemaObject): Promise<void> {
+    const connId = this.activeConnectionId
+    try {
+      const ddl = await this.requestObjectDdl(item)
+      if (this.activeConnectionId !== connId) return
+      copyTextFallback(ddl)
+      this.updateStatus(`Copied DDL for ${item.name}`)
+    } catch (err: unknown) {
+      if (this.activeConnectionId !== connId) return
+      const msg = err instanceof Error ? err.message : String(err)
+      this.updateStatus(`Failed to copy DDL: ${msg}`)
+    }
+  }
+
+  private async openObjectDdlInConsole(item: SchemaObject): Promise<void> {
+    const connId = this.activeConnectionId
+    try {
+      const ddl = await this.requestObjectDdl(item)
+      if (this.activeConnectionId !== connId) return
+      this.sqlConsole?.insertText(ddl)
+      if (this.activeViewMode === 'grid' || this.activeViewMode === 'inspector') {
+        this.switchMode('split')
+      }
+      this.updateStatus(`Opened DDL for ${item.name} in SQL Console`)
+    } catch (err: unknown) {
+      if (this.activeConnectionId !== connId) return
+      const msg = err instanceof Error ? err.message : String(err)
+      this.updateStatus(`Failed to open DDL: ${msg}`)
+    }
+  }
+
   private selectSidebarObject(item: SchemaObject): void {
     const isSameTable =
       this.activeTable === item.name &&
+      this.activeObjectKind === item.kind &&
       (this.activeSchema || '') === (item.schema || '') &&
       !this.isShowingSqlResult
     const hadActiveFilterOrPage = Boolean(
@@ -3046,6 +3377,8 @@ export class DatanoaStudioEditor {
         this.currentPage !== 1
     )
     this.activeTable = item.name
+    this.activeObjectKind = item.kind
+    this.activeReadOnlyObject = null
     this.activeSchema = item.schema || undefined
     this.currentPage = 1
     this.restoredPageOnBoot = null
@@ -3119,17 +3452,7 @@ export class DatanoaStudioEditor {
   }
 
   private formatQualifiedSqlTable(item: SchemaObject, driver: DatabaseDriverType): string {
-    const quotedName = quoteIdentForDialect(item.name, driver)
-    if (
-      item.schema &&
-      item.schema !== 'main' &&
-      driver !== 'sqlite' &&
-      driver !== 'libsql' &&
-      driver !== 'redis'
-    ) {
-      return `${quoteIdentForDialect(item.schema, driver)}.${quotedName}`
-    }
-    return quotedName
+    return formatQualifiedSqlTable(item, driver)
   }
 
   private async getObjectColumnMeta(
@@ -3177,60 +3500,8 @@ export class DatanoaStudioEditor {
     kind: 'select' | 'insert' | 'update'
   ): Promise<void> {
     const driver: DatabaseDriverType = this.getActiveConnection()?.driver || 'sqlite'
-    const tableRef = this.formatQualifiedSqlTable(item, driver)
     const { columns, primaryKey } = await this.getObjectColumnMeta(item)
-
-    const colNames = columns.map((c) => c.name)
-    let sqlText = ''
-
-    if (kind === 'select') {
-      const colList =
-        colNames.length > 0
-          ? colNames.map((name) => quoteIdentForDialect(name, driver)).join(', ')
-          : '*'
-      sqlText = `SELECT ${colList}\nFROM ${tableRef}\nLIMIT 100;`
-    } else if (kind === 'insert') {
-      const editableCols = columns.filter((c) => !c.isAutoIncrement)
-      const targetCols = editableCols.length > 0 ? editableCols : columns
-      if (targetCols.length > 0) {
-        const colsSql = targetCols.map((c) => quoteIdentForDialect(c.name, driver)).join(', ')
-        const valsSql = targetCols
-          .map((c) =>
-            /INT|REAL|FLOAT|NUMERIC|DECIMAL/i.test(c.type)
-              ? '0'
-              : /BOOL/i.test(c.type)
-                ? 'false'
-                : "''"
-          )
-          .join(', ')
-        sqlText = `INSERT INTO ${tableRef} (${colsSql})\nVALUES (${valsSql});`
-      } else {
-        sqlText = `INSERT INTO ${tableRef} ()\nVALUES ();`
-      }
-    } else {
-      const pkSet = new Set(primaryKey)
-      const setCols = columns.filter((c) => !pkSet.has(c.name) && !c.isAutoIncrement)
-      const effectiveSetCols = setCols.length > 0 ? setCols : columns
-      const setSql =
-        effectiveSetCols.length > 0
-          ? effectiveSetCols
-              .map((c) => {
-                const val = /INT|REAL|FLOAT|NUMERIC|DECIMAL/i.test(c.type)
-                  ? '0'
-                  : /BOOL/i.test(c.type)
-                    ? 'false'
-                    : "''"
-                return `${quoteIdentForDialect(c.name, driver)} = ${val}`
-              })
-              .join(',\n  ')
-          : `${quoteIdentForDialect('column_name', driver)} = ''`
-      const whereCols = primaryKey.length > 0 ? primaryKey : colNames.slice(0, 1)
-      const whereSql =
-        whereCols.length > 0
-          ? whereCols.map((c) => `${quoteIdentForDialect(c, driver)} = ''`).join(' AND ')
-          : '1 = 0'
-      sqlText = `UPDATE ${tableRef}\nSET ${setSql}\nWHERE ${whereSql};`
-    }
+    const sqlText = buildSqlTemplateForObject(item, kind, driver, columns, primaryKey)
 
     this.sqlConsole?.insertText(sqlText)
     if (this.activeViewMode === 'grid' || this.activeViewMode === 'inspector') {
@@ -3244,204 +3515,60 @@ export class DatanoaStudioEditor {
     this.closeTopbarPopover()
     if (typeof document === 'undefined') return
 
-    const menu = document.createElement('div')
-    menu.className = 'datanoa-context-menu'
-
-    const addItem = (label: string, onClick: () => void, opts?: { danger?: boolean; disabled?: boolean }) => {
-      const btn = document.createElement('button')
-      btn.type = 'button'
-      btn.className = `datanoa-context-item${opts?.danger ? ' danger' : ''}`
-      btn.textContent = label
-      if (opts?.disabled) {
-        btn.disabled = true
-      }
-      btn.addEventListener('click', () => {
-        if (opts?.disabled) return
+    this.sidebarContextMenuEl = createSidebarContextMenu({
+      clientX,
+      clientY,
+      item,
+      driver: this.getActiveConnection()?.driver || 'sqlite',
+      isReadOnly: this.isActiveConnectionReadOnly(),
+      activeViewMode: this.activeViewMode,
+      closeMenus: () => {
         this.closeSidebarContextMenu()
         this.closeTopbarPopover()
-        onClick()
-      })
-      menu.appendChild(btn)
-    }
-
-    const addSep = () => {
-      const sep = document.createElement('div')
-      sep.className = 'datanoa-context-sep'
-      menu.appendChild(sep)
-    }
-
-    const driver: DatabaseDriverType = this.getActiveConnection()?.driver || 'sqlite'
-    const isReadOnly = this.isActiveConnectionReadOnly()
-    const isRedis = driver === 'redis'
-
-    addItem('Open Data', () => {
-      this.selectSidebarObject(item)
-      if (this.activeViewMode === 'inspector') {
-        this.switchMode('split')
-      }
+      },
+      onSelectReadOnlyObject: (target) => this.selectReadOnlyObject(target),
+      onSelectSidebarObject: (target) => this.selectSidebarObject(target),
+      onSwitchMode: (mode) => this.switchMode(mode),
+      onUpdateStatus: (msg) => this.updateStatus(msg),
+      onCopyObjectDdl: (target) => {
+        void this.copyObjectDdl(target)
+      },
+      onOpenObjectDdlInConsole: (target) => {
+        void this.openObjectDdlInConsole(target)
+      },
+      onCountRows: (target) => {
+        void this.countRowsForObject(target)
+      },
+      onGenerateSql: (target, kind) => {
+        void this.generateSqlTemplateForObject(target, kind)
+      },
+      onOpenImportModal: (target) => {
+        void this.openImportDataModal(target)
+      },
+      onOpenDangerModal: (action, target) => this.openDangerTableModal(action, target),
     })
-    addItem('Count Rows', () => {
-      void this.countRowsForObject(item)
-    }, { disabled: isRedis })
-    addSep()
-    addItem('Generate SELECT', () => {
-      void this.generateSqlTemplateForObject(item, 'select')
-    })
-    addItem('Generate INSERT', () => {
-      void this.generateSqlTemplateForObject(item, 'insert')
-    })
-    addItem('Generate UPDATE', () => {
-      void this.generateSqlTemplateForObject(item, 'update')
-    })
-    addSep()
-    addItem('Inspect Schema & DDL', () => {
-      this.selectSidebarObject(item)
-      this.switchMode('inspector')
-    })
-    if (item.kind === 'table') {
-      addItem('Edit Table Structure', () => {
-        this.selectSidebarObject(item)
-        this.switchMode('inspector')
-      })
-    }
-    addItem('Copy Table Name', () => {
-      copyTextFallback(item.name)
-      this.updateStatus(`Copied "${item.name}" to clipboard`)
-    })
-    addItem('Copy SELECT *', () => {
-      const tableRef = this.formatQualifiedSqlTable(item, driver)
-      const selectSql = `SELECT * FROM ${tableRef} LIMIT 100;`
-      copyTextFallback(selectSql)
-      this.updateStatus(`Copied "${selectSql}" to clipboard`)
-    }, { disabled: isRedis })
-
-    if (!isRedis) {
-      addSep()
-      if (item.kind === 'table') {
-        addItem(
-          'Truncate Table...',
-          () => {
-            this.openDangerTableModal('truncate', item)
-          },
-          { danger: true, disabled: isReadOnly }
-        )
-      }
-      addItem(
-        item.kind === 'view' ? 'Drop View...' : 'Drop Table...',
-        () => {
-          this.openDangerTableModal('drop', item)
-        },
-        { danger: true, disabled: isReadOnly }
-      )
-    }
-
-    document.body.appendChild(menu)
-    this.sidebarContextMenuEl = menu
-
-    const rect = menu.getBoundingClientRect()
-    const vw = typeof window !== 'undefined' ? window.innerWidth : 1024
-    const vh = typeof window !== 'undefined' ? window.innerHeight : 768
-    const left = Math.max(6, Math.min(clientX, vw - rect.width - 8))
-    const top = Math.max(6, Math.min(clientY, vh - rect.height - 8))
-    menu.style.left = `${left}px`
-    menu.style.top = `${top}px`
   }
 
   private renderTopbarObjects(filtered: SchemaObject[]): void {
-    if (this.topbarCountEl) {
-      const total = this.schemaObjects.length
-      this.topbarCountEl.textContent =
-        this.filterQuery && filtered.length !== total
-          ? `${filtered.length}/${total}`
-          : String(total)
-    }
-    if (this.topbarAllBtn) {
-      this.topbarAllBtn.textContent = `All (${filtered.length}) ▾`
-    }
-    if (!this.topbarTrackEl) return
-    this.topbarTrackEl.innerHTML = ''
-
-    if (filtered.length === 0) {
-      const empty = document.createElement('span')
-      empty.className = 'datanoa-cell-null'
-      empty.style.padding = '0 8px'
-      empty.textContent = this.filterQuery
-        ? `No tables match "${this.filterQuery}"`
-        : 'No tables or views'
-      this.topbarTrackEl.appendChild(empty)
-      return
-    }
-
-    const trackEl = this.topbarTrackEl
-    for (const item of filtered) {
-      const pill = document.createElement('button')
-      pill.type = 'button'
-      const isActive = this.isObjectActive(item.name, item.schema)
-      pill.className = `datanoa-topbar-pill${isActive ? ' active' : ''}`
-      if (pill.dataset) {
-        pill.dataset.tableName = item.name
-        pill.dataset.tableSchema = item.schema || ''
-      }
-      pill.title = `${item.schema ? `${item.schema}.` : ''}${item.name} (${item.kind.toUpperCase()})`
-
-      const nameSpan = document.createElement('span')
-      nameSpan.textContent = item.name
-      pill.appendChild(nameSpan)
-
-      if (item.kind === 'view') {
-        const kindSpan = document.createElement('span')
-        kindSpan.className = 'datanoa-topbar-pill-kind'
-        kindSpan.textContent = 'VIEW'
-        pill.appendChild(kindSpan)
-      }
-
-      pill.addEventListener('click', () => {
-        this.selectSidebarObject(item)
-      })
-      pill.addEventListener('contextmenu', (e) => {
-        e.preventDefault()
-        this.openSidebarContextMenu(e.clientX, e.clientY, item)
-      })
-      trackEl.appendChild(pill)
-    }
-
-    if (this.sidebarCollapsed) {
-      this.scrollActiveTopbarPillIntoView()
-    }
+    const totalTableCount = this.schemaObjects.filter((o) => o.kind === 'table').length
+    renderStudioTopbarObjects({
+      filtered,
+      totalCount: this.schemaObjects.length,
+      totalTableCount,
+      filterQuery: this.filterQuery,
+      sidebarCollapsed: this.sidebarCollapsed,
+      topbarCountEl: this.topbarCountEl,
+      topbarAllBtn: this.topbarAllBtn,
+      topbarTrackEl: this.topbarTrackEl,
+      isObjectActive: (name, schema, kind) => this.isObjectActive(name, schema, kind),
+      onActivateObject: (item) => this.activateSidebarObject(item),
+      onOpenContextMenu: (x, y, item) => this.openSidebarContextMenu(x, y, item),
+      onScrollActiveIntoView: () => this.scrollActiveTopbarPillIntoView(),
+    })
   }
 
   private renderSidebarSkeleton(): void {
-    if (this.sidebarListEl) {
-      this.sidebarListEl.innerHTML = ''
-      const skelWrap = document.createElement('div')
-      skelWrap.className = 'datanoa-sidebar-skeleton'
-      const widths = [72, 58, 84, 64, 78, 52]
-      for (const w of widths) {
-        const bar = document.createElement('div')
-        bar.className = 'datanoa-skeleton-bar'
-        bar.style.width = `${w}%`
-        skelWrap.appendChild(bar)
-      }
-      this.sidebarListEl.appendChild(skelWrap)
-    }
-    if (this.topbarTrackEl) {
-      this.topbarTrackEl.innerHTML = ''
-      const topSkel = document.createElement('div')
-      topSkel.className = 'datanoa-sidebar-skeleton'
-      topSkel.style.flexDirection = 'row'
-      topSkel.style.padding = '0 4px'
-      for (let i = 0; i < 4; i++) {
-        const bar = document.createElement('div')
-        bar.className = 'datanoa-skeleton-bar'
-        bar.style.width = `${64 + (i % 3) * 18}px`
-        bar.style.height = '18px'
-        topSkel.appendChild(bar)
-      }
-      this.topbarTrackEl.appendChild(topSkel)
-    }
-    if (this.topbarCountEl) {
-      this.topbarCountEl.textContent = '...'
-    }
+    renderStudioSidebarSkeleton(this.sidebarListEl, this.topbarTrackEl, this.topbarCountEl)
   }
 
   private renderSidebarObjects(): void {
@@ -3450,106 +3577,34 @@ export class DatanoaStudioEditor {
       this.renderSidebarSkeleton()
       return
     }
-    this.sidebarListEl.innerHTML = ''
-
     const filtered = this.schemaObjects.filter(
       (o) => !this.filterQuery || o.name.toLowerCase().includes(this.filterQuery)
     )
     this.renderTopbarObjects(filtered)
-
-    const tables = filtered.filter((o) => o.kind === 'table')
-    const views = filtered.filter((o) => o.kind === 'view')
-
-    if (!this.activeConnectionId) {
-      const emptyConnWrap = document.createElement('div')
-      emptyConnWrap.className = 'datanoa-sidebar-empty-cta'
-      const emptyConnText = document.createElement('div')
-      emptyConnText.className = 'datanoa-cell-null'
-      emptyConnText.textContent = 'No database connection selected'
-      const connectBtn = document.createElement('button')
-      connectBtn.type = 'button'
-      connectBtn.className = 'datanoa-btn datanoa-btn-primary datanoa-btn-sm'
-      connectBtn.textContent = '+ Connect Database'
-      connectBtn.addEventListener('click', () => {
-        this.openConnectionModal()
-      })
-      emptyConnWrap.appendChild(emptyConnText)
-      emptyConnWrap.appendChild(connectBtn)
-      this.sidebarListEl.appendChild(emptyConnWrap)
-      return
-    }
-
-    if (tables.length === 0 && views.length === 0) {
-      const empty = document.createElement('div')
-      empty.className = 'datanoa-cell-null'
-      empty.style.padding = '12px'
-      empty.textContent = this.filterQuery
-        ? `No objects match "${this.filterQuery}"`
-        : 'No tables or views'
-      this.sidebarListEl.appendChild(empty)
-
-      const conn = this.getActiveConnection()
-      if (!this.filterQuery && conn && !conn.readOnly && conn.driver !== 'redis') {
-        const ctaWrap = document.createElement('div')
-        ctaWrap.style.padding = '0 12px 12px'
-        const ctaBtn = document.createElement('button')
-        ctaBtn.type = 'button'
-        ctaBtn.className = 'datanoa-btn datanoa-btn-primary datanoa-btn-sm'
-        ctaBtn.textContent = '+ New Table'
-        ctaBtn.addEventListener('click', () => {
-          this.openCreateTableModal()
-        })
-        ctaWrap.appendChild(ctaBtn)
-        this.sidebarListEl.appendChild(ctaWrap)
-      }
-      return
-    }
-
-    const sidebarListEl = this.sidebarListEl
-    if (!sidebarListEl) return
-    const createGroup = (title: string, items: SchemaObject[], badgeText: string) => {
-      const header = document.createElement('div')
-      header.className = 'datanoa-sidebar-group-title'
-      const labelSpan = document.createElement('span')
-      labelSpan.textContent = title
-      const countSpan = document.createElement('span')
-      countSpan.textContent = String(items.length)
-      header.appendChild(labelSpan)
-      header.appendChild(countSpan)
-      sidebarListEl.appendChild(header)
-
-      for (const item of items) {
-        const btn = document.createElement('button')
-        btn.type = 'button'
-        const isActive = this.isObjectActive(item.name, item.schema)
-        btn.className = `datanoa-sidebar-item${isActive ? ' active' : ''}`
-        if (btn.dataset) {
-          btn.dataset.tableName = item.name
-          btn.dataset.tableSchema = item.schema || ''
-        }
-        const nameSpan = document.createElement('span')
-        nameSpan.className = 'datanoa-sidebar-item-name'
-        nameSpan.textContent = item.name
-        const kindSpan = document.createElement('span')
-        kindSpan.className = 'datanoa-sidebar-item-kind'
-        kindSpan.textContent = badgeText
-        btn.appendChild(nameSpan)
-        btn.appendChild(kindSpan)
-        btn.addEventListener('click', () => {
-          this.selectSidebarObject(item)
-        })
-        btn.addEventListener('contextmenu', (e) => {
-          e.preventDefault()
-          this.openSidebarContextMenu(e.clientX, e.clientY, item)
-        })
-        sidebarListEl.appendChild(btn)
-      }
-    }
-
-    createGroup('Tables', tables, 'TBL')
-    if (views.length > 0) {
-      createGroup('Views', views, 'VIEW')
-    }
+    renderStudioSidebarList(
+      {
+        sidebarListEl: this.sidebarListEl,
+        schemaObjects: this.schemaObjects,
+        filterQuery: this.filterQuery,
+        activeConnectionId: this.activeConnectionId,
+        activeConnection: this.getActiveConnection(),
+        collapsedGroups: this.collapsedSidebarGroups,
+        isObjectActive: (name, schema, kind) => this.isObjectActive(name, schema, kind),
+        onOpenConnectionModal: () => this.openConnectionModal(),
+        onOpenCreateTableModal: () => this.openCreateTableModal(),
+        onToggleGroup: (kind) => {
+          if (this.collapsedSidebarGroups.has(kind)) {
+            this.collapsedSidebarGroups.delete(kind)
+          } else {
+            this.collapsedSidebarGroups.add(kind)
+          }
+          this.renderSidebarObjects()
+        },
+        onActivateObject: (item) => this.activateSidebarObject(item),
+        onOpenContextMenu: (x, y, item) => this.openSidebarContextMenu(x, y, item),
+      },
+      filtered
+    )
   }
 
   private async prefetchAutocompleteSchema(
@@ -3606,28 +3661,86 @@ export class DatanoaStudioEditor {
   }
 
   private async introspectSchema(connectionId: string, preservePage = false): Promise<void> {
-    if (typeof window === 'undefined' || !window.orca?.plugin?.request) return
+    if (this.isDestroyed || typeof window === 'undefined' || !window.orca?.plugin?.request) return
     const reqToken = ++this.introspectToken
-    this.isIntrospectingSchema = true
-    this.renderSidebarSkeleton()
-    this.updateStatus('Loading schema...')
-    this.dataGrid?.setEmptyMessage('Loading schema...')
+    const hasWarmCache = Boolean(
+      this.pendingBootDataCache && this.pendingBootDataCache.activeConnectionId === connectionId
+    )
+    if (!hasWarmCache || this.schemaObjects.length === 0) {
+      this.isIntrospectingSchema = true
+      this.renderSidebarSkeleton()
+      this.updateStatus('Loading schema...')
+      if (!hasWarmCache) {
+        this.dataGrid?.setEmptyMessage('Loading schema...')
+      }
+    }
     try {
-      const objects = await this.requestPlugin<SchemaObject[]>(
-        'schema.listObjects',
+      const schemasPromise = this.requestPlugin<{ schemas: string[]; defaultSchema: string }>(
+        'schema.listSchemas',
         { connectionId },
         { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
+      ).catch(() => null)
+      const objectsPromise = this.requestPlugin<SchemaObject[]>(
+        'schema.listObjects',
+        {
+          connectionId,
+          ...(this.selectedSchema ? { schema: this.selectedSchema } : {}),
+        },
+        { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
       )
+      const [schemasResult, objects] = await Promise.all([schemasPromise, objectsPromise])
       if (reqToken !== this.introspectToken || this.activeConnectionId !== connectionId) {
         return
       }
 
       this.isIntrospectingSchema = false
       this.schemaObjects = objects || []
+      const listedSchemas =
+        schemasResult && Array.isArray(schemasResult.schemas)
+          ? schemasResult.schemas.filter((s) => typeof s === 'string' && s.length > 0)
+          : []
+      const derivedSchemas = Array.from(
+        new Set(
+          this.schemaObjects
+            .map((o) => o.schema)
+            .filter((s): s is string => typeof s === 'string' && s.length > 0)
+        )
+      )
+      this.availableSchemas = listedSchemas.length > 0 ? listedSchemas : derivedSchemas
+      this.defaultSchema =
+        (schemasResult?.defaultSchema || '').trim() ||
+        this.availableSchemas[0] ||
+        undefined
+      if (this.selectedSchema && !this.availableSchemas.includes(this.selectedSchema)) {
+        this.selectedSchema = undefined
+      }
+      this.updateSchemaSwitcherDisplay()
+      this.updateExportDdlBtnState()
       const tableNames = this.schemaObjects.filter((o) => o.kind === 'table').map((t) => t.name)
+      const tabularNames = this.schemaObjects
+        .filter((o) => this.isTabularKind(o.kind))
+        .map((o) => o.name)
       this.schemaInspector?.setReferenceTables(tableNames)
-      const fallbackNames =
-        tableNames.length > 0 ? tableNames : this.schemaObjects.map((o) => o.name)
+      const fallbackNames = tableNames.length > 0 ? tableNames : tabularNames
+
+      if (this.activeReadOnlyObject) {
+        const stillPresent = this.schemaObjects.find(
+          (o) =>
+            o.name === this.activeReadOnlyObject?.name &&
+            o.kind === this.activeReadOnlyObject?.kind &&
+            (o.schema || '') === (this.activeReadOnlyObject?.schema || '')
+        )
+        if (stillPresent) {
+          this.activeReadOnlyObject = { ...stillPresent }
+          this.activeObjectKind = stillPresent.kind
+          this.activeSchema = stillPresent.schema || undefined
+          this.renderSidebarObjects()
+          void this.loadReadOnlyObjectDdl(stillPresent)
+          return
+        }
+        this.activeReadOnlyObject = null
+        this.activeObjectKind = null
+      }
 
       if (this.activeTable) {
         const matchedObj =
@@ -3661,9 +3774,54 @@ export class DatanoaStudioEditor {
 
       this.renderSidebarObjects()
 
+      const bootCache = this.pendingBootDataCache
+      if (
+        bootCache &&
+        bootCache.activeConnectionId === connectionId &&
+        bootCache.isShowingSqlResult &&
+        bootCache.lastSqlResult
+      ) {
+        this.pendingBootDataCache = null
+        this.restoredPageOnBoot = null
+        this.isShowingSqlResult = true
+        this.currentCanEdit = false
+        const cachedRes = bootCache.lastSqlResult
+        const conn = this.getActiveConnection()
+        this.dataGrid?.setContextMeta(
+          this.activeTable || 'query_result',
+          conn?.driver || 'sqlite',
+          connectionId,
+          this.activeSchema || ''
+        )
+        this.applyActiveQueryResult(cachedRes)
+        const rowCount = cachedRes.rowCount ?? (cachedRes.rows ? cachedRes.rows.length : 0)
+        this.currentPage = 1
+        this.totalRows = rowCount
+        this.currentPageRowCount = cachedRes.rows ? cachedRes.rows.length : 0
+        if (this.gridSubbarTitleEl) {
+          this.gridSubbarTitleEl.textContent = cachedRes.isSelect
+            ? `SQL Result · ${cachedRes.columns?.length ?? 0} cols`
+            : `Executed · ${cachedRes.affectedRows ?? 0} affected`
+        }
+        if (this.gridPageInfoEl) {
+          const rowLabel = `${rowCount} ${rowCount === 1 ? 'row' : 'rows'}`
+          this.gridPageInfoEl.textContent = cachedRes.truncated
+            ? `${rowLabel} (truncated)`
+            : rowLabel
+        }
+        this.updatePaginationButtons()
+        this.updateExportDropdownOptions()
+        this.consumePendingScrollState()
+        this.updateStatus('Restored SQL result', `${rowCount} rows`)
+        this.saveStudioDataCache()
+        void this.prefetchAutocompleteSchema(connectionId, tableNames, reqToken)
+        return
+      }
+
       if (this.schemaObjects.length === 0 || !this.activeTable) {
+        this.pendingBootDataCache = null
         this.currentPageRowCount = 0
-        this.dataGrid?.setEmptyMessage('No tables or views found in this connection.')
+        this.dataGrid?.setEmptyMessage('No objects found in this connection.')
         this.dataGrid?.setData({
           columns: [],
           rows: [],
@@ -3685,6 +3843,55 @@ export class DatanoaStudioEditor {
           ? Math.max(1, this.restoredPageOnBoot || this.currentPage || 1)
           : 1
       this.restoredPageOnBoot = null
+
+      if (
+        bootCache &&
+        bootCache.activeConnectionId === connectionId &&
+        bootCache.pageData &&
+        bootCache.activeTable === this.activeTable &&
+        (bootCache.activeSchema || '') === (this.activeSchema || '')
+      ) {
+        this.pendingBootDataCache = null
+        const cachedPage = bootCache.pageData
+        const conn = this.getActiveConnection()
+        const readOnly = Boolean(conn?.readOnly)
+        this.lastPageData = cachedPage
+        this.currentPage = cachedPage.page || initialPage
+        this.totalRows = cachedPage.totalRows || 0
+        this.currentPageRowCount = Array.isArray(cachedPage.rows) ? cachedPage.rows.length : 0
+        this.currentCanEdit = Boolean(cachedPage.canEdit) && !readOnly
+        this.dataGrid?.setContextMeta(
+          this.activeTable,
+          conn?.driver || 'sqlite',
+          connectionId,
+          this.activeSchema || ''
+        )
+        this.dataGrid?.setData({ ...cachedPage, canEdit: this.currentCanEdit })
+        const totalPages = Math.max(1, Math.ceil(this.totalRows / this.pageSize))
+        if (this.gridSubbarTitleEl) {
+          this.gridSubbarTitleEl.textContent = readOnly
+            ? `${this.activeTable} · ${cachedPage.columns.length} cols · RO`
+            : `${this.activeTable} · ${cachedPage.columns.length} cols`
+        }
+        if (this.gridPageInfoEl) {
+          this.gridPageInfoEl.textContent = `Page ${this.currentPage} / ${totalPages} (${this.totalRows} rows)`
+        }
+        this.updatePaginationButtons()
+        this.consumePendingScrollState()
+        await this.loadTableData(connectionId, this.activeTable, initialPage, undefined, true)
+        if (reqToken !== this.introspectToken || this.activeConnectionId !== connectionId) {
+          return
+        }
+        if (this.activeViewMode === 'inspector') {
+          void this.loadActiveTableSchema()
+        }
+        void this.prefetchAutocompleteSchema(connectionId, tableNames, reqToken)
+        return
+      }
+      if (bootCache && bootCache.activeConnectionId === connectionId) {
+        this.pendingBootDataCache = null
+      }
+
       await this.loadTableData(connectionId, this.activeTable, initialPage)
       if (reqToken !== this.introspectToken || this.activeConnectionId !== connectionId) {
         return
@@ -3807,9 +4014,10 @@ export class DatanoaStudioEditor {
     connectionId: string,
     table: string,
     page: number,
-    sort?: { column: string; direction: 'ASC' | 'DESC' }
+    sort?: { column: string; direction: 'ASC' | 'DESC' },
+    silent = false
   ): Promise<void> {
-    if (typeof window === 'undefined' || !window.orca?.plugin?.request) return
+    if (typeof window === 'undefined' || !window.orca?.plugin?.request || this.isDestroyed) return
     const targetSchema = this.activeSchema
     const targetTableKey = `${connectionId}:${targetSchema || ''}:${table}`
     const isSameTable = this.lastLoadedTableKey === targetTableKey
@@ -3820,12 +4028,18 @@ export class DatanoaStudioEditor {
     this.updatePaginationButtons()
     try {
       this.isShowingSqlResult = false
+      this.activeQueryResult = null
+      this.activeResultSetIndex = 0
+      this.editableSqlTarget = null
+      this.hideResultSetsBar()
       this.hideQueryBanner()
-      this.updateStatus(`Loading ${table}...`)
-      if (this.gridSubbarTitleEl) {
-        this.gridSubbarTitleEl.textContent = `Loading ${table}...`
+      if (!silent) {
+        this.updateStatus(`Loading ${table}...`)
+        if (this.gridSubbarTitleEl) {
+          this.gridSubbarTitleEl.textContent = `Loading ${table}...`
+        }
+        this.dataGrid?.setLoading(true, `Loading ${table}...`)
       }
-      this.dataGrid?.setLoading(true, `Loading ${table}...`)
       const payload: Record<string, unknown> = {
         connectionId,
         table,
@@ -3864,7 +4078,9 @@ export class DatanoaStudioEditor {
 
       const conn = this.getActiveConnection()
       const readOnly = Boolean(conn?.readOnly)
-      this.currentCanEdit = Boolean(pageData.canEdit) && !readOnly
+      const activeKind = this.findActiveSchemaObject()?.kind
+      this.currentCanEdit =
+        Boolean(pageData.canEdit) && !readOnly && activeKind !== 'materialized_view'
 
       this.currentPage = pageData.page || page
       this.totalRows = pageData.totalRows || 0
@@ -3885,12 +4101,28 @@ export class DatanoaStudioEditor {
           ? `No rows in "${table}" match the current WHERE filter.`
           : `Table "${table}" has no rows.`
       )
-      this.dataGrid?.setData({
-        ...pageData,
-        canEdit: this.currentCanEdit,
-      })
+      const isUnchangedSilentPayload = Boolean(
+        silent &&
+          isSameTable &&
+          this.lastPageData &&
+          this.lastPageData.totalRows === pageData.totalRows &&
+          this.lastPageData.page === pageData.page &&
+          this.lastPageData.pageSize === pageData.pageSize &&
+          this.lastPageData.rows.length === pageData.rows.length &&
+          JSON.stringify(this.lastPageData.columns) === JSON.stringify(pageData.columns) &&
+          JSON.stringify(this.lastPageData.rows) === JSON.stringify(pageData.rows)
+      )
+      if (!isUnchangedSilentPayload) {
+        this.dataGrid?.setData({
+          ...pageData,
+          canEdit: this.currentCanEdit,
+        })
+      }
+      this.lastPageData = pageData
       this.lastLoadedTableKey = targetTableKey
-      if (isSameTable && preservedScrollLeft > 0) {
+      if (this.pendingScrollState) {
+        this.consumePendingScrollState()
+      } else if (isSameTable && preservedScrollLeft > 0) {
         this.dataGrid?.setScrollLeft(preservedScrollLeft)
       }
       if (this.dmlPreviewEl) this.dmlPreviewEl.style.display = 'none'
@@ -3908,6 +4140,7 @@ export class DatanoaStudioEditor {
       this.updatePaginationButtons()
       this.updateExportDropdownOptions()
       this.saveStudioViewState(true)
+      this.saveStudioDataCache()
       this.updateStatus(`Loaded ${table}`, `${this.totalRows} rows`)
 
       if (!cachedDetails) {
@@ -3978,7 +4211,28 @@ export class DatanoaStudioEditor {
     const connId = this.activeConnectionId
     const tableName = this.activeTable
     const targetSchema = this.activeSchema
-    const targetKey = `${connId}:${targetSchema || ''}:${tableName}`
+    if (!this.activeObjectKind) {
+      const found = this.schemaObjects.find(
+        (o) => o.name === tableName && (o.schema || '') === (targetSchema || '')
+      )
+      if (found) this.activeObjectKind = found.kind
+    }
+    if (this.activeObjectKind === 'materialized_view') {
+      const obj =
+        this.activeReadOnlyObject?.kind === 'materialized_view'
+          ? this.activeReadOnlyObject
+          : this.schemaObjects.find(
+              (o) =>
+                o.name === tableName &&
+                o.kind === 'materialized_view' &&
+                (o.schema || '') === (targetSchema || '')
+            )
+      if (obj) {
+        await this.loadReadOnlyObjectDdl(obj)
+        return
+      }
+    }
+    const targetKey = this.inspectorKey()
     if (!force && this.lastInspectorLoadedKey === targetKey) return
 
     const cached = !force ? this.tableDetailsCache.get(targetKey) : undefined
@@ -3992,7 +4246,7 @@ export class DatanoaStudioEditor {
         this.schemaObjects.filter((o) => o.kind === 'table').map((t) => t.name)
       )
       this.schemaInspector?.setDetails(cached, driver)
-      this.lastInspectorLoadedKey = targetKey
+      this.lastInspectorLoadedKey = this.inspectorKey()
       return
     }
 
@@ -4016,7 +4270,7 @@ export class DatanoaStudioEditor {
         this.schemaObjects.filter((o) => o.kind === 'table').map((t) => t.name)
       )
       this.schemaInspector?.setDetails(details, driver)
-      this.lastInspectorLoadedKey = targetKey
+      this.lastInspectorLoadedKey = this.inspectorKey()
     } catch (err: unknown) {
       if (
         schemaToken !== this.schemaLoadToken ||
@@ -4045,6 +4299,559 @@ export class DatanoaStudioEditor {
         this.cancelQueryBtn.style.display = 'none'
       }
     }
+    this.updateTransactionToolbar()
+  }
+
+  private buildTransactionToolbar(parent: HTMLElement): void {
+    this.txToolbar.mount(parent)
+  }
+
+  private async refreshTransactionState(connectionId?: string): Promise<void> {
+    await this.txToolbar.refreshState(connectionId)
+  }
+
+  private updateTransactionToolbar(): void {
+    this.txToolbar.updateToolbar()
+  }
+
+  private renderConsoleTabs(): void {
+    const bar = this.consoleTabsBarEl
+    if (!bar) return
+    bar.setAttribute('role', 'tablist')
+    bar.innerHTML = ''
+    const tabs = this.consoleTabs.getTabs()
+    const activeId = this.consoleTabs.getActiveTabId()
+    let activeTabEl: HTMLDivElement | null = null
+    for (const tab of tabs) {
+      const isActive = tab.id === activeId
+      const tabEl = document.createElement('div')
+      tabEl.className = `datanoa-console-tab${isActive ? ' active' : ''}`
+      tabEl.title = tab.title
+      tabEl.setAttribute('role', 'tab')
+      tabEl.setAttribute('aria-selected', String(isActive))
+      tabEl.setAttribute('tabindex', isActive ? '0' : '-1')
+      if (isActive) activeTabEl = tabEl
+      tabEl.addEventListener('click', () => {
+        this.switchConsoleTab(tab.id)
+      })
+      tabEl.addEventListener('keydown', (e: KeyboardEvent) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          this.switchConsoleTab(tab.id)
+        } else if (e.key === 'F2') {
+          e.preventDefault()
+          if (isActive) {
+            this.beginConsoleTabRename(tabEl, tab)
+          } else {
+            this.switchConsoleTab(tab.id)
+            this.beginConsoleTabRenameById(tab.id)
+          }
+        }
+      })
+      const titleEl = document.createElement('span')
+      titleEl.className = 'datanoa-console-tab-title'
+      titleEl.textContent = tab.title
+      titleEl.addEventListener('dblclick', (e: MouseEvent) => {
+        e.stopPropagation()
+        this.beginConsoleTabRename(tabEl, tab)
+      })
+      tabEl.appendChild(titleEl)
+
+      const closeBtn = document.createElement('button')
+      closeBtn.type = 'button'
+      closeBtn.className = 'datanoa-console-tab-close'
+      closeBtn.textContent = '×'
+      closeBtn.setAttribute('aria-label', 'Close tab')
+      closeBtn.addEventListener('click', (e: MouseEvent) => {
+        e.stopPropagation()
+        this.closeConsoleTab(tab.id)
+      })
+      tabEl.appendChild(closeBtn)
+      bar.appendChild(tabEl)
+    }
+
+    const addBtn = document.createElement('button')
+    addBtn.type = 'button'
+    addBtn.className = 'datanoa-console-tab-add'
+    addBtn.textContent = '+'
+    addBtn.title = 'New SQL Console Tab'
+    addBtn.setAttribute('aria-label', 'New SQL Console Tab')
+    addBtn.addEventListener('click', () => {
+      this.addConsoleTab()
+    })
+    bar.appendChild(addBtn)
+    activeTabEl?.scrollIntoView?.({ inline: 'nearest', block: 'nearest' })
+  }
+
+  private beginConsoleTabRenameById(tabId: string): void {
+    const tabs = this.consoleTabs.getTabs()
+    const idx = tabs.findIndex((t) => t.id === tabId)
+    if (idx < 0) return
+    const tabEls = this.consoleTabsBarEl?.querySelectorAll('.datanoa-console-tab')
+    const tabEl = tabEls?.[idx] as HTMLElement | undefined
+    const tab = tabs[idx]
+    if (tabEl && tab) {
+      this.beginConsoleTabRename(tabEl, tab)
+    }
+  }
+
+  private beginConsoleTabRename(tabEl: HTMLElement, tab: SqlConsoleTabState): void {
+    let done = false
+    tabEl.innerHTML = ''
+    const input = document.createElement('input')
+    input.type = 'text'
+    input.className = 'datanoa-console-tab-rename'
+    input.value = tab.title
+    const finish = (commit: boolean): void => {
+      if (done) return
+      done = true
+      if (commit) {
+        this.consoleTabs.renameTab(tab.id, input.value)
+        this.saveStudioViewState(false)
+      }
+      this.renderConsoleTabs()
+    }
+    input.addEventListener('keydown', (e: KeyboardEvent) => {
+      if (e.key === 'Enter') {
+        e.preventDefault()
+        finish(true)
+      } else if (e.key === 'Escape') {
+        e.preventDefault()
+        finish(false)
+      }
+    })
+    input.addEventListener('click', (e: MouseEvent) => {
+      e.stopPropagation()
+    })
+    input.addEventListener('mousedown', (e: MouseEvent) => {
+      e.stopPropagation()
+    })
+    input.addEventListener('blur', () => {
+      finish(true)
+    })
+    tabEl.appendChild(input)
+    input.focus()
+    input.select()
+  }
+
+  private loadActiveConsoleTab(): void {
+    const tab = this.consoleTabs.getActiveTab()
+    this.suppressDocSync = true
+    try {
+      this.sqlConsole?.setText(tab.sql)
+      this.sqlConsole?.setCursorOffset?.(tab.cursorOffset ?? 0)
+    } finally {
+      this.suppressDocSync = false
+    }
+    this.renderConsoleTabs()
+  }
+
+  private saveActiveConsoleTabState(): void {
+    const current = this.sqlConsole?.getText()
+    if (current !== undefined) {
+      this.consoleTabs.updateActiveSql(current, this.sqlConsole?.getCursorOffset?.())
+    }
+  }
+
+  private clearSqlResultViewForEmptyTab(): void {
+    this.activeQueryResult = null
+    this.activeResultSetIndex = 0
+    this.activeExecutedSql = ''
+    this.activeEditableStmtSql = ''
+    this.editableSqlTarget = null
+    this.currentCanEdit = false
+    this.hideResultSetsBar()
+    this.dataGrid?.setEmptyMessage('Run a query in this tab to see results.')
+    this.dataGrid?.setData({
+      columns: [],
+      rows: [],
+      rowCount: 0,
+      executionTimeMs: 0,
+      truncated: false,
+      isSelect: true,
+    })
+    if (this.gridSubbarTitleEl) {
+      this.gridSubbarTitleEl.textContent = 'SQL Result'
+    }
+    if (this.gridPageInfoEl) {
+      this.gridPageInfoEl.textContent = '0 rows'
+    }
+  }
+
+  private switchConsoleTab(tabId: string): void {
+    if (tabId === this.consoleTabs.getActiveTabId()) return
+    this.saveActiveConsoleTabState()
+    if (!this.consoleTabs.switchTab(tabId)) return
+    this.loadActiveConsoleTab()
+    this.restoreConsoleTabResult()
+    this.saveStudioViewState(false)
+  }
+
+  private addConsoleTab(): void {
+    this.saveActiveConsoleTabState()
+    this.consoleTabs.addTab('')
+    this.loadActiveConsoleTab()
+    if (this.isShowingSqlResult) {
+      this.clearSqlResultViewForEmptyTab()
+    }
+    this.saveStudioViewState(false)
+    this.sqlConsole?.focus()
+  }
+
+  private closeConsoleTab(tabId: string): void {
+    this.saveActiveConsoleTabState()
+    if (!this.consoleTabs.closeTab(tabId)) return
+    this.loadActiveConsoleTab()
+    this.restoreConsoleTabResult()
+    this.saveStudioViewState(false)
+  }
+
+  private restoreConsoleTabResult(): void {
+    if (!this.isShowingSqlResult) return
+    this.editableSqlTarget = null
+    this.currentCanEdit = false
+    this.activeEditableStmtSql = ''
+    const tab = this.consoleTabs.getActiveTab()
+    this.activeExecutedSql = tab.executedSql || ''
+    if (!tab.lastResult) {
+      this.clearSqlResultViewForEmptyTab()
+      return
+    }
+    this.applyActiveQueryResult(tab.lastResult, tab.activeResultSetIndex)
+    const isSameConnection = Boolean(
+      tab.executedConnectionId &&
+      this.activeConnectionId &&
+      tab.executedConnectionId === this.activeConnectionId
+    )
+    if (tab.executedSql && this.activeConnectionId && isSameConnection) {
+      this.applySqlResultEditability(
+        tab.lastResult,
+        tab.activeResultSetIndex,
+        this.activeConnectionId,
+        tab.id,
+        this.querySeq
+      )
+    } else {
+      if (!isSameConnection && this.gridSubbarTitleEl) {
+        this.gridSubbarTitleEl.textContent = 'SQL Result · Read-only (another connection)'
+      }
+      this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
+    }
+  }
+
+  private getDefaultResultSetIndex(res: QueryResult): number {
+    const sets = res.resultSets
+    if (!sets || sets.length === 0) return 0
+    let index = 0
+    for (let i = 0; i < sets.length; i++) {
+      if (sets[i]?.isSelect) index = i
+    }
+    return index
+  }
+
+  private buildResultSetQueryResult(res: QueryResult, index: number): QueryResult {
+    const rs = res.resultSets?.[index]
+    if (!rs) return res
+    return {
+      columns: rs.columns,
+      rows: rs.rows,
+      rowCount: rs.rowCount,
+      affectedRows: rs.affectedRows,
+      executionTimeMs: res.executionTimeMs,
+      truncated: rs.truncated,
+      isSelect: rs.isSelect,
+      ...(rs.sourceTable ? { sourceTable: rs.sourceTable } : {}),
+    }
+  }
+
+  private applyActiveQueryResult(res: QueryResult, defaultIndex?: number): void {
+    this.editableSqlTarget = null
+    this.activeEditableStmtSql = ''
+    this.currentCanEdit = false
+    this.activeQueryResult = res
+    const idx = defaultIndex ?? this.getDefaultResultSetIndex(res)
+    this.activeResultSetIndex = Math.max(0, idx)
+    this.consoleTabs.setActiveResult(res, this.activeResultSetIndex)
+    this.renderResultSetsBar()
+    this.dataGrid?.setData(this.buildResultSetQueryResult(res, this.activeResultSetIndex))
+  }
+
+  /**
+   * Resolves the table inline edits must target: the editable SQL result table when a
+   * single-table SELECT is showing, otherwise the sidebar-selected table.
+   */
+  private resolveEditableTargetTable(): { table: string; schema?: string } | null {
+    if (this.isShowingSqlResult) {
+      return this.editableSqlTarget
+        ? { table: this.editableSqlTarget.table, schema: this.editableSqlTarget.schema }
+        : null
+    }
+    return this.activeTable ? { table: this.activeTable, schema: this.activeSchema } : null
+  }
+
+  private isEditableTargetCurrent(
+    targetTable: string,
+    targetSchema: string | undefined,
+    inSqlResultMode: boolean
+  ): boolean {
+    const current = this.resolveEditableTargetTable()
+    if (!current || current.table !== targetTable) return false
+    if ((current.schema || '') !== (targetSchema || '')) return false
+    if (!inSqlResultMode) return true
+    if (!this.isShowingSqlResult || !this.editableSqlTarget) return false
+    if (
+      this.editableSqlTarget.originConnectionId &&
+      this.editableSqlTarget.originConnectionId !== this.activeConnectionId
+    ) {
+      return false
+    }
+    if (
+      this.editableSqlTarget.originTabId &&
+      this.editableSqlTarget.originTabId !== this.consoleTabs.getActiveTabId()
+    ) {
+      return false
+    }
+    return (
+      this.editableSqlTarget.originResultSetIndex === undefined ||
+      this.editableSqlTarget.originResultSetIndex === this.activeResultSetIndex
+    )
+  }
+
+  /**
+   * Enables inline editing on a single-table SELECT result with a resolvable primary key
+   * (Phase 5C); re-renders read-only rows otherwise.
+   */
+  private applySqlResultEditability(
+    res: QueryResult,
+    resultSetIndex: number,
+    targetConnId: string,
+    originTabId: string,
+    seq: number,
+    allowFetch = true
+  ): void {
+    const rs = res.resultSets?.[resultSetIndex]
+    const columns = rs ? rs.columns || [] : res.columns || []
+    const rows = rs ? rs.rows || [] : res.rows || []
+    const isSelect = rs ? Boolean(rs.isSelect) : Boolean(res.isSelect)
+    const driver = this.connections.find((c) => c.id === targetConnId)?.driver || 'sqlite'
+
+    this.editableSqlTarget = null
+    this.currentCanEdit = false
+    this.activeEditableStmtSql = ''
+
+    if (isSelect && columns.length > 0) {
+      const stmts = splitSqlStatements(this.activeExecutedSql, driver)
+      const stmtSql = (stmts[resultSetIndex] || stmts[0])?.text || this.activeExecutedSql
+      const resolvedSourceTable = rs ? rs.sourceTable : res.sourceTable
+      const analysis: EditableSelectAnalysis = analyzeEditableSelectQuery({
+        sql: stmtSql,
+        dialect: driver,
+        isReadOnly: this.isActiveConnectionReadOnly(),
+        resultColumns: columns.map((c) => ({ name: c.name, type: c.type })),
+        schemaObjects: this.schemaObjects || [],
+        resolvedSourceTable,
+        resolveTableDetails: (tbl, sch) => {
+          const direct = this.tableDetailsCache?.get(`${targetConnId}:${sch || ''}:${tbl}`)
+          if (direct) return direct
+          if (sch) return undefined
+          return this.tableDetailsCache?.get(`${targetConnId}::${tbl}`)
+        },
+      })
+
+      if (analysis.editable && analysis.table && analysis.primaryKey && analysis.columns) {
+        const canonicalCols = analysis.columns
+        const recordRows = rows.map((row) => {
+          const rec: Record<string, unknown> = {}
+          canonicalCols.forEach((colInfo, i) => {
+            const key = colInfo?.name ?? columns[i]?.name
+            if (key !== undefined) {
+              rec[key] = row[i]
+            }
+          })
+          return rec
+        })
+        this.editableSqlTarget = {
+          table: analysis.table,
+          schema: analysis.schema,
+          primaryKey: analysis.primaryKey,
+          columns: analysis.columns,
+          originTabId,
+          originResultSetIndex: resultSetIndex,
+          originConnectionId: targetConnId,
+        }
+        this.activeEditableStmtSql = stmtSql
+        this.currentCanEdit = true
+        this.dataGrid?.setContextMeta(
+          analysis.table,
+          driver,
+          targetConnId,
+          analysis.schema || ''
+        )
+        this.dataGrid?.setData({
+          columns: analysis.columns,
+          rows: recordRows,
+          totalRows: recordRows.length,
+          page: 1,
+          pageSize: Math.max(1, recordRows.length),
+          primaryKey: analysis.primaryKey,
+          canEdit: true,
+        })
+        if (this.gridSubbarTitleEl) {
+          this.gridSubbarTitleEl.textContent = `SQL Result · Editable (${analysis.table})`
+        }
+        this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
+        return
+      }
+
+      // Table details not cached yet: fetch them once, then re-apply if still relevant.
+      if (allowFetch && analysis.reason === 'missing_table_details' && analysis.table) {
+        const targetTable = analysis.table
+        const targetSchema = analysis.schema
+        void this.fetchTableDetailsDeduped(targetConnId, targetTable, targetSchema)
+          .then(() => {
+            if (
+              seq !== this.querySeq ||
+              originTabId !== this.consoleTabs.getActiveTabId() ||
+              resultSetIndex !== this.activeResultSetIndex ||
+              this.activeConnectionId !== targetConnId ||
+              !this.isShowingSqlResult ||
+              (this.dataGrid?.getStagedCount() ?? 0) !== 0
+            ) {
+              return
+            }
+            this.applySqlResultEditability(
+              res,
+              resultSetIndex,
+              targetConnId,
+              originTabId,
+              seq,
+              false
+            )
+          })
+          .catch(() => {})
+      }
+    }
+
+    this.dataGrid?.setData(this.buildResultSetQueryResult(res, resultSetIndex))
+    this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
+  }
+
+  private renderResultSetsBar(): void {
+    const bar = this.resultSetsBarEl
+    if (!bar) return
+    const res = this.activeQueryResult
+    const sets = res?.resultSets
+    if (!res || !sets || sets.length <= 1 || this.activeViewMode === 'inspector') {
+      bar.innerHTML = ''
+      bar.style.display = 'none'
+      return
+    }
+    bar.innerHTML = ''
+    sets.forEach((rs, idx) => {
+      const btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = `datanoa-result-set-btn${idx === this.activeResultSetIndex ? ' active' : ''}`
+      btn.title = rs.sqlPreview || ''
+      btn.textContent = rs.isSelect
+        ? `Result ${idx + 1} · ${rs.rowCount} ${rs.rowCount === 1 ? 'row' : 'rows'}`
+        : `Result ${idx + 1} · ${rs.affectedRows ?? 0} affected`
+      btn.addEventListener('click', () => {
+        this.selectResultSetIndex(idx)
+      })
+      bar.appendChild(btn)
+    })
+    bar.style.display = 'flex'
+  }
+
+  private selectResultSetIndex(index: number): void {
+    const res = this.activeQueryResult
+    const sets = res?.resultSets
+    if (!res || !sets || index < 0 || index >= sets.length) return
+    const rs = sets[index]
+    if (!rs) return
+    this.editableSqlTarget = null
+    this.activeEditableStmtSql = ''
+    this.currentCanEdit = false
+    this.activeResultSetIndex = index
+    this.consoleTabs.setActiveResultSetIndex(index)
+    this.dataGrid?.setData(this.buildResultSetQueryResult(res, index))
+    this.currentPage = 1
+    this.currentPageRowCount = rs.rows.length
+    this.totalRows = rs.rowCount
+    this.updatePaginationButtons()
+    this.updateExportDropdownOptions()
+    const rowLabel = `${rs.rowCount} ${rs.rowCount === 1 ? 'row' : 'rows'}`
+    if (!rs.isSelect) {
+      const affectedLabel = `${rs.affectedRows ?? 0} affected`
+      if (this.gridSubbarTitleEl) {
+        this.gridSubbarTitleEl.textContent = `Result ${index + 1} · ${affectedLabel}`
+      }
+      if (this.gridPageInfoEl) {
+        this.gridPageInfoEl.textContent = affectedLabel
+      }
+    } else {
+      if (this.gridSubbarTitleEl) {
+        this.gridSubbarTitleEl.textContent = `Result ${index + 1} · ${rs.columns?.length ?? 0} cols`
+      }
+      if (this.gridPageInfoEl) {
+        this.gridPageInfoEl.textContent = rs.truncated ? `${rowLabel} (truncated)` : rowLabel
+      }
+    }
+    this.updateStatus(
+      `Result ${index + 1} of ${sets.length}`,
+      rs.isSelect ? rowLabel : `${rs.affectedRows ?? 0} affected`
+    )
+    this.renderResultSetsBar()
+    const activeTab = this.consoleTabs.getActiveTab()
+    const isSameConnection = Boolean(
+      activeTab.executedConnectionId &&
+      this.activeConnectionId &&
+      activeTab.executedConnectionId === this.activeConnectionId
+    )
+    if (rs.isSelect && this.activeConnectionId && isSameConnection) {
+      this.applySqlResultEditability(
+        res,
+        index,
+        this.activeConnectionId,
+        this.consoleTabs.getActiveTabId(),
+        this.querySeq
+      )
+    } else {
+      this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
+    }
+  }
+
+  private hideResultSetsBar(): void {
+    if (this.resultSetsBarEl) {
+      this.resultSetsBarEl.innerHTML = ''
+      this.resultSetsBarEl.style.display = 'none'
+    }
+  }
+
+  private promptBindParams(
+    sql: string,
+    dialect: DatabaseDriverType,
+    params: DetectedSqlParam[],
+    onRun: (boundSql: string) => void
+  ): void {
+    const expectedConnId = this.activeConnectionId
+    const ctx: StudioBindParamsModalContext = {
+      mountModal: (modalEl, canClose) => this.mountStudioModal(modalEl, canClose),
+      closeModal: () => this.closeActiveModal(),
+      sql,
+      dialect,
+      params,
+      rememberedValues: this.rememberedBindParams,
+      onConfirm: (boundSql, nextValues) => {
+        if (this.activeConnectionId !== expectedConnId) {
+          this.updateStatus('Connection changed — query cancelled')
+          return
+        }
+        this.rememberedBindParams = { ...this.rememberedBindParams, ...nextValues }
+        onRun(boundSql)
+      },
+    }
+    openStudioBindParamsModal(ctx)
   }
 
   public formatSqlInConsole(): void {
@@ -4062,17 +4869,28 @@ export class DatanoaStudioEditor {
     this.updateStatus('Formatted SQL')
   }
 
-  public async executeSql(executeAll = false): Promise<void> {
+  public async executeSql(
+    executeAll = false,
+    skipBindCheck = false,
+    sqlOverride?: string,
+    skipDangerGuard = false
+  ): Promise<void> {
     if (
       !this.sqlConsole ||
       (this.activeQueryId !== null && !this.cancelledQueryIds.has(this.activeQueryId))
     ) {
       return
     }
+    if (this.txToolbar.isBusy()) {
+      this.updateStatus('Wait for transaction operation to complete')
+      return
+    }
     const driver = this.getActiveConnection()?.driver || 'sqlite'
-    const sqlText = executeAll
-      ? this.sqlConsole.getText().trim()
-      : this.sqlConsole.getCaretStatementSql(driver)
+    const sqlText =
+      sqlOverride ??
+      (executeAll
+        ? this.sqlConsole.getText().trim()
+        : this.sqlConsole.getCaretStatementSql(driver))
     if (!sqlText) {
       this.updateStatus('No query text to execute')
       return
@@ -4083,9 +4901,50 @@ export class DatanoaStudioEditor {
       return
     }
 
+    if (!skipBindCheck && driver !== 'redis') {
+      const detectedParams = extractSqlParameters(sqlText, driver)
+      if (detectedParams.length > 0) {
+        this.promptBindParams(sqlText, driver, detectedParams, (boundSql) => {
+          void this.executeSql(executeAll, true, boundSql)
+        })
+        return
+      }
+    }
+
     if (typeof window === 'undefined' || !window.orca?.plugin?.request) {
       this.updateStatus('No runtime environment available')
       return
+    }
+
+    if (!skipDangerGuard && !this.isActiveConnectionReadOnly()) {
+      const conn = this.getActiveConnection()
+      const allFindings = analyzeDangerousSql(sqlText, driver)
+      const requiresAll = conn?.colorTag === 'prod' || conn?.colorTag === 'staging'
+      const activeFindings = requiresAll
+        ? allFindings
+        : allFindings.filter(
+            (finding) =>
+              finding.kind === 'delete_without_where' || finding.kind === 'update_without_where'
+          )
+      if (activeFindings.length > 0) {
+        const expectedConnId = this.activeConnectionId
+        openStudioDangerSqlModal({
+          mountModal: (modalEl, canClose) => this.mountStudioModal(modalEl, canClose),
+          closeModal: () => this.closeActiveModal(),
+          connectionName: conn?.name ?? 'Active Connection',
+          colorTag: conn?.colorTag,
+          findings: activeFindings,
+          sql: sqlText,
+          onConfirm: () => {
+            if (this.activeConnectionId !== expectedConnId) {
+              this.updateStatus('Connection changed — query cancelled')
+              return
+            }
+            void this.executeSql(executeAll, true, sqlText, true)
+          },
+        })
+        return
+      }
     }
 
     const seq = ++this.querySeq
@@ -4093,6 +4952,7 @@ export class DatanoaStudioEditor {
     this.tableLoadToken++
     this.isTableLoading = false
     const targetConnId = this.activeConnectionId
+    const originTabId = this.consoleTabs.getActiveTabId()
     this.hideQueryBanner()
     this.updateStatus('Running 0.0s...')
     const queryId = `query_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
@@ -4133,6 +4993,12 @@ export class DatanoaStudioEditor {
         return
       }
 
+      const defaultIdx = this.getDefaultResultSetIndex(res)
+      this.consoleTabs.setResultForTab(originTabId, res, defaultIdx, sqlText, targetConnId)
+      if (originTabId !== this.consoleTabs.getActiveTabId()) {
+        return
+      }
+
       const elapsed = Math.round(performance.now() - startTime)
       const queriedTable = extractQueriedTableName(sqlText)
       if (queriedTable) {
@@ -4149,6 +5015,8 @@ export class DatanoaStudioEditor {
 
       this.isShowingSqlResult = true
       this.currentCanEdit = false
+      this.activeExecutedSql = sqlText
+      this.activeEditableStmtSql = ''
       this.closeValueInspector()
       const contextTable = queriedTable || this.activeTable || 'query_result'
       this.dataGrid?.setContextMeta(
@@ -4164,7 +5032,8 @@ export class DatanoaStudioEditor {
           : 'Query returned no rows.'
         : `Statement executed successfully (${res.affectedRows ?? 0} affected rows).`
       this.dataGrid?.setEmptyMessage(emptyMsg)
-      this.dataGrid?.setData(res)
+      this.applyActiveQueryResult(res)
+      this.applySqlResultEditability(res, this.activeResultSetIndex, targetConnId, originTabId, seq)
       this.updateStagedActionButtons(0)
 
       const rowCount = res.rowCount ?? (res.rows ? res.rows.length : 0)
@@ -4174,16 +5043,17 @@ export class DatanoaStudioEditor {
       this.currentPageRowCount = res.rows ? res.rows.length : 0
       this.updatePaginationButtons()
       this.updateExportDropdownOptions()
-      if (this.gridSubbarTitleEl) {
+      if (this.gridSubbarTitleEl && !this.editableSqlTarget) {
         const tblLabel = queriedTable ? ` (${queriedTable})` : ''
         this.gridSubbarTitleEl.textContent = res.isSelect
           ? `SQL Result${tblLabel} · ${res.columns?.length ?? 0} cols`
           : `Executed · ${res.affectedRows ?? 0} affected`
       }
+      const rowLabel = `${rowCount} ${rowCount === 1 ? 'row' : 'rows'}`
       if (this.gridPageInfoEl) {
         this.gridPageInfoEl.textContent = res.truncated
-          ? `${rowCount} rows (truncated)`
-          : `${rowCount} rows`
+          ? `${rowLabel} (truncated)`
+          : rowLabel
       }
 
       const compactSql = sqlText.replace(/\s+/g, ' ').trim()
@@ -4192,7 +5062,7 @@ export class DatanoaStudioEditor {
         const truncNote = res.truncated ? ' (truncated)' : ''
         this.showQueryBanner(
           'success',
-          `Query OK · ${rowCount} rows returned in ${durationMs}ms${truncNote}`,
+          `Query OK · ${rowLabel} returned in ${durationMs}ms${truncNote}`,
           sqlPreview
         )
       } else {
@@ -4205,13 +5075,15 @@ export class DatanoaStudioEditor {
 
       this.updateStatus(
         `Query executed in ${durationMs}ms`,
-        res.truncated ? `${rowCount} rows (truncated)` : `${rowCount} rows`
+        res.truncated ? `${rowLabel} (truncated)` : rowLabel
       )
+      this.saveStudioViewState(true)
+      this.saveStudioDataCache()
       if (containsDdlStatement(sqlText) && this.activeConnectionId === targetConnId) {
         void this.refreshSchemaObjectsOnly(targetConnId)
       }
-      if (this.isHistoryOpen) {
-        void this.loadQueryHistory()
+      if (this.queryHistoryDrawer.isOpen()) {
+        void this.queryHistoryDrawer.load()
       }
     } catch (err: unknown) {
       if (
@@ -4221,12 +5093,18 @@ export class DatanoaStudioEditor {
       ) {
         return
       }
+      if (originTabId !== this.consoleTabs.getActiveTabId()) {
+        return
+      }
       const msg = err instanceof Error ? err.message : String(err)
       this.isShowingSqlResult = true
       this.currentCanEdit = false
       this.currentPageRowCount = 0
       this.closeValueInspector()
       this.showQueryBanner('error', 'SQL Execution Error', msg, { showBackToTable: true })
+      this.activeQueryResult = null
+      this.activeResultSetIndex = 0
+      this.hideResultSetsBar()
       this.dataGrid?.setEmptyMessage(`Query error: ${msg}`)
       this.dataGrid?.setData({
         columns: [],
@@ -4246,8 +5124,8 @@ export class DatanoaStudioEditor {
         this.gridPageInfoEl.textContent = '0 rows'
       }
       this.updateStatus(`Query error: ${msg}`, '0 rows')
-      if (this.isHistoryOpen) {
-        void this.loadQueryHistory()
+      if (this.queryHistoryDrawer.isOpen()) {
+        void this.queryHistoryDrawer.load()
       }
     } finally {
       stopTimer()
@@ -4258,10 +5136,11 @@ export class DatanoaStudioEditor {
         setButtonLoading(this.explainBtn, false)
         this.setQueryRunningState(null)
       }
+      void this.refreshTransactionState(targetConnId)
     }
   }
 
-  public async explainSql(): Promise<void> {
+  public async explainSql(skipBindCheck = false, sqlOverride?: string): Promise<void> {
     if (
       !this.sqlConsole ||
       (this.activeQueryId !== null && !this.cancelledQueryIds.has(this.activeQueryId))
@@ -4270,7 +5149,8 @@ export class DatanoaStudioEditor {
     }
     const driver = this.getActiveConnection()?.driver || 'sqlite'
     const sqlText =
-      this.sqlConsole.getCaretStatementSql(driver) || this.sqlConsole.getExecutableSql()
+      sqlOverride ??
+      (this.sqlConsole.getCaretStatementSql(driver) || this.sqlConsole.getExecutableSql())
     if (!sqlText) {
       this.updateStatus('No SQL statement to explain')
       return
@@ -4279,6 +5159,15 @@ export class DatanoaStudioEditor {
       this.updateStatus('Please select an active connection first')
       return
     }
+    if (!skipBindCheck && driver !== 'redis') {
+      const detectedParams = extractSqlParameters(sqlText, driver)
+      if (detectedParams.length > 0) {
+        this.promptBindParams(sqlText, driver, detectedParams, (boundSql) => {
+          void this.explainSql(true, boundSql)
+        })
+        return
+      }
+    }
     if (typeof window === 'undefined' || !window.orca?.plugin?.request) return
 
     const seq = ++this.querySeq
@@ -4286,6 +5175,7 @@ export class DatanoaStudioEditor {
     this.tableLoadToken++
     this.isTableLoading = false
     const targetConnId = this.activeConnectionId
+    const originTabId = this.consoleTabs.getActiveTabId()
     const queryId = `explain_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
     this.hideQueryBanner()
     this.updateStatus('Running EXPLAIN 0.0s...')
@@ -4322,12 +5212,24 @@ export class DatanoaStudioEditor {
       ) {
         return
       }
+      this.consoleTabs.setResultForTab(
+        originTabId,
+        res,
+        this.getDefaultResultSetIndex(res),
+        '',
+        targetConnId
+      )
+      if (originTabId !== this.consoleTabs.getActiveTabId()) {
+        return
+      }
       this.isShowingSqlResult = true
       this.currentCanEdit = false
+      this.editableSqlTarget = null
+      this.activeEditableStmtSql = ''
       this.closeValueInspector()
       this.dataGrid?.setForeignKeys([])
       this.dataGrid?.setEmptyMessage('No execution plan rows returned.')
-      this.dataGrid?.setData(res)
+      this.applyActiveQueryResult(res)
       this.updateStagedActionButtons(0)
       const rowCount = res.rowCount ?? res.rows.length
       this.currentPageRowCount = res.rows.length
@@ -4344,7 +5246,12 @@ export class DatanoaStudioEditor {
         'success',
         `EXPLAIN OK · ${rowCount} plan steps in ${res.executionTimeMs}ms`
       )
-      this.updateStatus(`EXPLAIN completed in ${res.executionTimeMs}ms`, `${rowCount} rows`)
+      this.updateStatus(
+        `EXPLAIN completed in ${res.executionTimeMs}ms`,
+        `${rowCount} ${rowCount === 1 ? 'row' : 'rows'}`
+      )
+      this.saveStudioViewState(true)
+      this.saveStudioDataCache()
     } catch (err: unknown) {
       if (
         seq !== this.querySeq ||
@@ -4353,11 +5260,17 @@ export class DatanoaStudioEditor {
       ) {
         return
       }
+      if (originTabId !== this.consoleTabs.getActiveTabId()) {
+        return
+      }
       const msg = err instanceof Error ? err.message : String(err)
       this.isShowingSqlResult = true
       this.currentCanEdit = false
       this.currentPageRowCount = 0
       this.showQueryBanner('error', 'EXPLAIN Error', msg, { showBackToTable: true })
+      this.activeQueryResult = null
+      this.activeResultSetIndex = 0
+      this.hideResultSetsBar()
       this.dataGrid?.setEmptyMessage(`EXPLAIN error: ${msg}`)
       this.dataGrid?.setData({
         columns: [],
@@ -4419,132 +5332,7 @@ export class DatanoaStudioEditor {
   }
 
   private async toggleQueryHistory(): Promise<void> {
-    this.isHistoryOpen = !this.isHistoryOpen
-    this.historyBtn?.classList.toggle('active', this.isHistoryOpen)
-    if (!this.historyDrawerEl) return
-    this.historyDrawerEl.style.display = this.isHistoryOpen ? 'flex' : 'none'
-    if (this.isHistoryOpen) {
-      await this.loadQueryHistory()
-    }
-  }
-
-  private renderQueryHistoryList(): void {
-    if (!this.historyListEl) return
-    this.historyListEl.innerHTML = ''
-    const q = this.historySearchQuery
-    const entries = q
-      ? this.cachedHistoryEntries.filter(
-          (e) =>
-            e.sql.toLowerCase().includes(q) ||
-            (e.connectionName || '').toLowerCase().includes(q)
-        )
-      : this.cachedHistoryEntries
-
-    if (entries.length === 0) {
-      const empty = document.createElement('div')
-      empty.className = 'datanoa-cell-null'
-      empty.style.padding = '10px 12px'
-      empty.textContent = q
-        ? `No query history matches "${q}".`
-        : 'No executed queries in history yet.'
-      this.historyListEl.appendChild(empty)
-      return
-    }
-
-    for (const entry of entries) {
-      const row = document.createElement('div')
-      row.className = 'datanoa-history-row'
-
-      const sqlSpan = document.createElement('span')
-      sqlSpan.className = 'datanoa-history-sql'
-      sqlSpan.textContent = entry.sql.replace(/\s+/g, ' ').trim()
-      sqlSpan.title = entry.sql
-      sqlSpan.style.cursor = 'pointer'
-      sqlSpan.addEventListener('click', () => {
-        this.sqlConsole?.setText(entry.sql)
-        this.sqlConsole?.focus()
-      })
-
-      const relTime = formatRelativeTimestamp(entry.timestamp)
-      const metaSpan = document.createElement('span')
-      metaSpan.className = 'datanoa-history-meta'
-      const baseMeta = entry.isError
-        ? `${entry.connectionName} · ERROR`
-        : `${entry.connectionName} · ${entry.durationMs}ms · ${entry.rowCount} rows`
-      metaSpan.textContent = relTime ? `${baseMeta} · ${relTime}` : baseMeta
-
-      const actions = document.createElement('div')
-      actions.className = 'datanoa-btn-group'
-
-      const insertBtn = document.createElement('button')
-      insertBtn.type = 'button'
-      insertBtn.className = 'datanoa-btn datanoa-btn-sm'
-      insertBtn.textContent = 'Insert'
-      insertBtn.addEventListener('click', (e) => {
-        e.stopPropagation()
-        this.sqlConsole?.insertText(entry.sql)
-        this.sqlConsole?.focus()
-        this.updateStatus('Inserted history query into SQL Console')
-      })
-
-      const copyBtn = document.createElement('button')
-      copyBtn.type = 'button'
-      copyBtn.className = 'datanoa-btn datanoa-btn-sm'
-      copyBtn.textContent = 'Copy'
-      copyBtn.addEventListener('click', (e) => {
-        e.stopPropagation()
-        copyTextFallback(entry.sql, copyBtn)
-        this.updateStatus('Copied history SQL to clipboard')
-      })
-
-      actions.appendChild(insertBtn)
-      actions.appendChild(copyBtn)
-
-      row.appendChild(sqlSpan)
-      row.appendChild(metaSpan)
-      row.appendChild(actions)
-      this.historyListEl.appendChild(row)
-    }
-  }
-
-  private async loadQueryHistory(): Promise<void> {
-    if (!this.historyListEl || typeof window === 'undefined' || !window.orca?.plugin?.request) return
-    const seq = ++this.historySeq
-    this.historyListEl.innerHTML = ''
-    const loadingEl = document.createElement('div')
-    loadingEl.className = 'datanoa-cell-null'
-    loadingEl.style.padding = '10px 12px'
-    loadingEl.style.display = 'flex'
-    loadingEl.style.alignItems = 'center'
-    loadingEl.style.gap = '6px'
-    const spinner = document.createElement('span')
-    spinner.className = 'datanoa-spinner'
-    spinner.setAttribute('aria-hidden', 'true')
-    const txt = document.createElement('span')
-    txt.textContent = 'Loading query history...'
-    loadingEl.appendChild(spinner)
-    loadingEl.appendChild(txt)
-    this.historyListEl.appendChild(loadingEl)
-
-    try {
-      const res = await this.requestPlugin<{ entries: QueryHistoryEntry[] }>('query.history.list', {
-        limit: 50,
-      })
-      if (seq !== this.historySeq) return
-      this.cachedHistoryEntries = res?.entries || []
-      this.renderQueryHistoryList()
-    } catch (err: unknown) {
-      if (seq !== this.historySeq) return
-      const msg = err instanceof Error ? err.message : String(err)
-      if (this.historyListEl) {
-        this.historyListEl.innerHTML = ''
-        const errEl = document.createElement('div')
-        errEl.style.padding = '10px 12px'
-        errEl.style.color = 'var(--danger)'
-        errEl.textContent = `Failed to load query history: ${msg}`
-        this.historyListEl.appendChild(errEl)
-      }
-    }
+    await this.queryHistoryDrawer.toggle()
   }
 
   private async clearQueryHistory(): Promise<void> {
@@ -4555,13 +5343,13 @@ export class DatanoaStudioEditor {
     ) {
       return
     }
-    this.historySeq++
+    this.queryHistoryDrawer.bumpSeq()
     this.isClearingHistory = true
     setButtonLoading(this.clearHistoryBtn, true, 'Clearing...')
     try {
       await this.requestPlugin<{ ok: boolean }>('query.history.clear')
-      this.cachedHistoryEntries = []
-      await this.loadQueryHistory()
+      this.queryHistoryDrawer.clearCached()
+      await this.queryHistoryDrawer.load()
       this.updateStatus('Query history cleared')
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err)
@@ -4573,11 +5361,12 @@ export class DatanoaStudioEditor {
   }
 
   private async previewStagedChanges(): Promise<void> {
+    const editTarget = this.resolveEditableTargetTable()
     if (
       this.isPreviewingDml ||
       !this.dataGrid ||
       !this.activeConnectionId ||
-      !this.activeTable ||
+      !editTarget ||
       !this.dmlPreviewEl ||
       !this.dmlPreviewPreEl
     ) {
@@ -4590,8 +5379,9 @@ export class DatanoaStudioEditor {
     }
     const seq = ++this.dmlPreviewSeq
     const targetConnId = this.activeConnectionId
-    const targetTable = this.activeTable
-    const targetSchema = this.activeSchema
+    const targetTable = editTarget.table
+    const targetSchema = editTarget.schema
+    const inSqlResultMode = this.isShowingSqlResult
     this.isPreviewingDml = true
     setButtonLoading(this.dmlPreviewBtn, true, 'Previewing...')
     try {
@@ -4606,19 +5396,23 @@ export class DatanoaStudioEditor {
       if (
         seq !== this.dmlPreviewSeq ||
         this.activeConnectionId !== targetConnId ||
-        this.activeTable !== targetTable ||
-        (this.activeSchema || '') !== (targetSchema || '')
+        !this.isEditableTargetCurrent(targetTable, targetSchema, inSqlResultMode)
       ) {
         return
       }
       const statements = res?.statements || []
-      this.dmlPreviewPreEl.textContent = statements.join('\n') || '-- No SQL statements generated'
+      this.lastPreviewDmlText = statements.join('\n')
+      const previewText =
+        statements.length > 300
+          ? `${statements.slice(0, 300).join('\n')}\n-- ... and ${statements.length - 300} more statements (click Copy SQL for full script)`
+          : this.lastPreviewDmlText
+      this.dmlPreviewPreEl.textContent = previewText || '-- No SQL statements generated'
       this.dmlPreviewEl.style.display = 'block'
     } catch (err: unknown) {
       if (
         seq !== this.dmlPreviewSeq ||
         this.activeConnectionId !== targetConnId ||
-        this.activeTable !== targetTable
+        !this.isEditableTargetCurrent(targetTable, targetSchema, inSqlResultMode)
       ) {
         return
       }
@@ -4628,12 +5422,13 @@ export class DatanoaStudioEditor {
     } finally {
       this.isPreviewingDml = false
       setButtonLoading(this.dmlPreviewBtn, false)
-      this.updateStagedActionButtons(this.dataGrid?.getStagedCount() ?? 0)
+      this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
     }
   }
 
   private async submitStagedChanges(): Promise<void> {
-    if (this.isSubmittingChanges || !this.dataGrid || !this.activeConnectionId || !this.activeTable) return
+    const editTarget = this.resolveEditableTargetTable()
+    if (this.isSubmittingChanges || !this.dataGrid || !this.activeConnectionId || !editTarget) return
     if (this.isActiveConnectionReadOnly()) {
       this.updateStatus('Cannot submit changes on a Read-Only connection')
       return
@@ -4642,9 +5437,10 @@ export class DatanoaStudioEditor {
     const total = payload.inserts.length + payload.updates.length + payload.deletes.length
     if (total === 0) return
 
+    const inSqlResultMode = this.isShowingSqlResult
     const targetConnId = this.activeConnectionId
-    const targetTable = this.activeTable
-    const targetSchema = this.activeSchema
+    const targetTable = editTarget.table
+    const targetSchema = editTarget.schema
     const targetPage = this.currentPage
     const submitViewSeq = this.gridViewSeq
 
@@ -4654,6 +5450,7 @@ export class DatanoaStudioEditor {
     if (this.addRowBtn) this.addRowBtn.disabled = true
     if (this.cloneRowBtn) this.cloneRowBtn.disabled = true
     if (this.delRowBtn) this.delRowBtn.disabled = true
+    if (this.importDataBtn) this.importDataBtn.disabled = true
     if (this.dmlPreviewBtn) this.dmlPreviewBtn.disabled = true
     setButtonLoading(this.submitBtn, true, 'Submitting...')
     setButtonLoading(this.dmlApplyBtn, true, 'Submitting...')
@@ -4684,8 +5481,7 @@ export class DatanoaStudioEditor {
       )
       const stillSameTarget =
         this.activeConnectionId === targetConnId &&
-        this.activeTable === targetTable &&
-        (this.activeSchema || '') === (targetSchema || '') &&
+        this.isEditableTargetCurrent(targetTable, targetSchema, inSqlResultMode) &&
         this.gridViewSeq === submitViewSeq
       if (!stillSameTarget) {
         return
@@ -4693,9 +5489,19 @@ export class DatanoaStudioEditor {
       if (res?.ok) {
         if (this.dmlPreviewEl) this.dmlPreviewEl.style.display = 'none'
         this.updateStatus(
-          `Committed +${res.inserted} inserted, ~${res.updated} updated, -${res.deleted} deleted`
+          this.txToolbar.getState().active
+            ? 'Staged edits applied inside open transaction'
+            : `Committed +${res.inserted} inserted, ~${res.updated} updated, -${res.deleted} deleted`
         )
-        await this.loadTableData(targetConnId, targetTable, targetPage)
+        void this.refreshTransactionState(targetConnId)
+        if (inSqlResultMode) {
+          this.dataGrid?.revertAllChanges()
+          if (this.activeEditableStmtSql) {
+            void this.executeSql(true, true, this.activeEditableStmtSql)
+          }
+        } else {
+          await this.loadTableData(targetConnId, targetTable, targetPage)
+        }
       } else {
         this.showQueryBanner('error', 'Submit Changes Rejected', 'The database rejected one or more staged edits.')
         this.updateStatus('Submit changes rejected')
@@ -4703,7 +5509,7 @@ export class DatanoaStudioEditor {
     } catch (err: unknown) {
       if (
         this.activeConnectionId !== targetConnId ||
-        this.activeTable !== targetTable ||
+        !this.isEditableTargetCurrent(targetTable, targetSchema, inSqlResultMode) ||
         this.gridViewSeq !== submitViewSeq
       ) {
         return
@@ -4717,164 +5523,30 @@ export class DatanoaStudioEditor {
       this.dataGrid?.setInteractionLocked(false)
       setButtonLoading(this.submitBtn, false)
       setButtonLoading(this.dmlApplyBtn, false)
-      this.updateStagedActionButtons(this.dataGrid?.getStagedCount() ?? 0)
+      this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
     }
   }
 
   private updateExportDropdownOptions(): void {
-    if (!this.exportSelectEl) return
-    const sel = this.exportSelectEl
-    sel.innerHTML = ''
-
-    const placeholder = document.createElement('option')
-    placeholder.value = ''
-    placeholder.textContent = 'Export...'
-    sel.appendChild(placeholder)
-
-    const pageScopeLabel = this.isShowingSqlResult
-      ? `Copy SQL Result (${this.currentPageRowCount} rows)`
-      : `Copy Current Page (${this.currentPageRowCount} / ${this.totalRows} rows)`
-
-    const addGroup = (
-      label: string,
-      items: ReadonlyArray<{ value: string; label: string }>
-    ) => {
-      const group = document.createElement('optgroup')
-      group.label = label
-      for (const optDef of items) {
-        const opt = document.createElement('option')
-        opt.value = optDef.value
-        opt.textContent = optDef.label
-        group.appendChild(opt)
-      }
-      sel.appendChild(group)
-    }
-
-    addGroup(pageScopeLabel, [
-      { value: 'sql-insert', label: 'Copy SQL INSERT' },
-      { value: 'sql-update', label: 'Copy SQL UPDATE' },
-      { value: 'json', label: 'Copy JSON' },
-      { value: 'ndjson', label: 'Copy NDJSON' },
-      { value: 'csv', label: 'Copy CSV' },
-      { value: 'tsv', label: 'Copy TSV' },
-      { value: 'markdown', label: 'Copy Markdown' },
-    ])
-
-    addGroup('Download File (Current Page)', [
-      { value: 'download:csv', label: 'Download .csv' },
-      { value: 'download:json', label: 'Download .json' },
-      { value: 'download:sql-insert', label: 'Download .sql (INSERT)' },
-      { value: 'download:markdown', label: 'Download .md' },
-    ])
-
-    const summary = this.lastSelectionSummary
-    if (summary && summary.cellCount > 1) {
-      addGroup(`Export Selected (${summary.rowCount}×${summary.colCount} · ${summary.cellCount} cells)`, [
-        { value: 'sel-copy:tsv', label: 'Copy Selected TSV' },
-        { value: 'sel-copy:tsv-headers', label: 'Copy Selected TSV + Headers' },
-        { value: 'sel-copy:csv', label: 'Copy Selected CSV' },
-        { value: 'sel-copy:json', label: 'Copy Selected JSON' },
-        { value: 'sel-copy:sql-in', label: 'Copy Selected SQL IN (...)' },
-        { value: 'sel-copy:sql-insert', label: 'Copy Selected SQL INSERT' },
-        { value: 'sel-download:csv', label: 'Download Selected .csv' },
-        { value: 'sel-download:json', label: 'Download Selected .json' },
-        { value: 'sel-download:sql-insert', label: 'Download Selected .sql' },
-      ])
-    }
-  }
-
-  private getExportFileMeta(
-    format: string,
-    tableName: string
-  ): { filename: string; mimeType: string } {
-    const safeName = tableName.replace(/[^A-Za-z0-9_-]/g, '_') || 'export'
-    if (format === 'csv') return { filename: `${safeName}.csv`, mimeType: 'text/csv;charset=utf-8' }
-    if (format === 'json')
-      return { filename: `${safeName}.json`, mimeType: 'application/json;charset=utf-8' }
-    if (format === 'markdown')
-      return { filename: `${safeName}.md`, mimeType: 'text/markdown;charset=utf-8' }
-    return { filename: `${safeName}.sql`, mimeType: 'text/sql;charset=utf-8' }
+    populateExportDropdownOptions(this.exportSelectEl, {
+      isShowingSqlResult: this.isShowingSqlResult,
+      currentPageRowCount: this.currentPageRowCount,
+      totalRows: this.totalRows,
+      lastSelectionSummary: this.lastSelectionSummary,
+    })
+    syncStudioSelectTooltip(this.exportSelectEl, 'Export Format')
   }
 
   private handleExportAction(actionValue: string): void {
-    if (!this.dataGrid || !actionValue) return
-    const driver = this.getActiveConnection()?.driver || 'sqlite'
-    const tableName = this.activeTable || 'query_result'
-
-    if (actionValue.startsWith('sel-copy:') || actionValue.startsWith('sel-download:')) {
-      const isDownload = actionValue.startsWith('sel-download:')
-      const rawFmt = actionValue.slice(isDownload ? 'sel-download:'.length : 'sel-copy:'.length)
-      if (
-        rawFmt !== 'tsv' &&
-        rawFmt !== 'tsv-headers' &&
-        rawFmt !== 'csv' &&
-        rawFmt !== 'json' &&
-        rawFmt !== 'sql-in' &&
-        rawFmt !== 'sql-insert'
-      ) {
-        return
-      }
-      const output = this.dataGrid.exportSelection(rawFmt)
-      if (!output) {
-        this.updateStatus('No selected cells to export')
-        return
-      }
-      if (isDownload) {
-        const meta = this.getExportFileMeta(rawFmt, `${tableName}_selected`)
-        downloadTextFile(output, meta.filename, meta.mimeType)
-        this.updateStatus(`Downloaded selected data as ${meta.filename}`)
-      } else {
-        copyTextFallback(output)
-        this.updateStatus(`Copied selected cells as ${rawFmt.toUpperCase()}`)
-      }
-      return
-    }
-
-    const isDownload = actionValue.startsWith('download:')
-    const rawFmt = actionValue.startsWith('copy:')
-      ? actionValue.slice('copy:'.length)
-      : isDownload
-        ? actionValue.slice('download:'.length)
-        : actionValue
-
-    if (
-      rawFmt !== 'sql-insert' &&
-      rawFmt !== 'sql-update' &&
-      rawFmt !== 'json' &&
-      rawFmt !== 'ndjson' &&
-      rawFmt !== 'csv' &&
-      rawFmt !== 'tsv' &&
-      rawFmt !== 'markdown'
-    ) {
-      return
-    }
-
-    if (isDownload) {
-      const output = this.dataGrid.exportData(rawFmt, tableName, driver)
-      if (!output) {
-        this.updateStatus('No rows available to download')
-        return
-      }
-      const meta = this.getExportFileMeta(rawFmt, tableName)
-      downloadTextFile(output, meta.filename, meta.mimeType)
-      this.updateStatus(`Downloaded ${meta.filename}`)
-      return
-    }
-
-    this.handleExportFormat(rawFmt)
-  }
-
-  private handleExportFormat(format: ExportFormat): void {
-    if (!this.dataGrid) return
-    const driver = this.getActiveConnection()?.driver || 'sqlite'
-    const tableName = this.activeTable || 'query_result'
-    const output = this.dataGrid.exportData(format, tableName, driver)
-    if (!output) {
-      this.updateStatus('No rows available to export')
-      return
-    }
-    copyTextFallback(output)
-    this.updateStatus(`Exported as ${format.toUpperCase()} (copied to clipboard)`)
+    executeStudioExportAction(
+      {
+        dataGrid: this.dataGrid,
+        driver: this.getActiveConnection()?.driver || 'sqlite',
+        tableName: this.activeTable || 'query_result',
+        updateStatus: (stateText) => this.updateStatus(stateText),
+      },
+      actionValue
+    )
   }
 
   private handleGridSelectionSummary(summary: SelectionSummary): void {
@@ -5000,6 +5672,39 @@ export class DatanoaStudioEditor {
     await this.applyServerFilters()
   }
 
+  private async handleColumnHeaderFilter(
+    column: string,
+    value: string,
+    op: ColumnHeaderFilterOp,
+    mode: 'query' | 'client' | 'clear'
+  ): Promise<void> {
+    if (mode === 'clear') {
+      this.dataGrid?.removeClientColumnFilter(column)
+      this.updateStatus(`Cleared column filter on ${column}`)
+      return
+    }
+    if (mode === 'client') {
+      this.dataGrid?.addClientColumnFilter(column, value, op)
+      this.updateStatus(`Filtered loaded rows on ${column}`)
+      return
+    }
+    const driver = this.getActiveConnection()?.driver || 'sqlite'
+    if (this.isShowingSqlResult) {
+      const baseSql = (this.activeExecutedSql || this.sqlConsole?.getText() || '').trim()
+      const injected = injectSqlColumnFilter(baseSql, column, value, op, driver)
+      if (injected.ok && this.sqlConsole) {
+        this.sqlConsole.setText(injected.sql)
+        await this.executeSql(false)
+        return
+      }
+      this.dataGrid?.addClientColumnFilter(column, value, op)
+      this.updateStatus(`Filtered loaded SQL rows on ${column}`)
+      return
+    }
+    const predicate = buildColumnHeaderPredicate(column, value, op, driver)
+    await this.handleQuickFilter(predicate, 'and')
+  }
+
   private async handleNavigateForeignKey(
     refTable: string,
     refColumn: string,
@@ -5097,331 +5802,27 @@ export class DatanoaStudioEditor {
     if (!this.dataGrid || !this.columnsBtn || typeof document === 'undefined' || !document.body) {
       return
     }
-
-    const pop = document.createElement('div')
-    pop.className = 'datanoa-cols-popover'
-
-    const head = document.createElement('div')
-    head.className = 'datanoa-cols-popover-head'
-
-    const searchInp = document.createElement('input')
-    searchInp.type = 'search'
-    searchInp.className = 'datanoa-search-input'
-    searchInp.placeholder = 'Filter columns...'
-    searchInp.style.flex = '1'
-
-    const showAllBtn = document.createElement('button')
-    showAllBtn.type = 'button'
-    showAllBtn.className = 'datanoa-btn datanoa-btn-sm'
-    showAllBtn.textContent = 'Show All'
-
-    head.appendChild(searchInp)
-    head.appendChild(showAllBtn)
-
-    const listEl = document.createElement('div')
-    listEl.className = 'datanoa-cols-popover-list'
-
-    const renderList = () => {
-      if (!this.dataGrid) return
-      const cfg = this.dataGrid.getColumnConfig()
-      const hiddenSet = new Set(cfg.hidden)
-      const pinnedSet = new Set(cfg.pinned)
-      const q = searchInp.value.trim().toLowerCase()
-      const cols = q
-        ? cfg.allColumns.filter((c) => c.toLowerCase().includes(q))
-        : cfg.allColumns
-
-      listEl.innerHTML = ''
-      if (cols.length === 0) {
-        const empty = document.createElement('div')
-        empty.className = 'datanoa-cell-null'
-        empty.style.padding = '8px'
-        empty.textContent = cfg.allColumns.length === 0 ? 'No columns loaded' : 'No matching columns'
-        listEl.appendChild(empty)
-        return
-      }
-
-      for (const colName of cols) {
-        const row = document.createElement('div')
-        row.className = 'datanoa-cols-popover-row'
-
-        const label = document.createElement('label')
-        label.style.display = 'inline-flex'
-        label.style.alignItems = 'center'
-        label.style.gap = '6px'
-        label.style.flex = '1'
-        label.style.minWidth = '0'
-        label.style.cursor = 'pointer'
-
-        const cb = document.createElement('input')
-        cb.type = 'checkbox'
-        cb.checked = !hiddenSet.has(colName)
-        cb.addEventListener('change', () => {
-          this.dataGrid?.setColumnVisibility(colName, cb.checked)
-          renderList()
-        })
-
-        const nameSpan = document.createElement('span')
-        nameSpan.textContent = colName
-        nameSpan.style.overflow = 'hidden'
-        nameSpan.style.textOverflow = 'ellipsis'
-        nameSpan.style.whiteSpace = 'nowrap'
-
-        label.appendChild(cb)
-        label.appendChild(nameSpan)
-
-        const pinBtn = document.createElement('button')
-        pinBtn.type = 'button'
-        const isPinned = pinnedSet.has(colName)
-        pinBtn.className = `datanoa-btn datanoa-btn-sm${isPinned ? ' active' : ''}`
-        pinBtn.textContent = isPinned ? 'Unpin' : 'Pin'
-        pinBtn.addEventListener('click', () => {
-          this.dataGrid?.togglePinColumn(colName)
-          renderList()
-        })
-
-        row.appendChild(label)
-        row.appendChild(pinBtn)
-        listEl.appendChild(row)
-      }
-    }
-
-    searchInp.addEventListener('input', renderList)
-    showAllBtn.addEventListener('click', () => {
-      this.dataGrid?.showAllColumns()
-      renderList()
+    const mounted = mountStudioColumnsPopover(this.dataGrid, this.columnsBtn, () => {
+      this.closeColumnsPopover()
     })
-
-    renderList()
-    pop.appendChild(head)
-    pop.appendChild(listEl)
-    document.body.appendChild(pop)
-    this.colsPopoverEl = pop
-    this.columnsBtn.classList.add('active')
-
-    if (typeof this.columnsBtn.getBoundingClientRect === 'function') {
-      const rect = this.columnsBtn.getBoundingClientRect()
-      const vw = typeof window !== 'undefined' ? window.innerWidth || 1024 : 1024
-      const vh = typeof window !== 'undefined' ? window.innerHeight || 768 : 768
-      const popRect = pop.getBoundingClientRect?.()
-      const popWidth = Math.max(268, Math.round(popRect?.width || 268))
-      const naturalH = Math.min(360, Math.round(popRect?.height || 300))
-      const spaceBelow = Math.max(0, vh - rect.bottom - 12)
-      const spaceAbove = Math.max(0, rect.top - 12)
-      const openUpward = spaceBelow < naturalH && spaceAbove > spaceBelow
-      const clampedMaxH = Math.max(120, Math.min(360, openUpward ? spaceAbove : spaceBelow))
-      pop.style.maxHeight = `${clampedMaxH}px`
-      const renderedH = Math.min(naturalH, clampedMaxH)
-      const top = openUpward
-        ? Math.max(8, Math.round(rect.top - renderedH - 4))
-        : Math.max(8, Math.min(Math.round(rect.bottom + 4), vh - renderedH - 8))
-      const left = Math.max(8, Math.min(Math.round(rect.left), vw - popWidth - 8))
-      pop.style.top = `${top}px`
-      pop.style.left = `${left}px`
-    }
-
-    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-      const onDocDown = (ev: MouseEvent) => {
-        const target = ev.target instanceof Node ? ev.target : null
-        if (target && (this.columnsBtn?.contains?.(target) || pop.contains?.(target))) return
-        this.closeColumnsPopover()
-      }
-      window.addEventListener('mousedown', onDocDown, true)
-      this.colsPopoverOutsideCleanup = () => {
-        window.removeEventListener('mousedown', onDocDown, true)
-      }
-    }
-
-    searchInp.focus?.()
+    this.colsPopoverEl = mounted.popoverEl
+    this.colsPopoverOutsideCleanup = mounted.outsideCleanup
   }
 
   private openValueInspector(info?: SelectedCellInfo): void {
-    const target = info ?? this.selectedCell
-    if (!target) return
-    this.selectedCell = target
-    this.isInspectorOpen = true
-    if (this.inspectCellBtn) {
-      this.inspectCellBtn.disabled = false
-      this.inspectCellBtn.classList.add('active')
-    }
-    this.renderValueInspector(target)
-    this.valueInspectorTextEl?.focus()
+    this.valueInspector.open(info)
   }
 
   private closeValueInspector(): void {
-    const wasOpen = this.isInspectorOpen
-    this.isInspectorOpen = false
-    if (this.valueInspectorEl) {
-      this.valueInspectorEl.style.display = 'none'
-    }
-    this.inspectCellBtn?.classList.remove('active')
-    if (wasOpen) {
-      this.dataGrid?.handleViewportResize()
-    }
+    this.valueInspector.close()
   }
 
   private toggleValueInspector(): void {
-    if (this.isInspectorOpen) {
-      this.closeValueInspector()
-      return
-    }
-    this.openValueInspector()
+    this.valueInspector.toggle()
   }
 
   private handleCellSelectionChanged(info: SelectedCellInfo | null): void {
-    this.selectedCell = info
-    if (this.inspectCellBtn) {
-      this.inspectCellBtn.disabled = !info
-      this.inspectCellBtn.classList.toggle('active', Boolean(info && this.isInspectorOpen))
-    }
-    if (!info) {
-      this.closeValueInspector()
-      return
-    }
-    if (!this.isInspectorOpen) {
-      return
-    }
-    this.renderValueInspector(info)
-  }
-
-  private updateValueInspectorMeta(isNullValue: boolean): void {
-    if (this.valueNullBadgeEl) {
-      this.valueNullBadgeEl.style.display = isNullValue ? 'inline-flex' : 'none'
-    }
-    if (!this.valueInspectorStatusEl || !this.valueInspectorTextEl) return
-    const text = this.valueInspectorTextEl.value
-    const chars = text.length
-    const lines = text.length === 0 ? 1 : text.split('\n').length
-    const trimmed = text.trim()
-
-    let jsonNote = ''
-    let statusClass = 'datanoa-json-status'
-    if (isNullValue) {
-      jsonNote = 'NULL value (distinct from empty string "")'
-    } else if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-      try {
-        JSON.parse(trimmed)
-        jsonNote = 'Valid JSON'
-        statusClass = 'datanoa-json-status valid'
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : 'Invalid JSON'
-        jsonNote = `Invalid JSON: ${msg}`
-        statusClass = 'datanoa-json-status invalid'
-      }
-    }
-    this.valueInspectorStatusEl.className = statusClass
-    this.valueInspectorStatusEl.textContent = jsonNote
-      ? `${chars} chars · ${lines} line${lines === 1 ? '' : 's'} · ${jsonNote}`
-      : `${chars} chars · ${lines} line${lines === 1 ? '' : 's'}`
-  }
-
-  private renderValueInspector(info: SelectedCellInfo): void {
-    if (!this.valueInspectorEl || !this.valueInspectorTitleEl || !this.valueInspectorTextEl) return
-    this.valueInspectorEl.style.display = 'flex'
-    const typeLabel = info.columnType ? ` (${info.columnType})` : ''
-    this.valueInspectorTitleEl.textContent = `Value Inspector · ${info.columnName}${typeLabel} · Row ${info.rowIndex + 1}`
-
-    const isNullVal = info.value === null || info.value === undefined
-    let formattedText = ''
-    if (isNullVal) {
-      formattedText = ''
-    } else if (typeof info.value === 'object') {
-      try {
-        formattedText = JSON.stringify(info.value, null, 2)
-      } catch {
-        formattedText = String(info.value)
-      }
-    } else if (typeof info.value === 'string') {
-      const trimmed = info.value.trim()
-      if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
-        try {
-          formattedText = JSON.stringify(JSON.parse(trimmed), null, 2)
-        } catch {
-          formattedText = info.value
-        }
-      } else {
-        formattedText = info.value
-      }
-    } else {
-      formattedText = String(info.value)
-    }
-
-    this.valueInspectorTextEl.value = formattedText
-    this.valueInspectorTextEl.placeholder = isNullVal ? 'NULL (type to set text value)' : ''
-    this.valueInspectorTextEl.readOnly = !info.isEditable
-    const canSetNull = info.isEditable && info.isNullable !== false
-    if (this.valueApplyBtn) this.valueApplyBtn.disabled = !info.isEditable || this.isSavingCell
-    if (this.valueNullBtn) this.valueNullBtn.disabled = !canSetNull || this.isSavingCell
-    this.updateValueInspectorMeta(isNullVal)
-  }
-
-  private async applyValueFromInspector(setNull: boolean): Promise<void> {
-    if (this.isSavingCell || !this.selectedCell || !this.dataGrid || !this.valueInspectorTextEl) return
-    const info = this.selectedCell
-    if (!info.isEditable) return
-    if (setNull && info.isNullable === false) return
-
-    let nextValue: unknown = null
-    if (!setNull) {
-      nextValue = coerceCellInputValue(
-        this.valueInspectorTextEl.value,
-        info.value,
-        info.columnType
-      )
-    }
-
-    if (this.dataGrid.isBatchMode() || this.dataGrid.getStagedCount() > 0 || info.isInserted) {
-      this.dataGrid.stageCellEdit(info.rowIndex, info.colIndex, nextValue)
-      this.updateValueInspectorMeta(setNull)
-      this.updateStatus(setNull ? `Staged NULL for ${info.columnName}` : `Staged edit for ${info.columnName}`)
-      return
-    }
-
-    const model = this.dataGrid.getModel()
-    if (!model || !this.activeConnectionId || !this.activeTable) return
-    const targetConnId = this.activeConnectionId
-    const targetTable = this.activeTable
-    const targetSchema = this.activeSchema
-    const targetPage = this.currentPage
-    const saveViewSeq = this.gridViewSeq
-    const row = model.rows[info.rowIndex]
-    const primaryKeys: Record<string, unknown> = {}
-    model.primaryKey.forEach((pk) => {
-      const pkIdx = model.headers.indexOf(pk)
-      primaryKeys[pk] = Array.isArray(row) ? row[pkIdx] : (row as Record<string, unknown>)[pk]
-    })
-
-    this.isSavingCell = true
-    const triggerBtn = setNull ? this.valueNullBtn : this.valueApplyBtn
-    if (this.valueApplyBtn) this.valueApplyBtn.disabled = true
-    if (this.valueNullBtn) this.valueNullBtn.disabled = true
-    setButtonLoading(triggerBtn, true, 'Saving...')
-
-    try {
-      const res = await this.handleUpdateCell({
-        primaryKeys,
-        column: info.columnName,
-        newValue: nextValue,
-        originalValue: info.value,
-        rowIndex: info.rowIndex,
-      })
-      if (
-        res.ok &&
-        this.activeConnectionId === targetConnId &&
-        this.activeTable === targetTable &&
-        (this.activeSchema || '') === (targetSchema || '') &&
-        this.gridViewSeq === saveViewSeq
-      ) {
-        await this.loadTableData(targetConnId, targetTable, targetPage)
-      }
-    } finally {
-      this.isSavingCell = false
-      setButtonLoading(triggerBtn, false)
-      const editable = Boolean(this.selectedCell?.isEditable)
-      const nullable = this.selectedCell?.isNullable !== false
-      if (this.valueApplyBtn) this.valueApplyBtn.disabled = !editable
-      if (this.valueNullBtn) this.valueNullBtn.disabled = !(editable && nullable)
-    }
+    this.valueInspector.handleSelectionChanged(info)
   }
 
   private findActiveSchemaObject(): SchemaObject | undefined {
@@ -5479,6 +5880,7 @@ export class DatanoaStudioEditor {
   }
 
   private closeActiveModal(): void {
+    closeActiveStudioCollapsibleDropdown()
     if (this.activeModalKeyCleanup) {
       this.activeModalKeyCleanup()
       this.activeModalKeyCleanup = null
@@ -5491,7 +5893,8 @@ export class DatanoaStudioEditor {
 
   private mountStudioModal(
     modalEl: HTMLElement,
-    canClose: () => boolean = () => true
+    canClose: () => boolean = () => true,
+    onDismiss?: () => void
   ): HTMLDivElement | null {
     this.closeActiveModal()
     if (typeof document === 'undefined' || !document.body) return null
@@ -5503,6 +5906,7 @@ export class DatanoaStudioEditor {
     backdrop.addEventListener('click', (e) => {
       if (e.target === backdrop && canClose()) {
         this.closeActiveModal()
+        onDismiss?.()
       }
     })
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
@@ -5512,6 +5916,7 @@ export class DatanoaStudioEditor {
           ev.stopPropagation()
           if (canClose()) {
             this.closeActiveModal()
+            onDismiss?.()
           }
         }
       }
@@ -5552,6 +5957,7 @@ export class DatanoaStudioEditor {
         createElapsedTimer: (onTick) => this.createElapsedTimer(onTick),
         updateStatus: (stateText, metricsText) => this.updateStatus(stateText, metricsText),
         activateSavedConnection: (savedId) => this.activateSavedConnection(savedId),
+        currentWorkspaceScope: this.currentWorkspaceScope,
         onConnectionDeleted: async (deletedId) => {
           if (this.storedActiveConnectionId === deletedId) this.storedActiveConnectionId = null
           if (this.pendingDocConnectionId === deletedId) this.pendingDocConnectionId = null
@@ -5584,6 +5990,122 @@ export class DatanoaStudioEditor {
         this.activeSchema = targetSchema
         this.showQueryBanner('success', `Table "${targetName}" Created`, currentSql)
         await this.introspectSchema(connId, false)
+      },
+    })
+  }
+
+  private async openImportDataModal(targetItem?: SchemaObject): Promise<void> {
+    if (this.isDestroyed) return
+    const conn = this.getActiveConnection()
+    const connId = this.activeConnectionId
+    if (!conn || !connId || conn.readOnly || conn.driver === 'redis') {
+      this.updateStatus('Cannot import data on a Read-Only or Redis connection')
+      return
+    }
+
+    const tableName = targetItem?.name || this.activeTable
+    const schemaName = targetItem ? targetItem.schema || undefined : this.activeSchema
+    if (!tableName) {
+      this.updateStatus('Select a table before importing a file')
+      return
+    }
+    if (targetItem?.kind === 'view' || (!targetItem && !this.isActiveObjectTable())) {
+      this.updateStatus('Cannot import rows into a view — select a table')
+      return
+    }
+
+    const openSeq = ++this.importModalOpenSeq
+    const cacheKey = `${connId}:${schemaName || ''}:${tableName}`
+    let targetColumns: ColumnInfo[] = []
+    const cachedDetails = this.tableDetailsCache.get(cacheKey)
+    if (cachedDetails && cachedDetails.columns.length > 0) {
+      targetColumns = cachedDetails.columns
+    } else if (
+      this.isObjectActive(tableName, schemaName) &&
+      !this.isShowingSqlResult &&
+      this.dataGrid
+    ) {
+      const modelCols = this.dataGrid.getModel()?.columns || []
+      const fullCols = modelCols.filter(
+        (col): col is ColumnInfo => 'nullable' in col && 'isPrimaryKey' in col
+      )
+      if (fullCols.length > 0) {
+        targetColumns = fullCols
+      }
+    }
+
+    if (targetColumns.length === 0) {
+      try {
+        this.updateStatus(`Loading schema for "${tableName}"...`)
+        const details = await this.fetchTableDetailsDeduped(connId, tableName, schemaName, false)
+        if (openSeq !== this.importModalOpenSeq || this.activeConnectionId !== connId) return
+        if (details.kind === 'view') {
+          this.updateStatus(`"${tableName}" is a view and cannot be imported into`)
+          return
+        }
+        targetColumns = details.columns
+      } catch (err: unknown) {
+        if (openSeq !== this.importModalOpenSeq || this.activeConnectionId !== connId) return
+        const msg = err instanceof Error ? err.message : String(err)
+        this.showQueryBanner('error', 'Import Unavailable', `Failed to load schema for "${tableName}": ${msg}`)
+        this.updateStatus(`Import unavailable: ${msg}`)
+        return
+      }
+    }
+
+    const canStageInGrid =
+      this.isObjectActive(tableName, schemaName) &&
+      !this.isShowingSqlResult &&
+      this.currentCanEdit &&
+      this.dataGrid !== null
+
+    openStudioImportModal({
+      mountModal: (modalEl, canClose) => this.mountStudioModal(modalEl, canClose),
+      closeModal: () => this.closeActiveModal(),
+      activeConnection: conn,
+      activeConnectionId: connId,
+      targetTable: tableName,
+      targetSchema: schemaName,
+      targetColumns,
+      canStageInGrid,
+      updateStatus: (stateText, metricsText) => this.updateStatus(stateText, metricsText),
+      showQueryBanner: (kind, title, detail, opts) =>
+        this.showQueryBanner(kind, title, detail, opts),
+      createElapsedTimer: (onTick) => this.createElapsedTimer(onTick),
+      requestPlugin: <T = unknown>(
+        method: string,
+        payload?: Record<string, unknown>,
+        options?: { timeoutMs?: number }
+      ) => this.requestPlugin<T>(method, payload, options),
+      onStageRows: (records) => {
+        if (
+          !this.dataGrid ||
+          this.activeConnectionId !== connId ||
+          !this.isObjectActive(tableName, schemaName) ||
+          this.isShowingSqlResult ||
+          !this.currentCanEdit
+        ) {
+          return 0
+        }
+        return this.dataGrid.stageImportedRows(records)
+      },
+      onDirectImportComplete: async (doneConnId, doneTable, doneSchema, insertedCount, options) => {
+        if (this.activeConnectionId !== doneConnId) return
+        if (this.isObjectActive(doneTable, doneSchema) && !this.isShowingSqlResult) {
+          await this.loadTableData(doneConnId, doneTable, this.currentPage)
+        }
+        if (this.activeConnectionId !== doneConnId) return
+        if (!options?.partial) {
+          const qualified = doneSchema ? `${doneSchema}.${doneTable}` : doneTable
+          this.showQueryBanner(
+            'success',
+            `Imported ${insertedCount} Row${insertedCount === 1 ? '' : 's'}`,
+            `Inserted ${insertedCount} row${insertedCount === 1 ? '' : 's'} into "${qualified}".`
+          )
+          this.updateStatus(
+            `Imported ${insertedCount} row${insertedCount === 1 ? '' : 's'} into ${doneTable}`
+          )
+        }
       },
     })
   }
@@ -5624,6 +6146,40 @@ export class DatanoaStudioEditor {
     )
   }
 
+  private openSavedQueriesModal(): void {
+    const conn = this.getActiveConnection()
+    openStudioSavedQueriesModal({
+      mountModal: (modalEl, canClose) => this.mountStudioModal(modalEl, canClose),
+      closeModal: () => this.closeActiveModal(),
+      currentSql: this.sqlConsole?.getText() ?? '',
+      activeDialect: conn?.driver,
+      requestPlugin: <T = unknown>(
+        method: string,
+        payload?: Record<string, unknown>,
+        options?: { timeoutMs?: number }
+      ) => this.requestPlugin<T>(method, payload, options),
+      updateStatus: (stateText, metricsText) => this.updateStatus(stateText, metricsText),
+      onInsertSql: (sql, mode, title) => {
+        if (mode === 'replace') {
+          this.sqlConsole?.setText(sql)
+          this.consoleTabs.updateActiveSql(sql)
+        } else {
+          this.saveActiveConsoleTabState()
+          this.consoleTabs.addTab(sql, title)
+          this.loadActiveConsoleTab()
+          if (this.isShowingSqlResult) {
+            this.clearSqlResultViewForEmptyTab()
+          }
+        }
+        if (this.activeViewMode !== 'sql' && this.activeViewMode !== 'split') {
+          this.switchMode('sql')
+        }
+        this.saveStudioViewState(false)
+        this.sqlConsole?.focus()
+      },
+    })
+  }
+
   private openCommandPalette(): void {
     openStudioCommandPalette({
       mountModal: (modalEl, canClose) => this.mountStudioModal(modalEl, canClose),
@@ -5632,7 +6188,10 @@ export class DatanoaStudioEditor {
       connections: this.connections,
       activeConnection: this.getActiveConnection(),
       sidebarCollapsed: this.sidebarCollapsed,
-      selectSidebarObject: (obj) => this.selectSidebarObject(obj),
+      selectSidebarObject: (obj) => this.activateSidebarObject(obj),
+      openExportSchemaDdl: () => {
+        void this.exportFullSchemaDdl()
+      },
       selectConnection: (connId) => {
         this.handleConnectionChanged(connId)
         this.updateMetadataHeader('connectionId', connId)
@@ -5640,13 +6199,33 @@ export class DatanoaStudioEditor {
       openConnectionModal: (editProfile) => this.openConnectionModal(editProfile),
       formatSqlInConsole: () => this.formatSqlInConsole(),
       openCreateTableModal: () => this.openCreateTableModal(),
+      openImportDataModal: () => {
+        void this.openImportDataModal()
+      },
       setSidebarCollapsed: (collapsed, persist) =>
         this.setSidebarCollapsed(collapsed, persist),
       switchMode: (mode) => this.switchMode(mode),
       toggleQueryHistory: () => this.toggleQueryHistory(),
+      openSavedQueriesModal: () => this.openSavedQueriesModal(),
       handleRefreshAction: () => this.handleRefreshAction(),
       openShortcutsModal: () => this.openShortcutsModal(),
       openFeedbackModal: (initialKind) => this.openFeedbackModal(initialKind),
+    })
+  }
+
+  private openDriverManagerModal(onCloseReturn?: () => void): void {
+    openStudioDriverManagerModal({
+      mountModal: (modalEl, canClose) =>
+        this.mountStudioModal(modalEl, canClose, onCloseReturn),
+      closeModal: () => {
+        this.closeActiveModal()
+        onCloseReturn?.()
+      },
+      requestPlugin: <T = unknown>(
+        method: string,
+        payload?: Record<string, unknown>,
+        options?: { timeoutMs?: number }
+      ) => this.requestPlugin<T>(method, payload, options),
     })
   }
 
@@ -5700,6 +6279,7 @@ export class DatanoaStudioEditor {
   }
 
   public async handleAlterTable(action: AlterTableAction): Promise<void> {
+    if (this.isDestroyed) return
     if (!this.activeConnectionId) {
       this.updateStatus('Select a connection first')
       return
@@ -5760,6 +6340,7 @@ export class DatanoaStudioEditor {
     statements: string[],
     draft: TableStructureDraft
   ): Promise<void> {
+    if (this.isDestroyed) return
     if (!this.activeConnectionId) {
       const errMsg = 'Select a connection first'
       this.updateStatus(errMsg)
@@ -5847,9 +6428,10 @@ export class DatanoaStudioEditor {
     originalValue: unknown
     rowIndex: number
   }): Promise<{ ok: boolean; affectedRows?: number; updatedRecord?: Record<string, unknown> }> {
+    const editTarget = this.resolveEditableTargetTable()
     if (
       !this.activeConnectionId ||
-      !this.activeTable ||
+      !editTarget ||
       this.isActiveConnectionReadOnly() ||
       typeof window === 'undefined' ||
       !window.orca?.plugin?.request
@@ -5865,8 +6447,8 @@ export class DatanoaStudioEditor {
         updatedRecord?: Record<string, unknown>
       }>('data.updateCell', {
         connectionId: this.activeConnectionId,
-        table: this.activeTable,
-        ...(this.activeSchema ? { schema: this.activeSchema } : {}),
+        table: editTarget.table,
+        ...(editTarget.schema ? { schema: editTarget.schema } : {}),
         primaryKeys: params.primaryKeys,
         column: params.column,
         newValue: params.newValue,
@@ -5909,6 +6491,7 @@ export class DatanoaStudioEditor {
 
   public destroy(): void {
     this.flushStudioViewState()
+    this.isDestroyed = true
     this.cancelClientSearchDebounce()
     this.introspectToken++
     this.gridViewSeq++
@@ -5916,12 +6499,24 @@ export class DatanoaStudioEditor {
     this.schemaLoadToken++
     this.querySeq++
     this.connectionsSeq++
-    this.historySeq++
+    this.importModalOpenSeq++
+    this.queryHistoryDrawer.bumpSeq()
     this.dmlPreviewSeq++
     this.countRowsSeq++
+    this.activeConnectionId = null
     this.cancelledQueryIds.clear()
     this.inFlightTableDetails.clear()
     this.stopAllTimers()
+
+    if (this.scrollRestoreRafId !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(this.scrollRestoreRafId)
+      this.scrollRestoreRafId = null
+    }
+
+    this.txToolbar.rollbackOnUnload()
+    this.txToolbar.destroy()
+    this.valueInspector.destroy()
+    this.queryHistoryDrawer.destroy()
 
     if (this.splitResizeRafId !== null && typeof cancelAnimationFrame === 'function') {
       cancelAnimationFrame(this.splitResizeRafId)
@@ -5938,6 +6533,7 @@ export class DatanoaStudioEditor {
       document.body.style.userSelect = ''
     }
 
+    closeActiveStudioCollapsibleDropdown()
     this.closeSidebarContextMenu()
     this.closeTopbarPopover()
     this.closeColumnsPopover()
@@ -5979,8 +6575,10 @@ export function initializeEditor(): DatanoaStudioEditor | null {
   return new DatanoaStudioEditor()
 }
 
-// Bootstrap custom editor frame with orca.document session attachment
+// Bootstrap custom editor frame immediately (0ms warm-cache paint), then attach orca.document session
+const editor = initializeEditor()
 if (
+  editor &&
   typeof window !== 'undefined' &&
   (window as unknown as { orca?: { document?: { session: () => Promise<DocumentSessionLike> } } }).orca?.document
 ) {
@@ -5989,14 +6587,11 @@ if (
   ).orca.document
     .session()
     .then((session) => {
-      const editor = initializeEditor()
-      if (editor && session) {
+      if (session) {
         editor.attachDocumentSession(session)
       }
     })
     .catch(() => {
-      initializeEditor()
+      // Non-fatal if document session is unavailable
     })
-} else {
-  initializeEditor()
 }

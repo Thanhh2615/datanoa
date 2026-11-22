@@ -6,6 +6,7 @@ import type {
   TableDetails,
 } from './driver'
 import { SUPPORTED_DRIVERS } from './connection-uri'
+import { formatSqlBinaryLiteral } from './sql-lexer'
 import { quoteIdentForDialect, sanitizeFilterClause } from './sql-tools'
 
 const SUPPORTED_DRIVER_SET: ReadonlySet<string> = new Set(SUPPORTED_DRIVERS)
@@ -27,7 +28,7 @@ export function quoteQualifiedTable(
   const trimmedSchema = schema?.trim()
   const omitSchema =
     !trimmedSchema ||
-    ((dialect === 'sqlite' || dialect === 'libsql') && trimmedSchema.toLowerCase() === 'main')
+    ((dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1') && trimmedSchema.toLowerCase() === 'main')
 
   if (omitSchema) {
     return quoteIdentForDialect(table, dialect)
@@ -80,13 +81,13 @@ export function formatSqlValue(value: unknown, dialect: DriverType): string {
 
   if (value instanceof ArrayBuffer) {
     const hex = Array.from(new Uint8Array(value), (b) => b.toString(16).padStart(2, '0')).join('')
-    return `X'${hex}'`
+    return formatSqlBinaryLiteral(hex, dialect)
   }
 
   if (ArrayBuffer.isView(value)) {
     const view = new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
     const hex = Array.from(view, (b) => b.toString(16).padStart(2, '0')).join('')
-    return `X'${hex}'`
+    return formatSqlBinaryLiteral(hex, dialect)
   }
 
   if (typeof value === 'object') {
@@ -113,6 +114,7 @@ export interface BuildUpdateOptions {
   newValue: unknown
   primaryKeys: Record<string, unknown>
   originalValue?: unknown
+  originalColumnType?: string
 }
 
 export interface BuildUpdateResult {
@@ -120,8 +122,21 @@ export interface BuildUpdateResult {
   params: unknown[]
 }
 
-export function canBindOptimisticLockValue(val: unknown): boolean {
+const APPROXIMATE_FLOAT_TYPE_REGEX =
+  /\b(?:float|float4|float8|float32|float64|real|double(?:\s+precision)?|binary_float|binary_double)\b/i
+const NON_EQUALITY_JSON_TYPE_REGEX = /^json$/i
+
+export function canBindOptimisticLockValue(val: unknown, columnType?: string): boolean {
   if (val === undefined) return false
+  if (typeof columnType === 'string' && columnType.trim().length > 0) {
+    const normalizedType = columnType.trim()
+    if (
+      APPROXIMATE_FLOAT_TYPE_REGEX.test(normalizedType) ||
+      NON_EQUALITY_JSON_TYPE_REGEX.test(normalizedType)
+    ) {
+      return false
+    }
+  }
   if (val === null) return true
   if (typeof val === 'object') return false
   if (typeof val === 'string' && /^\[BLOB\s+\d+\s*B\]$/i.test(val.trim())) return false
@@ -129,7 +144,16 @@ export function canBindOptimisticLockValue(val: unknown): boolean {
 }
 
 export function buildUpdateSql(options: BuildUpdateOptions): BuildUpdateResult {
-  const { driver, table, schema, column, newValue, primaryKeys, originalValue } = options
+  const {
+    driver,
+    table,
+    schema,
+    column,
+    newValue,
+    primaryKeys,
+    originalValue,
+    originalColumnType,
+  } = options
 
   if (!table || typeof table !== 'string') {
     throw new Error('Table name is required for buildUpdateSql')
@@ -163,7 +187,7 @@ export function buildUpdateSql(options: BuildUpdateOptions): BuildUpdateResult {
     }
   }
 
-  if (canBindOptimisticLockValue(originalValue)) {
+  if (canBindOptimisticLockValue(originalValue, originalColumnType)) {
     if (originalValue === null) {
       whereClauses.push(`${quotedCol} IS NULL`)
     } else {
@@ -174,6 +198,45 @@ export function buildUpdateSql(options: BuildUpdateOptions): BuildUpdateResult {
 
   const sql = `UPDATE ${quotedTable} SET ${setClause} WHERE ${whereClauses.join(' AND ')}`
   return { sql, params }
+}
+
+export interface BuildSelectByPrimaryKeyOptions {
+  driver: DriverType
+  table: string
+  schema?: string
+  primaryKeys: Record<string, unknown>
+  editedColumn?: string
+  newValue?: unknown
+}
+
+export function buildSelectByPrimaryKeySql(
+  options: BuildSelectByPrimaryKeyOptions
+): { sql: string; params: unknown[] } | null {
+  const { driver, table, schema, primaryKeys, editedColumn, newValue } = options
+  const entries = Object.entries(primaryKeys || {})
+  if (entries.length === 0) return null
+
+  const whereParts: string[] = []
+  const params: unknown[] = []
+  let paramIdx = 1
+
+  for (const [pkCol, rawPkVal] of entries) {
+    const effectivePkVal =
+      editedColumn !== undefined && pkCol === editedColumn ? newValue : rawPkVal
+    const quotedPk = quoteIdentForDialect(pkCol, driver)
+    if (effectivePkVal === null || effectivePkVal === undefined) {
+      whereParts.push(`${quotedPk} IS NULL`)
+    } else {
+      whereParts.push(`${quotedPk} = ${makePlaceholder(driver, paramIdx++)}`)
+      params.push(effectivePkVal)
+    }
+  }
+
+  const quotedTable = quoteQualifiedTable(table, schema, driver)
+  return {
+    sql: `SELECT * FROM ${quotedTable} WHERE ${whereParts.join(' AND ')}`,
+    params,
+  }
 }
 
 export interface ParameterizedStatement {
@@ -279,8 +342,9 @@ export function buildRowUpdateStatement(options: {
   table: string
   schema?: string
   update: ApplyChangesUpdate
+  columnTypes?: Record<string, string>
 }): ParameterizedStatement | null {
-  const { driver, table, schema, update } = options
+  const { driver, table, schema, update, columnTypes } = options
   if (!table || typeof table !== 'string') {
     throw new Error('Table name is required for buildRowUpdateStatement')
   }
@@ -328,7 +392,7 @@ export function buildRowUpdateStatement(options: {
     for (const [col] of changeEntries) {
       if (!Object.prototype.hasOwnProperty.call(update.originalRow, col)) continue
       const origVal = update.originalRow[col]
-      if (!canBindOptimisticLockValue(origVal)) continue
+      if (!canBindOptimisticLockValue(origVal, columnTypes?.[col])) continue
       const quotedCol = quoteIdentForDialect(col, driver)
       if (origVal === null) {
         whereClauses.push(`${quotedCol} IS NULL`)
@@ -348,12 +412,84 @@ export function buildRowUpdateStatement(options: {
   }
 }
 
+export interface ChunkedInsertStatement {
+  sql: string
+  params: unknown[]
+  rowCount: number
+}
+
 export interface BatchStatementsResult {
   deletes: ParameterizedStatement[]
   updates: ParameterizedStatement[]
   inserts: ParameterizedStatement[]
+  chunkedInserts: ChunkedInsertStatement[]
   all: ParameterizedStatement[]
   previewStatements: string[]
+}
+
+const MAX_CHUNKED_INSERT_ROWS = 250
+const MAX_CHUNKED_INSERT_PARAMS = 4000
+
+export function buildChunkedInsertStatements(options: {
+  driver: DriverType
+  table: string
+  schema?: string
+  inserts: Record<string, unknown>[]
+}): ChunkedInsertStatement[] {
+  const { driver, table, schema, inserts } = options
+  if (inserts.length === 0) return []
+  const quotedTable = quoteQualifiedTable(table, schema, driver)
+  const out: ChunkedInsertStatement[] = []
+  let idx = 0
+
+  while (idx < inserts.length) {
+    const firstRow = inserts[idx]
+    const firstEntries = Object.entries(firstRow || {}).filter(([, val]) => val !== undefined)
+    if (firstEntries.length === 0) {
+      const single = buildInsertStatement({ driver, table, schema, row: firstRow })
+      out.push({ sql: single.sql, params: single.params, rowCount: 1 })
+      idx += 1
+      continue
+    }
+
+    const cols = firstEntries.map(([col]) => col)
+    const colSig = cols.join('\0')
+    const colsSql = cols.map((col) => quoteIdentForDialect(col, driver)).join(', ')
+    const maxRows = Math.max(
+      1,
+      Math.min(MAX_CHUNKED_INSERT_ROWS, Math.floor(MAX_CHUNKED_INSERT_PARAMS / cols.length))
+    )
+
+    const params: unknown[] = []
+    const tuplePlaceholders: string[] = []
+    let paramIdx = 1
+    let rowCount = 0
+
+    while (idx < inserts.length && rowCount < maxRows) {
+      const candidate = inserts[idx]
+      const candEntries = Object.entries(candidate || {}).filter(([, val]) => val !== undefined)
+      if (candEntries.length !== cols.length) break
+      const candSig = candEntries.map(([col]) => col).join('\0')
+      if (candSig !== colSig) break
+
+      const rowPh: string[] = []
+      for (const [, val] of candEntries) {
+        rowPh.push(makePlaceholder(driver, paramIdx++))
+        params.push(val)
+      }
+      tuplePlaceholders.push(`(${rowPh.join(', ')})`)
+      rowCount += 1
+      idx += 1
+    }
+
+    out.push({
+      sql: `INSERT INTO ${quotedTable} (${colsSql}) VALUES ${tuplePlaceholders.join(', ')}`,
+      params,
+      rowCount,
+    })
+  }
+
+  return out
 }
 
 /**
@@ -362,14 +498,14 @@ export interface BatchStatementsResult {
 export function buildBatchStatements(
   options: { driver: DriverType } & ApplyChangesParams
 ): BatchStatementsResult {
-  const { driver, table, schema, inserts = [], updates = [], deletes = [] } = options
+  const { driver, table, schema, inserts = [], updates = [], deletes = [], columnTypes } = options
 
   const deleteStmts = deletes.map((primaryKeys) =>
     buildDeleteStatement({ driver, table, schema, primaryKeys })
   )
   const updateStmts: ParameterizedStatement[] = []
   for (const update of updates) {
-    const built = buildRowUpdateStatement({ driver, table, schema, update })
+    const built = buildRowUpdateStatement({ driver, table, schema, update, columnTypes })
     if (built) {
       updateStmts.push(built)
     }
@@ -377,6 +513,7 @@ export function buildBatchStatements(
   const insertStmts = inserts.map((row) =>
     buildInsertStatement({ driver, table, schema, row })
   )
+  const chunkedInserts = buildChunkedInsertStatements({ driver, table, schema, inserts })
 
   const all = [...deleteStmts, ...updateStmts, ...insertStmts]
   const previewStatements = all.map((s) => s.previewSql)
@@ -385,6 +522,7 @@ export function buildBatchStatements(
     deletes: deleteStmts,
     updates: updateStmts,
     inserts: insertStmts,
+    chunkedInserts,
     all,
     previewStatements,
   }

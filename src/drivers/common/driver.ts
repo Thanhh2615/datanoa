@@ -1,26 +1,33 @@
+import type { DriverTlsOptions } from './tls-and-tunnel'
 import type {
   ConnectionProfile,
   DatabaseDriverType,
   DataChangesInput,
   SchemaObject,
+  SchemaObjectKind,
   ColumnInfo,
   IndexInfo,
   ForeignKeyInfo,
   TableDetails,
   QueryResult,
+  QueryResultSet,
   TableBrowseResult,
+  TransactionState,
 } from '../../protocol'
 
 export type {
   ConnectionProfile,
   DataChangesInput,
   SchemaObject,
+  SchemaObjectKind,
   ColumnInfo,
   IndexInfo,
   ForeignKeyInfo,
   TableDetails,
   QueryResult,
+  QueryResultSet,
   TableBrowseResult,
+  TransactionState,
 }
 
 export type DriverType = DatabaseDriverType
@@ -43,6 +50,7 @@ export interface UpdateCellParams {
   column: string
   newValue: unknown
   originalValue?: unknown
+  columnType?: string
 }
 
 export interface UpdateCellResult {
@@ -59,6 +67,7 @@ export interface ApplyChangesParams {
   inserts?: Record<string, unknown>[]
   updates?: ApplyChangesUpdate[]
   deletes?: Record<string, unknown>[]
+  columnTypes?: Record<string, string>
 }
 
 export interface ApplyChangesResult {
@@ -100,8 +109,17 @@ export interface IDatabaseSession {
   /** Closes session and underlying resources (connections/threads) */
   close(): Promise<void>
 
-  /** Lists tables and views */
+  /** Lists database objects (tables, views, and other supported kinds) */
   listObjects(schema?: string): Promise<SchemaObject[]>
+
+  /** Lists available schemas/databases and the default one */
+  listSchemas?(): Promise<{ schemas: string[]; defaultSchema: string }>
+
+  /** Returns the DDL for a single database object */
+  getObjectDdl?(name: string, kind: SchemaObjectKind, schema?: string): Promise<string>
+
+  /** Exports the full DDL for a schema, ordered by dependency */
+  exportSchemaDdl?(schema?: string): Promise<{ ddl: string; objectCount: number }>
 
   /** Inspects detailed schema of a table or view */
   getTableDetails(table: string, schema?: string): Promise<TableDetails>
@@ -126,13 +144,78 @@ export interface IDatabaseSession {
 
   /** Cancels an actively running query by queryId */
   cancelQuery(queryId: string): Promise<{ ok: boolean }>
+
+  /** Returns current transaction state */
+  getTransactionState(): TransactionState
+
+  /** Begins an explicit manual transaction */
+  beginTransaction(): Promise<TransactionState>
+
+  /** Commits the current active manual transaction */
+  commitTransaction(): Promise<TransactionState>
+
+  /** Rolls back the current active manual transaction */
+  rollbackTransaction(): Promise<TransactionState>
+
+  /** Toggles auto-commit mode */
+  setAutoCommit(enabled: boolean): Promise<TransactionState>
 }
+
+export type { DriverTlsOptions }
 
 export interface IDatabaseDriver {
   readonly type: DriverType
-  createSession(profile: ConnectionProfile, secret?: string): Promise<IDatabaseSession>
+  createSession(
+    profile: ConnectionProfile,
+    secret?: string,
+    extraSecrets?: DriverTlsOptions
+  ): Promise<IDatabaseSession>
   testConnection(
     profile: ConnectionProfile,
-    secret?: string
+    secret?: string,
+    extraSecrets?: DriverTlsOptions
   ): Promise<{ ok: boolean; message?: string }>
+}
+
+export function buildCombinedAbortSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  if (!signal) return timeoutSignal
+  if (typeof AbortSignal.any === 'function') {
+    return AbortSignal.any([signal, timeoutSignal])
+  }
+  return signal
+}
+
+export async function runDriverConnectionTest(
+  createSession: () => Promise<IDatabaseSession>,
+  formatError: (err: unknown) => string
+): Promise<{ ok: boolean; message?: string }> {
+  let session: IDatabaseSession | null = null
+  try {
+    session = await createSession()
+    return await session.test()
+  } catch (err: unknown) {
+    return { ok: false, message: formatError(err) }
+  } finally {
+    if (session) {
+      await session.close().catch(() => {})
+    }
+  }
+}
+
+export function createUnsupportedTransactionState(reason: string): TransactionState {
+  return {
+    active: false,
+    autoCommit: true,
+    statementCount: 0,
+    supported: false,
+    reason,
+  }
+}
+
+export function createUnsupportedTransactionError(
+  driver: DriverType,
+  reason: string
+): DatabaseDriverError {
+  return new DatabaseDriverError(reason, 'UNSUPPORTED_TRANSACTION', driver)
 }

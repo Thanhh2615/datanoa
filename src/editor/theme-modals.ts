@@ -1,6 +1,6 @@
 // src/editor/theme-modals.ts
 // Fullscreen Studio Schema Inspector, Migration Confirm, Command Palette, Shortcuts,
-// Create/Danger Table, 8-Engine Connection Manager & Feedback Modals CSS
+// Create/Danger Table, 9-Engine Connection Manager, Driver Manager & Feedback Modals CSS
 
 export const EDITOR_MODALS_STYLE = `
   /* Schema Inspector View + Pinned Header + Scrollable Body */
@@ -73,21 +73,58 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-badge-pk {
-    background: rgba(56, 189, 248, 0.16);
+    background: color-mix(in srgb, var(--info) 16%, transparent);
     color: var(--info);
-    border: 1px solid rgba(56, 189, 248, 0.45);
+    border: 1px solid color-mix(in srgb, var(--info) 45%, transparent);
   }
 
   .datanoa-badge-unique {
-    background: rgba(74, 222, 128, 0.14);
+    background: color-mix(in srgb, var(--ok) 14%, transparent);
     color: var(--ok);
-    border: 1px solid rgba(74, 222, 128, 0.45);
+    border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent);
   }
 
   .datanoa-badge-fk {
-    background: rgba(251, 191, 36, 0.14);
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
     color: var(--warn);
-    border: 1px solid rgba(251, 191, 36, 0.45);
+    border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  }
+
+  .datanoa-badge-danger {
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
+    color: var(--danger);
+    border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  }
+
+  html.light .datanoa-badge-danger,
+  body.light .datanoa-badge-danger {
+    background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  }
+
+  .datanoa-object-schema-badge,
+  .datanoa-object-detail-pill {
+    background: var(--card);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    font-family: var(--mono-font);
+    font-size: 11px;
+  }
+
+  .datanoa-object-detail-pill {
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .datanoa-readonly-object-ddl-card {
+    margin: 0;
+  }
+
+  .datanoa-readonly-object-ddl-card .datanoa-ddl-pre {
+    max-height: none;
   }
 
   .datanoa-section-title {
@@ -321,6 +358,7 @@ export const EDITOR_MODALS_STYLE = `
   .datanoa-struct-cell-select {
     height: 27px;
     width: 100%;
+    max-width: 100%;
     background: transparent;
     color: var(--text);
     border: 1px solid transparent;
@@ -328,6 +366,9 @@ export const EDITOR_MODALS_STYLE = `
     padding: 0 8px;
     font-family: var(--mono-font);
     font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     transition: border-color 120ms ease, background 120ms ease;
   }
 
@@ -433,7 +474,8 @@ export const EDITOR_MODALS_STYLE = `
     padding: 16px;
   }
 
-  html.light .datanoa-modal-backdrop {
+  html.light .datanoa-modal-backdrop,
+  body.light .datanoa-modal-backdrop {
     background: rgba(15, 23, 42, 0.42);
   }
 
@@ -522,14 +564,9 @@ export const EDITOR_MODALS_STYLE = `
 
   .datanoa-btn-danger-solid {
     background: var(--danger);
-    color: #000000;
+    color: var(--primary-fg);
     border-color: var(--danger);
     font-weight: 600;
-  }
-
-  html.light .datanoa-btn-danger-solid,
-  body.light .datanoa-btn-danger-solid {
-    color: #ffffff;
   }
 
   .datanoa-btn-danger-solid:hover:not(:disabled) {
@@ -731,7 +768,8 @@ export const EDITOR_MODALS_STYLE = `
     flex: 1 1 auto;
     max-height: 340px;
     overflow-y: auto;
-    padding: 4px;
+    padding: 4px 4px 8px 4px;
+    box-sizing: border-box;
     display: flex;
     flex-direction: column;
     gap: 2px;
@@ -741,6 +779,7 @@ export const EDITOR_MODALS_STYLE = `
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-shrink: 0;
     gap: 10px;
     width: 100%;
     padding: 6px 10px;
@@ -755,7 +794,7 @@ export const EDITOR_MODALS_STYLE = `
 
   .datanoa-cmd-palette-item:hover,
   .datanoa-cmd-palette-item.active {
-    background: rgba(56, 189, 248, 0.14);
+    background: color-mix(in srgb, var(--info) 14%, transparent);
     color: var(--info);
   }
 
@@ -786,6 +825,40 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   /* Create Table Modal & Danger Confirmation Modal */
+  .datanoa-bind-params-modal {
+    width: min(680px, 94vw);
+    max-height: 88vh;
+  }
+
+  .datanoa-bind-params-modal .datanoa-matrix-table td {
+    vertical-align: middle;
+  }
+
+  .datanoa-bind-params-modal .datanoa-modal-sql {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--input-bg);
+    color: var(--text);
+    font-family: var(--mono-font);
+    font-size: 11.5px;
+    padding: 8px 10px;
+  }
+
+  .datanoa-bind-params-modal .datanoa-modal-box.error {
+    border: 1px solid var(--danger);
+    border-radius: var(--radius);
+    background: var(--card);
+    color: var(--danger);
+    padding: 6px 9px;
+    margin-bottom: 8px;
+    font-size: 11.5px;
+  }
+
+  html.light .datanoa-bind-params-modal .datanoa-modal-sql,
+  body.light .datanoa-bind-params-modal .datanoa-modal-sql {
+    background: var(--surface);
+  }
+
   .datanoa-create-table-modal {
     width: 100%;
     max-width: 720px;
@@ -797,6 +870,12 @@ export const EDITOR_MODALS_STYLE = `
     background: var(--card);
     box-shadow: var(--menu-shadow);
     overflow: hidden;
+  }
+
+  .datanoa-create-table-modal.datanoa-bind-params-modal {
+    width: min(680px, 94vw);
+    max-width: min(680px, 94vw);
+    max-height: 88vh;
   }
 
   .datanoa-danger-modal {
@@ -847,6 +926,7 @@ export const EDITOR_MODALS_STYLE = `
     flex: 1 1 auto;
     min-width: 0;
     width: 100%;
+    max-width: 100%;
     height: 26px;
     padding: 0 8px;
     border-radius: 4px;
@@ -856,6 +936,9 @@ export const EDITOR_MODALS_STYLE = `
     font: inherit;
     font-size: 12px;
     box-sizing: border-box;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .datanoa-conn-input.is-mono {
@@ -889,16 +972,15 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-conn-section-label {
-    font-size: 11px;
+    font-size: 11.5px;
     font-weight: 600;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
+    letter-spacing: 0.01em;
     color: var(--muted);
   }
 
   .datanoa-engine-grid {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 6px;
   }
 
@@ -955,6 +1037,90 @@ export const EDITOR_MODALS_STYLE = `
 
   .datanoa-conn-field > label {
     font-size: 11px;
+    color: var(--muted);
+  }
+
+  .datanoa-conn-collapsible {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    overflow: hidden;
+  }
+
+  .datanoa-conn-collapsible-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    min-height: 30px;
+    padding: 6px 10px;
+    border: 0;
+    border-bottom: 1px solid transparent;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .datanoa-conn-collapsible-head:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--info) 8%, transparent);
+  }
+
+  .datanoa-conn-collapsible-head:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  .datanoa-conn-collapsible.is-expanded .datanoa-conn-collapsible-head {
+    border-bottom-color: var(--border);
+  }
+
+  .datanoa-conn-chevron {
+    display: inline-block;
+    width: 10px;
+    font-size: 10px;
+    color: var(--muted);
+    transition: transform 0.12s ease;
+  }
+
+  .datanoa-conn-collapsible.is-expanded .datanoa-conn-chevron {
+    transform: rotate(90deg);
+  }
+
+  .datanoa-conn-collapsible-title {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .datanoa-conn-collapsible-pill {
+    flex: 0 0 auto;
+    padding: 1px 7px;
+    border: 1px solid var(--info);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--info) 14%, transparent);
+    color: var(--info);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .datanoa-conn-collapsible-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .datanoa-conn-hint {
+    grid-column: 1 / -1;
+    font-size: 11px;
+    line-height: 1.4;
     color: var(--muted);
   }
 
@@ -1148,6 +1314,492 @@ export const EDITOR_MODALS_STYLE = `
     height: 19px;
     padding: 0 7px;
     font-size: 11px;
+  }
+
+  /* Import Data (CSV / TSV / JSON / NDJSON) Modal */
+  .datanoa-import-modal {
+    width: min(860px, 95vw);
+    max-height: calc(100vh - 44px);
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    background: var(--card);
+    box-shadow: var(--menu-shadow);
+    overflow: hidden;
+  }
+
+  .datanoa-import-dropzone {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 10px 12px;
+    border: 1px dashed var(--border-strong);
+    border-radius: var(--radius);
+    background: var(--surface);
+    transition: border-color 120ms ease, background 120ms ease;
+  }
+
+  .datanoa-import-dropzone.dragover {
+    border-color: var(--info);
+    background: color-mix(in srgb, var(--info) 12%, var(--surface));
+  }
+
+  .datanoa-import-dropzone-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1 1 240px;
+  }
+
+  .datanoa-import-dropzone-title {
+    font-weight: 600;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .datanoa-import-dropzone-sub {
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .datanoa-import-options-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+
+  .datanoa-import-flags-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    grid-column: 1 / -1;
+    padding-top: 2px;
+  }
+
+  .datanoa-import-section-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .datanoa-import-mapping-wrap {
+    max-height: 210px;
+    overflow: auto;
+    margin-bottom: 0;
+  }
+
+  .datanoa-import-preview-wrap {
+    max-height: 175px;
+    overflow: auto;
+    margin-bottom: 0;
+  }
+
+  .datanoa-import-sample-cell {
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--muted);
+    font-family: var(--mono-font);
+    font-size: 11.5px;
+  }
+
+  .datanoa-import-mode-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+
+  .datanoa-import-mode-option {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  .datanoa-import-mode-option.disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+  }
+
+  .datanoa-import-actions {
+    justify-content: space-between;
+  }
+
+  .datanoa-import-summary {
+    font-size: 11.5px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  @media (max-width: 720px) {
+    .datanoa-import-options-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+
+  /* Driver Manager Modal (Built-in + BYOD Local Paths) */
+  .datanoa-driver-mgr-modal {
+    width: min(720px, 94vw);
+    max-height: 88vh;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    background: var(--card);
+    box-shadow: var(--menu-shadow);
+    overflow: hidden;
+  }
+
+  .datanoa-driver-mgr-modal .datanoa-modal-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    gap: 10px;
+  }
+
+  .datanoa-driver-mgr-builtin-list,
+  .datanoa-driver-mgr-byod-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .datanoa-driver-mgr-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+
+  .datanoa-driver-mgr-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
+  }
+
+  .datanoa-driver-mgr-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .datanoa-driver-mgr-name {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .datanoa-driver-mgr-meta {
+    font-size: 11.5px;
+    color: var(--muted);
+    overflow-wrap: anywhere;
+    white-space: normal;
+    max-width: 100%;
+  }
+
+  .datanoa-driver-mgr-badges,
+  .datanoa-driver-mgr-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .datanoa-driver-mgr-byod {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 9px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+
+  .datanoa-driver-mgr-byod-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .datanoa-driver-mgr-pill {
+    font-size: 10.5px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--border-strong);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  .datanoa-driver-mgr-pill.is-verified {
+    color: var(--ok);
+    border-color: var(--ok);
+    background: color-mix(in srgb, var(--ok) 12%, var(--bg));
+  }
+
+  .datanoa-driver-mgr-pill.is-error {
+    color: var(--danger);
+    border-color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 12%, var(--bg));
+  }
+
+  .datanoa-driver-mgr-badges .datanoa-badge {
+    border: 1px solid var(--border-strong);
+    background: var(--card);
+    color: var(--muted);
+  }
+
+  .datanoa-driver-mgr-hash {
+    font-family: var(--mono-font);
+    font-size: 11px;
+    color: var(--muted);
+    user-select: text;
+  }
+
+  .datanoa-driver-mgr-guide {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    padding: 8px 10px;
+  }
+
+  .datanoa-driver-mgr-guide-summary {
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--info);
+    user-select: none;
+  }
+
+  .datanoa-driver-mgr-guide-body {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .datanoa-driver-mgr-guide-steps {
+    margin: 0;
+    padding-left: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11.5px;
+    color: var(--text);
+    line-height: 1.45;
+  }
+
+  html.light .datanoa-driver-mgr-modal,
+  body.light .datanoa-driver-mgr-modal {
+    background: var(--card);
+    border-color: var(--border-strong);
+  }
+
+  html.light .datanoa-driver-mgr-row,
+  body.light .datanoa-driver-mgr-row,
+  html.light .datanoa-driver-mgr-byod,
+  body.light .datanoa-driver-mgr-byod {
+    background: var(--surface);
+    border-color: var(--border);
+  }
+
+  html.light .datanoa-driver-mgr-pill:not(.is-verified):not(.is-error),
+  body.light .datanoa-driver-mgr-pill:not(.is-verified):not(.is-error) {
+    color: var(--muted);
+    border-color: var(--border-strong);
+  }
+
+  /* Saved Queries / SQL Snippets Library Modal */
+  .datanoa-saved-queries-modal {
+    width: min(860px, 96vw);
+    max-width: 860px;
+  }
+
+  .datanoa-saved-queries-modal .datanoa-modal-body {
+    gap: 10px;
+  }
+
+  .datanoa-saved-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+  }
+
+  .datanoa-saved-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .datanoa-saved-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+  }
+
+  .datanoa-saved-form .datanoa-filter-input,
+  .datanoa-saved-filter,
+  .datanoa-create-table-modal .datanoa-filter-input,
+  .datanoa-danger-modal .datanoa-filter-input {
+    width: 100%;
+    flex: 0 0 auto;
+    height: 28px;
+    box-sizing: border-box;
+  }
+
+  .datanoa-saved-sql-input {
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .datanoa-saved-sql-input {
+    min-height: 88px;
+    padding: 8px;
+    resize: vertical;
+    border: 1px solid var(--input-border);
+    border-radius: 4px;
+    background: var(--input-bg);
+    color: var(--text);
+    font-family: var(--mono-font);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  .datanoa-saved-form-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .datanoa-saved-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+
+  .datanoa-saved-item {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg);
+  }
+
+  .datanoa-saved-item.is-editing {
+    border-color: var(--warn);
+    box-shadow: inset 0 0 0 1px var(--warn);
+  }
+
+  .datanoa-saved-item-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .datanoa-saved-item-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .datanoa-saved-tag {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--info);
+    background: color-mix(in srgb, var(--info) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--info) 40%, transparent);
+  }
+
+  .datanoa-saved-preview {
+    font-family: var(--mono-font);
+    font-size: 11px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .datanoa-saved-item-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .datanoa-saved-notice {
+    padding: 7px 10px;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 12px;
+  }
+
+  .datanoa-saved-notice.error {
+    border-color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 10%, var(--bg));
+    color: var(--danger);
+  }
+
+  .datanoa-saved-empty {
+    padding: 14px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  html.light .datanoa-saved-form,
+  body.light .datanoa-saved-form,
+  html.light .datanoa-saved-item,
+  body.light .datanoa-saved-item {
+    background: var(--surface);
+    border-color: var(--border-strong);
+  }
+
+  html.light .datanoa-saved-notice:not(.error),
+  body.light .datanoa-saved-notice:not(.error) {
+    background: var(--surface);
   }
 
   @media (prefers-reduced-motion: reduce) {

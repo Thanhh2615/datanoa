@@ -79,7 +79,7 @@ const IGNORED_SCAN_DIRS_LOWER = new Set(
 
 export const SQLITE_FILE_EXTENSIONS = new Set(['.db', '.sqlite', '.sqlite3'])
 
-function normalizePathForCompare(rawPath: string): string {
+export function normalizePathForCompare(rawPath: string): string {
   const cleaned = path.resolve(rawPath).replace(/[\\/]+$/, '')
   if (process.platform === 'win32') {
     return cleaned.toLowerCase()
@@ -338,7 +338,7 @@ export async function scanDirectoryForSqliteFiles(
         const absPath = path.resolve(current.dir, entry.name)
         const rawStem = path.basename(entry.name, matchedExt)
         const baseName =
-          rawStem && rawStem !== '.'
+          rawStem && rawStem !== '.' && !rawStem.startsWith('.')
             ? rawStem
             : `${path.basename(current.dir)}/${entry.name}`
         const cleanName = `${baseName} (Workspace)`
@@ -510,6 +510,8 @@ const KNOWN_DB_ENV_KEYS = new Set([
   'TURSO_URL',
   'LIBSQL_URL',
   'LIBSQL_DATABASE_URL',
+  'D1_DATABASE_URL',
+  'CLOUDFLARE_D1_URL',
   'SQLITE_URL',
 ])
 
@@ -525,6 +527,9 @@ const EXPLICIT_DB_SCHEMES = new Set([
   'clickhouse',
   'clickhouses',
   'libsql',
+  'd1',
+  'd1+http',
+  'd1+https',
   'sqlite',
   'file',
 ])

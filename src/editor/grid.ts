@@ -5,16 +5,12 @@
 import type {
   TableBrowseResult,
   QueryResult,
-  ColumnInfo,
   ForeignKeyInfo,
   DatabaseDriverType,
 } from '../protocol.js'
 import {
   formatDataExport,
-  formatSqlInList,
-  formatCellMatrixExport,
   buildQuickFilterPredicate,
-  formatSqlLiteral,
   type ExportFormat,
 } from '../drivers/common/sql-tools.js'
 import {
@@ -23,6 +19,7 @@ import {
   type CellCoord,
   type SelectionSummary,
 } from './grid-selection.js'
+import type { ColumnHeaderFilterOp } from './sql-column-filter.js'
 import {
   ROW_HEIGHT_PX,
   coerceCellInputValue,
@@ -37,13 +34,50 @@ import {
   cloneRowData as cloneRow,
   isNativeDomElement,
   rowToPlainRecord,
-  stringifyFilterValue,
   previewMenuValue,
   parseOptionalInt,
   type FormattedCell,
   type CellEditGate,
   type GridModel,
 } from './grid-formatters.js'
+import {
+  isEditableInputTarget,
+  findClosestTableCell,
+  findClosestFkBadge,
+  createSortArrowSvg,
+  createColSelectSvg,
+  createPinSvg,
+  createFkJumpSvg,
+  createColFilterSvg,
+} from './grid-icons.js'
+import {
+  computeInitialColumnWidthsForGrid,
+  computeFilteredRowIndices,
+  computeGridFindMatches,
+  compareGridCellValues,
+  buildGridSelectionSnapshot,
+  exportGridSelectionMatrix,
+  planGridPaste,
+  createClonedRowRecord,
+  buildGridChangesPayload,
+  countGridStagedChanges,
+  type CellStatus,
+  type SelectionExportFormat,
+  type StagedRowUpdate,
+  type GridChangesPayload,
+  type SelectedCellInfo,
+  type InternalRowState,
+  type ClientColumnFilter,
+  type ClipboardCopySnapshot,
+  type PasteColumnSpec,
+} from './grid-data-ops.js'
+import {
+  buildGridCellContextMenu,
+  buildGridCanvasContextMenu,
+  buildGridHeaderContextMenu,
+  buildGridBulkFillPopover,
+  buildGridColumnFilterPopover,
+} from './grid-menus.js'
 
 export {
   ROW_HEIGHT_PX,
@@ -60,56 +94,11 @@ export {
   type FormattedCell,
   type CellEditGate,
   type GridModel,
-}
-
-export type CellStatus = 'idle' | 'saving' | 'clean' | 'error'
-
-export type SelectionExportFormat =
-  | 'tsv'
-  | 'tsv-headers'
-  | 'csv'
-  | 'json'
-  | 'sql-in'
-  | 'sql-insert'
-
-export interface StagedRowUpdate {
-  primaryKeys: Record<string, unknown>
-  changes: Record<string, unknown>
-  originalRow?: Record<string, unknown>
-}
-
-export interface GridChangesPayload {
-  inserts: Record<string, unknown>[]
-  updates: StagedRowUpdate[]
-  deletes: Record<string, unknown>[]
-}
-
-export interface SelectedCellInfo {
-  rowIndex: number
-  colIndex: number
-  columnName: string
-  value: unknown
-  columnType?: string
-  isEditable: boolean
-  isInserted: boolean
-  isDeleted: boolean
-  isNullable?: boolean
-  isPrimaryKey?: boolean
-  isGenerated?: boolean
-}
-
-interface InternalRowState {
-  kind: 'existing' | 'inserted'
-  origin?: 'blank' | 'clone' | 'paste'
-  deleted: boolean
-  original: Record<string, unknown> | unknown[]
-  dirtyCols: Map<string, unknown>
-}
-
-interface ClientColumnFilter {
-  column: string
-  value: unknown
-  op: 'eq' | 'neq' | 'is-null' | 'is-not-null'
+  type CellStatus,
+  type SelectionExportFormat,
+  type StagedRowUpdate,
+  type GridChangesPayload,
+  type SelectedCellInfo,
 }
 
 interface DragSelectionState {
@@ -142,119 +131,6 @@ interface RenderedWindowSnapshot {
   colSpan: number
 }
 
-function isEditableInputTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false
-  const tag = target.tagName.toUpperCase()
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
-  return target.isContentEditable === true
-}
-
-function findClosestTableCell(target: EventTarget | null): HTMLTableCellElement | null {
-  if (!(target instanceof Node)) return null
-  let cur: Node | null = target
-  while (cur) {
-    if (cur instanceof HTMLTableCellElement) {
-      return cur
-    }
-    cur = cur.parentNode
-  }
-  return null
-}
-
-function findClosestFkBadge(target: EventTarget | null): HTMLButtonElement | null {
-  if (!(target instanceof Node)) return null
-  let cur: Node | null = target
-  while (cur) {
-    if (cur instanceof HTMLButtonElement && cur.classList.contains('datanoa-fk-badge')) {
-      return cur
-    }
-    cur = cur.parentNode
-  }
-  return null
-}
-
-function createSvgEl(tag: string, attrs: Record<string, string>): Element {
-  const el =
-    typeof document.createElementNS === 'function'
-      ? document.createElementNS('http://www.w3.org/2000/svg', tag)
-      : document.createElement(tag)
-  for (const [key, val] of Object.entries(attrs)) {
-    el.setAttribute(key, val)
-  }
-  return el
-}
-
-function createSortArrowSvg(direction: 'ASC' | 'DESC'): Element {
-  const svg = createSvgEl('svg', {
-    width: '11',
-    height: '11',
-    viewBox: '0 0 12 12',
-    fill: 'none',
-    stroke: 'currentColor',
-    'stroke-width': '1.6',
-    'stroke-linecap': 'round',
-    'stroke-linejoin': 'round',
-    'aria-hidden': 'true',
-  })
-  svg.appendChild(createSvgEl('path', { d: 'M6 9.5V2.5' }))
-  svg.appendChild(
-    createSvgEl('path', {
-      d: direction === 'ASC' ? 'M2.75 5.75L6 2.5L9.25 5.75' : 'M2.75 6.25L6 9.5L9.25 6.25',
-    })
-  )
-  return svg
-}
-
-function createColSelectSvg(): Element {
-  const svg = createSvgEl('svg', {
-    width: '10',
-    height: '10',
-    viewBox: '0 0 12 12',
-    fill: 'none',
-    stroke: 'currentColor',
-    'stroke-width': '1.5',
-    'stroke-linecap': 'round',
-    'stroke-linejoin': 'round',
-    'aria-hidden': 'true',
-  })
-  svg.appendChild(createSvgEl('path', { d: 'M3 4.5L6 7.5L9 4.5' }))
-  return svg
-}
-
-function createPinSvg(): Element {
-  const svg = createSvgEl('svg', {
-    width: '10',
-    height: '10',
-    viewBox: '0 0 12 12',
-    fill: 'none',
-    stroke: 'currentColor',
-    'stroke-width': '1.4',
-    'stroke-linecap': 'round',
-    'stroke-linejoin': 'round',
-    'aria-hidden': 'true',
-  })
-  svg.appendChild(createSvgEl('path', { d: 'M4 2h4l-.5 3.5L9 7H3l1.5-1.5L4 2z' }))
-  svg.appendChild(createSvgEl('path', { d: 'M6 7v3.5' }))
-  return svg
-}
-
-function createFkJumpSvg(): Element {
-  const svg = createSvgEl('svg', {
-    width: '10',
-    height: '10',
-    viewBox: '0 0 12 12',
-    fill: 'none',
-    stroke: 'currentColor',
-    'stroke-width': '1.5',
-    'stroke-linecap': 'round',
-    'stroke-linejoin': 'round',
-    'aria-hidden': 'true',
-  })
-  svg.appendChild(createSvgEl('path', { d: 'M3.5 8.5L8.5 3.5' }))
-  svg.appendChild(createSvgEl('path', { d: 'M4.5 3.5h4v4' }))
-  return svg
-}
-
 const DEFAULT_ROWNUM_WIDTH_PX = 44
 
 export interface VirtualDataGridOptions {
@@ -277,6 +153,12 @@ export interface VirtualDataGridOptions {
   onNotify?: (message: string) => void
   onSelectionChange?: (summary: SelectionSummary) => void
   onQuickFilter?: (predicateSql: string, mode: 'replace' | 'and') => void
+  onColumnHeaderFilter?: (
+    column: string,
+    value: string,
+    op: ColumnHeaderFilterOp,
+    mode: 'query' | 'client' | 'clear'
+  ) => void
   onNavigateForeignKey?: (refTable: string, refColumn: string, value: unknown) => void
   onColumnConfigChange?: (config: { hidden: string[]; pinned: string[] }) => void
   onFindStateChange?: (state: { total: number; activeIndex: number }) => void
@@ -294,6 +176,7 @@ export class VirtualDataGrid {
   private tbodyEl: HTMLTableSectionElement | null = null
   private contextMenuEl: HTMLDivElement | null = null
   private bulkFillPopoverEl: HTMLDivElement | null = null
+  private colFilterPopoverEl: HTMLDivElement | null = null
 
   private model: GridModel | null = null
   private rowStates: InternalRowState[] = []
@@ -362,12 +245,15 @@ export class VirtualDataGrid {
   private wheelListener: ((e: WheelEvent) => void) | null = null
   private keyDownListener: ((e: KeyboardEvent) => void) | null = null
   private pasteListener: ((e: ClipboardEvent) => void) | null = null
+  private tableContainerMouseDownListener: ((e: MouseEvent) => void) | null = null
+  private tableContainerContextMenuListener: ((e: MouseEvent) => void) | null = null
   private tbodyMouseDownListener: ((e: MouseEvent) => void) | null = null
   private tbodyClickListener: ((e: MouseEvent) => void) | null = null
   private tbodyDblClickListener: ((e: MouseEvent) => void) | null = null
   private tbodyContextMenuListener: ((e: MouseEvent) => void) | null = null
   private windowDocClickListener: ((e: MouseEvent) => void) | null = null
   private windowKeyDownListener: ((e: KeyboardEvent) => void) | null = null
+  private windowPasteListener: ((e: ClipboardEvent) => void) | null = null
   private resizeListeners: {
     move: (e: MouseEvent) => void
     up: () => void
@@ -380,6 +266,7 @@ export class VirtualDataGrid {
   private suppressSortClickUntil = 0
   private isLoading = false
   private lastCopiedDelimitedText = ''
+  private lastCopiedSnapshot: ClipboardCopySnapshot | null = null
 
   private onSort?: (column: string, direction: 'ASC' | 'DESC') => void
   private onUpdateCell?: VirtualDataGridOptions['onUpdateCell']
@@ -389,6 +276,7 @@ export class VirtualDataGrid {
   private onNotify?: VirtualDataGridOptions['onNotify']
   private onSelectionChange?: VirtualDataGridOptions['onSelectionChange']
   private onQuickFilter?: VirtualDataGridOptions['onQuickFilter']
+  private onColumnHeaderFilter?: VirtualDataGridOptions['onColumnHeaderFilter']
   private onNavigateForeignKey?: VirtualDataGridOptions['onNavigateForeignKey']
   private onColumnConfigChange?: VirtualDataGridOptions['onColumnConfigChange']
   private onFindStateChange?: VirtualDataGridOptions['onFindStateChange']
@@ -417,6 +305,7 @@ export class VirtualDataGrid {
     this.onNotify = options.onNotify
     this.onSelectionChange = options.onSelectionChange
     this.onQuickFilter = options.onQuickFilter
+    this.onColumnHeaderFilter = options.onColumnHeaderFilter
     this.onNavigateForeignKey = options.onNavigateForeignKey
     this.onColumnConfigChange = options.onColumnConfigChange
     this.onFindStateChange = options.onFindStateChange
@@ -509,6 +398,55 @@ export class VirtualDataGrid {
     }
     this.tableContainerEl.addEventListener('paste', this.pasteListener)
 
+    this.tableContainerMouseDownListener = (e: MouseEvent) => {
+      if (e.button !== 0 || this.isLoading || !this.model) return
+      if (isEditableInputTarget(e.target)) return
+      const containerEl = this.tableContainerEl
+      if (containerEl && e.target === containerEl) {
+        const rect = containerEl.getBoundingClientRect?.()
+        if (
+          rect &&
+          rect.width > 0 &&
+          rect.height > 0 &&
+          ((containerEl.clientWidth > 0 && e.clientX >= rect.left + containerEl.clientWidth) ||
+            (containerEl.clientHeight > 0 && e.clientY >= rect.top + containerEl.clientHeight))
+        ) {
+          return
+        }
+      }
+      if (this.theadEl && e.target instanceof Node && this.theadEl.contains(e.target)) return
+      const td = findClosestTableCell(e.target)
+      const isDataOrRowNumCell = Boolean(
+        td &&
+          this.tbodyEl?.contains(td) &&
+          (td.classList.contains('datanoa-td-rownum') ||
+            (td.dataset.rowIndex !== undefined && td.dataset.colIndex !== undefined))
+      )
+      if (!isDataOrRowNumCell) {
+        this.clearSelection()
+        this.focusGridContainer()
+      }
+    }
+    this.tableContainerEl.addEventListener('mousedown', this.tableContainerMouseDownListener)
+
+    this.tableContainerContextMenuListener = (e: MouseEvent) => {
+      if (this.isLoading || !this.model) return
+      if (this.theadEl && e.target instanceof Node && this.theadEl.contains(e.target)) return
+      const td = findClosestTableCell(e.target)
+      const isDataOrRowNumCell = Boolean(
+        td &&
+          this.tbodyEl?.contains(td) &&
+          (td.classList.contains('datanoa-td-rownum') ||
+            (td.dataset.rowIndex !== undefined && td.dataset.colIndex !== undefined))
+      )
+      if (isDataOrRowNumCell) return
+      e.preventDefault()
+      this.clearSelection()
+      this.focusGridContainer()
+      this.openCanvasContextMenu(e.clientX, e.clientY)
+    }
+    this.tableContainerEl.addEventListener('contextmenu', this.tableContainerContextMenuListener)
+
     this.tbodyMouseDownListener = (e: MouseEvent) => {
       this.handleTbodyMouseDown(e)
     }
@@ -542,15 +480,40 @@ export class VirtualDataGrid {
         ) {
           this.closeBulkFillPopover()
         }
+        if (
+          this.colFilterPopoverEl &&
+          e.target instanceof Node &&
+          !this.colFilterPopoverEl.contains(e.target)
+        ) {
+          this.closeColumnFilterPopover()
+        }
       }
       this.windowKeyDownListener = (e: KeyboardEvent) => {
         if (e.key === 'Escape') {
           this.closeContextMenu()
           this.closeBulkFillPopover()
+          this.closeColumnFilterPopover()
+          return
         }
+        if (
+          !e.defaultPrevented &&
+          (e.ctrlKey || e.metaKey) &&
+          e.shiftKey &&
+          e.key.toLowerCase() === 'v' &&
+          this.isGridVisibleForGlobalEvent(e.target)
+        ) {
+          e.preventDefault()
+          void this.triggerPasteAction(true)
+        }
+      }
+      this.windowPasteListener = (e: ClipboardEvent) => {
+        if (e.defaultPrevented) return
+        if (!this.isGridVisibleForGlobalEvent(e.target)) return
+        this.handleGridPaste(e)
       }
       window.addEventListener('mousedown', this.windowDocClickListener)
       window.addEventListener('keydown', this.windowKeyDownListener)
+      window.addEventListener('paste', this.windowPasteListener)
     }
   }
 
@@ -675,10 +638,11 @@ export class VirtualDataGrid {
   public addClientColumnFilter(
     column: string,
     value: unknown,
-    op: 'eq' | 'neq' | 'is-null' | 'is-not-null'
+    op: ColumnHeaderFilterOp
   ): void {
     const col = column.trim()
     if (!col) return
+    this.clientColumnFilters = this.clientColumnFilters.filter((f) => f.column !== col)
     this.clientColumnFilters.push({ column: col, value, op })
     this.invalidateFilterCache()
     if (this.tableContainerEl) {
@@ -691,9 +655,26 @@ export class VirtualDataGrid {
       this.recomputeFindMatches()
       this.onFindStateChange?.({ total: this.findMatches.length, activeIndex: this.findActiveIndex })
     }
-    if (this.isTransposed) {
-      this.renderHeader()
+    this.renderHeader()
+    this.renderVisibleRows()
+    this.notifyAllSelectionListeners()
+  }
+
+  public removeClientColumnFilter(column: string): void {
+    const col = column.trim()
+    if (!col) return
+    const next = this.clientColumnFilters.filter((f) => f.column !== col)
+    if (next.length === this.clientColumnFilters.length) return
+    this.clientColumnFilters = next
+    this.invalidateFilterCache()
+    if (this.tableContainerEl) {
+      this.tableContainerEl.scrollTop = 0
     }
+    if (this.findQuery) {
+      this.recomputeFindMatches()
+      this.onFindStateChange?.({ total: this.findMatches.length, activeIndex: this.findActiveIndex })
+    }
+    this.renderHeader()
     this.renderVisibleRows()
     this.notifyAllSelectionListeners()
   }
@@ -709,9 +690,7 @@ export class VirtualDataGrid {
       this.recomputeFindMatches()
       this.onFindStateChange?.({ total: this.findMatches.length, activeIndex: this.findActiveIndex })
     }
-    if (this.isTransposed) {
-      this.renderHeader()
-    }
+    this.renderHeader()
     this.renderVisibleRows()
   }
 
@@ -737,6 +716,7 @@ export class VirtualDataGrid {
       this.activeEditor = null
       this.closeContextMenu()
       this.closeBulkFillPopover()
+      this.closeColumnFilterPopover()
       this.model = null
       this.rowStates = []
       this.findMatches = []
@@ -787,7 +767,7 @@ export class VirtualDataGrid {
     this.rowStates = clonedRows.map((row) => ({
       kind: 'existing',
       deleted: false,
-      original: cloneRow(row),
+      original: row,
       dirtyCols: new Map<string, unknown>(),
     }))
 
@@ -798,6 +778,7 @@ export class VirtualDataGrid {
     this.activeEditor = null
     this.closeContextMenu()
     this.closeBulkFillPopover()
+    this.closeColumnFilterPopover()
     this.invalidateDataCache()
     this.invalidateFilterCache()
     this.invalidateColLayoutCache()
@@ -1098,64 +1079,15 @@ export class VirtualDataGrid {
       if (this.selection.isEmpty()) return ''
     }
 
-    const selVisRows = this.selection.getSelectedRowIndices(visibleRows.length)
-    const selVisCols = this.selection.getSelectedColIndices(visibleCols.length)
-    if (selVisRows.length === 0 || selVisCols.length === 0) return ''
-
-    const selHeaders = selVisCols.map((vc) => model.headers[visibleCols[vc]])
-
-    if (format === 'sql-in') {
-      const values: unknown[] = []
-      this.selection.forEachSelectedCell(visibleRows.length, visibleCols.length, (vr, vc) => {
-        const rIdx = visibleRows[vr]
-        const cIdx = visibleCols[vc]
-        if (rIdx !== undefined && cIdx !== undefined) {
-          values.push(getCellValue(model.rows[rIdx], cIdx, model.headers[cIdx]))
-        }
-      })
-      return formatSqlInList(values, this.dialect, {
-        deduplicate: true,
-        columnName: selHeaders.length === 1 ? selHeaders[0] : undefined,
-      })
-    }
-
-    if (format === 'sql-insert') {
-      const records: Record<string, unknown>[] = selVisRows.map((vr) => {
-        const rIdx = visibleRows[vr]
-        const rowObj: Record<string, unknown> = {}
-        for (const vc of selVisCols) {
-          const cIdx = visibleCols[vc]
-          const header = model.headers[cIdx]
-          if (this.selection.isSelected(vr, vc)) {
-            const val = getCellValue(model.rows[rIdx], cIdx, header)
-            rowObj[header] = val === undefined ? null : val
-          } else {
-            rowObj[header] = null
-          }
-        }
-        return rowObj
-      })
-      return formatDataExport({
-        columns: selHeaders,
-        rows: records,
-        format: 'sql-insert',
-        tableName: this.tableName,
-        dialect: this.dialect,
-      })
-    }
-
-    const matrix: unknown[][] = selVisRows.map((vr) => {
-      const rIdx = visibleRows[vr]
-      return selVisCols.map((vc) => {
-        if (!this.selection.isSelected(vr, vc)) {
-          return format === 'json' ? null : ''
-        }
-        const cIdx = visibleCols[vc]
-        const val = getCellValue(model.rows[rIdx], cIdx, model.headers[cIdx])
-        return val === undefined ? null : val
-      })
+    return exportGridSelectionMatrix({
+      model,
+      selection: this.selection,
+      visibleRows,
+      visibleCols,
+      format,
+      tableName: this.tableName,
+      dialect: this.dialect,
     })
-    return formatCellMatrixExport(selHeaders, matrix, format)
   }
 
   public getScrollLeft(): number {
@@ -1176,14 +1108,42 @@ export class VirtualDataGrid {
   }
 
   public copySelection(format: SelectionExportFormat): string {
-    const output = this.exportSelection(format)
-    if (output.length > 0) {
-      copyTextToClipboard(output)
-      if (format === 'tsv' || format === 'tsv-headers' || format === 'csv') {
-        this.lastCopiedDelimitedText = output
+    const model = this.model
+    if (!model) return ''
+    const visibleRows = this.getFilteredRowIndices()
+    const visibleCols = this.getVisibleColumnIndices()
+    if (visibleRows.length === 0 || visibleCols.length === 0) return ''
+
+    if (this.selection.isEmpty()) {
+      if (this.selectedRowIndex !== null && this.selectedColIndex !== null) {
+        const vr = visibleRows.indexOf(this.selectedRowIndex)
+        const vc = visibleCols.indexOf(this.selectedColIndex)
+        if (vr >= 0 && vc >= 0) {
+          this.selection.selectCell(vr, vc, 'cell')
+        }
       }
+      if (this.selection.isEmpty()) return ''
     }
-    return output
+
+    const snapshot = buildGridSelectionSnapshot({
+      model,
+      selection: this.selection,
+      visibleRows,
+      visibleCols,
+      format,
+      tableName: this.tableName,
+      dialect: this.dialect,
+    })
+    if (!snapshot) return ''
+
+    copyTextToClipboard(snapshot.text)
+    if (format === 'tsv' || format === 'tsv-headers' || format === 'csv') {
+      this.lastCopiedDelimitedText = snapshot.text
+      this.lastCopiedSnapshot = snapshot
+    } else {
+      this.lastCopiedSnapshot = null
+    }
+    return snapshot.text
   }
 
   public setFindQuery(query: string): { total: number; activeIndex: number } {
@@ -1271,54 +1231,9 @@ export class VirtualDataGrid {
 
     const visibleRows = this.getFilteredRowIndices()
     const visibleCols = this.getVisibleColumnIndices()
-    const rowCount = visibleRows.length
-    const colCount = visibleCols.length
-    if (rowCount === 0 || colCount === 0) return
-
-    const needleLower = needle.toLowerCase()
-    const needleMatchesNull = 'null'.includes(needleLower)
-    const maxMatches = 10000
-    const headers = model.headers
-    const rows = model.rows
-    const visHeaders = new Array<string>(colCount)
-    for (let vc = 0; vc < colCount; vc++) {
-      visHeaders[vc] = headers[visibleCols[vc]]
-    }
-
-    const matches: CellCoord[] = []
-    outer: for (let vr = 0; vr < rowCount; vr++) {
-      const row = rows[visibleRows[vr]]
-      if (row === undefined) continue
-      const isArr = Array.isArray(row)
-      for (let vc = 0; vc < colCount; vc++) {
-        const raw = isArr ? row[visibleCols[vc]] : row[visHeaders[vc]]
-        let matched = false
-        if (raw === null || raw === undefined) {
-          matched = needleMatchesNull
-        } else if (typeof raw === 'string') {
-          matched = raw.toLowerCase().includes(needleLower)
-        } else if (typeof raw === 'number' || typeof raw === 'boolean') {
-          matched = String(raw).toLowerCase().includes(needleLower)
-        } else if (typeof raw === 'object') {
-          try {
-            matched = JSON.stringify(raw).toLowerCase().includes(needleLower)
-          } catch {
-            matched = String(raw).toLowerCase().includes(needleLower)
-          }
-        } else {
-          matched = String(raw).toLowerCase().includes(needleLower)
-        }
-        if (matched) {
-          matches.push({ row: vr, col: vc })
-          this.findMatchKeys.add(`${vr}:${vc}`)
-          if (matches.length >= maxMatches) {
-            break outer
-          }
-        }
-      }
-    }
-
+    const { matches, matchKeys } = computeGridFindMatches(model, visibleRows, visibleCols, needle)
     this.findMatches = matches
+    this.findMatchKeys = matchKeys
     this.findActiveIndex = matches.length > 0 ? 0 : -1
   }
 
@@ -1374,33 +1289,7 @@ export class VirtualDataGrid {
   }
 
   private computeInitialColumnWidths(model: GridModel): number[] {
-    const sampleCount = Math.min(25, model.rows.length)
-    const widths = model.headers.map((header, colIdx) => {
-      const colDef = model.columns[colIdx]
-      const colType = colDef && 'type' in colDef ? colDef.type : undefined
-      let maxChars = header.length + 2
-      for (let r = 0; r < sampleCount; r++) {
-        const val = getCellValue(model.rows[r], colIdx, header)
-        const formatted = formatCellValue(val, colType).text
-        const len = Math.min(formatted.length, 60)
-        if (len > maxChars) {
-          maxChars = len
-        }
-      }
-      const px = Math.round(maxChars * 7.5 + 24)
-      return Math.max(84, Math.min(300, px))
-    })
-    if (model.rows.length === 0 && widths.length > 0) {
-      const minTableWidth = 340
-      const currentTotal = this.rowNumWidth + widths.reduce((sum, w) => sum + w, 0)
-      if (currentTotal < minTableWidth) {
-        const extraPerCol = Math.ceil((minTableWidth - currentTotal) / widths.length)
-        for (let i = 0; i < widths.length; i++) {
-          widths[i] += extraPerCol
-        }
-      }
-    }
-    return widths
+    return computeInitialColumnWidthsForGrid(model, this.rowNumWidth)
   }
 
   private updateTableWidthOnly(): void {
@@ -1416,35 +1305,6 @@ export class VirtualDataGrid {
     this.tableEl.style.width = `${totalWidth}px`
   }
 
-  private matchesClientColumnFilters(row: Record<string, unknown> | unknown[]): boolean {
-    const model = this.model
-    if (!model || this.clientColumnFilters.length === 0) return true
-    for (const flt of this.clientColumnFilters) {
-      const colIdx = model.headers.indexOf(flt.column)
-      if (colIdx < 0) continue
-      const cellVal = getCellValue(row, colIdx, flt.column)
-      const isNull = cellVal === null || cellVal === undefined
-      if (flt.op === 'is-null') {
-        if (!isNull) return false
-      } else if (flt.op === 'is-not-null') {
-        if (isNull) return false
-      } else if (flt.op === 'eq') {
-        if (flt.value === null || flt.value === undefined) {
-          if (!isNull) return false
-        } else if (isNull || stringifyFilterValue(cellVal) !== stringifyFilterValue(flt.value)) {
-          return false
-        }
-      } else if (flt.op === 'neq') {
-        if (flt.value === null || flt.value === undefined) {
-          if (isNull) return false
-        } else if (!isNull && stringifyFilterValue(cellVal) === stringifyFilterValue(flt.value)) {
-          return false
-        }
-      }
-    }
-    return true
-  }
-
   private getFilteredRowIndices(): number[] {
     if (this.cachedFilterStamp === this.filterStateStamp) {
       return this.cachedFilteredRowIndices
@@ -1455,72 +1315,12 @@ export class VirtualDataGrid {
       this.cachedFilterStamp = this.filterStateStamp
       return this.cachedFilteredRowIndices
     }
-    const total = model.rows.length
-    const hasSearch = this.clientFilter.length > 0
-    const hasColFilters = this.clientColumnFilters.length > 0
-    if (!hasSearch && !hasColFilters) {
-      const all = new Array<number>(total)
-      for (let i = 0; i < total; i++) {
-        all[i] = i
-      }
-      this.cachedFilteredRowIndices = all
-      this.cachedFilterStamp = this.filterStateStamp
-      return all
-    }
-
-    const query = this.clientFilter
-    const queryMatchesNull = 'null'.includes(query)
-    const headers = model.headers
-    const colCount = headers.length
-    const rows = model.rows
-    const matched: number[] = []
-    for (let i = 0; i < total; i++) {
-      if (this.rowStates[i]?.kind === 'inserted') {
-        matched.push(i)
-        continue
-      }
-      const row = rows[i]
-      if (hasColFilters && !this.matchesClientColumnFilters(row)) {
-        continue
-      }
-      if (hasSearch) {
-        const isArr = Array.isArray(row)
-        let hit = false
-        for (let colIdx = 0; colIdx < colCount; colIdx++) {
-          const val = isArr ? row[colIdx] : row[headers[colIdx]]
-          if (val === null || val === undefined) {
-            if (queryMatchesNull) {
-              hit = true
-              break
-            }
-            continue
-          }
-          if (typeof val === 'string') {
-            if (val.toLowerCase().includes(query)) {
-              hit = true
-              break
-            }
-          } else if (typeof val === 'object') {
-            try {
-              if (JSON.stringify(val).toLowerCase().includes(query)) {
-                hit = true
-                break
-              }
-            } catch {
-              if (String(val).toLowerCase().includes(query)) {
-                hit = true
-                break
-              }
-            }
-          } else if (String(val).toLowerCase().includes(query)) {
-            hit = true
-            break
-          }
-        }
-        if (!hit) continue
-      }
-      matched.push(i)
-    }
+    const matched = computeFilteredRowIndices(
+      model,
+      this.rowStates,
+      this.clientFilter,
+      this.clientColumnFilters
+    )
     this.cachedFilteredRowIndices = matched
     this.cachedFilterStamp = this.filterStateStamp
     return matched
@@ -1537,37 +1337,20 @@ export class VirtualDataGrid {
 
     this.sortColumn = column
     this.sortDirection = direction
-    const factor = direction === 'DESC' ? -1 : 1
+    const factor: 1 | -1 = direction === 'DESC' ? -1 : 1
 
     const paired = model.rows.map((row, idx) => ({
       row,
       state: this.rowStates[idx],
     }))
 
-    paired.sort((a, b) => {
-      const va = getCellValue(a.row, colIndex, column)
-      const vb = getCellValue(b.row, colIndex, column)
-      if (va === vb) return 0
-      if (va === null || va === undefined) return 1
-      if (vb === null || vb === undefined) return -1
-      if (typeof va === 'number' && typeof vb === 'number') {
-        return (va - vb) * factor
-      }
-      const na = Number(va)
-      const nb = Number(vb)
-      if (
-        !Number.isNaN(na) &&
-        !Number.isNaN(nb) &&
-        String(va).trim() !== '' &&
-        String(vb).trim() !== ''
-      ) {
-        return (na - nb) * factor
-      }
-      return (
-        String(va).localeCompare(String(vb), undefined, { numeric: true, sensitivity: 'base' }) *
+    paired.sort((a, b) =>
+      compareGridCellValues(
+        getCellValue(a.row, colIndex, column),
+        getCellValue(b.row, colIndex, column),
         factor
       )
-    })
+    )
 
     model.rows = paired.map((p) => p.row)
     this.rowStates = paired.map((p) => p.state)
@@ -2287,9 +2070,17 @@ export class VirtualDataGrid {
 
     if (isMod && lowerKey === 'c') {
       e.preventDefault()
+      const hadSel =
+        !this.selection.isEmpty() ||
+        (this.selectedRowIndex !== null && this.selectedColIndex !== null)
       const copied = this.copySelection('tsv')
-      if (copied.length > 0) {
-        this.onNotify?.('Copied selection to clipboard')
+      if (copied.length > 0 || hadSel) {
+        const summary = this.getSelectionSummary()
+        this.onNotify?.(
+          summary.cellCount > 1
+            ? `Copied ${summary.cellCount} cells to clipboard`
+            : 'Copied selection to clipboard'
+        )
       }
       return
     }
@@ -2400,16 +2191,83 @@ export class VirtualDataGrid {
     }
   }
 
+  private isGridVisibleForGlobalEvent(target: EventTarget | null): boolean {
+    if (this.isLoading || this.interactionLocked || !this.model || !this.model.canEdit) {
+      return false
+    }
+    if (
+      this.activeEditor !== null ||
+      this.contextMenuEl ||
+      this.bulkFillPopoverEl ||
+      this.colFilterPopoverEl
+    ) {
+      return false
+    }
+    if (!this.tableContainerEl || !this.tableContainerEl.isConnected) return false
+    if (this.tableContainerEl.offsetParent === null) return false
+    if (typeof this.container.closest === 'function' && this.container.closest('[hidden]')) {
+      return false
+    }
+    if (isEditableInputTarget(target)) return false
+    const nonGridRegionSelector =
+      '.cm-editor, .datanoa-sql-area, .datanoa-sql-toolbar, .datanoa-console-tabs, .datanoa-value-inspector, .datanoa-history-drawer, .datanoa-dml-preview, .datanoa-inspector-view, .datanoa-sidebar, .datanoa-columns-popover'
+    if (typeof document !== 'undefined') {
+      if (isEditableInputTarget(document.activeElement)) return false
+      if (document.querySelector('.datanoa-modal-backdrop')) return false
+      const activeEl = document.activeElement
+      if (activeEl instanceof Element && activeEl.closest(nonGridRegionSelector)) {
+        return false
+      }
+    }
+    if (target instanceof Element && target.closest(nonGridRegionSelector)) {
+      return false
+    }
+    return true
+  }
+
+  private notifyPasteOutcome(outcome: {
+    updatedCells: number
+    insertedRows: number
+    skippedReadOnly: number
+    mode: string
+  }): void {
+    const { updatedCells, insertedRows, skippedReadOnly } = outcome
+    const skippedNote =
+      skippedReadOnly > 0 ? ` (${skippedReadOnly} read-only/PK skipped)` : ''
+    if (updatedCells > 0 && insertedRows > 0) {
+      this.onNotify?.(
+        `Overwrote ${updatedCells} cell${updatedCells === 1 ? '' : 's'} and inserted ${insertedRows} new row${insertedRows === 1 ? '' : 's'} (marked PASTE)${skippedNote} — review & click Submit`
+      )
+    } else if (insertedRows > 0) {
+      this.onNotify?.(
+        `Pasted ${insertedRows} new row${insertedRows === 1 ? '' : 's'} (marked PASTE)${skippedNote} — review & click Submit`
+      )
+    } else if (updatedCells > 0) {
+      const submitHint = !this.batchMode ? ' into staged edits — click Submit to save' : ''
+      this.onNotify?.(
+        `Pasted ${updatedCells} cell${updatedCells === 1 ? '' : 's'}${submitHint}${skippedNote}`
+      )
+    } else if (skippedReadOnly > 0) {
+      this.onNotify?.(
+        'Selected cell(s) are read-only, deleted, or primary key — clear selection (Esc) or use Ctrl+Shift+V to paste as new rows'
+      )
+    }
+  }
+
   private handleGridPaste(e: ClipboardEvent): void {
     if (this.activeEditor !== null || isEditableInputTarget(e.target)) return
     if (this.interactionLocked || !this.model || !this.model.canEdit) return
-    const text = e.clipboardData?.getData('text/plain') || e.clipboardData?.getData('text') || ''
-    if (!text) return
+    const rawText = e.clipboardData?.getData('text/plain') ?? e.clipboardData?.getData('text') ?? ''
+    const isCopiedNullCell =
+      rawText === '' &&
+      this.lastCopiedSnapshot !== null &&
+      this.lastCopiedSnapshot.text === '' &&
+      this.lastCopiedSnapshot.rawMatrix.length === 1 &&
+      this.lastCopiedSnapshot.rawMatrix[0]?.length === 1
+    if (!rawText && !isCopiedNullCell) return
     e.preventDefault()
-    const count = this.pasteDelimitedText(text)
-    if (count > 0) {
-      this.onNotify?.(`Pasted ${count} cell${count === 1 ? '' : 's'}`)
-    }
+    const outcome = this.pasteDelimitedTextDetailed(rawText, { forceNewRows: false })
+    this.notifyPasteOutcome(outcome)
   }
 
   private createResizeHandle(colIndex: number, thEl: HTMLTableCellElement): HTMLDivElement {
@@ -2484,7 +2342,8 @@ export class VirtualDataGrid {
       tr.appendChild(thField)
 
       const indices = this.getFilteredRowIndices()
-      for (const rowIdx of indices) {
+      const cappedIndices = indices.slice(0, 100)
+      for (const rowIdx of cappedIndices) {
         const state = this.rowStates[rowIdx]
         const th = document.createElement('th')
         th.className = 'datanoa-th'
@@ -2493,6 +2352,13 @@ export class VirtualDataGrid {
           state?.kind === 'inserted' ? ' (+)' : state?.deleted ? ' (DEL)' : ''
         th.textContent = `Row ${rowIdx + 1}${suffix}`
         tr.appendChild(th)
+      }
+      if (indices.length > 100) {
+        const moreTh = document.createElement('th')
+        moreTh.className = 'datanoa-th'
+        moreTh.style.minWidth = '140px'
+        moreTh.textContent = `+${indices.length - 100} more rows`
+        tr.appendChild(moreTh)
       }
       this.theadEl.appendChild(tr)
       return
@@ -2584,6 +2450,25 @@ export class VirtualDataGrid {
       label.textContent = header
       label.title = header
       inner.appendChild(label)
+
+      const colFilterBtn = document.createElement('button')
+      colFilterBtn.type = 'button'
+      const hasColFilter = this.clientColumnFilters.some((f) => f.column === header)
+      colFilterBtn.className = `datanoa-col-filter-btn${hasColFilter ? ' active' : ''}`
+      colFilterBtn.title = hasColFilter
+        ? `Filter active on "${header}" — click to edit`
+        : `Filter column "${header}"`
+      colFilterBtn.setAttribute('aria-label', `Filter column ${header}`)
+      colFilterBtn.appendChild(createColFilterSvg())
+      colFilterBtn.addEventListener('mousedown', (e) => {
+        e.stopPropagation()
+      })
+      colFilterBtn.addEventListener('click', (e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        this.openColumnFilterPopover(header, colFilterBtn)
+      })
+      inner.appendChild(colFilterBtn)
 
       const colSelectBtn = document.createElement('button')
       colSelectBtn.type = 'button'
@@ -3019,13 +2904,17 @@ export class VirtualDataGrid {
           ? 'CLONE'
           : rowState.origin === 'paste'
             ? 'PASTE'
-            : 'NEW'
+            : rowState.origin === 'import'
+              ? 'IMPORT'
+              : 'NEW'
       rowNumTd.title =
         rowState.origin === 'clone'
           ? `Cloned row #${rowIndex + 1} (staged INSERT — click Submit to save)`
           : rowState.origin === 'paste'
             ? `Pasted new row #${rowIndex + 1} (staged INSERT — click Submit to save)`
-            : `New row #${rowIndex + 1} (staged INSERT — click Submit to save)`
+            : rowState.origin === 'import'
+              ? `Imported row #${rowIndex + 1} (staged INSERT — click Submit to save)`
+              : `New row #${rowIndex + 1} (staged INSERT — click Submit to save)`
       const existingBadge = rowNumTd.firstElementChild
       if (existingBadge instanceof HTMLElement && existingBadge.classList.contains('datanoa-row-badge')) {
         existingBadge.textContent = badgeLabel
@@ -3408,7 +3297,8 @@ export class VirtualDataGrid {
       labelTd.textContent = `${header}${isPk ? ' [PK]' : ''}${colType}`
       tr.appendChild(labelTd)
 
-      indices.forEach((rowIndex, visRow) => {
+      const cappedIndices = indices.slice(0, 100)
+      cappedIndices.forEach((rowIndex, visRow) => {
         const rowData = model.rows[rowIndex]
         const rowState = this.rowStates[rowIndex]
         const td = this.createDataCell(
@@ -3428,6 +3318,12 @@ export class VirtualDataGrid {
         if (rowState?.deleted) td.classList.add('datanoa-row-deleted')
         tr.appendChild(td)
       })
+      if (indices.length > 100) {
+        const moreTd = document.createElement('td')
+        moreTd.className = 'datanoa-td datanoa-cell-null'
+        moreTd.textContent = `... (${indices.length - 100} more)`
+        tr.appendChild(moreTd)
+      }
 
       frag.appendChild(tr)
     })
@@ -3571,16 +3467,6 @@ export class VirtualDataGrid {
     return td
   }
 
-  private clampFixedPopup(el: HTMLElement, clientX: number, clientY: number): void {
-    const rect = el.getBoundingClientRect()
-    const vw = typeof window !== 'undefined' ? window.innerWidth : 1024
-    const vh = typeof window !== 'undefined' ? window.innerHeight : 768
-    const left = Math.max(6, Math.min(clientX, vw - rect.width - 8))
-    const top = Math.max(6, Math.min(clientY, vh - rect.height - 8))
-    el.style.left = `${left}px`
-    el.style.top = `${top}px`
-  }
-
   private openContextMenu(
     clientX: number,
     clientY: number,
@@ -3595,217 +3481,75 @@ export class VirtualDataGrid {
     const model = this.model
     if (typeof document === 'undefined' || !model) return
 
-    const rowState = this.rowStates[rowIndex]
-    const gate = checkCellEditGate(model.canEdit, model.primaryKey)
-    const canEditRow =
-      !this.interactionLocked &&
-      (gate.allowed || (model.canEdit && rowState?.kind === 'inserted')) &&
-      !rowState?.deleted
-
-    const summary = this.getSelectionSummary()
-    const isMultiCell = summary.cellCount > 1
-    const selectedRowCount = Math.max(1, summary.rowCount)
-
-    const menu = document.createElement('div')
-    menu.className = 'datanoa-context-menu'
-
-    const addItem = (
-      label: string,
-      disabled: boolean,
-      onClick: () => void,
-      danger = false
-    ) => {
-      const btn = document.createElement('button')
-      btn.type = 'button'
-      btn.className = `datanoa-context-item${danger ? ' danger' : ''}`
-      btn.textContent = label
-      btn.disabled = disabled
-      btn.addEventListener('click', () => {
-        this.closeContextMenu()
-        onClick()
-      })
-      menu.appendChild(btn)
-    }
-
-    const addSep = () => {
-      const sep = document.createElement('div')
-      sep.className = 'datanoa-context-sep'
-      menu.appendChild(sep)
-    }
-
-    addItem(isMultiCell ? `Copy (${summary.cellCount} cells TSV)` : 'Copy Cell (TSV)', false, () => {
-      this.copySelection('tsv')
-      this.onNotify?.(isMultiCell ? `Copied ${summary.cellCount} cells (TSV)` : `Copied ${columnName} to clipboard`)
-    })
-
-    addItem('Copy with Headers (TSV)', false, () => {
-      this.copySelection('tsv-headers')
-      this.onNotify?.('Copied selection with headers (TSV)')
-    })
-
-    addItem('Copy as CSV', false, () => {
-      this.copySelection('csv')
-      this.onNotify?.('Copied selection as CSV')
-    })
-
-    addItem('Copy as JSON', false, () => {
-      this.copySelection('json')
-      this.onNotify?.('Copied selection as JSON')
-    })
-
-    addItem('Copy as SQL IN (...)', false, () => {
-      const sqlIn = this.copySelection('sql-in')
-      if (sqlIn) {
-        this.onNotify?.('Copied selection as SQL IN list')
-      }
-    })
-
-    addItem('Copy as SQL INSERT', false, () => {
-      const sqlIns = this.copySelection('sql-insert')
-      if (sqlIns) {
-        this.onNotify?.('Copied selection as SQL INSERT')
-      }
-    })
-
-    addItem('Copy SQL Literal', false, () => {
-      const literal = formatSqlLiteral(rawValue, this.dialect)
-      copyTextToClipboard(literal)
-      this.onNotify?.(`Copied SQL literal: ${literal}`)
-    })
-
-    addItem('Paste (Overwrite Cells)', !canEditRow, () => {
-      void this.triggerPasteAction(false)
-    })
-
-    addItem('Paste as New Row(s) (Ctrl+Shift+V)', !canEditRow, () => {
-      void this.triggerPasteAction(true)
-    })
-
-    addSep()
-
-    addItem('Edit in Value Inspector', false, () => {
-      const info = this.buildSelectedCellInfo(rowIndex, colIndex)
-      if (info) {
-        this.onInspectCell?.(info)
-      }
-    })
-
-    const canEditTargetCell = isMultiCell ? canEditRow : this.isCellEditable(rowIndex, colIndex)
-    const canSetNullTargetCell = isMultiCell
-      ? canEditRow
-      : canEditTargetCell && this.isColumnNullable(colIndex)
-    addItem(
-      isMultiCell ? `Bulk Set NULL (${summary.cellCount} cells)` : 'Set NULL',
-      !canSetNullTargetCell,
-      () => {
-        if (isMultiCell || this.batchMode || this.getStagedCount() > 0 || rowState?.kind === 'inserted') {
-          const count = this.bulkSetCellsValue(null)
-          if (count > 0) {
-            this.onNotify?.(`Set ${count} cell${count === 1 ? '' : 's'} to NULL`)
-          }
-        } else {
-          if (!this.isColumnNullable(colIndex)) {
-            this.onNotify?.(`Column "${columnName}" is NOT NULL — cannot set NULL.`)
-            return
-          }
-          void this.applyDirectCellValue(
-            rowIndex,
-            colIndex,
-            columnName,
-            null,
-            rawValue,
-            this.findLiveCell(rowIndex, colIndex) ?? td
-          )
-        }
-      }
-    )
-
-    addItem('Bulk Fill Value...', !canEditTargetCell, () => {
-      this.openBulkFillPopover(clientX, clientY, summary.cellCount || 1)
-    })
-
-    addSep()
-
-    const valPreview = previewMenuValue(rawValue)
-    const isNullVal = rawValue === null || rawValue === undefined
-
-    addItem(
-      isNullVal ? `Filter: ${columnName} IS NULL` : `Filter: ${columnName} = ${valPreview}`,
-      false,
-      () => {
-        this.triggerQuickFilter(columnName, rawValue, isNullVal ? 'is-null' : 'eq', 'replace')
-      }
-    )
-
-    addItem(
-      isNullVal ? `Filter: ${columnName} IS NOT NULL` : `Filter: ${columnName} != ${valPreview}`,
-      false,
-      () => {
-        this.triggerQuickFilter(columnName, rawValue, isNullVal ? 'is-not-null' : 'neq', 'replace')
-      }
-    )
-
-    addItem(
-      isNullVal ? `Filter AND: ${columnName} IS NULL` : `Filter AND: ${columnName} = ${valPreview}`,
-      false,
-      () => {
-        this.triggerQuickFilter(columnName, rawValue, isNullVal ? 'is-null' : 'eq', 'and')
-      }
-    )
-
-    if (!isNullVal) {
-      addItem(`Filter: ${columnName} IS NULL`, false, () => {
-        this.triggerQuickFilter(columnName, null, 'is-null', 'replace')
-      })
-    }
-
-    const fk = this.getForeignKeyForColumn(columnName)
-    if (fk && !isNullVal && this.onNavigateForeignKey) {
-      addSep()
-      addItem(`Go to ${fk.referencedTable}.${fk.referencedColumn}`, false, () => {
-        this.triggerFkJump(rowIndex, colIndex)
-      })
-    }
-
-    addSep()
-
-    addItem(
-      selectedRowCount > 1 ? `Clone ${selectedRowCount} Rows` : 'Clone Row',
-      !model.canEdit || this.interactionLocked,
-      () => {
-        if (selectedRowCount > 1) {
-          const cloned = this.bulkCloneSelectedRows()
-          if (cloned > 0) this.onNotify?.(`Cloned ${cloned} rows`)
-        } else {
-          this.selectedRowIndex = rowIndex
-          this.cloneSelectedRow()
-        }
-      }
-    )
-
-    const delLabel =
-      selectedRowCount > 1
-        ? `Mark ${selectedRowCount} Rows Deleted`
-        : rowState?.deleted
-          ? 'Restore Row'
-          : 'Mark Row Deleted'
-
-    addItem(
-      delLabel,
-      !model.canEdit || this.interactionLocked || (!gate.allowed && rowState?.kind !== 'inserted'),
-      () => {
-        if (selectedRowCount > 1) {
-          this.bulkMarkRowsDeleted()
-        } else {
-          this.markRowDeleted(rowIndex)
-        }
+    this.contextMenuEl = buildGridCellContextMenu({
+      clientX,
+      clientY,
+      rowIndex,
+      colIndex,
+      columnName,
+      rawValue,
+      td,
+      model,
+      rowState: this.rowStates[rowIndex],
+      interactionLocked: this.interactionLocked,
+      batchMode: this.batchMode,
+      stagedCount: this.getStagedCount(),
+      dialect: this.dialect,
+      summary: this.getSelectionSummary(),
+      fk: this.getForeignKeyForColumn(columnName),
+      hasFkHandler: Boolean(this.onNavigateForeignKey),
+      isCellEditable: this.isCellEditable(rowIndex, colIndex),
+      isColumnNullable: this.isColumnNullable(colIndex),
+      closeMenu: () => this.closeContextMenu(),
+      copySelection: (fmt) => this.copySelection(fmt),
+      onNotify: this.onNotify,
+      triggerPasteAction: (asNewRows) => this.triggerPasteAction(asNewRows),
+      buildSelectedCellInfo: () => this.buildSelectedCellInfo(rowIndex, colIndex),
+      onInspectCell: this.onInspectCell,
+      bulkSetCellsValue: (val) => this.bulkSetCellsValue(val),
+      applyDirectNull: () => {
+        void this.applyDirectCellValue(
+          rowIndex,
+          colIndex,
+          columnName,
+          null,
+          rawValue,
+          this.findLiveCell(rowIndex, colIndex) ?? td
+        )
       },
-      selectedRowCount > 1 || !rowState?.deleted
-    )
+      openBulkFill: (x, y, count) => this.openBulkFillPopover(x, y, count),
+      triggerQuickFilter: (col, val, op, mode) => this.triggerQuickFilter(col, val, op, mode),
+      triggerFkJump: () => this.triggerFkJump(rowIndex, colIndex),
+      bulkCloneSelectedRows: () => this.bulkCloneSelectedRows(),
+      cloneSingleRow: () => {
+        this.selectedRowIndex = rowIndex
+        this.cloneSelectedRow()
+      },
+      bulkMarkRowsDeleted: () => {
+        this.bulkMarkRowsDeleted()
+      },
+      markSingleRowDeleted: () => {
+        this.markRowDeleted(rowIndex)
+      },
+    })
+  }
 
-    document.body.appendChild(menu)
-    this.contextMenuEl = menu
-    this.clampFixedPopup(menu, clientX, clientY)
+  private openCanvasContextMenu(clientX: number, clientY: number): void {
+    this.closeContextMenu()
+    this.closeBulkFillPopover()
+    const model = this.model
+    if (typeof document === 'undefined' || !model) return
+
+    this.contextMenuEl = buildGridCanvasContextMenu({
+      clientX,
+      clientY,
+      canInsert: !this.interactionLocked && model.canEdit,
+      closeMenu: () => this.closeContextMenu(),
+      onPasteNewRows: () => this.triggerPasteAction(true),
+      onAddBlankRow: () => {
+        this.addBlankRow()
+      },
+    })
   }
 
   private openHeaderContextMenu(
@@ -3821,164 +3565,42 @@ export class VirtualDataGrid {
     const model = this.model
     if (typeof document === 'undefined' || !model) return
 
-    const visibleCols = this.getVisibleColumnIndices()
-    const isPinned = this.pinnedColumns.includes(header)
-
-    const menu = document.createElement('div')
-    menu.className = 'datanoa-context-menu'
-
-    const addItem = (label: string, disabled: boolean, onClick: () => void) => {
-      const btn = document.createElement('button')
-      btn.type = 'button'
-      btn.className = 'datanoa-context-item'
-      btn.textContent = label
-      btn.disabled = disabled
-      btn.addEventListener('click', () => {
-        this.closeContextMenu()
-        onClick()
-      })
-      menu.appendChild(btn)
-    }
-
-    const addSep = () => {
-      const sep = document.createElement('div')
-      sep.className = 'datanoa-context-sep'
-      menu.appendChild(sep)
-    }
-
-    addItem('Select Column', false, () => {
-      const rowCount = this.getFilteredRowIndices().length
-      this.selection.selectColumn(visCol, rowCount)
-      this.syncSelectionClasses()
-      this.notifyAllSelectionListeners()
+    this.contextMenuEl = buildGridHeaderContextMenu({
+      clientX,
+      clientY,
+      modelColIdx,
+      header,
+      model,
+      dialect: this.dialect,
+      isPinned: this.pinnedColumns.includes(header),
+      visibleColsCount: this.getVisibleColumnIndices().length,
+      rowIndices: this.getFilteredRowIndices(),
+      closeMenu: () => this.closeContextMenu(),
+      selectColumn: () => {
+        const rowCount = this.getFilteredRowIndices().length
+        this.selection.selectColumn(visCol, rowCount)
+        this.syncSelectionClasses()
+        this.notifyAllSelectionListeners()
+      },
+      onNotify: this.onNotify,
+      onSort: (dir) => this.handleHeaderClick(header, dir),
+      togglePin: () => this.togglePinColumn(header),
+      hideColumn: () => this.setColumnVisibility(header, false),
+      autoFitColumn: () => this.autoFitColumn(modelColIdx, thEl),
     })
-
-    addItem('Copy Column Values', false, () => {
-      const rowIndices = this.getFilteredRowIndices()
-      const lines = rowIndices.map((rIdx) => {
-        const val = getCellValue(model.rows[rIdx], modelColIdx, header)
-        return val === null || val === undefined ? '' : stringifyFilterValue(val)
-      })
-      copyTextToClipboard(lines.join('\n'))
-      this.onNotify?.(`Copied ${lines.length} values from "${header}"`)
-    })
-
-    addItem('Copy as SQL IN (...)', false, () => {
-      const rowIndices = this.getFilteredRowIndices()
-      const vals = rowIndices.map((rIdx) => getCellValue(model.rows[rIdx], modelColIdx, header))
-      const sqlIn = formatSqlInList(vals, this.dialect, { deduplicate: true, columnName: header })
-      if (sqlIn) {
-        copyTextToClipboard(sqlIn)
-        this.onNotify?.(`Copied "${header}" as SQL IN list`)
-      }
-    })
-
-    addItem('Copy Column Name', false, () => {
-      copyTextToClipboard(header)
-      this.onNotify?.(`Copied column name "${header}"`)
-    })
-
-    addSep()
-
-    addItem('Sort Ascending (ASC)', false, () => {
-      this.handleHeaderClick(header, 'ASC')
-    })
-
-    addItem('Sort Descending (DESC)', false, () => {
-      this.handleHeaderClick(header, 'DESC')
-    })
-
-    addSep()
-
-    addItem(isPinned ? 'Unpin Column' : 'Pin Column', false, () => {
-      this.togglePinColumn(header)
-    })
-
-    addItem('Hide Column', visibleCols.length <= 1, () => {
-      this.setColumnVisibility(header, false)
-    })
-
-    addItem('Auto-fit Column', false, () => {
-      this.autoFitColumn(modelColIdx, thEl)
-    })
-
-    document.body.appendChild(menu)
-    this.contextMenuEl = menu
-    this.clampFixedPopup(menu, clientX, clientY)
   }
 
   private openBulkFillPopover(clientX: number, clientY: number, cellCount: number): void {
     this.closeBulkFillPopover()
     if (typeof document === 'undefined') return
-
-    const pop = document.createElement('div')
-    pop.className = 'datanoa-bulk-fill-popover'
-
-    const title = document.createElement('div')
-    title.className = 'datanoa-bulk-fill-title'
-    title.textContent = `Fill ${cellCount} Selected Cell${cellCount === 1 ? '' : 's'}`
-    pop.appendChild(title)
-
-    const input = document.createElement('input')
-    input.type = 'text'
-    input.className = 'datanoa-search-input'
-    input.placeholder = 'Enter value to fill...'
-    pop.appendChild(input)
-
-    const actions = document.createElement('div')
-    actions.className = 'datanoa-bulk-fill-actions'
-
-    const nullBtn = document.createElement('button')
-    nullBtn.type = 'button'
-    nullBtn.className = 'datanoa-btn datanoa-btn-sm'
-    nullBtn.textContent = 'Set NULL'
-    nullBtn.addEventListener('click', () => {
-      this.closeBulkFillPopover()
-      const updated = this.bulkSetCellsValue(null)
-      if (updated > 0) this.onNotify?.(`Set ${updated} cells to NULL`)
+    this.bulkFillPopoverEl = buildGridBulkFillPopover({
+      clientX,
+      clientY,
+      cellCount,
+      closePopover: () => this.closeBulkFillPopover(),
+      onApplyValue: (val) => this.bulkSetCellsValue(val),
+      onNotify: this.onNotify,
     })
-
-    const cancelBtn = document.createElement('button')
-    cancelBtn.type = 'button'
-    cancelBtn.className = 'datanoa-btn datanoa-btn-sm'
-    cancelBtn.textContent = 'Cancel'
-    cancelBtn.addEventListener('click', () => {
-      this.closeBulkFillPopover()
-    })
-
-    const applyBtn = document.createElement('button')
-    applyBtn.type = 'button'
-    applyBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-btn-primary'
-    applyBtn.textContent = 'Apply'
-    const doApply = () => {
-      const val = input.value
-      this.closeBulkFillPopover()
-      const updated = this.bulkSetCellsValue(val)
-      if (updated > 0) {
-        this.onNotify?.(`Filled ${updated} cell${updated === 1 ? '' : 's'}`)
-      }
-    }
-    applyBtn.addEventListener('click', doApply)
-
-    input.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') {
-        ev.preventDefault()
-        doApply()
-      } else if (ev.key === 'Escape') {
-        ev.preventDefault()
-        this.closeBulkFillPopover()
-      }
-    })
-
-    actions.appendChild(nullBtn)
-    actions.appendChild(cancelBtn)
-    actions.appendChild(applyBtn)
-    pop.appendChild(actions)
-
-    document.body.appendChild(pop)
-    this.bulkFillPopoverEl = pop
-    this.clampFixedPopup(pop, clientX, clientY)
-    input.focus()
   }
 
   private triggerQuickFilter(
@@ -4014,6 +3636,42 @@ export class VirtualDataGrid {
       this.bulkFillPopoverEl.remove()
       this.bulkFillPopoverEl = null
     }
+  }
+
+  private closeColumnFilterPopover(): void {
+    if (this.colFilterPopoverEl) {
+      this.colFilterPopoverEl.remove()
+      this.colFilterPopoverEl = null
+    }
+  }
+
+  private openColumnFilterPopover(column: string, anchorEl: HTMLElement): void {
+    if (typeof document === 'undefined' || !document.body) return
+    const existingForCol = this.clientColumnFilters.find((f) => f.column === column)
+    this.closeContextMenu()
+    this.closeBulkFillPopover()
+    this.closeColumnFilterPopover()
+
+    this.colFilterPopoverEl = buildGridColumnFilterPopover({
+      column,
+      anchorEl,
+      existingForCol,
+      closePopover: () => this.closeColumnFilterPopover(),
+      onApply: (rawVal, op, mode) => {
+        if (this.onColumnHeaderFilter) {
+          this.onColumnHeaderFilter(column, rawVal, op, mode)
+        } else {
+          this.addClientColumnFilter(column, rawVal, op)
+        }
+      },
+      onClear: (op) => {
+        if (this.onColumnHeaderFilter) {
+          this.onColumnHeaderFilter(column, '', op, 'clear')
+        } else {
+          this.removeClientColumnFilter(column)
+        }
+      },
+    })
   }
 
   /**
@@ -4098,101 +3756,66 @@ export class VirtualDataGrid {
         clipText = ''
       }
     }
-    if (!clipText) {
+    if (!clipText && this.lastCopiedDelimitedText) {
       clipText = this.lastCopiedDelimitedText
     }
-    if (!clipText) {
+    const isCopiedNullCell =
+      clipText === '' &&
+      this.lastCopiedSnapshot !== null &&
+      this.lastCopiedSnapshot.text === '' &&
+      this.lastCopiedSnapshot.rawMatrix.length === 1 &&
+      this.lastCopiedSnapshot.rawMatrix[0]?.length === 1
+    if (!clipText && !isCopiedNullCell) {
       this.onNotify?.(
         asNewRows
           ? 'Copy rows first (Ctrl+C), then use Paste as New Row(s) (Ctrl+Shift+V)'
-          : 'Use Ctrl+V to paste directly into the focused grid'
+          : 'Use Ctrl+V to paste directly into the grid'
       )
       return
     }
-    if (asNewRows) {
-      const inserted = this.pasteAsNewRows(clipText)
-      if (inserted > 0) {
-        this.onNotify?.(
-          `Pasted ${inserted} new row${inserted === 1 ? '' : 's'} (marked PASTE) — review & click Submit`
-        )
-      }
-    } else {
-      const count = this.pasteDelimitedText(clipText)
-      if (count > 0) {
-        this.onNotify?.(`Pasted ${count} cell${count === 1 ? '' : 's'}`)
-      }
-    }
+    const outcome = this.pasteDelimitedTextDetailed(clipText, { forceNewRows: asNewRows })
+    this.notifyPasteOutcome(outcome)
   }
 
   public pasteAsNewRows(text: string): number {
+    return this.pasteDelimitedTextDetailed(text, { forceNewRows: true }).insertedRows
+  }
+
+  /**
+   * Stages pre-mapped records (e.g. from CSV/TSV/JSON file import) as batch INSERT rows.
+   * Preserves explicit mapped values while blocking generated columns and leaving unmapped
+   * columns undefined so database defaults / auto-increment apply on Submit.
+   */
+  public stageImportedRows(records: Record<string, unknown>[]): number {
     const model = this.model
-    if (this.interactionLocked || !model || !model.canEdit) return 0
-    const matrix = parseDelimitedClipboard(text)
-    if (matrix.length === 0) return 0
-
-    const visibleCols = this.getVisibleColumnIndices()
-    const headerLookup = new Map<string, number>()
-    model.headers.forEach((h, idx) => headerLookup.set(h.toLowerCase(), idx))
-
-    // Detect if first row is a header row matching table columns
-    let startRowIdx = 0
-    let colMapping: number[] | null = null
-    if (matrix.length >= 2) {
-      const candidate = matrix[0].map((cell) => headerLookup.get(cell.trim().toLowerCase()) ?? -1)
-      const matchedCount = candidate.filter((idx) => idx >= 0).length
-      if (matchedCount >= Math.min(2, matrix[0].length) && matchedCount === matrix[0].length) {
-        colMapping = candidate
-        startRowIdx = 1
-      }
+    if (this.interactionLocked || !model || !model.canEdit || records.length === 0) {
+      return 0
     }
 
-    const bbox = this.selection.getBoundingBox()
-    const startVisCol =
-      bbox && matrix[startRowIdx] && matrix[startRowIdx].length < visibleCols.length
-        ? bbox.startCol
-        : 0
+    const allowedHeaders = new Set<string>()
+    model.headers.forEach((header, idx) => {
+      const col = model.columns[idx]
+      const isGenerated = Boolean(col && 'isGenerated' in col && col.isGenerated === true)
+      if (!isGenerated) {
+        allowedHeaders.add(header)
+      }
+    })
 
+    const visibleCols = this.getVisibleColumnIndices()
     const firstNewIdx = model.rows.length
     let insertedCount = 0
 
-    for (let r = startRowIdx; r < matrix.length; r++) {
-      const rowCells = matrix[r]
-      const record: Record<string, unknown> = {}
-      model.headers.forEach((header, idx) => {
-        const col = model.columns[idx]
-        const isAutoInc = Boolean(col && 'isAutoIncrement' in col && col.isAutoIncrement)
-        const isGenerated = Boolean(col && 'isGenerated' in col && col.isGenerated === true)
-        const hasDefault = Boolean(
-          col && 'defaultValue' in col && col.defaultValue !== null && col.defaultValue !== undefined
-        )
-        if (!isAutoInc && !isGenerated && !hasDefault) {
-          record[header] = null
-        }
-      })
-
-      for (let dc = 0; dc < rowCells.length; dc++) {
-        const modelColIdx = colMapping
-          ? colMapping[dc]
-          : visibleCols[startVisCol + dc]
-        if (modelColIdx === undefined || modelColIdx < 0 || modelColIdx >= model.headers.length) {
-          continue
-        }
-        const col = model.columns[modelColIdx]
-        if (
-          col &&
-          (('isAutoIncrement' in col && col.isAutoIncrement) ||
-            ('isGenerated' in col && col.isGenerated === true))
-        ) {
-          continue
-        }
-        const header = model.headers[modelColIdx]
-        record[header] = this.coerceEditedValue(rowCells[dc], null, modelColIdx)
+    for (const sourceRecord of records) {
+      const rowRecord: Record<string, unknown> = {}
+      for (const [colName, val] of Object.entries(sourceRecord)) {
+        if (!allowedHeaders.has(colName) || val === undefined) continue
+        rowRecord[colName] = val
       }
 
-      model.rows.push(record)
+      model.rows.push(rowRecord)
       this.rowStates.push({
         kind: 'inserted',
-        origin: 'paste',
+        origin: 'import',
         deleted: false,
         original: {},
         dirtyCols: new Map<string, unknown>(),
@@ -4274,19 +3897,7 @@ export class VirtualDataGrid {
   }
 
   private createClonedRowRecord(model: GridModel, sourceIdx: number): Record<string, unknown> {
-    const sourceRow = model.rows[sourceIdx]
-    const cloned = rowToPlainRecord(model.headers, sourceRow, true)
-    model.headers.forEach((header, idx) => {
-      const col = model.columns[idx]
-      if (
-        col &&
-        (('isAutoIncrement' in col && col.isAutoIncrement) ||
-          ('isGenerated' in col && col.isGenerated === true))
-      ) {
-        delete cloned[header]
-      }
-    })
-    return cloned
+    return createClonedRowRecord(model, sourceIdx)
   }
 
   /**
@@ -4494,6 +4105,9 @@ export class VirtualDataGrid {
 
     const columnName = model.headers[colIndex]
     const rowData = model.rows[rowIndex]
+    if (rowState.kind === 'existing' && rowState.original === rowData) {
+      rowState.original = cloneRow(rowData)
+    }
     setCellValue(rowData, colIndex, columnName, newValue)
 
     if (rowState.kind === 'existing') {
@@ -4597,35 +4211,132 @@ export class VirtualDataGrid {
     return updated
   }
 
+  private resolveClipboardPayloadForPaste(text: string): {
+    matrix: readonly (readonly unknown[])[]
+    explicitHasHeaders: boolean
+    sourceHeaders?: readonly string[]
+  } {
+    const normalizeEol = (s: string): string => s.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+    const snap = this.lastCopiedSnapshot
+    if (snap && snap.rawMatrix.length > 0 && normalizeEol(text) === normalizeEol(snap.text)) {
+      return {
+        matrix: snap.rawMatrix,
+        explicitHasHeaders: snap.hasHeaders,
+        sourceHeaders: snap.headers,
+      }
+    }
+    return {
+      matrix: parseDelimitedClipboard(text),
+      explicitHasHeaders: false,
+      sourceHeaders: undefined,
+    }
+  }
+
+  private coercePastedValue(rawVal: unknown, originalValue: unknown, colIndex: number): unknown {
+    if (rawVal === null || rawVal === undefined) {
+      return null
+    }
+    if (typeof rawVal === 'object') {
+      try {
+        return JSON.stringify(rawVal)
+      } catch {
+        return String(rawVal)
+      }
+    }
+    return this.coerceEditedValue(String(rawVal), originalValue, colIndex)
+  }
+
+  private buildPasteColumnSpecs(model: GridModel): PasteColumnSpec[] {
+    return model.headers.map((header, idx) => {
+      const col = model.columns[idx]
+      const isAutoIncrement = Boolean(col && 'isAutoIncrement' in col && col.isAutoIncrement)
+      const isGenerated = Boolean(col && 'isGenerated' in col && col.isGenerated === true)
+      const isPrimaryKey = Boolean(
+        (col && 'isPrimaryKey' in col && col.isPrimaryKey) || model.primaryKey.includes(header)
+      )
+      return { name: header, isAutoIncrement, isPrimaryKey, isGenerated }
+    })
+  }
+
   /**
-   * Pastes RFC-4180 TSV/CSV text starting at the selection anchor (or fills multi-selection for 1x1 text).
+   * Smart RFC-4180 TSV/CSV paste:
+   * - Active selection: overwrites existing cells starting at anchor and inserts overflow rows beyond table end
+   *   (1x1 scalar into multi-cell selection fills the selected cells).
+   * - No selection / empty table / forceNewRows: inserts all pasted rows as brand-new staged INSERT rows.
    */
-  public pasteDelimitedText(text: string): number {
+  public pasteDelimitedTextDetailed(
+    text: string,
+    options?: { forceNewRows?: boolean }
+  ): {
+    updatedCells: number
+    insertedRows: number
+    skippedReadOnly: number
+    mode: 'empty' | 'fill' | 'overwrite' | 'insert' | 'overwrite-and-insert'
+  } {
+    const emptyOutcome = {
+      updatedCells: 0,
+      insertedRows: 0,
+      skippedReadOnly: 0,
+      mode: 'empty' as const,
+    }
     const model = this.model
-    if (this.interactionLocked || !model || !model.canEdit) return 0
-    const matrix = parseDelimitedClipboard(text)
-    if (matrix.length === 0) return 0
+    if (this.interactionLocked || !model || !model.canEdit) return emptyOutcome
+
+    const visibleCols = this.getVisibleColumnIndices()
+    if (visibleCols.length === 0) return emptyOutcome
+
+    const { matrix, explicitHasHeaders, sourceHeaders } = this.resolveClipboardPayloadForPaste(text)
+    if (matrix.length === 0) return emptyOutcome
 
     const visibleRows = this.getFilteredRowIndices()
-    const visibleCols = this.getVisibleColumnIndices()
-    if (visibleRows.length === 0 || visibleCols.length === 0) return 0
+    const forceNewRows = Boolean(options?.forceNewRows)
 
-    const summary = this.getSelectionSummary()
-    if (matrix.length === 1 && matrix[0].length === 1 && summary.cellCount > 1) {
-      const rawVal = matrix[0][0]
-      let updated = 0
+    let bbox = this.selection.getBoundingBox()
+    let hasSelection = !this.selection.isEmpty() && bbox !== null
+    let selectedCellCount = hasSelection ? this.getSelectionSummary().cellCount : 0
+    if (!hasSelection && this.selectedRowIndex !== null && this.selectedColIndex !== null) {
+      const vr = visibleRows.indexOf(this.selectedRowIndex)
+      const vc = visibleCols.indexOf(this.selectedColIndex)
+      if (vr >= 0 && vc >= 0) {
+        hasSelection = true
+        bbox = { startRow: vr, endRow: vr, startCol: vc, endCol: vc }
+        selectedCellCount = 1
+      }
+    }
+
+    const colSpecs = this.buildPasteColumnSpecs(model)
+    const plan = planGridPaste({
+      matrix,
+      hasSelection,
+      selectionBBox: bbox,
+      selectedCellCount,
+      existingRowCount: visibleRows.length,
+      visibleColIndices: visibleCols,
+      allColumns: colSpecs,
+      forceNewRows,
+      explicitHasHeaders,
+      sourceHeaders,
+    })
+
+    if (plan.mode === 'empty') return emptyOutcome
+
+    if (plan.mode === 'fill') {
+      let updatedCells = 0
+      let skippedReadOnly = 0
       this.selection.forEachSelectedCell(visibleRows.length, visibleCols.length, (vr, vc) => {
         const rIdx = visibleRows[vr]
         const cIdx = visibleCols[vc]
         if (rIdx === undefined || cIdx === undefined) return
         const header = model.headers[cIdx]
         const currentVal = getCellValue(model.rows[rIdx], cIdx, header)
-        const coerced = this.coerceEditedValue(rawVal, currentVal, cIdx)
+        const coerced = this.coercePastedValue(plan.fillValue, currentVal, cIdx)
         if (this.stageCellValueInMemory(rIdx, cIdx, coerced)) {
-          updated++
+          updatedCells++
+        } else {
+          skippedReadOnly++
         }
       })
-      if (updated > 0) {
+      if (updatedCells > 0) {
         this.invalidateDataCache()
         this.invalidateFilterCache()
         this.renderVisibleRows()
@@ -4633,50 +4344,178 @@ export class VirtualDataGrid {
         this.onStageChange?.(this.getStagedCount())
         this.notifyAllSelectionListeners()
       }
-      return updated
+      return { updatedCells, insertedRows: 0, skippedReadOnly, mode: 'fill' }
     }
 
-    const bbox = this.selection.getBoundingBox()
-    const startVisRow = bbox ? bbox.startRow : 0
-    const startVisCol = bbox ? bbox.startCol : 0
+    let updatedCells = 0
+    let skippedReadOnly = 0
+    let minVisCol = Number.POSITIVE_INFINITY
+    let maxVisCol = -1
+    let maxOverwrittenVisRow = plan.startVisRow
 
-    let updated = 0
-    let maxVisRow = startVisRow
-    let maxVisCol = startVisCol
-
-    for (let dr = 0; dr < matrix.length; dr++) {
-      const targetVisRow = startVisRow + dr
-      if (targetVisRow >= visibleRows.length) break
-      const rIdx = visibleRows[targetVisRow]
-      const rowCells = matrix[dr]
-      for (let dc = 0; dc < rowCells.length; dc++) {
-        const targetVisCol = startVisCol + dc
-        if (targetVisCol >= visibleCols.length) break
-        const cIdx = visibleCols[targetVisCol]
+    for (const owRow of plan.overwrites) {
+      const rIdx = visibleRows[owRow.targetVisRow]
+      if (rIdx === undefined) continue
+      const rowState = this.rowStates[rIdx]
+      const isMultiColRow = owRow.cells.length > 1
+      for (const cell of owRow.cells) {
+        const cIdx = cell.modelColIdx
+        const colSpec = colSpecs[cIdx]
+        if (rowState?.kind === 'inserted' && isMultiColRow && colSpec?.isAutoIncrement) {
+          continue
+        }
         const header = model.headers[cIdx]
         const currentVal = getCellValue(model.rows[rIdx], cIdx, header)
-        const coerced = this.coerceEditedValue(rowCells[dc], currentVal, cIdx)
+        const coerced = this.coercePastedValue(cell.rawValue, currentVal, cIdx)
         if (this.stageCellValueInMemory(rIdx, cIdx, coerced)) {
-          updated++
-          if (targetVisRow > maxVisRow) maxVisRow = targetVisRow
-          if (targetVisCol > maxVisCol) maxVisCol = targetVisCol
+          updatedCells++
+          if (owRow.targetVisRow > maxOverwrittenVisRow) {
+            maxOverwrittenVisRow = owRow.targetVisRow
+          }
+          if (cell.visColIdx >= 0) {
+            if (cell.visColIdx < minVisCol) minVisCol = cell.visColIdx
+            if (cell.visColIdx > maxVisCol) maxVisCol = cell.visColIdx
+          }
+        } else {
+          skippedReadOnly++
         }
       }
     }
 
-    if (updated > 0) {
-      this.invalidateDataCache()
-      this.invalidateFilterCache()
-      this.selection.selectCell(startVisRow, startVisCol, 'cell')
-      if (maxVisRow !== startVisRow || maxVisCol !== startVisCol) {
-        this.selection.extendTo(maxVisRow, maxVisCol, 'cell')
+    const firstNewIdx = model.rows.length
+    let insertedRows = 0
+
+    for (const insRow of plan.inserts) {
+      if (insRow.cells.length === 0) {
+        skippedReadOnly++
+        continue
+      }
+      const record: Record<string, unknown> = {}
+      model.headers.forEach((header, idx) => {
+        const col = model.columns[idx]
+        const isAutoInc = Boolean(col && 'isAutoIncrement' in col && col.isAutoIncrement)
+        const isGenerated = Boolean(col && 'isGenerated' in col && col.isGenerated === true)
+        const hasDefault = Boolean(
+          col && 'defaultValue' in col && col.defaultValue !== null && col.defaultValue !== undefined
+        )
+        if (!isAutoInc && !isGenerated && !hasDefault) {
+          record[header] = null
+        }
+      })
+
+      for (const cell of insRow.cells) {
+        const cIdx = cell.modelColIdx
+        const col = model.columns[cIdx]
+        if (
+          col &&
+          (('isAutoIncrement' in col && col.isAutoIncrement) ||
+            ('isGenerated' in col && col.isGenerated === true))
+        ) {
+          continue
+        }
+        const header = model.headers[cIdx]
+        const coerced = this.coercePastedValue(cell.rawValue, null, cIdx)
+        if (coerced === null && !this.isColumnNullable(cIdx)) {
+          const hasDefault = Boolean(
+            col &&
+              'defaultValue' in col &&
+              col.defaultValue !== null &&
+              col.defaultValue !== undefined
+          )
+          if (hasDefault) continue
+        }
+        record[header] = coerced
+        if (cell.visColIdx >= 0) {
+          if (cell.visColIdx < minVisCol) minVisCol = cell.visColIdx
+          if (cell.visColIdx > maxVisCol) maxVisCol = cell.visColIdx
+        }
+      }
+
+      model.rows.push(record)
+      this.rowStates.push({
+        kind: 'inserted',
+        origin: 'paste',
+        deleted: false,
+        original: {},
+        dirtyCols: new Map<string, unknown>(),
+      })
+      insertedRows++
+    }
+
+    if (updatedCells === 0 && insertedRows === 0) {
+      return { updatedCells: 0, insertedRows: 0, skippedReadOnly, mode: plan.mode }
+    }
+
+    this.invalidateDataCache()
+    this.invalidateFilterCache()
+
+    const nextVisibleRows = this.getFilteredRowIndices()
+    const maxAllowedVisRow = nextVisibleRows.length - 1
+    if (insertedRows > 0 && updatedCells === 0) {
+      const firstVis = nextVisibleRows.indexOf(firstNewIdx)
+      const lastVis = nextVisibleRows.indexOf(model.rows.length - 1)
+      if (firstVis >= 0 && lastVis >= firstVis) {
+        this.selection.selectRow(firstVis, visibleCols.length)
+        if (lastVis > firstVis) {
+          this.selection.selectRow(lastVis, visibleCols.length, { shift: true })
+        }
+        this.selectedRowIndex = firstNewIdx
+        this.selectedColIndex = visibleCols[0] ?? 0
+      }
+      if (this.isTransposed) {
+        this.renderHeader()
+      }
+      this.scrollToBottomForRows(nextVisibleRows.length)
+    } else if (insertedRows > 0 && updatedCells > 0) {
+      const lastVis = nextVisibleRows.indexOf(model.rows.length - 1)
+      if (maxAllowedVisRow >= 0) {
+        const clampedStart = Math.min(plan.startVisRow, maxAllowedVisRow)
+        const selStartCol = Number.isFinite(minVisCol) ? minVisCol : plan.startVisCol
+        const selEndCol = maxVisCol >= selStartCol ? maxVisCol : selStartCol
+        const selEndRow = Math.min(
+          maxAllowedVisRow,
+          Math.max(clampedStart, lastVis >= clampedStart ? lastVis : maxOverwrittenVisRow)
+        )
+        this.selection.selectCell(clampedStart, selStartCol, 'cell')
+        if (selEndRow !== clampedStart || selEndCol !== selStartCol) {
+          this.selection.extendTo(selEndRow, selEndCol, 'cell')
+        }
+      } else {
+        this.selection.clear()
+      }
+      if (this.isTransposed) {
+        this.renderHeader()
+      }
+      this.scrollToBottomForRows(nextVisibleRows.length)
+    } else {
+      if (maxAllowedVisRow >= 0) {
+        const clampedStart = Math.min(plan.startVisRow, maxAllowedVisRow)
+        const clampedEnd = Math.min(maxOverwrittenVisRow, maxAllowedVisRow)
+        const selStartCol = Number.isFinite(minVisCol) ? minVisCol : plan.startVisCol
+        const selEndCol = maxVisCol >= selStartCol ? maxVisCol : selStartCol
+        this.selection.selectCell(clampedStart, selStartCol, 'cell')
+        if (clampedEnd > clampedStart || selEndCol !== selStartCol) {
+          this.selection.extendTo(Math.max(clampedStart, clampedEnd), selEndCol, 'cell')
+        }
+      } else {
+        this.selection.clear()
       }
       this.renderVisibleRows()
-      this.refreshFindMatchesIfActive()
-      this.onStageChange?.(this.getStagedCount())
-      this.notifyAllSelectionListeners()
     }
-    return updated
+
+    this.refreshFindMatchesIfActive()
+    this.onStageChange?.(this.getStagedCount())
+    this.notifyAllSelectionListeners()
+    return { updatedCells, insertedRows, skippedReadOnly, mode: plan.mode }
+  }
+
+  /**
+   * Pastes RFC-4180 TSV/CSV text with smart overwrite + overflow insert (or new rows when nothing is selected).
+   * Returns total affected items (updatedCells + insertedRows).
+   */
+  public pasteDelimitedText(text: string): number {
+    const res = this.pasteDelimitedTextDetailed(text, { forceNewRows: false })
+    return res.updatedCells + res.insertedRows
   }
 
   /**
@@ -4689,13 +4528,14 @@ export class VirtualDataGrid {
     const keptRows: (Record<string, unknown> | unknown[])[] = []
     const keptStates: InternalRowState[] = []
 
-    this.rowStates.forEach((state) => {
+    this.rowStates.forEach((state, idx) => {
       if (state.kind === 'inserted') return
-      keptRows.push(cloneRow(state.original))
+      const restored = state.original === model.rows[idx] ? state.original : cloneRow(state.original)
+      keptRows.push(restored)
       keptStates.push({
         kind: 'existing',
         deleted: false,
-        original: cloneRow(state.original),
+        original: restored,
         dirtyCols: new Map<string, unknown>(),
       })
     })
@@ -4723,59 +4563,15 @@ export class VirtualDataGrid {
    * Returns staged inserts, updates, and deletes formatted for `data.applyChanges` / `data.previewChanges`.
    */
   public getChangesPayload(): GridChangesPayload {
-    const inserts: Record<string, unknown>[] = []
-    const updates: StagedRowUpdate[] = []
-    const deletes: Record<string, unknown>[] = []
-
-    const model = this.model
-    if (!model) {
-      return { inserts, updates, deletes }
-    }
-
-    const headers = model.headers
-    const pkCols = model.primaryKey
-
-    this.rowStates.forEach((state, rowIndex) => {
-      if (state.kind === 'inserted') {
-        if (!state.deleted) {
-          inserts.push(rowToPlainRecord(headers, model.rows[rowIndex], true))
-        }
-        return
-      }
-
-      const primaryKeys: Record<string, unknown> = {}
-      pkCols.forEach((pk) => {
-        const pkIdx = headers.indexOf(pk)
-        primaryKeys[pk] = getCellValue(state.original, pkIdx, pk)
-      })
-
-      if (state.deleted) {
-        deletes.push(primaryKeys)
-        return
-      }
-
-      if (state.dirtyCols.size > 0) {
-        const changes: Record<string, unknown> = {}
-        for (const [k, v] of state.dirtyCols.entries()) {
-          changes[k] = v
-        }
-        updates.push({
-          primaryKeys,
-          changes,
-          originalRow: rowToPlainRecord(headers, state.original, false),
-        })
-      }
-    })
-
-    return { inserts, updates, deletes }
+    return buildGridChangesPayload(this.model, this.rowStates)
   }
 
   /**
-   * Total number of staged operations (inserts + updates + deletes).
+   * Total number of staged operations (inserts + updates + deletes) in O(N) with zero object allocations.
    */
   public getStagedCount(): number {
-    const payload = this.getChangesPayload()
-    return payload.inserts.length + payload.updates.length + payload.deletes.length
+    if (!this.model) return 0
+    return countGridStagedChanges(this.rowStates)
   }
 
   /**
@@ -4953,8 +4749,13 @@ export class VirtualDataGrid {
 
   private coerceEditedValue(rawNewValue: string, originalValue: unknown, colIndex: number): unknown {
     const colDef = this.model?.columns[colIndex]
-    const colType = colDef && 'type' in colDef ? colDef.type : undefined
-    return coerceCellInputValue(rawNewValue, originalValue, colType)
+    const colType =
+      colDef && 'nativeType' in colDef && typeof colDef.nativeType === 'string' && colDef.nativeType
+        ? colDef.nativeType
+        : colDef && 'type' in colDef
+          ? colDef.type
+          : undefined
+    return coerceCellInputValue(rawNewValue, originalValue, colType, this.isColumnNullable(colIndex))
   }
 
   private refreshSingleCellDisplay(
@@ -5001,6 +4802,7 @@ export class VirtualDataGrid {
     td: HTMLTableCellElement
   ): Promise<void> {
     if (!this.activeEditor || !this.model) return
+    const userTyped = this.activeEditor.userTyped
     this.activeEditor = null
     td.classList.remove('editing')
 
@@ -5013,6 +4815,11 @@ export class VirtualDataGrid {
     ) {
       const liveTd = this.findLiveCell(rowIndex, colIndex) ?? td
       this.refreshSingleCellDisplay(liveTd, rowIndex, colIndex, columnName, undefined)
+      return
+    }
+    if (originalValue === null && rawNewValue === '' && !userTyped) {
+      const liveTd = this.findLiveCell(rowIndex, colIndex) ?? td
+      this.refreshSingleCellDisplay(liveTd, rowIndex, colIndex, columnName, null)
       return
     }
 
@@ -5047,6 +4854,9 @@ export class VirtualDataGrid {
     }
     const rowData = targetModel.rows[rowIndex]
     const rowState = this.rowStates[rowIndex]
+    if (rowState && rowState.original === rowData) {
+      rowState.original = cloneRow(rowData)
+    }
 
     setCellValue(rowData, colIndex, columnName, newValue)
     this.invalidateDataCache()
@@ -5252,11 +5062,22 @@ export class VirtualDataGrid {
       if (this.pasteListener) {
         this.tableContainerEl.removeEventListener('paste', this.pasteListener)
       }
+      if (this.tableContainerMouseDownListener) {
+        this.tableContainerEl.removeEventListener('mousedown', this.tableContainerMouseDownListener)
+      }
+      if (this.tableContainerContextMenuListener) {
+        this.tableContainerEl.removeEventListener(
+          'contextmenu',
+          this.tableContainerContextMenuListener
+        )
+      }
     }
     this.scrollListener = null
     this.wheelListener = null
     this.keyDownListener = null
     this.pasteListener = null
+    this.tableContainerMouseDownListener = null
+    this.tableContainerContextMenuListener = null
 
     if (this.tbodyEl) {
       if (this.tbodyMouseDownListener) {
@@ -5286,12 +5107,17 @@ export class VirtualDataGrid {
         window.removeEventListener('keydown', this.windowKeyDownListener)
         this.windowKeyDownListener = null
       }
+      if (this.windowPasteListener) {
+        window.removeEventListener('paste', this.windowPasteListener)
+        this.windowPasteListener = null
+      }
     }
     this.cleanupColumnResize()
     this.cleanupDragSelection()
 
     this.closeContextMenu()
     this.closeBulkFillPopover()
+    this.closeColumnFilterPopover()
     this.mountedRowsByVisRow.clear()
     this.freeRowPool.length = 0
     this.isPoolMountedInTbody = false

@@ -5,6 +5,7 @@ import { MysqlDriver } from './mysql/driver'
 import { RedisDriver } from './redis/driver'
 import { ClickHouseDriver } from './clickhouse/driver'
 import { LibsqlDriver } from './libsql/driver'
+import { D1Driver } from './d1/driver'
 
 export * from './common/driver'
 export * from './common/update-builder'
@@ -15,6 +16,7 @@ export { MysqlDriver, MysqlSession, type MysqlEngineType } from './mysql/driver'
 export { RedisDriver, RedisSession, tokenizeRedisCommandScript } from './redis/driver'
 export { ClickHouseDriver, ClickHouseSession } from './clickhouse/driver'
 export { LibsqlDriver, LibsqlSession } from './libsql/driver'
+export { D1Driver, D1Session } from './d1/driver'
 
 const registry = new Map<DriverType, IDatabaseDriver>()
 
@@ -45,6 +47,9 @@ export function getDriver(type: DriverType): IDatabaseDriver {
         break
       case 'libsql':
         driver = new LibsqlDriver()
+        break
+      case 'd1':
+        driver = new D1Driver()
         break
       default: {
         const exhaustive: never = type

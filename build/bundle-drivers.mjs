@@ -35,6 +35,60 @@ const mockAwsSslPlugin = {
   },
 }
 
+// Narrow, locked-source patch for mysql2's TLS identity check.
+// startTLS() forwards Node's raw checkServerIdentity, which validates against the TLS
+// servername (DNS-only) and therefore falls back to 'localhost' for IP hosts, rejecting a
+// correctly CA-signed IP-SAN-only certificate during the handshake. Datanoa already chooses
+// config.host as the intended DNS/IP identity (including tunnel identity), so bind the check
+// to config.host. DNS-only SNI, TLS materials, rejectUnauthorized, async guards, cache keys and
+// error wiring stay untouched. node_modules is never modified: the patch lives only in memory
+// while bundling the locked module.
+const MYSQL2_VERSION = '3.24.6'
+const MYSQL2_CONNECTION = 'node_modules/mysql2/lib/base/connection.js'
+const TLS_IDENTITY_ANCHOR = `        checkServerIdentity: verifyIdentity
+          ? Tls.checkServerIdentity
+          : function () {
+              return undefined;
+            },`
+const TLS_IDENTITY_PATCH = `        checkServerIdentity: verifyIdentity
+          ? (hostname, cert) => Tls.checkServerIdentity(this.config.host, cert)
+          : function () {
+              return undefined;
+            },`
+
+function createMysqlTlsIpSanPlugin(state) {
+  const target = path.resolve(projectRoot, MYSQL2_CONNECTION)
+  return {
+    name: 'mysql-tls-ip-san',
+    setup(build) {
+      build.onLoad({ filter: /[\\/]mysql2[\\/]lib[\\/]base[\\/]connection\.js$/ }, args => {
+        if (path.resolve(args.path) !== target) {
+          throw new Error(
+            `[bundle-drivers] mysql-tls-ip-san matched unexpected module: ${args.path} (expected ${target})`
+          )
+        }
+        state.loads += 1
+        const source = fs.readFileSync(args.path, 'utf8')
+        const anchorCount = source.split(TLS_IDENTITY_ANCHOR).length - 1
+        if (anchorCount !== 1) {
+          throw new Error(
+            `[bundle-drivers] mysql-tls-ip-san expected exactly one TLS identity anchor in ${MYSQL2_CONNECTION} (mysql2 ${MYSQL2_VERSION}); found ${anchorCount}. Refusing to bundle.`
+          )
+        }
+        const patched = source.replace(TLS_IDENTITY_ANCHOR, TLS_IDENTITY_PATCH)
+        const replacementCount = patched.split(TLS_IDENTITY_PATCH).length - 1
+        if (patched === source || replacementCount !== 1) {
+          throw new Error(
+            `[bundle-drivers] mysql-tls-ip-san replacement failed for ${MYSQL2_CONNECTION}: expected exactly one patched anchor, got ${replacementCount}. Refusing to bundle.`
+          )
+        }
+        state.replacements += 1
+        return { contents: patched, loader: 'js' }
+      })
+    },
+  }
+}
+
 // Node ESM banner to provide require for CommonJS modules referencing Node built-ins
 const nodeEsmBanner = {
   js: `import { createRequire as __createRequire } from "node:module";\nconst require = __createRequire(import.meta.url);`,
@@ -258,6 +312,17 @@ export {
 export default mysql;
 `
 
+  const mysql2Version = JSON.parse(
+    fs.readFileSync(path.join(projectRoot, 'node_modules/mysql2/package.json'), 'utf8')
+  ).version
+  if (mysql2Version !== MYSQL2_VERSION) {
+    throw new Error(
+      `[bundle-drivers] mysql2 version drift: expected ${MYSQL2_VERSION}, found ${mysql2Version}. Refusing to bundle the locked TLS patch.`
+    )
+  }
+  const tlsIpSanState = { loads: 0, replacements: 0 }
+  const tlsIpSanPlugin = createMysqlTlsIpSanPlugin(tlsIpSanState)
+
   const outfile = path.join(vendorDir, 'mysql2.js')
   await esbuild.build({
     stdin: {
@@ -270,7 +335,7 @@ export default mysql;
     format: 'esm',
     target: ['node22', 'es2022'],
     outfile,
-    plugins: [mockAwsSslPlugin],
+    plugins: [mockAwsSslPlugin, tlsIpSanPlugin],
     minify: true,
     // Keep non-ASCII text as UTF-8 so iconv-lite codepage tables inside mysql2 stay literal UTF-8
     // instead of long \xNN / \uNNNN escape runs that trigger Orca directory under-review (code).
@@ -281,6 +346,21 @@ export default mysql;
   })
 
   validateBundle(outfile, 'vendor/mysql2.js', { rejectEscapedRuns: true })
+
+  // The patch must have actually executed on the locked module exactly once (not merely be
+  // capable of matching), and the generated vendor must carry exactly one rebound identity check.
+  if (tlsIpSanState.loads !== 1 || tlsIpSanState.replacements !== 1) {
+    throw new Error(
+      `[bundle-drivers] mysql-tls-ip-san did not run exactly once for ${MYSQL2_CONNECTION} (loads=${tlsIpSanState.loads}, replacements=${tlsIpSanState.replacements}). Refusing to continue.`
+    )
+  }
+  const bundledMysql = fs.readFileSync(outfile, 'utf8')
+  const reboundChecks = bundledMysql.match(/\.checkServerIdentity\(this\.config\.host\s*,/g)
+  if (!reboundChecks || reboundChecks.length !== 1) {
+    throw new Error(
+      `[bundle-drivers] generated vendor/mysql2.js is missing the single config.host identity check (found ${reboundChecks ? reboundChecks.length : 0}). Refusing to continue.`
+    )
+  }
 
   // Emit companion TypeScript declaration
   const dtsContent = `
@@ -300,8 +380,9 @@ async function bundleCodeMirror() {
 export { EditorState, EditorSelection, Compartment } from '@codemirror/state';
 export { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter } from '@codemirror/view';
 export { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
-export { HighlightStyle, syntaxHighlighting, LanguageSupport, StreamLanguage } from '@codemirror/language';
+export { HighlightStyle, syntaxHighlighting, LanguageSupport, StreamLanguage, foldGutter, codeFolding, foldKeymap, bracketMatching } from '@codemirror/language';
 export { autocompletion, completionKeymap } from '@codemirror/autocomplete';
+export { search, searchKeymap, highlightSelectionMatches, openSearchPanel } from '@codemirror/search';
 export { sql, SQLite, PostgreSQL, MySQL, MariaSQL, schemaCompletionSource } from '@codemirror/lang-sql';
 export { tags } from '@lezer/highlight';
 `
@@ -332,8 +413,9 @@ export { tags } from '@lezer/highlight';
 export { EditorState, EditorSelection, Compartment, type Extension } from '@codemirror/state';
 export { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter } from '@codemirror/view';
 export { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
-export { HighlightStyle, syntaxHighlighting, LanguageSupport, StreamLanguage } from '@codemirror/language';
+export { HighlightStyle, syntaxHighlighting, LanguageSupport, StreamLanguage, foldGutter, codeFolding, foldKeymap, bracketMatching } from '@codemirror/language';
 export { autocompletion, completionKeymap } from '@codemirror/autocomplete';
+export { search, searchKeymap, highlightSelectionMatches, openSearchPanel } from '@codemirror/search';
 export { sql, SQLite, PostgreSQL, MySQL, MariaSQL, schemaCompletionSource, type SQLDialect } from '@codemirror/lang-sql';
 export { tags } from '@lezer/highlight';
 `

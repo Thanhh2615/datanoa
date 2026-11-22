@@ -488,7 +488,23 @@ export class GridSelectionModel {
     if (!Number.isFinite(rowCount) || !Number.isFinite(colCount) || rowCount <= 0 || colCount <= 0) {
       return
     }
+    const maxRow = Math.floor(rowCount) - 1
     const maxCol = Math.floor(colCount) - 1
+    if (this.ranges.length === 1) {
+      const rg = this.ranges[0]
+      const rStart = Math.max(0, rg.startRow)
+      const rEnd = Math.min(maxRow, rg.endRow)
+      const cStart = Math.max(0, rg.startCol)
+      const cEnd = Math.min(maxCol, rg.endCol)
+      for (let row = rStart; row <= rEnd; row++) {
+        for (let col = cStart; col <= cEnd; col++) {
+          if (cb(row, col) === false) {
+            return
+          }
+        }
+      }
+      return
+    }
     const rows = this.getSelectedRowIndices(rowCount)
     for (const row of rows) {
       const colIntervals = this.getMergedColIntervalsForRow(row, maxCol)
@@ -569,32 +585,57 @@ export class GridSelectionModel {
     let max = Number.NEGATIVE_INFINITY
     let isTruncatedScan = false
 
-    for (const rowIv of rowIntervals) {
-      for (let r = rowIv.start; r <= rowIv.end; r++) {
-        const rowCols: ClosedInterval[] = []
-        for (const rg of clampedRanges) {
-          if (r >= rg.startRow && r <= rg.endRow) {
-            rowCols.push({ start: rg.startCol, end: rg.endCol })
+    if (clampedRanges.length === 1) {
+      const rg = clampedRanges[0]
+      cellCount = distinctRowCount * distinctColCount
+      outerSingle: for (let r = rg.startRow; r <= rg.endRow; r++) {
+        for (let c = rg.startCol; c <= rg.endCol; c++) {
+          if (scannedCount >= effectiveCap) {
+            isTruncatedScan = true
+            break outerSingle
+          }
+          scannedCount++
+          const value = getValue(r, c)
+          if (value !== null && value !== undefined) {
+            nonNullCount++
+            const num = parseFiniteNumericValue(value)
+            if (num !== null) {
+              numericCount++
+              sum += num
+              if (num < min) min = num
+              if (num > max) max = num
+            }
           }
         }
-        const mergedCols = mergeClosedIntervals(rowCols)
-        for (const colIv of mergedCols) {
-          cellCount += colIv.end - colIv.start + 1
-          for (let c = colIv.start; c <= colIv.end; c++) {
-            if (scannedCount >= effectiveCap) {
-              isTruncatedScan = true
-              break
+      }
+    } else {
+      for (const rowIv of rowIntervals) {
+        for (let r = rowIv.start; r <= rowIv.end; r++) {
+          const rowCols: ClosedInterval[] = []
+          for (const rg of clampedRanges) {
+            if (r >= rg.startRow && r <= rg.endRow) {
+              rowCols.push({ start: rg.startCol, end: rg.endCol })
             }
-            scannedCount++
-            const value = getValue(r, c)
-            if (value !== null && value !== undefined) {
-              nonNullCount++
-              const num = parseFiniteNumericValue(value)
-              if (num !== null) {
-                numericCount++
-                sum += num
-                if (num < min) min = num
-                if (num > max) max = num
+          }
+          const mergedCols = mergeClosedIntervals(rowCols)
+          for (const colIv of mergedCols) {
+            cellCount += colIv.end - colIv.start + 1
+            for (let c = colIv.start; c <= colIv.end; c++) {
+              if (scannedCount >= effectiveCap) {
+                isTruncatedScan = true
+                break
+              }
+              scannedCount++
+              const value = getValue(r, c)
+              if (value !== null && value !== undefined) {
+                nonNullCount++
+                const num = parseFiniteNumericValue(value)
+                if (num !== null) {
+                  numericCount++
+                  sum += num
+                  if (num < min) min = num
+                  if (num > max) max = num
+                }
               }
             }
           }
@@ -654,33 +695,131 @@ export class GridSelectionModel {
   }
 }
 
-function detectClipboardDelimiter(text: string): '\t' | ',' {
-  let inQuotes = false
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i]
-    if (ch === '"') {
-      if (inQuotes && i + 1 < text.length && text[i + 1] === '"') {
-        i++
-        continue
-      }
-      inQuotes = !inQuotes
-      continue
-    }
-    if (!inQuotes && ch === '\t') {
-      return '\t'
+function looksLikeJsonLiteral(trimmed: string): boolean {
+  if (
+    (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+    (trimmed.startsWith('[') && trimmed.endsWith(']'))
+  ) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed)
+      return parsed !== null && typeof parsed === 'object'
+    } catch {
+      return false
     }
   }
-  return ','
+  return false
+}
+
+function detectClipboardDelimiter(text: string): '\t' | ',' {
+  const trimmed = text.trim()
+  if (looksLikeJsonLiteral(trimmed)) {
+    return '\t'
+  }
+
+  let inQuotes = false
+  let atFieldStart = true
+  let hasQuotedCommaBoundary = false
+  const lineCommaCounts: number[] = []
+  let currentCommas = 0
+  let currentLineHasChars = false
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (inQuotes) {
+      if (ch === '"') {
+        if (i + 1 < text.length && text[i + 1] === '"') {
+          i++
+          continue
+        }
+        inQuotes = false
+        if (i + 1 < text.length && text[i + 1] === ',') {
+          hasQuotedCommaBoundary = true
+        }
+        continue
+      }
+      continue
+    }
+
+    if (atFieldStart && ch === '"') {
+      inQuotes = true
+      atFieldStart = false
+      currentLineHasChars = true
+      continue
+    }
+
+    if (ch === '\t') {
+      return '\t'
+    }
+
+    if (ch === ',') {
+      currentCommas++
+      atFieldStart = true
+      currentLineHasChars = true
+      continue
+    }
+
+    if (ch === '\r' || ch === '\n') {
+      if (currentLineHasChars) {
+        lineCommaCounts.push(currentCommas)
+      }
+      currentCommas = 0
+      currentLineHasChars = false
+      atFieldStart = true
+      if (ch === '\r' && i + 1 < text.length && text[i + 1] === '\n') {
+        i++
+      }
+      continue
+    }
+
+    atFieldStart = false
+    currentLineHasChars = true
+  }
+
+  if (currentLineHasChars) {
+    lineCommaCounts.push(currentCommas)
+  }
+
+  if (lineCommaCounts.length === 0) {
+    return '\t'
+  }
+
+  // Multi-line CSV: every non-empty logical record has identical unquoted comma count >= 1
+  if (lineCommaCounts.length >= 2) {
+    const first = lineCommaCounts[0]
+    if (first >= 1 && lineCommaCounts.every((count) => count === first)) {
+      return ','
+    }
+    return '\t'
+  }
+
+  // Single-line RFC-4180 quoted CSV row (e.g. "a","b","c")
+  if (hasQuotedCommaBoundary && lineCommaCounts[0] >= 1) {
+    return ','
+  }
+
+  // Default to TSV so single-cell values containing commas (addresses, prose, formatted numbers) stay intact
+  return '\t'
 }
 
 /**
- * RFC-4180 compliant clipboard parser. Auto-detects `\t` vs `,`, preserves quoted
- * newlines & `""` escapes, and strips a trailing empty newline.
+ * RFC-4180 compliant clipboard parser. Auto-detects `\t` vs `,` without splitting
+ * single-cell prose/addresses/JSON (including pretty-printed JSON) on commas or newlines,
+ * preserves quoted newlines & `""` escapes, and strips a trailing empty newline.
  */
-export function parseDelimitedClipboard(text: string): string[][] {
+export function parseDelimitedClipboard(
+  text: string,
+  options?: { delimiter?: '\t' | ',' }
+): string[][] {
   if (!text) return []
 
-  const delimiter = detectClipboardDelimiter(text)
+  if (!options?.delimiter) {
+    const trimmed = text.trim()
+    if (looksLikeJsonLiteral(trimmed)) {
+      return [[trimmed]]
+    }
+  }
+
+  const delimiter = options?.delimiter ?? detectClipboardDelimiter(text)
   const rows: string[][] = []
   let currentRow: string[] = []
   let field = ''

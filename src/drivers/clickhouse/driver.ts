@@ -1,3 +1,5 @@
+import * as https from 'node:https'
+import type * as tls from 'node:tls'
 import type {
   ApplyChangesParams,
   ApplyChangesResult,
@@ -8,13 +10,24 @@ import type {
   IDatabaseSession,
   PreviewChangesResult,
   QueryResult,
+  QueryResultSet,
   SchemaObject,
+  SchemaObjectKind,
   TableBrowseResult,
   TableDetails,
+  TransactionState,
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
-import { DatabaseDriverError } from '../common/driver'
+import {
+  DatabaseDriverError,
+  buildCombinedAbortSignal,
+  createUnsupportedTransactionError,
+  createUnsupportedTransactionState,
+  runDriverConnectionTest,
+} from '../common/driver'
+import type { DriverTlsOptions } from '../common/tls-and-tunnel'
+import { resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
 import {
   assembleTableBrowseResult,
   buildSelectPageSql,
@@ -22,9 +35,15 @@ import {
   formatSqlValue,
   quoteQualifiedTable,
 } from '../common/update-builder'
-import { quoteIdentForDialect, reconstructTableDdl, splitSqlStatements } from '../common/sql-tools'
+import { TableDetailsCache, collectAndAssembleSchemaDdl } from '../common/schema'
+import { stripCommentsAndLiterals, isMutatingStatement } from '../common/sql-lexer'
+import { compactSql, quoteIdentForDialect, reconstructTableDdl, splitSqlStatements } from '../common/sql-tools'
 
 const CLICKHOUSE_HTTP_TIMEOUT_MS = 30_000
+const CLICKHOUSE_UNSUPPORTED_TX_REASON =
+  'ClickHouse does not support interactive multi-statement transactions'
+const CLICKHOUSE_MAX_INSERT_ROWS_PER_STMT = 500
+const CLICKHOUSE_MAX_INSERT_SQL_BYTES = 256 * 1024
 
 interface ClickHouseJsonCompactResponse {
   meta?: Array<{ name: string; type: string }>
@@ -36,18 +55,114 @@ const CLICKHOUSE_ROW_RETURNING_REGEX =
   /^\s*\(*\s*(?:SELECT|SHOW|DESCRIBE|DESC|EXPLAIN|EXISTS|WITH)\b/i
 const CLICKHOUSE_FORMAT_SUFFIX_REGEX = /\bFORMAT\s+([A-Za-z0-9_]+)\s*;?\s*$/i
 
-function buildClickHouseAbortSignal(signal?: AbortSignal): AbortSignal {
-  const timeoutSignal = AbortSignal.timeout(CLICKHOUSE_HTTP_TIMEOUT_MS)
-  if (!signal) {
-    return timeoutSignal
+function finishClickHouseHttp(
+  text: string,
+  ok: boolean,
+  status: number,
+  summaryHeader: string | null,
+  expectJsonCompact: boolean
+): { json?: ClickHouseJsonCompactResponse; summaryAffectedRows?: number; rawText: string } {
+  if (!ok) {
+    throw new DatabaseDriverError(
+      text.trim() || `ClickHouse HTTP error ${status}`,
+      'CLICKHOUSE_ERROR',
+      'clickhouse'
+    )
   }
-  if (typeof AbortSignal.any === 'function') {
-    return AbortSignal.any([signal, timeoutSignal])
+
+  let summaryAffectedRows: number | undefined
+  if (summaryHeader) {
+    try {
+      const summary = JSON.parse(summaryHeader) as { written_rows?: string | number }
+      if (summary.written_rows !== undefined) {
+        const n = Number(summary.written_rows)
+        if (Number.isFinite(n)) summaryAffectedRows = n
+      }
+    } catch {
+      // Ignore malformed summary header
+    }
   }
-  return signal
+
+  if (expectJsonCompact) {
+    if (!text.trim()) {
+      return { json: { meta: [], data: [], rows: 0 }, summaryAffectedRows, rawText: text }
+    }
+    try {
+      const parsed = JSON.parse(text) as ClickHouseJsonCompactResponse
+      return { json: parsed, summaryAffectedRows, rawText: text }
+    } catch (err) {
+      throw new DatabaseDriverError(
+        `Failed to parse ClickHouse JSONCompact response: ${err instanceof Error ? err.message : String(err)}`,
+        'CLICKHOUSE_PARSE_ERROR',
+        'clickhouse',
+        err
+      )
+    }
+  }
+
+  return { summaryAffectedRows, rawText: text }
 }
 
-function normalizeClickHouseBaseUrl(profile: ConnectionProfile): string {
+/** POSTs through node:https so custom CA / mTLS options apply to ClickHouse over HTTPS */
+function sendHttpsRequest(
+  url: URL,
+  headers: Record<string, string>,
+  body: string,
+  tlsOptions: tls.ConnectionOptions,
+  signal: AbortSignal
+): Promise<{ text: string; ok: boolean; status: number; summaryHeader: string | null }> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      url,
+      { method: 'POST', headers, ...tlsOptions, agent: false, signal },
+      (res) => {
+        res.setEncoding('utf8')
+        let text = ''
+        res.on('data', (chunk: string) => {
+          text += chunk
+        })
+        res.on('error', reject)
+        res.on('end', () => {
+          const summary = res.headers['x-clickhouse-summary']
+          resolve({
+            text,
+            ok: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300,
+            status: res.statusCode ?? 0,
+            summaryHeader: typeof summary === 'string' ? summary : null,
+          })
+        })
+      }
+    )
+    req.on('error', reject)
+    req.end(body)
+  })
+}
+
+export function normalizeClickHouseBaseUrl(
+  profile: ConnectionProfile,
+  tlsOverride?: false | tls.ConnectionOptions
+): string {
+  if (tlsOverride === false) {
+    // Explicit sslMode: 'disable' — force plain HTTP, never fall back to auto-SSL
+    const raw = (profile.url?.trim() || '').replace(/^clickhouses:\/\//i, 'http://')
+    if (raw.length > 0) return raw.replace(/^https:\/\//i, 'http://').replace(/\/+$/, '')
+    return `http://${profile.host || 'localhost'}:${profile.port || 8123}`
+  }
+  if (tlsOverride) {
+    const host = profile.host || 'localhost'
+    const rawUrl = typeof profile.url === 'string' ? profile.url.trim() : ''
+    if (rawUrl.length === 0) return `https://${host}:${profile.port || 8443}`
+    // Custom CA / mTLS requires HTTPS: upgrade plain http:// URLs so https.request
+    // never throws ERR_INVALID_PROTOCOL
+    const raw = rawUrl.replace(/\/+$/, '')
+    if (/^http:\/\//i.test(raw)) return raw.replace(/^http:\/\//i, 'https://')
+    if (/^clickhouses?:\/\//i.test(raw)) return raw.replace(/^clickhouses?:\/\//i, 'https://')
+    return raw
+  }
+  return resolveClickHouseBaseUrl(profile)
+}
+
+function resolveClickHouseBaseUrl(profile: ConnectionProfile): string {
   if (profile.url && profile.url.trim().length > 0) {
     let raw = profile.url.trim().replace(/\/+$/, '')
     if (/^clickhouses:\/\//i.test(raw)) {
@@ -89,11 +204,18 @@ function stripLeadingComments(sql: string): string {
 
 function isRowReturningClickHouseQuery(sql: string): boolean {
   const clean = stripLeadingComments(sql)
-  return CLICKHOUSE_ROW_RETURNING_REGEX.test(clean)
+  if (!CLICKHOUSE_ROW_RETURNING_REGEX.test(clean)) {
+    return false
+  }
+  const stripped = stripCommentsAndLiterals(sql, 'clickhouse').trim()
+  if (/^\(*\s*WITH\b/i.test(stripped) && /\b(?:INSERT\s+INTO|ALTER\s+TABLE|UPDATE|DELETE)\b/i.test(stripped)) {
+    return false
+  }
+  return true
 }
 
 function extractExplicitClickHouseFormat(sql: string): string | null {
-  const stripped = sql.trim().replace(/;+\s*$/, '')
+  const stripped = stripCommentsAndLiterals(sql, 'clickhouse').trim().replace(/;+\s*$/, '')
   const match = CLICKHOUSE_FORMAT_SUFFIX_REGEX.exec(stripped)
   return match ? match[1] : null
 }
@@ -102,7 +224,7 @@ function prepareClickHouseSql(sql: string, forceJsonCompact: boolean): string {
   const stmts = splitSqlStatements(sql, 'clickhouse')
   const core = stmts.length === 1 ? stmts[0].text : sql.trim().replace(/;+\s*$/, '')
   const stripped = core.replace(/;+\s*$/, '')
-  if (!forceJsonCompact || CLICKHOUSE_FORMAT_SUFFIX_REGEX.test(stripped)) {
+  if (!forceJsonCompact || extractExplicitClickHouseFormat(stripped) !== null) {
     return stripped
   }
   const hasTrailingLineComment = /(?:--|#)[^\r\n]*$/.test(stripped)
@@ -127,7 +249,8 @@ function mapCompactRowsToObjects(
 function buildClickHouseWhereSql(
   conditions: Record<string, unknown>,
   extraRow?: Record<string, unknown>,
-  changeKeys?: string[]
+  changeKeys?: string[],
+  columnTypes?: Record<string, string>
 ): string {
   const parts: string[] = []
   for (const [col, val] of Object.entries(conditions)) {
@@ -139,7 +262,7 @@ function buildClickHouseWhereSql(
     for (const col of changeKeys) {
       if (!Object.prototype.hasOwnProperty.call(extraRow, col)) continue
       const orig = extraRow[col]
-      if (!canBindOptimisticLockValue(orig)) continue
+      if (!canBindOptimisticLockValue(orig, columnTypes?.[col])) continue
       const qCol = quoteIdentForDialect(col, 'clickhouse')
       parts.push(orig === null ? `${qCol} IS NULL` : `${qCol} = ${formatSqlValue(orig, 'clickhouse')}`)
     }
@@ -174,12 +297,20 @@ export class ClickHouseSession implements IDatabaseSession {
   private readonly baseUrl: string
   private readonly secret?: string
   private readonly activeQueries = new Map<string, ActiveClickHouseQuery>()
+  private readonly tableDetailsCache = new TableDetailsCache()
+  private readonly tlsOptions?: tls.ConnectionOptions
+  private serverReadOnlySettings = false
   private isClosed = false
 
-  constructor(profile: ConnectionProfile, secret?: string) {
+  constructor(
+    profile: ConnectionProfile,
+    secret?: string,
+    tlsOverride?: false | tls.ConnectionOptions
+  ) {
     this.profile = profile
     this.secret = secret
-    this.baseUrl = normalizeClickHouseBaseUrl(profile)
+    this.tlsOptions = tlsOverride === false ? undefined : tlsOverride
+    this.baseUrl = normalizeClickHouseBaseUrl(profile, tlsOverride)
   }
 
   isAlive(): boolean {
@@ -202,13 +333,25 @@ export class ClickHouseSession implements IDatabaseSession {
     return headers
   }
 
+  private assertWritable(): void {
+    if (this.profile.readOnly) {
+      throw new DatabaseDriverError(
+        'Connection is read-only. Write operations are disabled.',
+        'READ_ONLY',
+        'clickhouse'
+      )
+    }
+  }
+
   private async executeHttp(
     sql: string,
     options?: {
       queryId?: string
       expectJsonCompact?: boolean
       signal?: AbortSignal
-    }
+      maxResultRows?: number
+    },
+    retryWithoutSettings = false
   ): Promise<{
     json?: ClickHouseJsonCompactResponse
     summaryAffectedRows?: number
@@ -222,19 +365,69 @@ export class ClickHouseSession implements IDatabaseSession {
       options?.queryId || `ch_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
     const url = new URL(`${this.baseUrl}/`)
     url.searchParams.set('query_id', qid)
+    const allowSettings = !this.serverReadOnlySettings
+    let sentSettings = false
+    if (this.profile.readOnly && allowSettings) {
+      url.searchParams.set('readonly', '1')
+      sentSettings = true
+    }
+    if (options?.expectJsonCompact && !this.profile.readOnly && allowSettings) {
+      url.searchParams.set('output_format_json_quote_denormals', '1')
+      sentSettings = true
+    }
+    if (
+      !this.profile.readOnly &&
+      allowSettings &&
+      typeof options?.maxResultRows === 'number' &&
+      Number.isFinite(options.maxResultRows) &&
+      options.maxResultRows > 0
+    ) {
+      url.searchParams.set('max_result_rows', String(Math.floor(options.maxResultRows)))
+      url.searchParams.set('result_overflow_mode', 'break')
+      sentSettings = true
+    }
 
     const bodySql = prepareClickHouseSql(sql, Boolean(options?.expectJsonCompact))
 
-    const combinedSignal = buildClickHouseAbortSignal(options?.signal)
-    let response: Response
+    const combinedSignal = buildCombinedAbortSignal(CLICKHOUSE_HTTP_TIMEOUT_MS, options?.signal)
+    const headers = this.buildHeaders()
     try {
-      response = await fetch(url.toString(), {
-        method: 'POST',
-        headers: this.buildHeaders(),
-        body: bodySql,
-        signal: combinedSignal,
-      })
+      if (this.tlsOptions === undefined) {
+        const response = await fetch(url.toString(), {
+          method: 'POST',
+          headers,
+          body: bodySql,
+          signal: combinedSignal,
+        })
+        const text = await response.text()
+        return finishClickHouseHttp(
+          text,
+          response.ok,
+          response.status,
+          response.headers.get('x-clickhouse-summary'),
+          Boolean(options?.expectJsonCompact)
+        )
+      }
+      // Custom CA / client certs (mTLS) need node:https so tls.ConnectionOptions apply
+      const result = await sendHttpsRequest(url, headers, bodySql, this.tlsOptions, combinedSignal)
+      return finishClickHouseHttp(
+        result.text,
+        result.ok,
+        result.status,
+        result.summaryHeader,
+        Boolean(options?.expectJsonCompact)
+      )
     } catch (err: unknown) {
+      if (
+        !retryWithoutSettings &&
+        sentSettings &&
+        err instanceof DatabaseDriverError &&
+        err.code === 'CLICKHOUSE_ERROR' &&
+        /Cannot modify\s+'[^']+'\s+setting in readonly mode/i.test(err.message)
+      ) {
+        this.serverReadOnlySettings = true
+        return await this.executeHttp(sql, options, true)
+      }
       const errName = (err as { name?: string })?.name
       if (options?.signal?.aborted) {
         throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'clickhouse', err)
@@ -247,6 +440,9 @@ export class ClickHouseSession implements IDatabaseSession {
           err
         )
       }
+      if (err instanceof DatabaseDriverError) {
+        throw err
+      }
       throw new DatabaseDriverError(
         err instanceof Error ? err.message : 'ClickHouse HTTP request failed',
         'CONNECTION_FAILED',
@@ -254,48 +450,6 @@ export class ClickHouseSession implements IDatabaseSession {
         err
       )
     }
-
-    const text = await response.text()
-    if (!response.ok) {
-      throw new DatabaseDriverError(
-        text.trim() || `ClickHouse HTTP error ${response.status}`,
-        'CLICKHOUSE_ERROR',
-        'clickhouse'
-      )
-    }
-
-    let summaryAffectedRows: number | undefined
-    const summaryHeader = response.headers.get('x-clickhouse-summary')
-    if (summaryHeader) {
-      try {
-        const summary = JSON.parse(summaryHeader) as { written_rows?: string | number }
-        if (summary.written_rows !== undefined) {
-          const n = Number(summary.written_rows)
-          if (Number.isFinite(n)) summaryAffectedRows = n
-        }
-      } catch {
-        // Ignore malformed summary header
-      }
-    }
-
-    if (options?.expectJsonCompact) {
-      if (!text.trim()) {
-        return { json: { meta: [], data: [], rows: 0 }, summaryAffectedRows, rawText: text }
-      }
-      try {
-        const parsed = JSON.parse(text) as ClickHouseJsonCompactResponse
-        return { json: parsed, summaryAffectedRows, rawText: text }
-      } catch (err) {
-        throw new DatabaseDriverError(
-          `Failed to parse ClickHouse JSONCompact response: ${err instanceof Error ? err.message : String(err)}`,
-          'CLICKHOUSE_PARSE_ERROR',
-          'clickhouse',
-          err
-        )
-      }
-    }
-
-    return { summaryAffectedRows, rawText: text }
   }
 
   async test(): Promise<{ ok: boolean; message?: string }> {
@@ -314,6 +468,7 @@ export class ClickHouseSession implements IDatabaseSession {
   }
 
   async close(): Promise<void> {
+    this.tableDetailsCache.clear()
     if (this.isClosed) return
     this.isClosed = true
     for (const active of this.activeQueries.values()) {
@@ -339,12 +494,71 @@ export class ClickHouseSession implements IDatabaseSession {
     const rows = mapCompactRowsToObjects(meta, json?.data || [])
     return rows.map((r) => {
       const engine = String(r.engine || '')
-      const isView = /View$/i.test(engine)
+      const kind: SchemaObjectKind =
+        engine === 'MaterializedView'
+          ? 'materialized_view'
+          : /View$/i.test(engine)
+            ? 'view'
+            : 'table'
       return {
         name: String(r.name),
         schema: String(r.schema || targetDb),
-        kind: isView ? 'view' : 'table',
+        kind,
       }
+    })
+  }
+
+  async listSchemas(): Promise<{ schemas: string[]; defaultSchema: string }> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'clickhouse')
+    }
+    const { json } = await this.executeHttp('SHOW DATABASES', { expectJsonCompact: true })
+    const rows = mapCompactRowsToObjects(json?.meta || [], json?.data || [])
+    const names = rows
+      .map((r) => String(r.name ?? ''))
+      .filter((name) => name.length > 0 && name !== 'system')
+    const defaultSchema = this.getDatabase()
+    return {
+      schemas: names.includes(defaultSchema) ? names : [defaultSchema, ...names],
+      defaultSchema,
+    }
+  }
+
+  async getObjectDdl(name: string, kind: SchemaObjectKind, schema?: string): Promise<string> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'clickhouse')
+    }
+    const targetDb = schema || this.getDatabase()
+    const qTable = quoteQualifiedTable(name, targetDb, 'clickhouse')
+    const commands = kind === 'view' ? ['SHOW CREATE VIEW', 'SHOW CREATE TABLE'] : ['SHOW CREATE TABLE']
+    for (const command of commands) {
+      try {
+        const { json } = await this.executeHttp(`${command} ${qTable}`, {
+          expectJsonCompact: true,
+        })
+        const firstRow = json?.data?.[0]
+        if (Array.isArray(firstRow) && typeof firstRow[0] === 'string' && firstRow[0].trim()) {
+          const stmt = firstRow[0].trim()
+          return stmt.endsWith(';') ? stmt : `${stmt};`
+        }
+      } catch {
+        // Try the next SHOW CREATE variant before falling back to metadata reconstruction
+      }
+    }
+    return this.getDdl(name, targetDb)
+  }
+
+  async exportSchemaDdl(schema?: string): Promise<{ ddl: string; objectCount: number }> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'clickhouse')
+    }
+    const targetDb = schema || this.getDatabase()
+    const objects = await this.listObjects(targetDb)
+    return collectAndAssembleSchemaDdl({
+      dialect: 'clickhouse',
+      schemaName: targetDb,
+      objects,
+      getObjectDdl: (object) => this.getObjectDdl(object.name, object.kind, targetDb),
     })
   }
 
@@ -353,6 +567,10 @@ export class ClickHouseSession implements IDatabaseSession {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'clickhouse')
     }
     const targetDb = schema || this.getDatabase()
+    const cached = this.tableDetailsCache.get(targetDb, 'default', table)
+    if (cached) {
+      return cached
+    }
     const escapedDb = escapeClickHouseLiteralText(targetDb)
     const escapedTable = escapeClickHouseLiteralText(table)
 
@@ -416,7 +634,7 @@ export class ClickHouseSession implements IDatabaseSession {
       }
     })
 
-    return {
+    const details: TableDetails = {
       name: table,
       schema: targetDb,
       kind,
@@ -425,6 +643,8 @@ export class ClickHouseSession implements IDatabaseSession {
       indexes: [],
       foreignKeys: [],
     }
+    this.tableDetailsCache.set(targetDb, 'default', table, details)
+    return details
   }
 
   async fetchPage(params: FetchPageParams): Promise<TableBrowseResult> {
@@ -473,6 +693,7 @@ export class ClickHouseSession implements IDatabaseSession {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'clickhouse')
     }
+    this.assertWritable()
     if (!params.primaryKeys || Object.keys(params.primaryKeys).length === 0) {
       throw new DatabaseDriverError(
         'Cannot update ClickHouse record without primary key conditions',
@@ -482,13 +703,21 @@ export class ClickHouseSession implements IDatabaseSession {
     }
 
     const targetDb = params.schema || this.getDatabase()
+    const originalColumnType = this.tableDetailsCache.findColumnType(
+      targetDb,
+      'default',
+      params.table,
+      params.column,
+      params.columnType
+    )
     const qTable = quoteQualifiedTable(params.table, targetDb, 'clickhouse')
     const qCol = quoteIdentForDialect(params.column, 'clickhouse')
     const valSql = formatSqlValue(params.newValue, 'clickhouse')
     const whereSql = buildClickHouseWhereSql(
       params.primaryKeys,
       params.originalValue !== undefined ? { [params.column]: params.originalValue } : undefined,
-      params.originalValue !== undefined ? [params.column] : undefined
+      params.originalValue !== undefined ? [params.column] : undefined,
+      originalColumnType ? { [params.column]: originalColumnType } : undefined
     )
 
     const checkRes = await this.executeHttp(
@@ -533,15 +762,24 @@ export class ClickHouseSession implements IDatabaseSession {
   }
 
   private buildChangeStatements(params: ApplyChangesParams): {
-    deletes: { preview: string; exec: string }[]
+    deletes: { preview: string; exec: string; rowCount: number }[]
     updates: { preview: string; exec: string }[]
-    inserts: { preview: string; exec: string }[]
+    inserts: { preview: string; exec: string; rowCount: number }[]
   } {
     const targetDb = params.schema || this.getDatabase()
     const qTable = quoteQualifiedTable(params.table, targetDb, 'clickhouse')
+    const columnTypes = this.tableDetailsCache.resolveColumnTypes(
+      targetDb,
+      'default',
+      params.table,
+      params.columnTypes
+    )
 
-    const deletes: { preview: string; exec: string }[] = []
-    for (const pk of params.deletes ?? []) {
+    const deletes: { preview: string; exec: string; rowCount: number }[] = []
+    const rawDeletes = params.deletes ?? []
+    let delIdx = 0
+    while (delIdx < rawDeletes.length) {
+      const pk = rawDeletes[delIdx]
       const pkEntries = Object.entries(pk || {}).filter(([, v]) => v !== undefined)
       if (pkEntries.length === 0) {
         throw new DatabaseDriverError(
@@ -550,11 +788,37 @@ export class ClickHouseSession implements IDatabaseSession {
           'clickhouse'
         )
       }
+      if (rawDeletes.length > 1 && pkEntries.length === 1 && pkEntries[0][1] !== null) {
+        const [pkCol, firstVal] = pkEntries[0]
+        const qCol = quoteIdentForDialect(pkCol, 'clickhouse')
+        const inLiterals: string[] = [formatSqlValue(firstVal, 'clickhouse')]
+        let nextDelIdx = delIdx + 1
+        while (nextDelIdx < rawDeletes.length && inLiterals.length < CLICKHOUSE_MAX_INSERT_ROWS_PER_STMT) {
+          const candEntries = Object.entries(rawDeletes[nextDelIdx] || {}).filter(([, v]) => v !== undefined)
+          if (candEntries.length !== 1 || candEntries[0][0] !== pkCol || candEntries[0][1] === null) {
+            break
+          }
+          inLiterals.push(formatSqlValue(candEntries[0][1], 'clickhouse'))
+          nextDelIdx += 1
+        }
+        if (inLiterals.length > 1) {
+          const whereInSql = `${qCol} IN (${inLiterals.join(', ')})`
+          deletes.push({
+            preview: `ALTER TABLE ${qTable} DELETE WHERE ${whereInSql};`,
+            exec: `ALTER TABLE ${qTable} DELETE WHERE ${whereInSql} SETTINGS mutations_sync = 1`,
+            rowCount: inLiterals.length,
+          })
+          delIdx = nextDelIdx
+          continue
+        }
+      }
       const whereSql = buildClickHouseWhereSql(pk)
       deletes.push({
         preview: `ALTER TABLE ${qTable} DELETE WHERE ${whereSql};`,
         exec: `ALTER TABLE ${qTable} DELETE WHERE ${whereSql} SETTINGS mutations_sync = 1`,
+        rowCount: 1,
       })
+      delIdx += 1
     }
 
     const updates: { preview: string; exec: string }[] = []
@@ -579,7 +843,8 @@ export class ClickHouseSession implements IDatabaseSession {
       const whereSql = buildClickHouseWhereSql(
         upd.primaryKeys,
         upd.originalRow,
-        changeEntries.map(([c]) => c)
+        changeEntries.map(([c]) => c),
+        columnTypes
       )
       updates.push({
         preview: `ALTER TABLE ${qTable} UPDATE ${setSql} WHERE ${whereSql};`,
@@ -587,9 +852,12 @@ export class ClickHouseSession implements IDatabaseSession {
       })
     }
 
-    const inserts: { preview: string; exec: string }[] = []
-    for (const row of params.inserts ?? []) {
-      const entries = Object.entries(row || {}).filter(([, v]) => v !== undefined)
+    const inserts: { preview: string; exec: string; rowCount: number }[] = []
+    const rawInserts = params.inserts ?? []
+    let idx = 0
+    while (idx < rawInserts.length) {
+      const firstRow = rawInserts[idx]
+      const entries = Object.entries(firstRow || {}).filter(([, v]) => v !== undefined)
       if (entries.length === 0) {
         throw new DatabaseDriverError(
           'ClickHouse INSERT requires at least one column value',
@@ -597,10 +865,32 @@ export class ClickHouseSession implements IDatabaseSession {
           'clickhouse'
         )
       }
-      const colsSql = entries.map(([c]) => quoteIdentForDialect(c, 'clickhouse')).join(', ')
-      const valsSql = entries.map(([, v]) => formatSqlValue(v, 'clickhouse')).join(', ')
-      const sql = `INSERT INTO ${qTable} (${colsSql}) VALUES (${valsSql});`
-      inserts.push({ preview: sql, exec: sql })
+      const cols = entries.map(([c]) => c)
+      const colSig = cols.join('\0')
+      const colsSql = cols.map((c) => quoteIdentForDialect(c, 'clickhouse')).join(', ')
+      const firstTuple = `(${entries.map(([, v]) => formatSqlValue(v, 'clickhouse')).join(', ')})`
+      const prefixSql = `INSERT INTO ${qTable} (${colsSql}) VALUES `
+      let runningBytes = Buffer.byteLength(prefixSql + firstTuple + ';', 'utf8')
+      const tuples: string[] = [firstTuple]
+
+      let nextIdx = idx + 1
+      while (nextIdx < rawInserts.length && tuples.length < CLICKHOUSE_MAX_INSERT_ROWS_PER_STMT) {
+        const candidate = rawInserts[nextIdx]
+        const candEntries = Object.entries(candidate || {}).filter(([, v]) => v !== undefined)
+        if (candEntries.length === 0) break
+        const candCols = candEntries.map(([c]) => c)
+        if (candCols.join('\0') !== colSig) break
+        const candTuple = `(${candEntries.map(([, v]) => formatSqlValue(v, 'clickhouse')).join(', ')})`
+        const addedBytes = Buffer.byteLength(', ' + candTuple, 'utf8')
+        if (runningBytes + addedBytes > CLICKHOUSE_MAX_INSERT_SQL_BYTES) break
+        tuples.push(candTuple)
+        runningBytes += addedBytes
+        nextIdx += 1
+      }
+
+      const sql = `${prefixSql}${tuples.join(', ')};`
+      inserts.push({ preview: sql, exec: sql, rowCount: tuples.length })
+      idx = nextIdx
     }
 
     return { deletes, updates, inserts }
@@ -624,12 +914,13 @@ export class ClickHouseSession implements IDatabaseSession {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'clickhouse')
     }
+    this.assertWritable()
     const built = this.buildChangeStatements(params)
 
     let deleted = 0
     for (const d of built.deletes) {
       await this.executeHttp(d.exec)
-      deleted += 1
+      deleted += d.rowCount
     }
 
     let updated = 0
@@ -641,7 +932,7 @@ export class ClickHouseSession implements IDatabaseSession {
     let inserted = 0
     for (const i of built.inserts) {
       await this.executeHttp(i.exec)
-      inserted += 1
+      inserted += i.rowCount
     }
 
     return {
@@ -700,10 +991,21 @@ export class ClickHouseSession implements IDatabaseSession {
     const start = performance.now()
     const stmts = splitSqlStatements(trimmed, 'clickhouse').map((s) => s.text)
     const statementList = stmts.length > 0 ? stmts : [trimmed]
+    if (
+      this.profile.readOnly &&
+      statementList.some((stmt) => isMutatingStatement(stmt, 'clickhouse'))
+    ) {
+      throw new DatabaseDriverError(
+        'Connection is read-only. Write operations are disabled.',
+        'READ_ONLY',
+        'clickhouse'
+      )
+    }
 
     try {
       let totalAffectedRows = 0
       let lastSelect: Omit<QueryResult, 'executionTimeMs'> | null = null
+      const collectedSets: QueryResultSet[] = []
 
       for (let i = 0; i < statementList.length; i++) {
         const stmtSql = statementList[i]
@@ -719,9 +1021,21 @@ export class ClickHouseSession implements IDatabaseSession {
           queryId: serverQueryId,
           expectJsonCompact: expectRows && !isCustomNonJsonCompact,
           signal: controller.signal,
+          maxResultRows: expectRows && !isCustomNonJsonCompact && maxRows > 0 ? maxRows + 1 : undefined,
         })
         if (!expectRows) {
-          totalAffectedRows += res.summaryAffectedRows ?? 0
+          const affected = res.summaryAffectedRows ?? 0
+          totalAffectedRows += affected
+          collectedSets.push({
+            index: i,
+            sqlPreview: compactSql(stmtSql),
+            columns: [{ name: 'affected_rows', type: 'INTEGER' }],
+            rows: [[affected]],
+            rowCount: 1,
+            affectedRows: affected,
+            truncated: false,
+            isSelect: false,
+          })
         } else if (isCustomNonJsonCompact) {
           const normalizedText = res.rawText.replace(/\r?\n$/, '')
           const rawLines = normalizedText.length > 0 ? normalizedText.split(/\r?\n/) : []
@@ -735,6 +1049,15 @@ export class ClickHouseSession implements IDatabaseSession {
             truncated,
             isSelect: true,
           }
+          collectedSets.push({
+            index: i,
+            sqlPreview: compactSql(stmtSql),
+            columns: lastSelect.columns,
+            rows: lastSelect.rows,
+            rowCount: lastSelect.rowCount,
+            truncated: lastSelect.truncated,
+            isSelect: true,
+          })
         } else {
           const columns = (res.json?.meta || []).map((m) => ({
             name: m.name,
@@ -751,12 +1074,26 @@ export class ClickHouseSession implements IDatabaseSession {
             truncated,
             isSelect: true,
           }
+          collectedSets.push({
+            index: i,
+            sqlPreview: compactSql(stmtSql),
+            columns: lastSelect.columns,
+            rows: lastSelect.rows,
+            rowCount: lastSelect.rowCount,
+            truncated: lastSelect.truncated,
+            isSelect: true,
+          })
         }
       }
 
       const executionTimeMs = Math.round(performance.now() - start)
       return lastSelect
-        ? { ...lastSelect, executionTimeMs }
+        ? {
+            ...lastSelect,
+            affectedRows: totalAffectedRows,
+            ...(collectedSets.length > 1 ? { resultSets: collectedSets } : {}),
+            executionTimeMs,
+          }
         : {
             columns: [],
             rows: [],
@@ -765,6 +1102,7 @@ export class ClickHouseSession implements IDatabaseSession {
             executionTimeMs,
             truncated: false,
             isSelect: false,
+            ...(collectedSets.length > 1 ? { resultSets: collectedSets } : {}),
           }
     } catch (err) {
       if (active.cancelled && !(err instanceof DatabaseDriverError && err.code === 'cancelled')) {
@@ -798,32 +1136,55 @@ export class ClickHouseSession implements IDatabaseSession {
     }
     return { ok: true }
   }
+
+  getTransactionState(): TransactionState {
+    return createUnsupportedTransactionState(CLICKHOUSE_UNSUPPORTED_TX_REASON)
+  }
+
+  async beginTransaction(): Promise<TransactionState> {
+    throw createUnsupportedTransactionError('clickhouse', CLICKHOUSE_UNSUPPORTED_TX_REASON)
+  }
+
+  async commitTransaction(): Promise<TransactionState> {
+    throw createUnsupportedTransactionError('clickhouse', CLICKHOUSE_UNSUPPORTED_TX_REASON)
+  }
+
+  async rollbackTransaction(): Promise<TransactionState> {
+    throw createUnsupportedTransactionError('clickhouse', CLICKHOUSE_UNSUPPORTED_TX_REASON)
+  }
+
+  async setAutoCommit(enabled: boolean): Promise<TransactionState> {
+    if (!enabled) {
+      throw createUnsupportedTransactionError('clickhouse', CLICKHOUSE_UNSUPPORTED_TX_REASON)
+    }
+    return this.getTransactionState()
+  }
 }
 
 export class ClickHouseDriver implements IDatabaseDriver {
   readonly type = 'clickhouse' as const
 
-  async createSession(profile: ConnectionProfile, secret?: string): Promise<IDatabaseSession> {
-    return new ClickHouseSession(profile, secret)
+  async createSession(
+    profile: ConnectionProfile,
+    secret?: string,
+    extraSecrets?: DriverTlsOptions
+  ): Promise<IDatabaseSession> {
+    const tlsOverride = await resolveEffectiveTlsOptions(
+      profile,
+      extraSecrets,
+      extraSecrets?.tlsServername
+    )
+    return new ClickHouseSession(profile, secret, tlsOverride)
   }
 
   async testConnection(
     profile: ConnectionProfile,
-    secret?: string
+    secret?: string,
+    extraSecrets?: DriverTlsOptions
   ): Promise<{ ok: boolean; message?: string }> {
-    let session: IDatabaseSession | null = null
-    try {
-      session = await this.createSession(profile, secret)
-      return await session.test()
-    } catch (err: unknown) {
-      return {
-        ok: false,
-        message: err instanceof Error ? err.message : 'ClickHouse connection failed',
-      }
-    } finally {
-      if (session) {
-        await session.close().catch(() => {})
-      }
-    }
+    return runDriverConnectionTest(
+      () => this.createSession(profile, secret, extraSecrets),
+      (err) => (err instanceof Error ? err.message : 'ClickHouse connection failed')
+    )
   }
 }

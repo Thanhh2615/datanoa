@@ -5,13 +5,15 @@
 <h1 align="center">Datanoa Studio — Database Client &amp; SQL Studio for Orca</h1>
 
 <p align="center">
-  <strong>Browse tables, edit data inline, design schemas visually, and run SQL or Redis queries across 8 database engines — right inside Orca.</strong>
+  <strong>Browse multi-schema objects, edit data inline, paste spreadsheets, import CSV/JSON, design schemas visually, and run multi-tab SQL or Redis queries over SSH &amp; TLS across 9 built-in engines + BYOD local drivers — right inside Orca.</strong>
 </p>
 
 <p align="center">
-  <a href="https://onorca.dev"><img src="https://img.shields.io/badge/Orca-%3E%3D1.4.248-000000?style=flat-square&logoColor=white&labelColor=141414&color=38bdf8" alt="Orca >=1.4.248" /></a>
-  <a href="#8-supported-database-engines"><img src="https://img.shields.io/badge/Databases-8%20Engines-4ade80?style=flat-square&labelColor=141414" alt="8 Database Engines" /></a>
-  <a href="#data-grid-bulk-operations--sql-console"><img src="https://img.shields.io/badge/Editor-SQL%20%26%20Schema%20Designer-60a5fa?style=flat-square&labelColor=141414" alt="SQL & Schema Designer" /></a>
+  <a href="https://orca.dev/plugins/thanhh2615.datanoa?catalog=community"><img src="https://img.shields.io/badge/Install%20in%20Orca-One--Click-38bdf8?style=flat-square&labelColor=141414" alt="Install in Orca" /></a>
+  <a href="https://orca.dev/plugins/thanhh2615/datanoa"><img src="https://img.shields.io/badge/Orca%20Directory-Listed-22c55e?style=flat-square&labelColor=141414" alt="Listed on Orca Directory" /></a>
+  <a href="https://orca.dev"><img src="https://img.shields.io/badge/Orca-%3E%3D1.4.248-000000?style=flat-square&logoColor=white&labelColor=141414&color=38bdf8" alt="Orca >=1.4.248" /></a>
+  <a href="#9-supported-database-engines"><img src="https://img.shields.io/badge/Databases-9%20Engines%20%2B%20BYOD-4ade80?style=flat-square&labelColor=141414" alt="9 Database Engines + BYOD" /></a>
+  <a href="#data-grid-smart-paste-import--sql-console"><img src="https://img.shields.io/badge/Editor-SQL%20%26%20Schema%20Designer-60a5fa?style=flat-square&labelColor=141414" alt="SQL & Schema Designer" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-e6e6e6?style=flat-square&labelColor=141414" alt="MIT License" /></a>
   <a href="https://github.com/Thanhh2615/datanoa/issues/new/choose"><img src="https://img.shields.io/badge/Feedback-Report%20Bug%20%2F%20Request%20Feature-fbbf24?style=flat-square&labelColor=141414" alt="Report Bug / Request Feature" /></a>
 </p>
@@ -24,42 +26,53 @@
 
 ## Why Datanoa?
 
-Switch less between your code editor and heavy external database tools. **Datanoa** brings a complete database client, schema designer, and SQL/Redis workspace directly into **Orca** (`>=1.4.248`):
+Switch less between your code editor and external database tools. **Datanoa** brings a complete database client, schema designer, and SQL/Redis workspace directly into **Orca** (`>=1.4.248`):
 
-- **Side Panel & Fullscreen Studio:** Inspect tables right beside your code in Orca's **Right Sidebar Panel**, or open a fullscreen **Datanoa Studio** tab (`.datanoa` / `.sql`) straight from Orca's `+` Tab Bar menu.
-- **8 Database Engines Built In:** Connect to **SQLite**, **PostgreSQL**, **MySQL**, **MariaDB**, **CockroachDB**, **ClickHouse**, **Redis**, and **LibSQL / Turso** with zero native compilation or external CLI dependencies.
-- **Auto-Discovery & One-Click URI Setup:** Paste a connection URI (`Neon`, `Supabase`, `Turso`, `Upstash`, `ClickHouse Cloud`, `CockroachDB Cloud`, `RDS`) or auto-detect `.env` connection strings and local `.db` / `.sqlite` files in your workspace.
-- **Fast Virtualized Data Grid:** Smoothly browse, filter, sort, pin columns, and drag-select ranges across large tables with instant status-bar math aggregates (`Count`, `Sum`, `Avg`, `Min`, `Max`).
-- **Safe Transactional Editing & Schema Design:** Stage inline cell edits, cloned/pasted rows, and visual `ALTER TABLE` schema migrations locally, review the exact generated SQL, and commit atomically inside transactions with optimistic concurrency checks.
-- **Native Orca Look & Feel:** Automatically adapts to Orca's Dark and Light themes (`--orca-*` design tokens and `Geist` typography).
+- **Side Panel & Fullscreen Studio with Warm-Cache Resume:** Inspect tables right beside your code in Orca's **Right Sidebar Panel**, or open a fullscreen **Datanoa Studio** tab (`.datanoa` / `.sql`) from Orca's `+` Tab Bar menu. Both surfaces restore instantly from a sanitized local warm cache and refresh live data silently in the background.
+- **9 Built-In Engines + BYOD Local Drivers:** Connect to **SQLite**, **PostgreSQL**, **MySQL**, **MariaDB**, **CockroachDB**, **ClickHouse**, **Redis**, **LibSQL / Turso**, and **Cloudflare D1** out of the box, or scaffold and SHA-256-verify local Node driver adapters (**SQL Server / MSSQL**, **Oracle**, **MongoDB**, **Custom BYOD**) via the Connection form or **Driver Manager**.
+- **SSH Bastion Tunnels, Custom TLS / mTLS & Workspace Organization:** Route TCP engines securely through non-interactive OS `ssh -N -L` bastion tunnels (`agent`, `key` + passphrase, `password`), configure custom CA / mTLS modes (`auto`, `disable`, `require`, `verify-ca`, `verify-full`), group connections into collapsible folders, pin them to Orca workspace scopes, and scan `.env` + `.db`/`.sqlite` files automatically.
+- **Multi-Tab SQL Console, Bind Params, Saved Queries & Manual Transactions:** Work across up to 20 persisted SQL tabs with Find & Replace (`Ctrl+F` / `Ctrl+H`), block folding (`Ctrl+Shift+[` / `]`), Bind Parameters (`:name`, `@name`, `$1`, `?`, `{{var}}`), a Saved Queries library, searchable Query History with automatic credential scrubbing, a sticky Manual Transaction toolbar (`Auto-Commit`, `BEGIN`, `COMMIT`, `ROLLBACK`), and a Dangerous SQL guard modal (`DROP` / `TRUNCATE` / unfiltered `DELETE` & `UPDATE`).
+- **Virtualized Data Grid, Smart Paste, File Import & Visual Schema Designer:** Browse multi-schema objects, filter via column headers, edit single-table `SELECT` results inline, paste spreadsheets with smart overwrite/overflow/new-row staging, import `CSV`/`TSV`/`JSON`/`NDJSON` files up to `25 MB`, export dependency-ordered full schema DDL, and design table migrations with live SQL preview.
+- **Native Orca Look & Feel:** Adapts automatically to Orca's Dark and Light themes (`--orca-*` design tokens and `Geist` typography).
 
 ---
 
-## 8 Supported Database Engines
+## 9 Supported Database Engines
 
-| Engine | Driver ID | Default Port | Wire Protocol & Transport | Cloud Auto-SSL & Resilience | Transaction & Mutation Safety |
+| Engine | Driver ID | Default Port | Wire Protocol & Transport | Cloud Auto-SSL, TLS/mTLS & SSH | Transaction & Mutation Safety |
 |---|---|---|---|---|---|
-| **SQLite** | `sqlite` | Local file / `:memory:` | Built-in `node:sqlite` (`DatabaseSync`) isolated in Node `worker_threads` | Instant workspace `.db` / `.sqlite` / `.sqlite3` BFS scanner (`800ms` budget) | `BEGIN IMMEDIATE` batch transactions + **12-step atomic table rebuild** for full `ALTER TABLE` parity |
-| **PostgreSQL** | `postgres` | `5432` | Pre-bundled `pg` + `pg-cursor` (`vendor/pg.js`) with `DATE` string preservation & `rowMode: 'array'` | Auto-SSL on 22+ cloud providers, `options` (`endpoint=...`) preservation & **Supabase IPv6-to-IPv4 Supavisor bridge** | `BEGIN` / `COMMIT` / `ROLLBACK` transactions, backend `pg_cancel_backend(pid)` query cancellation & optimistic concurrency |
-| **MySQL** | `mysql` | `3306` | Pre-bundled pure-JS `mysql2` (`vendor/mysql2.js`) with connection pooling | Cloud Auto-SSL (`sslmode=require`, PlanetScale, Aiven, AWS RDS, Railway, TiDB Cloud) | Pooled transactional batch staging, `KILL QUERY` cancellation & MySQL `/*!...*/` executable comment awareness |
-| **MariaDB** | `mariadb` | `3306` | Pre-bundled pure-JS `mysql2` (`vendor/mysql2.js`) with MariaDB metadata introspection | Cloud Auto-SSL & URI flag resolution (`tls`, `ssl`, `sslmode`) | Atomic batch DML transactions & backtick-escaped DDL migration planner |
-| **CockroachDB** | `cockroachdb` | `26257` | PostgreSQL wire protocol (`vendor/pg.js`) with CockroachDB DDL/cluster awareness | TLS enabled by default + full `?options=--cluster=...` round-trip preservation | Distributed SQL transactional batch commit & dialect-aware `EXPLAIN` |
-| **ClickHouse** | `clickhouse` | `8123` / `8443` | Native HTTP(S) `JSONCompact` streaming & parameterized mutation driver | Auto-HTTPS on port `8443` and `.clickhouse.cloud` endpoints with basic/header auth | Dialect-aware `ALTER TABLE ... UPDATE` / `DELETE` & `INSERT INTO` batch execution |
-| **Redis** | `redis` | `6379` | Zero-dependency native TCP / TLS RESP2 protocol client (`db0`–`db15`) | Auto-TLS on `rediss://` and `.upstash.io` endpoints (respecting explicit `ssl` toggle) | Non-blocking `SCAN` keyspace pagination, type inspection (`string`, `hash`, `list`, `set`, `zset`) & command runner |
-| **LibSQL / Turso** | `libsql` | `443` | Hrana v2 HTTP pipeline client (`/v2/pipeline`) | HTTPS / `libsql://` transport with encrypted `authToken` storage in Orca's `secrets:own` vault | Batched pipeline transactions + atomic 12-step SQLite-compatible schema migration rebuild |
+| **SQLite** | `sqlite` | Local file / `:memory:` | Built-in `node:sqlite` (`DatabaseSync`) isolated in Node `worker_threads` | Instant workspace `.db` / `.sqlite` / `.sqlite3` BFS scanner (`800ms` budget) | Manual `BEGIN` / `COMMIT` / `ROLLBACK` + `BEGIN IMMEDIATE` batch commits & **12-step atomic table rebuild** |
+| **PostgreSQL** | `postgres` | `5432` | Pre-bundled `pg` + `pg-cursor` (`vendor/pg.js`) with `DATE` string preservation & `rowMode: 'array'` | Auto-SSL on 22+ cloud providers, Custom TLS/mTLS, SSH tunnels, `options` (`endpoint=...`) & **Supabase IPv4 Supavisor bridge** | Manual pinned-client transactions (`TX OPEN` + aborted-tx detection), `pg_cancel_backend(pid)` cancellation & optimistic concurrency |
+| **MySQL** | `mysql` | `3306` | Pre-bundled pure-JS `mysql2` (`vendor/mysql2.js`) with connection pooling | Cloud Auto-SSL (`sslmode=require`, PlanetScale, Aiven, RDS, Railway, TiDB Cloud), Custom TLS/mTLS & SSH tunnels | Manual pinned-connection transactions, `KILL QUERY` cancellation & MySQL `/*!...*/` executable comment awareness |
+| **MariaDB** | `mariadb` | `3306` | Pre-bundled pure-JS `mysql2` (`vendor/mysql2.js`) with MariaDB catalog introspection | Cloud Auto-SSL, Custom TLS/mTLS & SSH tunnels | Manual transactions, atomic batch DML & backtick-escaped DDL migration planner |
+| **CockroachDB** | `cockroachdb` | `26257` | PostgreSQL wire protocol (`vendor/pg.js`) with CockroachDB cluster & portable view DDL awareness | TLS enabled by default, Custom TLS/mTLS, SSH tunnels & `?options=--cluster=...` round-trip preservation | Distributed SQL manual/batch transactions & dialect-aware `EXPLAIN` |
+| **ClickHouse** | `clickhouse` | `8123` / `8443` | Native HTTP(S) `JSONCompact` streaming & parameterized mutation driver | Auto-HTTPS (`8443` / `.clickhouse.cloud`), Custom TLS/mTLS & SSH tunnels | Dialect-aware `ALTER TABLE ... UPDATE` / `DELETE` & chunked `INSERT INTO` batch execution |
+| **Redis** | `redis` | `6379` | Zero-dependency native TCP / TLS RESP2 protocol client (`db0`–`db15`) | Auto-TLS (`rediss://` / `.upstash.io`), Custom TLS/mTLS & SSH tunnels | Non-blocking `SCAN` keyspace pagination, type inspection (`string`, `hash`, `list`, `set`, `zset`) & command runner |
+| **LibSQL / Turso** | `libsql` | `443` | Hrana v2 HTTP pipeline client (`/v2/pipeline`) | HTTPS / `libsql://` transport with encrypted `authToken` stored in Orca's `secrets:own` vault | Batched pipeline transactions + atomic 12-step SQLite-compatible schema migration rebuild |
+| **Cloudflare D1** | `d1` | `443` | Zero-vendor native `fetch` REST client (`/accounts/{id}/d1/database/{id}/query`) | HTTPS API with encrypted Bearer token in `secrets:own` + loopback-only guard against sending tokens over plain HTTP | Atomic REST `{ batch }` commits with `changes()` optimistic-lock guard & SQLite-compatible schema introspection |
+
+### Local Custom Drivers (BYOD — MSSQL, Oracle, MongoDB, Custom)
+
+To keep every bundled file strictly `< 1 MiB` (Orca Directory limit) with zero unsolicited network downloads, heavier drivers such as **Microsoft SQL Server (`mssql`)**, **Oracle (`oracledb`)**, and **MongoDB (`mongodb`)** are never bundled. Selecting **SQL Server**, **Oracle**, **MongoDB**, or **Custom BYOD** inside **New / Edit Connection** (or opening **Driver Manager**) renders a local BYOD setup & SHA-256 verification workflow:
+
+1. Click **`1-Click Auto-Setup & Install`** to scaffold `package.json` (`type: "module"`, `main: "index.mjs"`), write Datanoa's canonical adapter starter `index.mjs`, run `npm install --ignore-scripts <pkg>` in your chosen directory, compute its SHA-256 digest, and trust it automatically.
+2. Or configure manually: pick a folder via the native **`Browse Folder...`** picker, copy the terminal command (`Copy Cmd`) and canonical starter (`Copy Starter index.mjs`), click **`Inspect SHA-256`** to verify the digest without executing code, then click **`Trust & Verify`** to pin the SHA-256 hash and connect live.
 
 ---
 
 ## Install in Orca
 
-### 1. From Orca Community Plugins (Recommended)
+### 1. One-Click Install from Orca Directory (Recommended)
 
-Open **Orca** → **Settings** → **Plugins** → **Community Plugins** (`https://github.com/stablyai/orca-community-plugins.git`), search for **Datanoa** (`thanhh2615.datanoa`), and click **Install**.
+- **[Open & Install Datanoa Studio in Orca →](https://orca.dev/plugins/thanhh2615.datanoa?catalog=community)**
+- Browse full listing & screenshots: **[orca.dev/plugins/thanhh2615/datanoa](https://orca.dev/plugins/thanhh2615/datanoa)**
 
-### 2. Via Orca CLI
+Or inside **Orca**, open **Settings → Plugins → Community Plugins**, search **`Datanoa Studio`**, and click **Install**.
+
+### 2. Via Orca CLI / Git URL
 
 ```bash
-orca plugin install https://github.com/Thanhh2615/datanoa.git
+orca plugin install https://github.com/Thanhh2615/datanoa#v1.1.0
 ```
 
 ### 3. Local Development
@@ -79,28 +92,28 @@ orca plugin dev load .
 Datanoa integrates into Orca across four natural entry points:
 
 1. **Open Fullscreen Studio from Orca's `+` Tab Bar:** Click **`+`** on Orca's editor tab bar and select **Datanoa Studio** to open a standalone `.datanoa` studio tab.
-2. **Open the Docked Side Panel:** Click the **Datanoa** database icon in Orca's Right Sidebar Panel to browse schemas, inspect rows, or run quick queries right beside your code.
+2. **Open the Docked Side Panel:** Click the **Datanoa** database icon in Orca's Right Sidebar Panel to browse schemas, inspect rows, paste data, or run quick queries right beside your code.
 3. **Open Any `.sql` or `.datanoa` File:** Opening any `.sql` or `.datanoa` file in your workspace launches the full Datanoa Studio custom editor automatically.
-4. **Connect in One Click (`+ Connect`):** Click **`+ Connect`** in either Fullscreen Studio or the Side Panel to paste a connection URI (`postgres://`, `mysql://`, `redis://`, `libsql://`, `clickhouse://`, `sqlite://`), pick any of the 8 database engines, or click **`Auto-Detect (.env & .db)`** to import credentials from `.env` / `.env.local` / `.env.development` and local SQLite `.db` files.
+4. **Connect in One Click (`+ Connect`):** Click **`+ Connect`** in Fullscreen Studio (all 9 built-in engines including `d1://` for Cloudflare D1, SSH tunnels, and Custom TLS/mTLS) or the Side Panel to paste a connection URI (`postgres://`, `mysql://`, `redis://`, `libsql://`, `d1://`, `clickhouse://`, `sqlite://`) or click **`Auto-Detect (.env & .db)`** to import credentials from `.env` / `.env.local` / `.env.development` and local SQLite `.db` files. Connection pickers stay clean with compact `name (driver)` labels and show full connection targets on hover.
 
 ---
 
 ## Visual Walkthrough & Screenshots
 
-### 1. Split View — SQL Console, Interactive Data Grid & Value/JSON Inspector
+### 1. Split View — Multi-Tab SQL Console, Manual Transactions, Data Grid & JSON Inspector
 
-Write multi-statement SQL with dialect-aware syntax highlighting and smart column/alias autocomplete in the top pane while browsing and staging edits on large tables below — complete with live multi-cell selection math (`Count`, `Sum`, `Avg`, `Min`, `Max`), `CLONE` row badges, Foreign Key jump badges (`↗`), and a dockable **Value / JSON Inspector**.
+Work across multiple persisted SQL tabs with dialect-aware syntax highlighting, Find & Replace (`Ctrl+F` / `Ctrl+H`), Bind Parameters, Saved Queries, and a sticky Manual Transaction toolbar (`Auto-Commit`, `BEGIN`, `COMMIT`, `ROLLBACK`). Browse and stage edits on tables or single-table `SELECT` results below — complete with live multi-cell selection math (`Count`, `Sum`, `Avg`, `Min`, `Max`), `CLONE` / `PASTE` row badges, Foreign Key jump badges (`↗`), and a collapsible **Value / JSON Inspector**.
 
 <p align="center">
-  <img src="images/studio-split-view.webp" alt="Datanoa Studio Split View with SQL Console, Interactive Data Grid, Multi-Cell Selection Aggregates & JSON Value Inspector" width="100%" />
+  <img src="images/studio-split-view.webp" alt="Datanoa Studio Split View with Multi-Tab SQL Console, Manual Transactions, Interactive Data Grid, Smart Paste & JSON Inspector" width="100%" />
 </p>
 
-### 2. 8-Engine Connection Manager, URI Quick-Fill & Workspace Auto-Detect
+### 2. 9-Engine Connection Manager, BYOD Local Drivers, SSH Tunnels & Custom TLS / mTLS
 
-Paste any cloud or local database URI (`Neon`, `Supabase`, `Turso`, `Upstash`, `ClickHouse Cloud`, `CockroachDB Cloud`, `RDS`), auto-detect `.env` variables (`DATABASE_URL`, `REDIS_URL`, `TURSO_DATABASE_URL`) and workspace SQLite files, tag environments (`None`, `Dev`, `Staging`, `Prod`), and verify connectivity with live latency diagnostics.
+Paste any cloud or local database URI (`Neon`, `Supabase`, `Turso`, `Cloudflare D1`, `Upstash`, `ClickHouse Cloud`, `CockroachDB Cloud`, `RDS`), auto-detect `.env` variables (`DATABASE_URL`, `REDIS_URL`, `TURSO_DATABASE_URL`) and workspace SQLite files, configure SSH bastion tunnels (`[SSH]`) and Custom TLS/mTLS (`[TLS]` / `[mTLS]`), organize connections with Folders, Workspace Scopes, and Environment Tags (`None`, `Dev`, `Staging`, `Prod`), or scaffold SHA-256-verified BYOD local drivers.
 
 <p align="center">
-  <img src="images/studio-connection-modal.webp" alt="Datanoa 8-Engine Connection Modal with Quick URI Parser, Workspace .env & .db Auto-Discovery, and Cloud Auto-SSL" width="100%" />
+  <img src="images/studio-connection-modal.webp" alt="Datanoa Connection Manager with 9 Built-In Engines, BYOD Local Drivers, SSH Tunnels, TLS/mTLS, Folders & Workspace Auto-Discovery" width="100%" />
 </p>
 
 ### 3. Visual Table Structure Designer & Live Migration SQL Preview
@@ -111,37 +124,38 @@ Edit table schemas visually in **Schema Inspector** mode: add, rename, or re-typ
   <img src="images/schema-designer.webp" alt="Datanoa Visual Table Structure Designer with Staged Column Changes, In-DOM Data Type Combobox & Live Migration SQL Preview" width="100%" />
 </p>
 
-### 4. Clean Light Theme (`html.light`), Horizontal Top Table Switcher & Pinned Columns
+### 4. Clean Light Theme (`html.light`), Horizontal Top Table Bar (`All (N) ▾`) & Pinned Columns
 
-Switch Orca to a light theme and Datanoa adapts automatically. Collapse the left sidebar into the **Horizontal Top Table Switcher Bar** to maximize horizontal grid space, pin key identifier columns (`id`, `order_code`) to the left edge with opaque elevation shadows, and use **Find & Highlight (`Ctrl+F`)** to jump across matching cells in real time.
+Switch Orca to a light theme and Datanoa adapts automatically. Collapse the left sidebar into the **Horizontal Top Table Bar** with a grouped searchable **`All (N) ▾`** popover (Tables, Views, Materialized Views, Functions, Procedures, Triggers, Sequences, Types), manage column visibility and pinned columns via the Columns popover, and jump across matches with **Find & Highlight (`Ctrl+F`)**.
 
 <p align="center">
-  <img src="images/studio-light-theme.webp" alt="Datanoa Studio in Clean Light Theme with Horizontal Top Table Switcher Bar, Pinned Columns & Find Highlight" width="100%" />
+  <img src="images/studio-light-theme.webp" alt="Datanoa Studio in Clean Light Theme with Horizontal Top Table Bar, Grouped Object Popover, Pinned Columns & Find Highlight" width="100%" />
 </p>
 
-### 5. Docked Side Panel — Schema Explorer, Data Grid & Quick SQL Runner
+### 5. Docked Side Panel — Schema Explorer, Virtualized Data Grid & Quick SQL Runner
 
-Use the **Datanoa Side Panel** without leaving your active code editor: expand multiple database connections simultaneously in the **Explorer** tree, stage and filter data in the virtualized **Data** tab with live multi-cell selection math, or run multi-statement queries in the **SQL** tab with persistent history and 1-click exports.
+Use the **Datanoa Side Panel** without leaving your active code editor: expand multiple connections and collapsible folders in the **Explorer** tree, stage inline edits and Smart Copy/Paste rows in the virtualized **Data** tab with live multi-cell selection math, or run multi-statement queries in the **SQL** tab with persistent history and 1-click exports.
 
 <p align="center">
-  <img src="images/side-panel-explorer.webp" alt="Datanoa Side Panel Showcase — Schema Explorer Tree, Virtualized Data Grid & Quick SQL Runner" width="100%" />
+  <img src="images/side-panel-explorer.webp" alt="Datanoa Side Panel Showcase — Schema Explorer Tree, Virtualized Data Grid with Smart Paste & Quick SQL Runner" width="100%" />
 </p>
 
 ---
 
-## Data Grid, Bulk Operations & SQL Console
+## Data Grid, Smart Paste, Import & SQL Console
 
-- **Rectangular Multi-Cell Selection & Live Math Aggregates:** Drag across cells, Shift-click ranges, click row numbers or column headers, or press `Ctrl+A`. The status bar immediately computes **`Count`**, **`Sum`**, **`Avg`**, **`Min`**, and **`Max`** across numeric cells (click the aggregate pill to copy statistics to the clipboard).
-- **Multi-Format Copy, Paste & Export:**
-  - Copy any cell range as **TSV** (`Ctrl+C`), **CSV**, **JSON**, **NDJSON**, **SQL `IN (...)` list**, **SQL `INSERT`**, **SQL `UPDATE`**, or **Markdown table** from the right-click context menu or Export selector.
-  - **Paste as New Row(s) (`Ctrl+V`):** Paste multi-row TSV or CSV data from Excel, Google Sheets, or another table directly into existing cells or as newly staged rows.
+- **Rectangular Multi-Cell Selection & Live Math Aggregates:** Drag across cells, Shift-click ranges, click row numbers or column headers, or press `Ctrl+A`. The status bar immediately computes **`Count`**, **`Sum`**, **`Avg`**, **`Min`**, and **`Max`** across numeric cells (click the aggregate pill to copy statistics).
+- **Smart Copy & Paste (Studio + Side Panel):**
+  - Copy any cell range as **TSV** (`Ctrl+C`), **CSV**, **JSON**, **NDJSON**, **SQL `IN (...)` list**, **SQL `INSERT`**, **SQL `UPDATE`**, or **Markdown table** from the context menu or Export selector.
+  - **Smart Paste (`Ctrl+V`):** Auto-detects TSV vs RFC-4180 CSV and optional header rows. With an active selection, pastes a 1×1 value as a multi-cell fill or overwrites cells from the anchor while automatically staging overflow rows beyond the current page as new inserts. With no active selection (e.g., after clicking empty canvas or pressing `Escape`), pastes directly as newly staged rows.
+  - **Paste as New Row(s) (`Ctrl+Shift+V` or right-click empty canvas):** Always stages clipboard rows as brand-new inserts while safely skipping auto-increment, generated, and read-only columns with clear feedback.
   - **Bulk Fill Selected Cells:** Fill an entire rectangular selection with a constant value or `NULL` in one operation.
-- **Transactional Row Staging & `CLONE` Badges:** Stage inline cell edits (sky-blue highlight), new rows (`+ Row`), row deletions (`− Row`), and cloned rows (`Clone` → marked with a `CLONE` badge while automatically omitting unedited `AUTOINCREMENT` and `DEFAULT` columns so the database engine evaluates true defaults cleanly). Preview exact SQL via **`DML Preview`** before clicking **`Submit [N]`** (`Ctrl+S`).
-- **Pin / Freeze Columns & Column Visibility:** Pin arbitrary columns to the left edge of the grid and toggle column visibility per table (persisted across sessions).
-- **Quick Filter & Server `WHERE` / `ORDER BY` Bar:** Right-click any cell to **`Filter by Value (=)`** or **`Exclude Value (!=)`**, or type custom `WHERE` and `ORDER BY` clauses protected by `sanitizeFilterClause` against statement breakout.
-- **1-Click Foreign Key Jump (`Ctrl+Click` / `↗`):** Click the `↗` badge or `Ctrl+Click` any foreign key cell to open the referenced parent table filtered directly to that primary key.
-- **Dockable Value & JSON Inspector:** Inspect and edit large text or JSON payloads, validate JSON syntax live, one-click **`Format JSON`** / **`Minify JSON`**, set `NULL`, or copy values.
-- **Dialect-Aware SQL Console & Smart Autocomplete:** Powered by CodeMirror 6 with syntax highlighting, dialect-aware SQL formatting (`Shift+Alt+F`), caret-aware statement splitting (`Ctrl+Enter` runs the statement at the cursor; `Ctrl+Shift+Enter` runs all statements), table/alias-aware column autocomplete, Redis command completion, `EXPLAIN` execution plans, and persistent Query History.
+- **File Import Modal (`CSV` / `TSV` / `JSON` / `NDJSON`):** Import files up to `25 MB` with automatic format, encoding, and delimiter detection, auto-mapped columns, type coercion, and SQL preview. Stage up to `500` rows directly in the grid (`<= 200` auto-suggested) or commit larger datasets directly in resumable chunks (`250` rows/chunk).
+- **Transactional Row Staging, Inline `SELECT` Editing & `CLONE` Badges:** Stage inline cell edits on tables or verified single-table `SELECT` results with primary keys, add new rows (`+ Row`), delete rows (`− Row`), or clone rows (`CLONE` badge automatically omitting unedited `AUTOINCREMENT`/`DEFAULT` columns). Preview exact SQL via **`DML Preview`** before clicking **`Submit [N]`** (`Ctrl+S`).
+- **Column Header Filters, Pinning & Foreign Key Jump:** Filter any column directly from its header popover (`=`, `!=`, `CONTAINS`, `IS NULL`, `IS NOT NULL`, `>`, `<`) with client filtering or lexer-safe SQL `WHERE` injection; pin/hide columns per table; `Ctrl+Click` (or click `↗`) any foreign key cell to jump straight to the referenced parent row.
+- **Multi-Schema Browser & Full Schema DDL Export:** Switch schemas, inspect DDL for views, materialized views, functions, procedures, triggers, sequences, and types, and export an entire schema to `.sql` (`Export DDL`) ordered by dependency (including cyclic FK deferral on PostgreSQL and portable view rewrites on CockroachDB).
+- **Collapsible Value & JSON Inspector:** Inspect and edit large text or JSON payloads, validate JSON syntax live, one-click **`Format JSON`** / **`Minify JSON`**, set `NULL`, or copy values.
+- **Multi-Tab SQL Console, Bind Params, Saved Queries, History & Safety Guards:** Powered by CodeMirror 6 with up to 20 persisted tabs, multi-result-set tabs, Find & Replace (`Ctrl+F` / `Ctrl+H`), code folding (`Ctrl+Shift+[` / `]`), dialect-aware formatting (`Shift+Alt+F`), caret-aware statement splitting (`Ctrl+Enter` / `Ctrl+Shift+Enter`), smart table/alias column autocomplete, Redis command completion, Bind Parameters modal, Saved Queries library, searchable Query History drawer (auto-skipping queries containing credentials), `EXPLAIN` plans, Manual Transaction toolbar, and a Dangerous SQL guard modal (`PROD` / `STAGING` aware).
 
 ---
 
@@ -150,21 +164,26 @@ Use the **Datanoa Side Panel** without leaving your active code editor: expand m
 | Shortcut / Gesture | Action | Scope |
 |---|---|---|
 | `Ctrl+Enter` / `Cmd+Enter` | Execute SQL statement at current caret position (or active selection) | SQL Console & Side Panel |
-| `Ctrl+Shift+Enter` | Execute all statements in the SQL console sequentially | SQL Console |
+| `Ctrl+Shift+Enter` | Execute all statements in the SQL console sequentially | SQL Console & Side Panel |
+| `Ctrl+F` / `Ctrl+H` | Open SQL Console Find / Find & Replace panel | Fullscreen Studio (SQL) |
+| `Ctrl+Shift+[` / `Ctrl+Shift+]` | Fold / Unfold SQL statement or block | Fullscreen Studio (SQL) |
 | `Shift+Alt+F` | Format SQL buffer with dialect-aware indentation & keyword casing | SQL Console & Side Panel |
 | `Ctrl+S` / `Cmd+S` | Submit staged data edits (`INSERT` / `UPDATE` / `DELETE`) or staged schema migration | Data Grid & Schema Designer |
 | `Ctrl+F` / `Cmd+F` | Focus Find & Highlight bar (`Enter` / `Shift+Enter` to cycle matches) | Data Grid & Side Panel |
-| `Ctrl+K` / `Ctrl+P` | Open Quick Switcher / Command Palette (tables, connections, views, actions) | Fullscreen Studio |
-| `Ctrl+/` | Open Keyboard Shortcuts cheatsheet modal | Fullscreen Studio |
+| `Ctrl+K` / `Ctrl+P` | Open Quick Switcher / Command Palette (`Ctrl+K` also available in Side Panel) | Fullscreen Studio & Side Panel |
+| `Ctrl+/` | Open Keyboard Shortcuts cheatsheet modal | Fullscreen Studio & Side Panel |
 | `Arrow Keys` / `Shift+Arrow` | Navigate cells and extend rectangular multi-cell selection | Data Grid & Side Panel |
 | `Ctrl+A` / `Cmd+A` | Select all visible cells in the current table or query result | Data Grid & Side Panel |
-| `Ctrl+C` / `Ctrl+V` | Copy selected range as TSV / Paste TSV or CSV data into grid | Data Grid & Side Panel |
+| `Ctrl+C` | Copy selected range as TSV | Data Grid & Side Panel |
+| `Ctrl+V` | Smart Paste TSV/CSV: 1×1 fill, overwrite + overflow insert, or new rows when empty selection | Data Grid & Side Panel |
+| `Ctrl+Shift+V` | Paste clipboard rows as newly staged row(s) | Data Grid & Side Panel |
+| `Click / Right-Click Empty Grid Canvas` | Clear cell selection / open canvas menu (`Paste as New Row(s)`) | Data Grid & Side Panel |
 | `Enter` / `F2` / `Double-Click` | Open inline cell editor (`Tab` / `Shift+Tab` to commit and move horizontally) | Data Grid & Side Panel |
 | `Delete` / `Backspace` | Stage `NULL` across selected nullable cells (blocks `NOT NULL` columns safely) | Data Grid & Side Panel |
 | `Ctrl+Click` (or click `↗`) | Jump directly to referenced Foreign Key row in parent table | Data Grid & Side Panel |
 | `Ctrl + Mouse Wheel` | Smooth horizontal panning across wide data grids, SQL results & DDL cards | Fullscreen Studio & Side Panel |
 | `Drag / Double-Click Column Edge` | Resize column width smoothly or auto-fit column width (`64px–480px`) to content | Fullscreen Studio & Side Panel |
-| `Escape` | Cancel inline edit or close active context menu, popover, drawer, or modal | Fullscreen Studio & Side Panel |
+| `Escape` | Clear selection, cancel inline edit, or close active menu, popover, drawer, or modal | Fullscreen Studio & Side Panel |
 
 ---
 
@@ -174,14 +193,15 @@ Datanoa runs under Orca's `"trusted-worker"` execution model (`manifestVersion: 
 
 | Capability | Purpose in Datanoa |
 |---|---|
-| `storage:own` | Stores non-sensitive connection profiles (`datanoa.savedConnections`), query history, and UI view state (`datanoa.studioViewState`, `datanoa.panelViewState`). |
-| `secrets:own` | Stores database passwords (`pwd_<id>`) and Turso/LibSQL bearer tokens (`tok_<id>`) exclusively inside Orca's OS-backed encrypted secrets vault. Secrets are never written to plain storage or `.datanoa` files. |
-| `workspace:read` | Enables bounded `.env` / `.env.local` connection discovery and asynchronous BFS discovery of workspace `.db` / `.sqlite` / `.sqlite3` files (blocking system/home root crawls). |
-| `workspace:write` | Creates `.datanoa/` studio session files and exports user-requested CSV / JSON / SQL / Markdown dumps. |
+| `storage:own` | Stores non-sensitive connection profiles (`datanoa.savedConnections`), saved queries, query history, BYOD SHA-256 trust records, and sanitized UI session snapshots. |
+| `secrets:own` | Stores database passwords, Turso/LibSQL & Cloudflare D1 API tokens, TLS client key passphrases, and SSH key passphrases/passwords exclusively inside Orca's OS-backed encrypted secrets vault. Secrets are never written to plain storage, warm-cache snapshots, or `.datanoa` files. |
+| `workspace:read` | Enables bounded `.env` / `.env.local` connection discovery, workspace scope listing, and asynchronous BFS discovery of workspace `.db` / `.sqlite` / `.sqlite3` files (blocking system/home root crawls). |
+| `workspace:write` | Creates `.datanoa/` studio session files, exports user-requested CSV / JSON / SQL / Markdown files, and scaffolds user-confirmed BYOD local driver directories. |
 | `settings:own` | Reads user-configured `maxRows` (`1–50,000`, default `1,000`) and `queryTimeoutSeconds` (`1–110`, default `30`). |
 
-- **Strict Read-Only & `PROD` Guards:** Connections marked **Read-Only** enforce worker-level mutation blocking (`isMutatingStatement`) across every single-statement and multi-statement query (`INSERT`, `UPDATE`, `DELETE`, `ALTER`, `DROP`, `TRUNCATE`, `CREATE`, `REPLACE`, and Redis write commands), powered by a dialect-aware SQL lexer (`src/drivers/common/sql-lexer.ts`) that properly scans dollar-quoted strings (`$tag$...$tag$`), PostgreSQL `E'...'` escapes, MySQL/MariaDB/ClickHouse `\'` & `#` comments, and MySQL `/*!...*/` executable comments.
-- **CSP & Bundle Compliance:** All pre-bundled vendor modules (`vendor/pg.js`, `vendor/mysql2.js`, `vendor/codemirror.js`) are audited at build time (`build/bundle-drivers.mjs`) to ensure each file is strictly `< 1 MiB` with zero `eval(` and zero `new Function(`.
+- **Strict Read-Only, `PROD` & Credential Scrubber Guards:** Connections marked **Read-Only** enforce worker-level mutation blocking (`isMutatingStatement`) across single- and multi-statement SQL and Redis write commands using a dialect-aware lexer (`src/drivers/common/sql-lexer.ts`). Destructive queries (`DROP`, `TRUNCATE`, unfiltered `DELETE`/`UPDATE`) prompt a confirmation modal with stricter protection on `PROD`-tagged connections. Query History automatically skips queries containing inline passwords/tokens/DB URI credentials and scrubs credentials from stored error text.
+- **Zero-Shell SSH Askpass & SHA-256 Trust Pinning:** SSH bastion tunnels spawn `ssh -N -L` with option-injection defenses and a SHA-256-verified zero-shell askpass helper on Windows (`build/build-askpass.mjs --check`). BYOD local drivers require explicit SHA-256 digest trust before loading.
+- **CSP, IPC & Bundle Compliance:** Pre-bundled vendor modules (`vendor/pg.js`, `vendor/mysql2.js`, `vendor/codemirror.js`) are verified at build time (`build/bundle-drivers.mjs`) to stay strictly `< 1 MiB` each with zero `eval(` and zero `new Function(`. Large query responses are safely bounded within Orca's IPC limit while guarding against overwriting compacted preview cells.
 - **Zero Telemetry:** Datanoa makes zero background network calls and collects zero telemetry. Network connections occur exclusively to user-configured database endpoints.
 
 ---
@@ -198,7 +218,7 @@ Have a bug to report or a feature / UI improvement to suggest?
 2. **Direct on GitHub:**
    - Open a guided Bug Report or Feature Request anytime at **[github.com/Thanhh2615/datanoa/issues](https://github.com/Thanhh2615/datanoa/issues/new/choose)**.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for local build, test (`385+` tests), and pull request guidelines, and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for bundled open-source license attributions.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local build, verification, and pull request guidelines, and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for bundled open-source license attributions.
 
 ---
 

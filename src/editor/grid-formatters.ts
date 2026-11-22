@@ -25,8 +25,12 @@ export interface GridModel {
 }
 
 export const NUMERIC_COLUMN_TYPE_REGEX =
-  /\b(?:INT|INTEGER|BIGINT|SMALLINT|TINYINT|MEDIUMINT|REAL|FLOAT|DOUBLE|NUMERIC|DECIMAL)\b/i
+  /\b(?:INT|INTEGER|BIGINT|SMALLINT|TINYINT|MEDIUMINT|INT2|INT4|INT8|UINT8|UINT16|UINT32|UINT64|FLOAT4|FLOAT8|REAL|FLOAT|DOUBLE|NUMERIC|DECIMAL|NUMBER|SERIAL|BIGSERIAL|SMALLSERIAL)\b/i
+export const BOOLEAN_COLUMN_TYPE_REGEX = /\b(?:BOOL|BOOLEAN)\b/i
+export const EMPTY_AS_NULL_NON_TEXT_TYPE_REGEX =
+  /\b(?:DATE|TIME|TIMESTAMP|TIMESTAMPTZ|DATETIME|YEAR|UUID|GUID|JSON|JSONB|INET|CIDR|MACADDR|BYTEA|BLOB|BINARY|VARBINARY|INTERVAL)\b/i
 export const INTEGER_LITERAL_REGEX = /^[+-]?\d+$/
+export const DECIMAL_LITERAL_REGEX = /^[+-]?(?:\d+\.?\d*|\.\d+)$/
 
 export function isNativeDomElement(el: unknown): boolean {
   return (
@@ -37,23 +41,42 @@ export function isNativeDomElement(el: unknown): boolean {
 }
 
 /**
- * Safely coerces user-entered string values for numeric columns while preserving
- * 64-bit BIGINT precision (Number.isSafeInteger) and avoiding false matches on POINT/INTERVAL.
+ * Safely coerces user-entered or pasted string values for typed columns while preserving
+ * 64-bit BIGINT precision (Number.isSafeInteger) and avoiding invalid empty strings on non-text types.
  */
 export function coerceCellInputValue(
   rawNewValue: string,
   originalValue: unknown,
-  colType?: string
+  colType?: string,
+  nullable = true
 ): unknown {
+  const trimmed = rawNewValue.trim()
   const isNumericCol =
     typeof originalValue === 'number' ||
     Boolean(colType && NUMERIC_COLUMN_TYPE_REGEX.test(colType))
+  const isBoolCol =
+    typeof originalValue === 'boolean' ||
+    Boolean(colType && BOOLEAN_COLUMN_TYPE_REGEX.test(colType))
+  const isOtherNonTextCol = Boolean(colType && EMPTY_AS_NULL_NON_TEXT_TYPE_REGEX.test(colType))
+
+  if (trimmed === '' && (isNumericCol || isBoolCol || isOtherNonTextCol)) {
+    return null
+  }
+
+  if (
+    trimmed.toUpperCase() === 'NULL' &&
+    nullable &&
+    (isNumericCol || isBoolCol || isOtherNonTextCol)
+  ) {
+    return null
+  }
+
+  if (isBoolCol) {
+    if (/^true$/i.test(trimmed)) return true
+    if (/^false$/i.test(trimmed)) return false
+  }
 
   if (isNumericCol) {
-    const trimmed = rawNewValue.trim()
-    if (trimmed === '' && originalValue === null) {
-      return null
-    }
     if (trimmed !== '') {
       if (INTEGER_LITERAL_REGEX.test(trimmed)) {
         const num = Number(trimmed)
@@ -61,6 +84,15 @@ export function coerceCellInputValue(
           return num
         }
         return trimmed
+      }
+      if (DECIMAL_LITERAL_REGEX.test(trimmed)) {
+        const normalizedDigits = trimmed
+          .replace(/^[+-]?0+(?=\d)/, '')
+          .replace('.', '')
+          .replace(/^0+$/, '0')
+        if (normalizedDigits.length > 15) {
+          return trimmed
+        }
       }
       const num = Number(trimmed)
       if (Number.isFinite(num)) {

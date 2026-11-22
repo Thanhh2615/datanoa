@@ -1,5 +1,6 @@
 import { parentPort } from 'node:worker_threads'
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
+import type { QueryResultSet } from '../../protocol'
 
 if (!parentPort) {
   throw new Error('src/drivers/sqlite/thread.ts must be run within a Worker thread.')
@@ -8,6 +9,51 @@ const workerPort = parentPort
 
 let db: DatabaseSync | null = null
 let foreignKeysEnabled = true
+let inManualTx = false
+let autoCommit = true
+let txStatementCount = 0
+let txStartedAt: number | undefined
+
+function getTransactionStatePayload(): {
+  active: boolean
+  autoCommit: boolean
+  statementCount: number
+  startedAt?: number
+  supported: boolean
+} {
+  return {
+    active: inManualTx,
+    autoCommit,
+    statementCount: txStatementCount,
+    startedAt: txStartedAt,
+    supported: true,
+  }
+}
+
+function compactSql(sql: string, maxLength = 80): string {
+  const compact = sql.replace(/\s+/g, ' ').trim()
+  return compact.length > maxLength ? `${compact.slice(0, maxLength - 3)}...` : compact
+}
+
+function stripLeadingSqlComments(sql: string): string {
+  let rest = sql
+  for (;;) {
+    const trimmed = rest.trimStart()
+    if (trimmed.startsWith('--')) {
+      const nl = trimmed.indexOf('\n')
+      if (nl < 0) return ''
+      rest = trimmed.slice(nl + 1)
+      continue
+    }
+    if (trimmed.startsWith('/*')) {
+      const end = trimmed.indexOf('*/', 2)
+      if (end < 0) return ''
+      rest = trimmed.slice(end + 2)
+      continue
+    }
+    return trimmed
+  }
+}
 
 function extractSqliteErrorInfo(err: unknown): { message: string; code: string; stack?: string } {
   if (err && typeof err === 'object') {
@@ -96,6 +142,11 @@ export type WorkerRequest =
   | { id: string; type: 'query'; sql: string; statements?: string[]; params?: unknown[]; maxRows?: number }
   | { id: string; type: 'serialize' }
   | { id: string; type: 'close' }
+  | { id: string; type: 'txBegin' }
+  | { id: string; type: 'txCommit' }
+  | { id: string; type: 'txRollback' }
+  | { id: string; type: 'txSetAutoCommit'; enabled: boolean }
+  | { id: string; type: 'txStatus' }
 
 workerPort.on('message', (msg: WorkerRequest) => {
   try {
@@ -169,8 +220,67 @@ workerPort.on('message', (msg: WorkerRequest) => {
       return
     }
 
+    if (msg.type === 'txStatus') {
+      workerPort.postMessage({ id: msg.id, ok: true, data: getTransactionStatePayload() })
+      return
+    }
+
+    if (msg.type === 'txBegin') {
+      if (inManualTx) {
+        throw new Error('Transaction is already active')
+      }
+      db.exec('BEGIN;')
+      inManualTx = true
+      txStatementCount = 0
+      txStartedAt = Date.now()
+      workerPort.postMessage({ id: msg.id, ok: true, data: getTransactionStatePayload() })
+      return
+    }
+
+    if (msg.type === 'txCommit') {
+      if (!inManualTx) {
+        throw new Error('Cannot commit: no active transaction')
+      }
+      db.exec('COMMIT;')
+      inManualTx = false
+      txStatementCount = 0
+      txStartedAt = undefined
+      workerPort.postMessage({ id: msg.id, ok: true, data: getTransactionStatePayload() })
+      return
+    }
+
+    if (msg.type === 'txRollback') {
+      if (!inManualTx) {
+        throw new Error('Cannot rollback: no active transaction')
+      }
+      db.exec('ROLLBACK;')
+      inManualTx = false
+      txStatementCount = 0
+      txStartedAt = undefined
+      workerPort.postMessage({ id: msg.id, ok: true, data: getTransactionStatePayload() })
+      return
+    }
+
+    if (msg.type === 'txSetAutoCommit') {
+      if (msg.enabled) {
+        if (inManualTx) {
+          throw new Error('Commit or rollback the active transaction before switching to Auto-Commit')
+        }
+        autoCommit = true
+      } else {
+        autoCommit = false
+      }
+      workerPort.postMessage({ id: msg.id, ok: true, data: getTransactionStatePayload() })
+      return
+    }
+
     if (msg.type === 'applyBatch') {
-      db.exec('BEGIN IMMEDIATE;')
+      const isNested = inManualTx
+      if (isNested) {
+        db.exec('SAVEPOINT datanoa_apply_batch;')
+      } else {
+        db.exec('BEGIN IMMEDIATE;')
+      }
       try {
         let deleted = 0
         for (const item of msg.deletes) {
@@ -209,15 +319,25 @@ workerPort.on('message', (msg: WorkerRequest) => {
           inserted += Number(res.changes ?? 1)
         }
 
-        db.exec('COMMIT;')
+        if (isNested) {
+          db.exec('RELEASE datanoa_apply_batch;')
+          txStatementCount += msg.deletes.length + msg.updates.length + msg.inserts.length
+        } else {
+          db.exec('COMMIT;')
+        }
         workerPort.postMessage({
           id: msg.id,
           ok: true,
-          data: { inserted, updated, deleted },
+          data: { inserted, updated, deleted, txState: getTransactionStatePayload() },
         })
       } catch (batchErr: unknown) {
         try {
-          db.exec('ROLLBACK;')
+          if (isNested) {
+            db.exec('ROLLBACK TO datanoa_apply_batch;')
+            db.exec('RELEASE datanoa_apply_batch;')
+          } else {
+            db.exec('ROLLBACK;')
+          }
         } catch {
           // Ignore if SQLite already rolled back automatically
         }
@@ -225,6 +345,7 @@ workerPort.on('message', (msg: WorkerRequest) => {
           id: msg.id,
           ok: false,
           error: extractSqliteErrorInfo(batchErr),
+          txState: getTransactionStatePayload(),
         })
       }
       return
@@ -236,9 +357,21 @@ workerPort.on('message', (msg: WorkerRequest) => {
       const boundParams = execList.length === 1 ? normalizeSqliteParams(msg.params) : []
       const maxRows = msg.maxRows && msg.maxRows > 0 ? msg.maxRows : 1000
 
+      // When !autoCommit and not yet in tx, auto-begin before running query
+      if (!autoCommit && !inManualTx) {
+        const firstStmt = stripLeadingSqlComments(execList[0] || '')
+        if (!/^(?:BEGIN|START\s+TRANSACTION)\b/i.test(firstStmt)) {
+          db.exec('BEGIN;')
+          inManualTx = true
+          txStatementCount = 0
+          txStartedAt = Date.now()
+        }
+      }
+
       let totalAffectedRows = 0
       let startedTx = false
       let touchedForeignKeys = false
+      const collectedSets: QueryResultSet[] = []
       let lastRowResult: {
         isSelect: true
         columns: { name: string; type: string }[]
@@ -248,14 +381,21 @@ workerPort.on('message', (msg: WorkerRequest) => {
       } | null = null
 
       try {
-        for (const rawSql of execList) {
+        for (let execIndex = 0; execIndex < execList.length; execIndex++) {
+          const rawSql = execList[execIndex]
           const trimmedStmt = rawSql.trim()
           if (!trimmedStmt) continue
+          const normalizedStmt = stripLeadingSqlComments(trimmedStmt)
+          const isStandaloneBegin = /^(?:BEGIN|START\s+TRANSACTION)\b/i.test(normalizedStmt)
 
-          if (/^\s*BEGIN\b/i.test(trimmedStmt)) {
+          // A BEGIN that SQLite itself will reject must not arm the catch-block rollback
+          if (isStandaloneBegin && !inManualTx) {
+            inManualTx = true
+            txStatementCount = 0
+            txStartedAt = Date.now()
             startedTx = true
           }
-          if (/^\s*PRAGMA\s+foreign_keys\b/i.test(trimmedStmt)) {
+          if (/^PRAGMA\s+foreign_keys\b/i.test(normalizedStmt)) {
             touchedForeignKeys = true
           }
 
@@ -285,12 +425,41 @@ workerPort.on('message', (msg: WorkerRequest) => {
               rowCount: rows.length,
               truncated,
             }
+            collectedSets.push({
+              index: execIndex,
+              sqlPreview: compactSql(trimmedStmt),
+              columns: cols,
+              rows,
+              rowCount: rows.length,
+              truncated,
+              isSelect: true,
+            })
           } else {
             const res = stmt.run(...boundParams)
-            totalAffectedRows += Number(res.changes ?? 0)
-            if (/^\s*(?:COMMIT|END|ROLLBACK)\b/i.test(trimmedStmt)) {
+            const changes = Number(res.changes ?? 0)
+            totalAffectedRows += changes
+            collectedSets.push({
+              index: execIndex,
+              sqlPreview: compactSql(trimmedStmt),
+              columns: [{ name: 'affected_rows', type: 'INTEGER' }],
+              rows: [[changes]],
+              rowCount: 1,
+              affectedRows: changes,
+              truncated: false,
+              isSelect: false,
+            })
+            const isCommit = /^(?:COMMIT|END(?:\s+TRANSACTION)?)\b/i.test(normalizedStmt)
+            const isRollback = /^ROLLBACK\b(?!\s+TO\b)/i.test(normalizedStmt)
+            if (isCommit || isRollback) {
+              inManualTx = false
+              txStatementCount = 0
+              txStartedAt = undefined
               startedTx = false
             }
+          }
+
+          if (inManualTx && !isStandaloneBegin) {
+            txStatementCount++
           }
         }
       } catch (queryErr: unknown) {
@@ -300,6 +469,9 @@ workerPort.on('message', (msg: WorkerRequest) => {
           } catch {
             // Not in an active transaction
           }
+          inManualTx = false
+          txStatementCount = 0
+          txStartedAt = undefined
         }
         if (touchedForeignKeys) {
           try {
@@ -308,19 +480,30 @@ workerPort.on('message', (msg: WorkerRequest) => {
             // Ignore pragma restore errors
           }
         }
-        throw queryErr
+        workerPort.postMessage({
+          id: msg.id,
+          ok: false,
+          error: extractSqliteErrorInfo(queryErr),
+          txState: getTransactionStatePayload(),
+        })
+        return
       }
 
       workerPort.postMessage({
         id: msg.id,
         ok: true,
-        data: lastRowResult ?? {
-          isSelect: false,
-          columns: [],
-          rows: [],
-          rowCount: 0,
+        data: {
+          ...(lastRowResult ?? {
+            isSelect: false,
+            columns: [],
+            rows: [],
+            rowCount: 0,
+            affectedRows: totalAffectedRows,
+            truncated: false,
+          }),
           affectedRows: totalAffectedRows,
-          truncated: false,
+          ...(collectedSets.length > 1 ? { resultSets: collectedSets } : {}),
+          txState: getTransactionStatePayload(),
         },
       })
       return
@@ -333,6 +516,14 @@ workerPort.on('message', (msg: WorkerRequest) => {
     }
 
     if (msg.type === 'close') {
+      if (inManualTx) {
+        try {
+          db.exec('ROLLBACK;')
+        } catch {
+          // Ignore rollback errors on close
+        }
+        inManualTx = false
+      }
       db.close()
       db = null
       workerPort.postMessage({ id: msg.id, ok: true })

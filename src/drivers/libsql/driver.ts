@@ -7,34 +7,50 @@ import type {
   IDatabaseSession,
   PreviewChangesResult,
   QueryResult,
+  QueryResultSet,
   SchemaObject,
+  SchemaObjectKind,
   TableBrowseResult,
   TableDetails,
+  TransactionState,
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
-import { DatabaseDriverError } from '../common/driver'
+import {
+  DatabaseDriverError,
+  buildCombinedAbortSignal,
+  createUnsupportedTransactionError,
+  createUnsupportedTransactionState,
+  runDriverConnectionTest,
+} from '../common/driver'
 import {
   assembleTableBrowseResult,
   buildBatchStatements,
+  buildSelectByPrimaryKeySql,
   buildSelectPageSql,
   buildUpdateSql,
-  quoteQualifiedTable,
 } from '../common/update-builder'
 import {
   TableDetailsCache,
+  collectAndAssembleSchemaDdl,
+  introspectSqliteObjectDdl,
   introspectSqliteObjects,
+  introspectSqliteSchemas,
   introspectSqliteTableDetails,
 } from '../common/schema'
 import {
+  compactSql,
   containsDdlStatement,
   isMutatingStatement,
   quoteIdentForDialect,
   reconstructTableDdl,
   splitSqlStatements,
 } from '../common/sql-tools'
+import { stripLeadingSqlComments } from '../common/sql-lexer'
 
 const LIBSQL_HTTP_TIMEOUT_MS = 30_000
+const LIBSQL_UNSUPPORTED_TX_REASON =
+  'LibSQL does not support interactive multi-statement transactions'
 
 type HranaValue =
   | { type: 'null' }
@@ -95,17 +111,6 @@ interface HranaPipelineRawResponse {
   baton?: string | null
   base_url?: string | null
   results?: HranaPipelineResponseItem[]
-}
-
-function buildCombinedAbortSignal(signal?: AbortSignal): AbortSignal {
-  const timeoutSignal = AbortSignal.timeout(LIBSQL_HTTP_TIMEOUT_MS)
-  if (!signal) {
-    return timeoutSignal
-  }
-  if (typeof AbortSignal.any === 'function') {
-    return AbortSignal.any([signal, timeoutSignal])
-  }
-  return signal
 }
 
 function resolveLibsqlPipelineUrl(profile: ConnectionProfile): string {
@@ -325,7 +330,7 @@ export class LibsqlSession implements IDatabaseSession {
       payload.baton = options.baton
     }
 
-    const combinedSignal = buildCombinedAbortSignal(options?.signal)
+    const combinedSignal = buildCombinedAbortSignal(LIBSQL_HTTP_TIMEOUT_MS, options?.signal)
     let response: Response
     try {
       response = await fetch(this.resolveTargetUrl(options?.baseUrl), {
@@ -467,6 +472,37 @@ export class LibsqlSession implements IDatabaseSession {
     return introspectSqliteObjects(this.queryExecutor, schema || 'main')
   }
 
+  async listSchemas(): Promise<{ schemas: string[]; defaultSchema: string }> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'libsql')
+    }
+    return introspectSqliteSchemas(this.queryExecutor)
+  }
+
+  async getObjectDdl(name: string, kind: SchemaObjectKind, schema?: string): Promise<string> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'libsql')
+    }
+    if (kind === 'table' || kind === 'view') {
+      return this.getDdl(name, schema)
+    }
+    return introspectSqliteObjectDdl(this.queryExecutor, name, kind, schema || 'main')
+  }
+
+  async exportSchemaDdl(schema?: string): Promise<{ ddl: string; objectCount: number }> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'libsql')
+    }
+    const targetSchema = (schema || 'main').trim() || 'main'
+    const objects = await this.listObjects(targetSchema)
+    return collectAndAssembleSchemaDdl({
+      dialect: 'libsql',
+      schemaName: targetSchema,
+      objects,
+      getObjectDdl: (object) => this.getObjectDdl(object.name, object.kind, targetSchema),
+    })
+  }
+
   async getTableDetails(table: string, schema?: string): Promise<TableDetails> {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'libsql')
@@ -520,6 +556,17 @@ export class LibsqlSession implements IDatabaseSession {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'libsql')
     }
+    if (this.profile.readOnly) {
+      throw new DatabaseDriverError('Connection is configured as read-only', 'READ_ONLY', 'libsql')
+    }
+    const targetSchema = params.schema || 'main'
+    const originalColumnType = this.tableDetailsCache.findColumnType(
+      targetSchema,
+      'main',
+      params.table,
+      params.column,
+      params.columnType
+    )
     const { sql, params: updateParams } = buildUpdateSql({
       driver: 'libsql',
       table: params.table,
@@ -528,6 +575,7 @@ export class LibsqlSession implements IDatabaseSession {
       newValue: params.newValue,
       primaryKeys: params.primaryKeys,
       originalValue: params.originalValue,
+      originalColumnType,
     })
 
     const res = await this.executeSingle(sql, updateParams)
@@ -542,25 +590,18 @@ export class LibsqlSession implements IDatabaseSession {
 
     this.tableDetailsCache.clear()
 
-    const whereParts: string[] = []
-    const pkValues: unknown[] = []
-    for (const [pkCol, rawPkVal] of Object.entries(params.primaryKeys)) {
-      const effectivePkVal = pkCol === params.column ? params.newValue : rawPkVal
-      if (effectivePkVal === null || effectivePkVal === undefined) {
-        whereParts.push(`${quoteIdentForDialect(pkCol, 'libsql')} IS NULL`)
-      } else {
-        whereParts.push(`${quoteIdentForDialect(pkCol, 'libsql')} = ?`)
-        pkValues.push(effectivePkVal)
-      }
-    }
+    const reloadQuery = buildSelectByPrimaryKeySql({
+      driver: 'libsql',
+      table: params.table,
+      schema: params.schema,
+      primaryKeys: params.primaryKeys,
+      editedColumn: params.column,
+      newValue: params.newValue,
+    })
 
     let updatedRecord: Record<string, unknown> | undefined
-    if (whereParts.length > 0) {
-      const qTable = quoteQualifiedTable(params.table, params.schema, 'libsql')
-      const sel = await this.executeSingle(
-        `SELECT * FROM ${qTable} WHERE ${whereParts.join(' AND ')}`,
-        pkValues
-      )
+    if (reloadQuery) {
+      const sel = await this.executeSingle(reloadQuery.sql, reloadQuery.params)
       updatedRecord = hranaRowsToRecords(sel)[0]
     }
 
@@ -582,6 +623,12 @@ export class LibsqlSession implements IDatabaseSession {
       inserts: params.inserts,
       updates: params.updates,
       deletes: params.deletes,
+      columnTypes: this.tableDetailsCache.resolveColumnTypes(
+        params.schema,
+        'main',
+        params.table,
+        params.columnTypes
+      ),
     })
     return { statements: batch.previewStatements }
   }
@@ -590,6 +637,9 @@ export class LibsqlSession implements IDatabaseSession {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'libsql')
     }
+    if (this.profile.readOnly) {
+      throw new DatabaseDriverError('Connection is configured as read-only', 'READ_ONLY', 'libsql')
+    }
     const batch = buildBatchStatements({
       driver: 'libsql',
       table: params.table,
@@ -597,6 +647,12 @@ export class LibsqlSession implements IDatabaseSession {
       inserts: params.inserts,
       updates: params.updates,
       deletes: params.deletes,
+      columnTypes: this.tableDetailsCache.resolveColumnTypes(
+        params.schema,
+        'main',
+        params.table,
+        params.columnTypes
+      ),
     })
     if (batch.all.length === 0) {
       return { ok: true, inserted: 0, updated: 0, deleted: 0, statements: [] }
@@ -778,16 +834,45 @@ export class LibsqlSession implements IDatabaseSession {
     const start = performance.now()
     try {
       const stmts = splitSqlStatements(trimmed, 'libsql').map((s) => s.text)
+      if (
+        this.profile.readOnly &&
+        (isMutatingStatement(trimmed, 'libsql') || stmts.some((s) => isMutatingStatement(s, 'libsql')))
+      ) {
+        throw new DatabaseDriverError('Connection is configured as read-only', 'READ_ONLY', 'libsql')
+      }
       let totalAffectedRows = 0
       let lastSelect: Omit<QueryResult, 'executionTimeMs'> | null = null
+      const collectedSets: QueryResultSet[] = []
+      const pushAffectedSet = (index: number, stmtSql: string, affected: number): void => {
+        collectedSets.push({
+          index,
+          sqlPreview: compactSql(stmtSql),
+          columns: [{ name: 'affected_rows', type: 'INTEGER' }],
+          rows: [[affected]],
+          rowCount: 1,
+          affectedRows: affected,
+          truncated: false,
+          isSelect: false,
+        })
+      }
 
       if (stmts.length <= 1) {
         const res = await this.executeSingle(trimmed, [], controller.signal)
         const parsed = parseHranaStatementResult(res, trimmed, maxRows)
         if (parsed.isSelect) {
           lastSelect = parsed.result
+          collectedSets.push({
+            index: 0,
+            sqlPreview: compactSql(trimmed),
+            columns: parsed.result.columns,
+            rows: parsed.result.rows,
+            rowCount: parsed.result.rowCount,
+            truncated: parsed.result.truncated,
+            isSelect: true,
+          })
         } else {
           totalAffectedRows = parsed.affectedRows
+          pushAffectedSet(0, trimmed, parsed.affectedRows)
         }
       } else {
         // Use Hrana v2 conditional batch so any mid-script failure halts subsequent steps
@@ -796,11 +881,11 @@ export class LibsqlSession implements IDatabaseSession {
           ...(idx > 0 ? { condition: { type: 'ok' as const, step: idx - 1 } } : {}),
           stmt: { sql: stmtSql, args: [] },
         }))
-        const beginIdx = stmts.findIndex((s) => /^\s*BEGIN\b/i.test(s))
+        const beginIdx = stmts.findIndex((s) => /^\s*BEGIN\b/i.test(stripLeadingSqlComments(s, 'libsql')))
         if (beginIdx >= 0) {
           let commitIdx = -1
           for (let i = stmts.length - 1; i > beginIdx; i--) {
-            if (/^\s*(?:COMMIT|END)\b/i.test(stmts[i])) {
+            if (/^\s*(?:COMMIT|END)\b/i.test(stripLeadingSqlComments(stmts[i], 'libsql'))) {
               commitIdx = i
               break
             }
@@ -855,15 +940,30 @@ export class LibsqlSession implements IDatabaseSession {
           const parsed = parseHranaStatementResult(stepRes, stmts[i], maxRows)
           if (parsed.isSelect) {
             lastSelect = parsed.result
+            collectedSets.push({
+              index: i,
+              sqlPreview: compactSql(stmts[i]),
+              columns: parsed.result.columns,
+              rows: parsed.result.rows,
+              rowCount: parsed.result.rowCount,
+              truncated: parsed.result.truncated,
+              isSelect: true,
+            })
           } else {
             totalAffectedRows += parsed.affectedRows
+            pushAffectedSet(i, stmts[i], parsed.affectedRows)
           }
         }
       }
 
       const executionTimeMs = Math.round(performance.now() - start)
       return lastSelect
-        ? { ...lastSelect, executionTimeMs }
+        ? {
+            ...lastSelect,
+            affectedRows: totalAffectedRows,
+            ...(collectedSets.length > 1 ? { resultSets: collectedSets } : {}),
+            executionTimeMs,
+          }
         : {
             columns: [],
             rows: [],
@@ -872,6 +972,7 @@ export class LibsqlSession implements IDatabaseSession {
             executionTimeMs,
             truncated: false,
             isSelect: false,
+            ...(collectedSets.length > 1 ? { resultSets: collectedSets } : {}),
           }
     } catch (err) {
       if (active.cancelled && !(err instanceof DatabaseDriverError && err.code === 'cancelled')) {
@@ -898,6 +999,29 @@ export class LibsqlSession implements IDatabaseSession {
     active.controller.abort()
     return { ok: true }
   }
+
+  getTransactionState(): TransactionState {
+    return createUnsupportedTransactionState(LIBSQL_UNSUPPORTED_TX_REASON)
+  }
+
+  async beginTransaction(): Promise<TransactionState> {
+    throw createUnsupportedTransactionError('libsql', LIBSQL_UNSUPPORTED_TX_REASON)
+  }
+
+  async commitTransaction(): Promise<TransactionState> {
+    throw createUnsupportedTransactionError('libsql', LIBSQL_UNSUPPORTED_TX_REASON)
+  }
+
+  async rollbackTransaction(): Promise<TransactionState> {
+    throw createUnsupportedTransactionError('libsql', LIBSQL_UNSUPPORTED_TX_REASON)
+  }
+
+  async setAutoCommit(enabled: boolean): Promise<TransactionState> {
+    if (!enabled) {
+      throw createUnsupportedTransactionError('libsql', LIBSQL_UNSUPPORTED_TX_REASON)
+    }
+    return this.getTransactionState()
+  }
 }
 
 export class LibsqlDriver implements IDatabaseDriver {
@@ -911,19 +1035,9 @@ export class LibsqlDriver implements IDatabaseDriver {
     profile: ConnectionProfile,
     authToken?: string
   ): Promise<{ ok: boolean; message?: string }> {
-    let session: IDatabaseSession | null = null
-    try {
-      session = await this.createSession(profile, authToken)
-      return await session.test()
-    } catch (err: unknown) {
-      return {
-        ok: false,
-        message: err instanceof Error ? err.message : 'LibSQL connection failed',
-      }
-    } finally {
-      if (session) {
-        await session.close().catch(() => {})
-      }
-    }
+    return runDriverConnectionTest(
+      () => this.createSession(profile, authToken),
+      (err) => (err instanceof Error ? err.message : 'LibSQL connection failed')
+    )
   }
 }
