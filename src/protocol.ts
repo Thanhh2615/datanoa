@@ -437,7 +437,6 @@ interface DatanoaPluginRequests {
     input: {
       driverId: string
       localPath: string
-      runNpmInstall?: boolean
       autoTrust?: boolean
     }
     output: {
@@ -445,18 +444,27 @@ interface DatanoaPluginRequests {
       dirPath: string
       entryPath: string
       wroteCanonicalEntry?: boolean
-      installedPackage?: string
+      installPackage?: string
       inspect: DriverInspectResult
       item?: DriverRegistryItem
     }
   }
-  'fs.pickFile': {
-    input?: { title?: string; filter?: string; initialDir?: string }
-    output: { ok: boolean; path?: string; cancelled?: boolean }
-  }
-  'fs.pickFolder': {
-    input?: { title?: string; initialDir?: string }
-    output: { ok: boolean; path?: string; cancelled?: boolean }
+  'fs.listDir': {
+    input?: { dir?: string; mode?: 'file' | 'folder'; extensions?: string[]; strictDir?: boolean }
+    output: {
+      ok: boolean
+      currentDir: string
+      parentDir: string | null
+      roots: string[]
+      entries: Array<{
+        name: string
+        path: string
+        kind: 'dir' | 'file'
+        size?: number
+      }>
+      truncated?: boolean
+      error?: string
+    }
   }
   'workspace.listScopes': {
     input?: Record<string, never>

@@ -746,8 +746,10 @@ function hideBanner() {
 }
 
 function showFormNotice(text, tone = 'neutral') {
+  hideBanner()
   const box = $('formNotice')
-  box.className = `banner ${tone}`
+  box.className = `banner form-notice-sticky ${tone}`
+  box.setAttribute('role', tone === 'danger' || tone === 'warn' ? 'alert' : 'status')
   $('formNoticeText').textContent = text
   box.hidden = false
 }
@@ -2501,6 +2503,7 @@ $('closeFormBtn').addEventListener('click', () => {
   if (!state.formBusy) setFormOpen(false)
 })
 $('globalBannerClose').addEventListener('click', hideBanner)
+$('formNoticeClose')?.addEventListener('click', clearFormNotice)
 $('refreshBtn').addEventListener('click', () => void refreshConnections({ forceLive: true }))
 $('expandAllTreeBtn')?.addEventListener('click', () => expandAllExplorer())
 $('collapseAllTreeBtn')?.addEventListener('click', () => collapseAllExplorer())
@@ -3642,6 +3645,7 @@ window.addEventListener('blur', () => {
 // Capture-phase Escape: dismiss overlays/popovers/modals before PanelGridSelection clears cell selection
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return
+  if (document.querySelector('.panel-fp-backdrop')) return
   const activeEl = document.activeElement
   if (activeEl instanceof HTMLInputElement && activeEl.classList.contains('cell-edit-input')) {
     return

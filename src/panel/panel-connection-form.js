@@ -15,6 +15,8 @@ import {
   getFolderSvgMarkup,
   enhanceCollapsibleSelectDropdown,
   syncSelectTooltip,
+  openPanelFilePickerModal,
+  writeTextToClipboard,
 } from './panel-utils.js'
 
 function deriveSmartSqliteConnName(filePath) {
@@ -113,9 +115,17 @@ export function createPanelConnectionFormController(ctx) {
     badge.textContent = isVerified
       ? `Verified (${(item?.sha256 || '').slice(0, 8)}…)`
       : 'Not Configured'
+    const hasNpmPkg = Boolean(BYOD_NPM_PKGS[driver])
     $('panelByodGuide').textContent = isVerified
       ? `Verified from "${item?.resolvedEntry || item?.localPath}". Ready to connect.`
-      : `Choose a folder to store the ${meta?.label || driver} driver, or click "1-Click Auto-Setup & Install".`
+      : hasNpmPkg
+        ? `Choose a folder for the ${meta?.label || driver} driver, click "Create Folder & Copy Cmd", run it in Terminal, then click "Trust & Verify".`
+        : `Choose a folder for your custom driver, click "Create Folder & Starter", then click "Inspect SHA-256" and "Trust & Verify".`
+    if ($('panelByodAutoSetupBtn')) {
+      $('panelByodAutoSetupBtn').textContent = hasNpmPkg
+        ? 'Create Folder & Copy Cmd'
+        : 'Create Folder & Starter'
+    }
     const folderInp = $('panelByodFolderInput')
     const resolvedDefault = item?.localPath || byodDefaultDirs[driver] || ''
     if (
@@ -353,9 +363,11 @@ export function createPanelConnectionFormController(ctx) {
 
     const pickAndFillLocalSqliteFile = () => {
       if (state.formBusy || !state.formOpen) return
-      void rpc('fs.pickFile', {
-        title: 'Select SQLite Database File (.db, .sqlite, .sqlite3)',
+      void openPanelFilePickerModal({
+        title: 'Select SQLite database file',
+        mode: 'file',
         initialDir: $('formFilePath')?.value.trim() || undefined,
+        extensions: ['.db', '.sqlite', '.sqlite3', '.db3'],
       })
         .then((res) => {
           if (!state.formOpen) return
@@ -390,8 +402,9 @@ export function createPanelConnectionFormController(ctx) {
     if ($('quickScanFolderBtn')) {
       $('quickScanFolderBtn').addEventListener('click', () => {
         if (state.formBusy || !state.formOpen) return
-        void rpc('fs.pickFolder', {
-          title: 'Select Folder to Scan for SQLite Databases & .env Connections',
+        void openPanelFilePickerModal({
+          title: 'Select folder to scan',
+          mode: 'folder',
           initialDir: $('formFilePath')?.value.trim() || undefined,
         })
           .then((res) => {
@@ -418,8 +431,9 @@ export function createPanelConnectionFormController(ctx) {
       $('panelByodBrowseBtn').addEventListener('click', () => {
         if (state.formBusy || byodActionBusy || !state.formOpen) return
         const targetDriver = state.formDriver
-        void rpc('fs.pickFolder', {
-          title: `Select Folder for ${targetDriver} Driver`,
+        void openPanelFilePickerModal({
+          title: `Select folder for ${targetDriver} driver`,
+          mode: 'folder',
           initialDir: $('panelByodFolderInput').value.trim() || undefined,
         })
           .then((res) => {
@@ -442,7 +456,7 @@ export function createPanelConnectionFormController(ctx) {
       $('panelByodCopyCmdBtn').addEventListener('click', (e) => {
         const val = $('panelByodCmdInput').value
         if (typeof copyText === 'function') {
-          void copyText(val, 'BYOD setup command copied', e.currentTarget)
+          void copyText(val, 'Setup command copied', e.currentTarget)
         } else {
           navigator.clipboard?.writeText(val).catch(() => {})
         }
@@ -478,32 +492,34 @@ export function createPanelConnectionFormController(ctx) {
         const driverId = state.formDriver
         const targetDir = $('panelByodFolderInput').value.trim()
         const btn = $('panelByodAutoSetupBtn')
-        setButtonLoading(btn, true, 'Installing...')
+        setButtonLoading(btn, true, 'Creating folder...')
         try {
-          const res = await rpc(
-            'drivers.setupLocal',
-            {
-              driverId,
-              localPath: targetDir,
-              runNpmInstall: Boolean(BYOD_NPM_PKGS[driverId]),
-              autoTrust: true,
-            },
-            { timeoutMs: 120000 }
-          )
+          const res = await rpc('drivers.setupLocal', {
+            driverId,
+            localPath: targetDir,
+            autoTrust: true,
+          })
           if (state.formDriver !== driverId) return
           if (res?.ok && res.inspect?.sha256) {
+            const installCmd = buildPanelByodCmd(driverId, res.dirPath || targetDir)
+            if ($('panelByodCmdInput')) $('panelByodCmdInput').value = installCmd
+            if (res.installPackage && res.item?.status !== 'local-verified') {
+              void writeTextToClipboard(installCmd)
+            }
             if (res.item?.status === 'local-verified') {
               byodPendingSha.delete(driverId)
               await refreshPanelByodAndWorkspaces()
               if (state.formDriver === driverId) {
-                showFormNotice(`${driverId} driver installed and verified!`, 'success')
+                showFormNotice(`${driverId} driver verified.`, 'success')
               }
             } else {
               byodPendingSha.set(driverId, { localPath: res.dirPath || targetDir, sha256: res.inspect.sha256 })
               await refreshPanelByodAndWorkspaces()
               if (state.formDriver === driverId) {
                 showFormNotice(
-                  `Setup complete (SHA-256: ${res.inspect.sha256.slice(0, 16)}…). Review and click Trust & Verify.`,
+                  res.installPackage
+                    ? `Folder created and install command copied. Run it in Terminal, then click Trust & Verify.`
+                    : `Folder created (SHA-256: ${res.inspect.sha256.slice(0, 16)}…). Review and click Trust & Verify.`,
                   'warn'
                 )
               }
@@ -537,7 +553,6 @@ export function createPanelConnectionFormController(ctx) {
               const scaffolded = await rpc('drivers.setupLocal', {
                 driverId,
                 localPath: targetDir,
-                runNpmInstall: false,
                 autoTrust: false,
               })
               res = scaffolded?.inspect
@@ -1085,7 +1100,6 @@ export function createPanelConnectionFormController(ctx) {
           'No .env connections or SQLite database files found in the workspace.',
           'neutral'
         )
-        showBanner('No .env connections or SQLite files found.', 'neutral')
       }
     } catch {
       if (seq !== detectSeq) return

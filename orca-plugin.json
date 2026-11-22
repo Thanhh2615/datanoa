@@ -2,9 +2,8 @@
   "$schema": "https://raw.githubusercontent.com/stablyai/orca/main/docs/schemas/plugins/orca-plugin.v2.schema.json",
   "manifestVersion": 2,
   "id": "datanoa",
-  "publisher": "thanhh2615",
   "name": "Datanoa Studio",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "license": "MIT",
   "author": {
     "name": "Thanhh2615",
@@ -15,41 +14,41 @@
   "icon": "assets/icon.png",
   "cover": {
     "path": "images/cover.webp",
-    "alt": "Datanoa Studio database client for Orca with multi-tab SQL editor, interactive data grid, schema explorer, 9 built-in engines, and BYOD local drivers"
+    "alt": "Datanoa Studio database client and SQL studio for Orca with multi-tab SQL editor, data grid, and schema explorer"
   },
   "screenshots": [
     {
       "path": "images/studio-split-view.webp",
-      "alt": "Datanoa Studio split view with multi-tab PostgreSQL SQL console, manual transactions, interactive data grid with Smart Paste, and JSON inspector",
-      "caption": "Multi-tab SQL Console, Manual Transactions, Data Grid, and JSON Inspector",
+      "alt": "Datanoa Studio split view with multi-tab SQL console, transactions, data grid, and JSON inspector",
+      "caption": "Multi-tab SQL console, transactions, data grid, and JSON inspector",
       "theme": "dark"
     },
     {
       "path": "images/studio-connection-modal.webp",
-      "alt": "Datanoa Connection Manager with 9 built-in engines including Cloudflare D1, BYOD local drivers, SSH tunnels, TLS/mTLS, folders, and .env/.db discovery",
-      "caption": "9 built-in engines, BYOD local drivers, SSH tunnels, TLS/mTLS, and URI/.env auto-detect",
+      "alt": "Datanoa Connection Manager with database engines, SSH tunnels, TLS/mTLS, folders, and auto-detect",
+      "caption": "Connection manager with SSH tunnels, TLS/mTLS, folders, and URI/.env auto-detect",
       "theme": "dark"
     },
     {
       "path": "images/schema-designer.webp",
-      "alt": "Datanoa Visual Table Structure Designer showing staged column edits, dialect data type combobox, foreign keys, indexes, and live migration SQL preview",
-      "caption": "Visual table structure designer with live DDL migration preview",
+      "alt": "Datanoa visual table designer showing staged column edits, data types, foreign keys, indexes, and SQL migration preview",
+      "caption": "Visual table designer with live SQL migration preview",
       "theme": "dark"
     },
     {
       "path": "images/studio-light-theme.webp",
-      "alt": "Datanoa Studio in light theme with horizontal top table bar, grouped All (N) object popover, pinned columns, and instant find highlighting",
-      "caption": "Light theme with horizontal top table bar, pinned columns, and instant find",
+      "alt": "Datanoa Studio in light theme with compact table bar, grouped schema objects, pinned columns, and find highlighting",
+      "caption": "Light theme with compact table bar and pinned columns",
       "theme": "light"
     },
     {
       "path": "images/side-panel-explorer.webp",
-      "alt": "Datanoa Side Panel showing schema explorer tree with folders, virtualized data grid with Smart Copy & Paste and live aggregates, and quick SQL runner",
-      "caption": "Docked Side Panel explorer, data grid with Smart Paste, and quick SQL runner",
+      "alt": "Datanoa Side Panel with schema explorer tree, data grid with live aggregates, and quick SQL runner",
+      "caption": "Docked Side Panel explorer, data grid, and quick SQL runner",
       "theme": "dark"
     }
   ],
-  "description": "All-in-one database client and SQL studio for Orca. Browse multi-schema objects, edit data inline, paste spreadsheets, import CSV/JSON, design schemas, run multi-tab SQL with bind params and manual transactions over SSH/TLS across 9 built-in engines (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, Turso/LibSQL, Cloudflare D1) plus SHA-256-verified local BYOD drivers.",
+  "description": "Database client and SQL studio for Orca. Browse schemas, edit and import data, design tables, and run SQL or Redis queries over SSH and TLS across SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, LibSQL/Turso, Cloudflare D1, SQL Server (MSSQL), Oracle, and MongoDB.",
   "engines": {
     "orca": ">=1.4.248"
   },

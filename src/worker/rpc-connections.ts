@@ -28,14 +28,13 @@ import {
   createSerializedQueue,
   getDefaultByodDriverDirs,
   getUiSessionSnapshot,
+  listDirectoryForPicker,
   listWorkspaceScopesForUi,
   normalizeSqliteProfile,
-  pickNativeFileDialog,
-  pickNativeFolderDialog,
   readHostConfigBackup,
   sanitizeConnectionProfile,
   saveUiSessionSnapshot,
-  scaffoldAndInstallByodDriver,
+  scaffoldLocalDriverDirectory,
   writeHostConfigBackupPatch,
   type WorkerRegisterHandler,
 } from './worker-utils'
@@ -532,10 +531,9 @@ export function registerConnectionHandlers({
     if (!input?.driverId || !input?.localPath) {
       throw createHostError('invalid_params', 'driverId and localPath are required')
     }
-    const setupRes = await scaffoldAndInstallByodDriver({
+    const setupRes = await scaffoldLocalDriverDirectory({
       driverId: input.driverId,
       localPath: input.localPath,
-      runNpmInstall: Boolean(input.runNpmInstall),
     })
     const inspect = await driverManager.inspectLocalDriver({
       driverId: input.driverId,
@@ -561,7 +559,7 @@ export function registerConnectionHandlers({
         await sessionManager.closeSessionsByDriver(input.driverId)
         await syncByodConfigsToBackup()
       } catch {
-        // Leave pending for manual Trust & Verify if dependency import is not yet complete
+        // Leave pending for manual Trust & Verify until npm package is installed
       }
     }
     return {
@@ -569,18 +567,15 @@ export function registerConnectionHandlers({
       dirPath: setupRes.dirPath,
       entryPath: setupRes.entryPath,
       wroteCanonicalEntry: setupRes.wroteCanonicalEntry,
-      installedPackage: setupRes.installedPackage,
+      installPackage: setupRes.installPackage,
       inspect,
       item,
     }
   })
 
-  registerHandler('fs.pickFile', async (input) => {
-    return await pickNativeFileDialog(input || {})
-  })
-
-  registerHandler('fs.pickFolder', async (input) => {
-    return await pickNativeFolderDialog(input || {})
+  registerHandler('fs.listDir', async (input) => {
+    const workspaceDirs = await getLocalWorkspaceDirs(orca).catch(() => [])
+    return await listDirectoryForPicker(input || {}, workspaceDirs)
   })
 
   registerHandler('workspace.listScopes', async () => {

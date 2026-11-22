@@ -364,9 +364,8 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
 
   // 3. Feedback Boxes (Errors & Warnings)
   const errorBox = document.createElement('div')
-  errorBox.className = 'datanoa-modal-box error datanoa-import-error-box'
+  errorBox.className = 'datanoa-modal-box error datanoa-import-error-box is-pinned'
   errorBox.style.display = 'none'
-  body.appendChild(errorBox)
 
   const warnBox = document.createElement('div')
   warnBox.className = 'datanoa-modal-box warn datanoa-import-warn-box'
@@ -1058,6 +1057,7 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
   rebuildPreviewAndValidation()
 
   modal.appendChild(head)
+  modal.appendChild(errorBox)
   modal.appendChild(body)
   modal.appendChild(actions)
   ctx.mountModal(modal, () => !isImporting)

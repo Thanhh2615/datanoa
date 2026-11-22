@@ -1,4 +1,3 @@
-import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
@@ -979,168 +978,234 @@ export async function listWorkspaceScopesForUi(orca: OrcaWorkerApi): Promise<{
   return { currentScopeId, currentScopeLabel, workspaces }
 }
 
-function runExecFileText(
-  cmd: string,
-  args: string[],
-  options?: { cwd?: string; timeoutMs?: number; env?: NodeJS.ProcessEnv }
-): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      cmd,
-      args,
-      {
-        cwd: options?.cwd,
-        env: options?.env ? { ...process.env, ...options.env } : process.env,
-        timeout: options?.timeoutMs ?? 120_000,
-        windowsHide: true,
-        maxBuffer: 4 * 1024 * 1024,
-      },
-      (err, stdout, stderr) => {
-        if (err) {
-          reject(
-            new Error(
-              (typeof stderr === 'string' && stderr.trim()) ||
-                (err instanceof Error ? err.message : String(err))
-            )
-          )
-          return
-        }
-        resolve({
-          stdout: typeof stdout === 'string' ? stdout : String(stdout ?? ''),
-          stderr: typeof stderr === 'string' ? stderr : String(stderr ?? ''),
-        })
+const MAX_PICKER_ENTRIES = 500
+const WIN_DRIVE_CACHE_TTL_MS = 30_000
+const WIN_DRIVE_PROBE_TIMEOUT_MS = 150
+
+let cachedWinDrives: string[] | null = null
+let cachedWinDrivesAt = 0
+
+async function resolvePickerInitialDir(
+  rawInitial?: string,
+  fallbackDirs?: readonly string[]
+): Promise<string> {
+  const candidates: string[] = []
+  const trimmed = typeof rawInitial === 'string' ? rawInitial.trim() : ''
+  if (trimmed) candidates.push(trimmed)
+  if (fallbackDirs) {
+    for (const dir of fallbackDirs) {
+      if (typeof dir === 'string' && dir.trim()) candidates.push(dir.trim())
+    }
+  }
+  const home = os.homedir()
+  if (home) candidates.push(home)
+
+  for (const candidate of candidates) {
+    try {
+      const resolved = path.resolve(candidate)
+      const st = await fs.promises.stat(resolved)
+      return st.isDirectory() ? resolved : path.dirname(resolved)
+    } catch {
+      try {
+        const parent = path.dirname(path.resolve(candidate))
+        const parentStat = await fs.promises.stat(parent)
+        if (parentStat.isDirectory()) return parent
+      } catch {
+        // Continue to next fallback
       }
-    )
-  })
-}
-
-async function resolvePickerInitialDir(rawInitial?: string): Promise<string> {
-  const trimmed = rawInitial ? rawInitial.trim() : ''
-  if (!trimmed) return ''
-  try {
-    const resolved = path.resolve(trimmed)
-    const st = await fs.promises.stat(resolved)
-    return st.isDirectory() ? resolved : path.dirname(resolved)
-  } catch {
-    return ''
+    }
   }
+  return path.resolve('.')
 }
 
-export async function pickNativeFileDialog(options?: {
-  title?: string
-  filter?: string
-  initialDir?: string
-}): Promise<{ ok: boolean; path?: string; cancelled?: boolean }> {
-  const title = stripControlChars(options?.title || 'Select Database File').slice(0, 120)
-  const filter = stripControlChars(
-    options?.filter ||
-      'SQLite Database (*.db;*.sqlite;*.sqlite3;*.db3)|*.db;*.sqlite;*.sqlite3;*.db3|All Files (*.*)|*.*'
-  ).slice(0, 240)
-  const initialDir = await resolvePickerInitialDir(options?.initialDir)
-
+async function probeWinDriveWithTimeout(drive: string): Promise<string | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
   try {
-    if (process.platform === 'win32') {
-      const psScript = [
-        '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
-        'Add-Type -AssemblyName System.Windows.Forms',
-        '$f = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false }',
-        '$d = New-Object System.Windows.Forms.OpenFileDialog',
-        '$d.Title = $env:DATANOA_PICKER_TITLE',
-        '$d.Filter = $env:DATANOA_PICKER_FILTER',
-        'if ($env:DATANOA_PICKER_DIR) { $d.InitialDirectory = $env:DATANOA_PICKER_DIR }',
-        'try { if ($d.ShowDialog($f) -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.FileName) } } finally { $f.Dispose() }',
-      ].join('; ')
-      const { stdout } = await runExecFileText(
-        'powershell.exe',
-        ['-NoProfile', '-Sta', '-Command', psScript],
-        {
-          env: {
-            DATANOA_PICKER_TITLE: title,
-            DATANOA_PICKER_FILTER: filter,
-            DATANOA_PICKER_DIR: initialDir,
-          },
-        }
-      )
-      const picked = stdout.trim()
-      return picked ? { ok: true, path: picked } : { ok: false, cancelled: true }
-    }
-    if (process.platform === 'darwin') {
-      const { stdout } = await runExecFileText('osascript', [
-        '-e',
-        'on run argv',
-        '-e',
-        'POSIX path of (choose file with prompt (item 1 of argv))',
-        '-e',
-        'end run',
-        '--',
-        title,
-      ])
-      const picked = stdout.trim()
-      return picked ? { ok: true, path: picked } : { ok: false, cancelled: true }
-    }
-    const { stdout } = await runExecFileText('zenity', ['--file-selection', `--title=${title}`])
-    const picked = stdout.trim()
-    return picked ? { ok: true, path: picked } : { ok: false, cancelled: true }
-  } catch {
-    return { ok: false, cancelled: true }
-  }
-}
-
-export async function pickNativeFolderDialog(options?: {
-  title?: string
-  initialDir?: string
-}): Promise<{ ok: boolean; path?: string; cancelled?: boolean }> {
-  const title = stripControlChars(options?.title || 'Select Folder').slice(0, 120)
-  const initialDir = await resolvePickerInitialDir(options?.initialDir)
-
-  try {
-    if (process.platform === 'win32') {
-      const psScript = [
-        '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
-        'Add-Type -AssemblyName System.Windows.Forms',
-        '$f = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false }',
-        '$d = New-Object System.Windows.Forms.FolderBrowserDialog',
-        '$d.Description = $env:DATANOA_PICKER_TITLE',
-        '$d.ShowNewFolderButton = $true',
-        'if ($env:DATANOA_PICKER_DIR) { $d.SelectedPath = $env:DATANOA_PICKER_DIR }',
-        'try { if ($d.ShowDialog($f) -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.SelectedPath) } } finally { $f.Dispose() }',
-      ].join('; ')
-      const { stdout } = await runExecFileText(
-        'powershell.exe',
-        ['-NoProfile', '-Sta', '-Command', psScript],
-        {
-          env: {
-            DATANOA_PICKER_TITLE: title,
-            DATANOA_PICKER_DIR: initialDir,
-          },
-        }
-      )
-      const picked = stdout.trim()
-      return picked ? { ok: true, path: picked } : { ok: false, cancelled: true }
-    }
-    if (process.platform === 'darwin') {
-      const { stdout } = await runExecFileText('osascript', [
-        '-e',
-        'on run argv',
-        '-e',
-        'POSIX path of (choose folder with prompt (item 1 of argv))',
-        '-e',
-        'end run',
-        '--',
-        title,
-      ])
-      const picked = stdout.trim()
-      return picked ? { ok: true, path: picked } : { ok: false, cancelled: true }
-    }
-    const { stdout } = await runExecFileText('zenity', [
-      '--file-selection',
-      '--directory',
-      `--title=${title}`,
+    return await Promise.race([
+      fs.promises.access(drive).then(
+        () => drive,
+        () => null
+      ),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), WIN_DRIVE_PROBE_TIMEOUT_MS)
+      }),
     ])
-    const picked = stdout.trim()
-    return picked ? { ok: true, path: picked } : { ok: false, cancelled: true }
-  } catch {
-    return { ok: false, cancelled: true }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+async function listWindowsDrivesCached(): Promise<string[]> {
+  const now = Date.now()
+  if (cachedWinDrives && now - cachedWinDrivesAt < WIN_DRIVE_CACHE_TTL_MS) {
+    return cachedWinDrives
+  }
+  const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')
+  const checks = await Promise.all(letters.map((l) => probeWinDriveWithTimeout(`${l}:\\`)))
+  cachedWinDrives = checks.filter((d): d is string => d !== null)
+  cachedWinDrivesAt = now
+  return cachedWinDrives
+}
+
+async function listAvailablePickerRoots(workspaceDirs?: readonly string[]): Promise<string[]> {
+  const seen = new Set<string>()
+  const roots: string[] = []
+  const pushUnique = (dir: string): void => {
+    const norm = normalizePathForCompare(dir)
+    if (!norm || seen.has(norm)) return
+    seen.add(norm)
+    roots.push(dir)
+  }
+
+  if (workspaceDirs) {
+    for (const ws of workspaceDirs) {
+      if (typeof ws === 'string' && ws.trim()) pushUnique(path.resolve(ws.trim()))
+    }
+  }
+  const home = os.homedir()
+  if (home) pushUnique(path.resolve(home))
+
+  if (process.platform === 'win32') {
+    for (const drive of await listWindowsDrivesCached()) {
+      pushUnique(drive)
+    }
+  } else {
+    pushUnique('/')
+  }
+  return roots
+}
+
+type PickerDirEntry = { name: string; path: string; kind: 'dir' | 'file'; size?: number }
+
+async function classifyPickerDirent(
+  currentDir: string,
+  entry: fs.Dirent,
+  mode: 'file' | 'folder',
+  extSet: ReadonlySet<string> | null
+): Promise<PickerDirEntry | null> {
+  const fullPath = path.join(currentDir, entry.name)
+  let isDir = entry.isDirectory()
+  let isFile = entry.isFile()
+  if (entry.isSymbolicLink()) {
+    try {
+      const st = await fs.promises.stat(fullPath)
+      isDir = st.isDirectory()
+      isFile = st.isFile()
+    } catch {
+      return null
+    }
+  }
+  if (isDir) return { name: entry.name, path: fullPath, kind: 'dir' }
+  if (mode === 'folder' || !isFile) return null
+  if (extSet && !extSet.has(path.extname(entry.name).toLowerCase())) return null
+  return { name: entry.name, path: fullPath, kind: 'file' }
+}
+
+export async function listDirectoryForPicker(
+  options?: { dir?: string; mode?: 'file' | 'folder'; extensions?: string[]; strictDir?: boolean },
+  workspaceDirs?: readonly string[]
+): Promise<{
+  ok: boolean
+  currentDir: string
+  parentDir: string | null
+  roots: string[]
+  entries: PickerDirEntry[]
+  truncated?: boolean
+  error?: string
+}> {
+  const mode = options?.mode === 'folder' ? 'folder' : 'file'
+  const rawDir = typeof options?.dir === 'string' ? options.dir.trim() : ''
+  const strictDir = Boolean(options?.strictDir && rawDir)
+  const extSet =
+    Array.isArray(options?.extensions) && options.extensions.length > 0
+      ? new Set(
+          options.extensions
+            .filter((ext): ext is string => typeof ext === 'string')
+            .map((ext) => ext.trim().toLowerCase())
+            .filter(Boolean)
+            .map((ext) => (ext.startsWith('.') ? ext : `.${ext}`))
+        )
+      : null
+
+  const roots = await listAvailablePickerRoots(workspaceDirs)
+  let currentDir: string
+  if (strictDir) {
+    currentDir = path.resolve(rawDir)
+    try {
+      const st = await fs.promises.stat(currentDir)
+      if (!st.isDirectory()) {
+        return {
+          ok: false,
+          currentDir: '',
+          parentDir: null,
+          roots,
+          entries: [],
+          error: `Not a directory: ${currentDir}`,
+        }
+      }
+    } catch {
+      return {
+        ok: false,
+        currentDir: '',
+        parentDir: null,
+        roots,
+        entries: [],
+        error: `Directory not found: ${currentDir}`,
+      }
+    }
+  } else {
+    currentDir = await resolvePickerInitialDir(rawDir, workspaceDirs)
+  }
+
+  const rawParent = path.dirname(currentDir)
+  const parentDir =
+    normalizePathForCompare(rawParent) !== normalizePathForCompare(currentDir) ? rawParent : null
+
+  try {
+    const dirents = await fs.promises.readdir(currentDir, { withFileTypes: true })
+    dirents.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+
+    const dirs: PickerDirEntry[] = []
+    const files: PickerDirEntry[] = []
+    let truncated = false
+    for (const entry of dirents) {
+      const classified = await classifyPickerDirent(currentDir, entry, mode, extSet)
+      if (!classified) continue
+      if (classified.kind === 'dir') {
+        if (dirs.length < MAX_PICKER_ENTRIES) dirs.push(classified)
+        else truncated = true
+      } else if (dirs.length + files.length < MAX_PICKER_ENTRIES) {
+        files.push(classified)
+      } else {
+        truncated = true
+      }
+    }
+
+    const combined = [...dirs, ...files].slice(0, MAX_PICKER_ENTRIES)
+    if (dirs.length + files.length > MAX_PICKER_ENTRIES) truncated = true
+
+    // Populate file sizes only for the bounded visible slice
+    await Promise.all(
+      combined.map(async (item) => {
+        if (item.kind !== 'file') return
+        try {
+          item.size = (await fs.promises.stat(item.path)).size
+        } catch {
+          // Optional metadata
+        }
+      })
+    )
+
+    return { ok: true, currentDir, parentDir, roots, entries: combined, truncated }
+  } catch (err) {
+    return {
+      ok: false,
+      currentDir,
+      parentDir,
+      roots,
+      entries: [],
+      error: err instanceof Error ? err.message : String(err),
+    }
   }
 }
 
@@ -1245,14 +1310,13 @@ export async function ensureByodDirectoryScaffolded(
   return { dirPath, entryPath, canonicalSha256, wroteCanonicalEntry }
 }
 
-export async function scaffoldAndInstallByodDriver(input: {
+export async function scaffoldLocalDriverDirectory(input: {
   driverId: string
   localPath: string
-  runNpmInstall?: boolean
 }): Promise<{
   dirPath: string
   entryPath: string
-  installedPackage?: string
+  installPackage?: string
   canonicalSha256: string
   wroteCanonicalEntry: boolean
 }> {
@@ -1260,34 +1324,10 @@ export async function scaffoldAndInstallByodDriver(input: {
   const { dirPath, entryPath, canonicalSha256, wroteCanonicalEntry } =
     await ensureByodDirectoryScaffolded(id, input.localPath, false)
 
-  const npmPkg = ALLOWED_BYOD_NPM_PACKAGES[id]
-  if (input.runNpmInstall && npmPkg) {
-    if (process.platform === 'win32') {
-      const comSpec = process.env.ComSpec || 'cmd.exe'
-      await runExecFileText(
-        comSpec,
-        ['/d', '/s', '/c', `npm install ${npmPkg} --ignore-scripts --no-audit --no-fund`],
-        {
-          cwd: dirPath,
-          timeoutMs: 110_000,
-        }
-      )
-    } else {
-      await runExecFileText(
-        'npm',
-        ['install', npmPkg, '--ignore-scripts', '--no-audit', '--no-fund'],
-        {
-          cwd: dirPath,
-          timeoutMs: 110_000,
-        }
-      )
-    }
-  }
-
   return {
     dirPath,
     entryPath,
-    installedPackage: input.runNpmInstall ? npmPkg : undefined,
+    installPackage: ALLOWED_BYOD_NPM_PACKAGES[id],
     canonicalSha256,
     wroteCanonicalEntry,
   }

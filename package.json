@@ -1,7 +1,7 @@
 {
   "name": "datanoa",
-  "version": "1.1.0",
-  "description": "All-in-one database client and SQL studio for Orca (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, Turso/LibSQL, Cloudflare D1 + BYOD custom drivers)",
+  "version": "1.1.1",
+  "description": "Database client and SQL studio for Orca — SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, LibSQL/Turso, Cloudflare D1, SQL Server (MSSQL), Oracle, and MongoDB.",
   "private": true,
   "type": "module",
   "license": "MIT",

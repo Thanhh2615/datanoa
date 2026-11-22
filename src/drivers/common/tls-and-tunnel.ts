@@ -2,14 +2,12 @@
 // Zero vendor additions: uses node:fs / node:net / node:tls / node:child_process only.
 
 import { spawn, type ChildProcess } from 'node:child_process'
-import { createHash } from 'node:crypto'
 import * as fs from 'node:fs'
 import * as net from 'node:net'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import * as tls from 'node:tls'
 import type { ConnectionProfile } from '../../protocol'
-import { WIN_ASKPASS_EXE_BASE64, WIN_ASKPASS_EXE_SHA256 } from './ssh-askpass-win-bin'
 
 /** Secrets resolved from `orca.secrets` (never persisted on the profile) */
 export interface TlsSecretBundle {
@@ -402,7 +400,19 @@ interface EphemeralAskpass {
 }
 
 const ASKPASS_HELPER_JS = [
-  'const prompt = process.argv.slice(2).join(" ").trim();',
+  'function extractPrompt() {',
+  '  const argvPrompt = process.argv.slice(2).join(" ").trim();',
+  '  if (argvPrompt) return argvPrompt;',
+  '  const raw = String(process.env.DATANOA_CMD_RAW || "");',
+  '  if (!raw) return "";',
+  '  const m = /askpass\\.cmd"?\\s+([\\s\\S]+)$/i.exec(raw);',
+  '  if (!m) return "";',
+  '  let rest = m[1].trim();',
+  '  if (/\\/c\\s+""/i.test(raw) && rest.endsWith(\'"\')) rest = rest.slice(0, -1).trim();',
+  '  if (rest.length >= 2 && rest.startsWith(\'"\') && rest.endsWith(\'"\')) rest = rest.slice(1, -1);',
+  '  return rest.trim();',
+  '}',
+  'const prompt = extractPrompt();',
   'if (!prompt) { process.exit(1); }',
   'if (/(?:continue connecting|fingerprint|\\(yes\\/no|are you sure|host key)/i.test(prompt)) { process.exit(1); }',
   'const mode = String(process.env.DATANOA_SSH_AUTH_MODE || "").trim().toLowerCase();',
@@ -420,15 +430,6 @@ const ASKPASS_HELPER_JS = [
   '',
 ].join('\n')
 
-function decodeVerifiedWindowsAskpassBinary(): Buffer {
-  const bytes = Buffer.from(WIN_ASKPASS_EXE_BASE64, 'base64')
-  const actualSha = createHash('sha256').update(bytes).digest('hex')
-  if (bytes.length < 1024 || bytes[0] !== 0x4d || bytes[1] !== 0x5a || actualSha !== WIN_ASKPASS_EXE_SHA256) {
-    throw new Error('Windows SSH askpass helper binary failed integrity verification')
-  }
-  return bytes
-}
-
 async function createEphemeralAskpassHelper(): Promise<EphemeralAskpass> {
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'datanoa-ssh-'))
   const isWin = process.platform === 'win32'
@@ -441,14 +442,18 @@ async function createEphemeralAskpassHelper(): Promise<EphemeralAskpass> {
 
   let scriptPath: string
   try {
-    if (isWin) {
-      const exeBytes = decodeVerifiedWindowsAskpassBinary()
-      scriptPath = path.join(dir, 'askpass.exe')
-      await fs.promises.writeFile(scriptPath, exeBytes, { mode: 0o700 })
-    } else {
+    if (!isWin) {
       await fs.promises.chmod(dir, 0o700).catch(() => {})
-      const jsPath = path.join(dir, 'askpass.cjs')
-      await fs.promises.writeFile(jsPath, ASKPASS_HELPER_JS, { encoding: 'utf8', mode: 0o600 })
+    }
+    const jsPath = path.join(dir, 'askpass.cjs')
+    await fs.promises.writeFile(jsPath, ASKPASS_HELPER_JS, { encoding: 'utf8', mode: 0o600 })
+    if (isWin) {
+      scriptPath = path.join(dir, 'askpass.cmd')
+      // Pass raw command line via delayed expansion so cmd.exe never re-parses quotes or metacharacters
+      const cmdContent =
+        '@echo off\r\nsetlocal EnableDelayedExpansion\r\nset "DATANOA_CMD_RAW=!CMDCMDLINE!"\r\n"%DATANOA_NODE_EXE%" "%~dp0askpass.cjs"\r\n'
+      await fs.promises.writeFile(scriptPath, cmdContent, { encoding: 'utf8', mode: 0o700 })
+    } else {
       scriptPath = path.join(dir, 'askpass.sh')
       const scriptContent = '#!/bin/sh\nexec "$DATANOA_NODE_EXE" "$(dirname "$0")/askpass.cjs" "$@"\n'
       await fs.promises.writeFile(scriptPath, scriptContent, { encoding: 'utf8', mode: 0o700 })
@@ -512,12 +517,8 @@ export async function openSshTunnel(
             DISPLAY: process.env.DISPLAY || 'datanoa:0',
             DATANOA_SSH_SECRET: askpassSecret,
             DATANOA_SSH_AUTH_MODE: authMethod === 'password' ? 'password' : 'passphrase',
-            ...(process.platform !== 'win32'
-              ? {
-                  DATANOA_NODE_EXE: process.execPath,
-                  ELECTRON_RUN_AS_NODE: '1',
-                }
-              : {}),
+            DATANOA_NODE_EXE: process.execPath,
+            ELECTRON_RUN_AS_NODE: '1',
           }
         : { ...process.env }
 

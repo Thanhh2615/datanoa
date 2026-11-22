@@ -122,19 +122,24 @@
       </div>
     </section>
 
+    <!-- Global Notice Banner (pinned above scrollable viewport) -->
+    <div id="globalBanner" class="banner" hidden>
+      <span id="globalBannerText" class="banner-text"></span>
+      <button id="globalBannerClose" class="btn btn-ghost btn-icon btn-sm" type="button" aria-label="Dismiss">&times;</button>
+    </div>
+
     <!-- Viewport -->
     <main class="viewport">
-      <!-- Global Notice Banner -->
-      <div id="globalBanner" class="banner" hidden>
-        <span id="globalBannerText" class="banner-text"></span>
-        <button id="globalBannerClose" class="btn btn-ghost btn-icon btn-sm" type="button" aria-label="Dismiss">&times;</button>
-      </div>
-
       <!-- Connection Drawer (Create / Edit / URI Import / Env & SQLite Detect) -->
       <section id="connFormBox" class="drawer-section" hidden>
         <div class="panel-head">
           <h2 id="connFormTitle" class="panel-title">New Database Connection</h2>
           <button id="closeFormBtn" class="btn btn-ghost btn-sm" type="button">Cancel</button>
+        </div>
+
+        <div id="formNotice" class="banner form-notice-sticky" role="status" hidden>
+          <span id="formNoticeText" class="banner-text"></span>
+          <button id="formNoticeClose" class="btn btn-ghost btn-icon btn-sm" type="button" aria-label="Dismiss">&times;</button>
         </div>
 
         <!-- Paste Connection URI Bar -->
@@ -168,7 +173,7 @@
             <button id="panelByodCopyCmdBtn" class="btn btn-sm" type="button">Copy Cmd</button>
           </div>
           <div class="input-group input-wrap-wrap" style="gap: 4px;">
-            <button id="panelByodAutoSetupBtn" class="btn btn-primary btn-sm" type="button">1-Click Auto-Setup &amp; Install</button>
+            <button id="panelByodAutoSetupBtn" class="btn btn-primary btn-sm" type="button">Create Folder &amp; Copy Cmd</button>
             <button id="panelByodCopyStarterBtn" class="btn btn-sm" type="button">Copy Starter index.mjs</button>
             <button id="panelByodInspectBtn" class="btn btn-sm" type="button">Inspect SHA-256</button>
             <button id="panelByodTrustBtn" class="btn btn-sm" type="button" disabled>Trust &amp; Verify</button>
@@ -325,10 +330,6 @@
           <input id="formReadOnly" type="checkbox" />
           <span>Read-Only Mode (block INSERT / UPDATE / DELETE / DDL)</span>
         </label>
-
-        <div id="formNotice" class="banner" style="flex-shrink: 0;" hidden>
-          <span id="formNoticeText" class="banner-text"></span>
-        </div>
 
         <div class="input-group" style="justify-content: flex-end; flex-shrink: 0; padding-right: 34px;">
           <button id="testFormBtn" class="btn" type="button">Test</button>
@@ -838,7 +839,7 @@
         <kbd>Ctrl+Enter</kbd><span>Execute SQL at Caret / Apply Cell</span>
         <kbd>Ctrl+Shift+Enter</kbd><span>Run All SQL Statements</span>
         <kbd>Shift+Alt+F</kbd><span>Format SQL Query</span>
-        <kbd>Ctrl+C / Ctrl+V</kbd><span>Copy TSV / Smart Paste (overwrite + overflow, or new rows if empty)</span>
+        <kbd>Ctrl+C / Ctrl+V</kbd><span>Copy selected cells / Paste into cells or new rows</span>
         <kbd>Ctrl+Shift+V</kbd><span>Paste Clipboard as New Staged Row(s)</span>
         <kbd>Ctrl+F</kbd><span>Find &amp; Highlight in Data Page</span>
         <kbd>Ctrl+S</kbd><span>Submit Staged Data / Schema Edits</span>

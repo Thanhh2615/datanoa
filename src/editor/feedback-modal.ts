@@ -105,15 +105,14 @@ export function openStudioFeedbackModal(
   body.className = 'datanoa-modal-body'
 
   const noticeBox = document.createElement('div')
-  noticeBox.className = 'datanoa-modal-box datanoa-feedback-notice'
+  noticeBox.className = 'datanoa-modal-box datanoa-feedback-notice is-pinned'
   noticeBox.style.display = 'none'
   noticeBox.setAttribute('role', 'status')
   const showNotice = (status: 'success' | 'neutral', text: string): void => {
-    noticeBox.className = `datanoa-modal-box datanoa-feedback-notice${status === 'success' ? ' success' : ''}`
+    noticeBox.className = `datanoa-modal-box datanoa-feedback-notice is-pinned${status === 'success' ? ' success' : ''}`
     noticeBox.textContent = text
     noticeBox.style.display = 'block'
   }
-  body.appendChild(noticeBox)
 
   // Kind Toggle: Bug Report vs Feature Request / UI Improvement
   const kindRow = document.createElement('div')
@@ -281,6 +280,7 @@ export function openStudioFeedbackModal(
   actions.appendChild(githubBtn)
 
   modal.appendChild(head)
+  modal.appendChild(noticeBox)
   modal.appendChild(body)
   modal.appendChild(actions)
   ctx.mountModal(modal)

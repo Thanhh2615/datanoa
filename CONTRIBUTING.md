@@ -60,108 +60,105 @@ orca plugin dev load .
 
 ## Architecture & Module Layout
 
-Datanoa is organized into deep, single-responsibility modules across four layers:
-
 ```text
 datanoa/
 ├── assets/
 │   └── icon.png                          # 256x256 plugin icon
 ├── build/
-│   ├── build-askpass.mjs                 # Deterministic Windows PE SSH askpass builder & verifier
-│   ├── bundle-drivers.mjs                # esbuild bundler + < 1 MiB & CSP static auditor
-│   ├── check-package-size.mjs            # 5,000,000-byte total & < 1 MiB vendor ceiling guard
-│   └── ssh-askpass/
-│       └── askpass.cs                    # Minimal zero-shell Windows SSH_ASKPASS source
-├── images/                               # 1600x1000 (16:10) showcase screenshots & cover
+│   ├── bundle-drivers.mjs                # esbuild bundler + size & CSP static auditor
+│   └── check-package-size.mjs            # Package payload & vendor size budget guard
+├── images/                               # 1600x1000 (16:10) screenshots & cover
 ├── src/
-│   ├── protocol.ts                       # Canonical IPC contracts & JsonValue payload sanitizer
-│   ├── shared-constants.ts               # Shared version, RPC timeout, chunk & storage key constants
+│   ├── protocol.ts                       # Canonical IPC contracts & payload sanitizer
+│   ├── shared-constants.ts               # Shared version, timeout, chunk & storage constants
+│   ├── shared-file-picker.js             # Shared in-app file/folder picker modal (Studio & Side Panel)
+│   ├── shared-file-picker.d.ts           # TypeScript declaration for shared-file-picker.js
 │   ├── assets/
-│   │   ├── geist-font.js                 # Shared embedded WOFF2 data URI for Studio & Side Panel
-│   │   ├── geist-font.d.ts               # TypeScript companion declaration for geist-font.js
-│   │   └── logo.ts                       # Embedded 64x64 brand logo data URI
+│   │   ├── geist-font.js                 # Embedded WOFF2 data URI for Studio & Side Panel
+│   │   ├── geist-font.d.ts               # TypeScript declaration for geist-font.js
+│   │   └── logo.ts                       # Embedded 64x64 logo data URI
 │   ├── drivers/
-│   │   ├── index.ts                      # 9-engine driver registry
-│   │   ├── driver-manager.ts             # BYOD local driver manager with SHA-256 & in-memory hooks
+│   │   ├── index.ts                      # Built-in driver registry
+│   │   ├── driver-manager.ts             # Local driver manager with SHA-256 verification
 │   │   ├── common/
-│   │   │   ├── byod-templates.ts         # Canonical BYOD starter adapter templates
+│   │   │   ├── byod-templates.ts         # Starter adapter templates (MSSQL, Oracle, MongoDB, Custom)
 │   │   │   ├── connection-uri.ts         # Multi-dialect URI parser & Cloud Auto-SSL detector
 │   │   │   ├── driver.ts                 # Shared driver contracts, abort signal, test & tx helpers
-│   │   │   ├── engine-catalog.ts         # 9-engine metadata & capability definitions
-│   │   │   ├── schema.ts                 # Dialect catalog introspection, DDL export & TableDetailsCache
-│   │   │   ├── sql-credentials.ts        # Dialect-aware credential & secret literal scanner
+│   │   │   ├── engine-catalog.ts         # Engine metadata & capability definitions
+│   │   │   ├── schema.ts                 # Catalog introspection, DDL export & TableDetailsCache
+│   │   │   ├── sql-credentials.ts        # Credential & secret literal scanner
 │   │   │   ├── sql-lexer.ts              # Dialect-aware SQL splitter, comment stripper & guards
-│   │   │   ├── sql-formatter.ts          # Dialect SQL formatter & multi-format data exporters
-│   │   │   ├── sql-migration.ts          # Visual table structure planner & 12-step SQLite rebuild
-│   │   │   ├── sql-tools.ts              # Backward-compatible barrel re-export
-│   │   │   ├── ssh-askpass-win-bin.ts    # Embedded SHA-256-verified Windows PE askpass binary
+│   │   │   ├── sql-formatter.ts          # SQL formatter & data exporters
+│   │   │   ├── sql-migration.ts          # Table structure migration planner
+│   │   │   ├── sql-tools.ts              # Barrel re-export
 │   │   │   ├── tls-and-tunnel.ts         # TLS/mTLS options, IPv4 bridge & SSH tunnel manager
 │   │   │   └── update-builder.ts         # Parameterized DML, PK reload, chunked INSERT & pagination
-│   │   ├── sqlite/                       # node:sqlite driver + isolated worker_threads runner
+│   │   ├── sqlite/                       # node:sqlite driver + worker_threads runner
 │   │   ├── postgres/                     # PostgreSQL & CockroachDB driver + Supabase IPv4 bridge
 │   │   ├── mysql/                        # MySQL & MariaDB pooled driver
-│   │   ├── clickhouse/                   # ClickHouse HTTP(S) JSONCompact driver
-│   │   ├── redis/                        # Zero-dependency TCP/TLS RESP2 client
-│   │   ├── libsql/                       # Turso / LibSQL Hrana v2 HTTP pipeline client
-│   │   └── d1/                           # Cloudflare D1 pure-TS HTTP REST client (SQLite-compatible)
+│   │   ├── clickhouse/                   # ClickHouse HTTP(S) driver
+│   │   ├── redis/                        # TCP/TLS RESP2 client
+│   │   ├── libsql/                       # Turso / LibSQL HTTP pipeline client
+│   │   └── d1/                           # Cloudflare D1 HTTP REST client
 │   ├── editor/                           # Isolated Custom Editor (.sql / .datanoa)
 │   │   ├── index.ts                      # Fullscreen Studio controller & IPC orchestration
-│   │   ├── document-meta.ts              # .datanoa metadata header & warm-cache snapshot helpers
-│   │   ├── studio-dom.ts                 # Typed Studio DOM tree builder (StudioDomRefs)
-│   │   ├── studio-sidebar.ts             # Sidebar explorer, horizontal topbar & SQL template builders
+│   │   ├── document-meta.ts              # .datanoa metadata header & session cache snapshot helpers
+│   │   ├── studio-dom.ts                 # Typed Studio DOM tree builder
+│   │   ├── studio-sidebar.ts             # Sidebar explorer, top table bar & SQL templates
 │   │   ├── studio-columns-popover.ts     # Column visibility & pin popover
-│   │   ├── studio-export.ts              # Studio export dropdown & multi-format download orchestration
-│   │   ├── db-icons.ts                   # 9-engine + BYOD brand SVG icons & select dropdown helpers
-│   │   ├── connection-modal.ts           # 9-Engine Connection Manager Modal (SSH, TLS/mTLS, BYOD)
-│   │   ├── driver-manager-modal.ts       # Built-in & BYOD Local Driver Manager Modal
-│   │   ├── studio-modals.ts              # Command Palette, Shortcuts, Create/Drop & modal base types
-│   │   ├── feedback-modal.ts             # Privacy-safe in-app Feedback / Bug Report modal
-│   │   ├── bind-params-modal.ts          # Interactive SQL Bind Parameters modal & live preview
-│   │   ├── danger-sql-modal.ts           # Dangerous SQL execution guard modal (PROD/STAGING aware)
-│   │   ├── data-import.ts                # Pure CSV/TSV/JSON/NDJSON import parser, mapper & coercer
-│   │   ├── import-modal.ts               # File Import modal (grid staging & chunked resumable commit)
-│   │   ├── saved-queries-modal.ts        # Saved Queries / SQL Snippets library modal
-│   │   ├── query-history-drawer.ts       # Searchable Query History slide-out drawer
-│   │   ├── value-inspector.ts            # Collapsible Value & JSON Inspector drawer
-│   │   ├── console.ts                    # CodeMirror 6 SQL & Redis console, find/replace & folding
-│   │   ├── console-tabs.ts               # Multi-Tab SQL Console state & persistence manager
-│   │   ├── sql-params.ts                 # Dialect-aware SQL bind parameter extractor & binder
-│   │   ├── sql-safety.ts                 # Lexer-based dangerous SQL statement detector
-│   │   ├── sql-column-filter.ts          # Column header filter predicate builder & WHERE injector
+│   │   ├── studio-export.ts              # Export dropdown & file download orchestration
+│   │   ├── db-icons.ts                   # Engine SVG icons & select dropdown helpers
+│   │   ├── connection-modal.ts           # Connection Manager Modal (SSH, TLS/mTLS, local drivers)
+│   │   ├── driver-manager-modal.ts       # Built-in & local Driver Manager Modal
+│   │   ├── file-picker-modal.ts          # In-app file and folder picker modal
+│   │   ├── studio-modals.ts              # Command Palette, Shortcuts, Create/Drop & modal types
+│   │   ├── feedback-modal.ts             # In-app Feedback / Bug Report modal
+│   │   ├── bind-params-modal.ts          # SQL Bind Parameters modal & live preview
+│   │   ├── danger-sql-modal.ts           # Destructive SQL confirmation modal
+│   │   ├── data-import.ts                # CSV/TSV/JSON/NDJSON parser, mapper & coercer
+│   │   ├── import-modal.ts               # File Import modal (grid staging & chunked commit)
+│   │   ├── saved-queries-modal.ts        # Saved Queries library modal
+│   │   ├── query-history-drawer.ts       # Searchable Query History drawer
+│   │   ├── value-inspector.ts            # Value & JSON Inspector drawer
+│   │   ├── console.ts                    # CodeMirror 6 SQL & Redis console
+│   │   ├── console-tabs.ts               # Multi-Tab SQL Console state & persistence
+│   │   ├── sql-params.ts                 # SQL bind parameter extractor & binder
+│   │   ├── sql-safety.ts                 # Dangerous SQL statement detector
+│   │   ├── sql-column-filter.ts          # Column filter predicate builder & WHERE injector
 │   │   ├── grid.ts                       # Virtualized data grid & inline batch staging
 │   │   ├── grid-icons.ts                 # Data grid DOM helpers, SVG icons & popup clamping
-│   │   ├── grid-data-ops.ts              # Pure grid filtering, sorting, Smart Paste & exporters
-│   │   ├── grid-menus.ts                 # Cell/header/canvas context menus, bulk-fill & filter popovers
-│   │   ├── grid-formatters.ts            # Pure cell coercion, window math & clipboard helpers
-│   │   ├── grid-selection.ts             # Rectangular multi-cell selection & live aggregate math
+│   │   ├── grid-data-ops.ts              # Grid filtering, sorting, clipboard paste & exporters
+│   │   ├── grid-menus.ts                 # Context menus, bulk-fill & filter popovers
+│   │   ├── grid-formatters.ts            # Cell coercion, window math & clipboard helpers
+│   │   ├── grid-selection.ts             # Multi-cell selection & aggregate math
 │   │   ├── select-editability.ts         # Single-table SELECT inline editability analyzer
-│   │   ├── transaction-toolbar.ts        # Sticky Transaction & Auto-Commit status bar
-│   │   ├── schema-inspector.ts           # Visual Table Structure Designer & migration confirmation
-│   │   ├── schema-ddl.ts                 # Multi-line DDL syntax highlighter & dialect type catalogs
-│   │   ├── theme.ts                      # Assembled Dark & Light Mode stylesheet
-│   │   ├── theme-grid.ts                 # Grid, pinned column, filter & value inspector styles
-│   │   └── theme-modals.ts               # Schema designer, combobox & modal styles
+│   │   ├── transaction-toolbar.ts        # Transaction & Auto-Commit status bar
+│   │   ├── schema-inspector.ts           # Visual Table Designer & migration confirmation
+│   │   ├── schema-ddl.ts                 # DDL syntax highlighter & dialect type catalogs
+│   │   ├── theme.ts                      # Dark & Light Mode stylesheet
+│   │   ├── theme-grid.ts                 # Grid, pinned column, filter & inspector styles
+│   │   └── theme-modals.ts               # Table designer, combobox & modal styles
 │   ├── panel/                            # Docked Right Sidebar Panel
 │   │   ├── panel.html                    # Side Panel DOM markup
 │   │   ├── panel.css                     # Side Panel Dark & Light Mode stylesheet
-│   │   ├── panel-app.js                  # Side Panel composition root & shared state orchestrator
-│   │   ├── panel-core.js                 # Pure Side Panel SQL, Smart Paste, migration & feedback helpers
-│   │   ├── panel-utils.js                # Brand SVGs, RPC bridge, clipboard & virtual table window engine
-│   │   ├── panel-selection.js            # Side Panel rectangular cell selection & aggregates
+│   │   ├── panel-app.js                  # Side Panel composition root & shared state
+│   │   ├── panel-core.js                 # Side Panel SQL, clipboard paste, migration & feedback helpers
+│   │   ├── panel-utils.js                # Brand SVGs, RPC bridge, clipboard & virtual window
+│   │   ├── panel-selection.js            # Side Panel multi-cell selection & aggregates
 │   │   ├── panel-connection-form.js      # Connection form, URI parser & workspace discovery
-│   │   ├── panel-explorer.js             # Schema explorer tree & object context menus
-│   │   ├── panel-data-grid.js            # Virtualized data grid, staging, Smart Paste & inspector
+│   │   ├── panel-explorer.js             # Schema explorer tree & context menus
+│   │   ├── panel-data-grid.js            # Virtualized data grid, staging & inspector
 │   │   ├── panel-sql.js                  # SQL runner, autocomplete, EXPLAIN & history
-│   │   ├── panel-structure.js            # Visual Table Structure Designer & type combobox
+│   │   ├── panel-structure.js            # Visual Table Designer & type combobox
 │   │   └── panel-feedback-palette.js     # Command Palette, confirmation modals & shortcuts
 │   └── worker/
-│       ├── index.ts                      # Trusted Worker composition root
-│       ├── worker-utils.ts               # Sanitization, serialized queues, IPC shield & backup helpers
-│       ├── rpc-connections.ts            # Connection, workspace discovery & BYOD driver RPCs
+│       ├── index.ts                      # Trusted Worker entry
+│       ├── worker-utils.ts               # Sanitization, serialized queues, IPC cap & backup
+│       ├── rpc-connections.ts            # Connection, workspace discovery & local driver RPCs
 │       ├── rpc-data-schema.ts            # Schema introspection & data browse/mutation RPCs
-│       ├── rpc-query-tx.ts               # Query execution, cancellation, history & transaction RPCs
-│       ├── session-manager.ts            # Connection profile storage & secrets:own vault manager
-│       └── discovery.ts                  # Bounded .env parser & async BFS SQLite file scanner
+│       ├── rpc-query-tx.ts               # Query execution, cancellation, history & transactions
+│       ├── session-manager.ts            # Connection profile storage & secrets vault manager
+│       └── discovery.ts                  # Bounded .env parser & async BFS SQLite scanner
 ```
 
 ---
@@ -176,7 +173,6 @@ npm run verify
 
 # Or run individual checks
 npm run build
-node build/build-askpass.mjs --check
 npm run size
 npm run typecheck
 npm run validate

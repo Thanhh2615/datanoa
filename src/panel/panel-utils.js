@@ -2,6 +2,7 @@
 // Pure stateless DOM, IPC, SVG, theme, typography & file-export utilities for Datanoa Side Panel.
 
 import { GEIST_FONT_DATA_URI } from '../assets/geist-font.js'
+import { openSharedFilePickerModal } from '../shared-file-picker.js'
 import { sanitizeJson, srgbLin } from './panel-core.js'
 
 if (
@@ -886,6 +887,43 @@ export function syncVirtualTableWindow({
     selectionController?.applyDomClasses()
   }
   return true
+}
+
+const PANEL_PICKER_CLASSES = {
+  overlay: 'modal-backdrop panel-fp-backdrop',
+  modal: 'modal-card panel-fp-card',
+  head: 'panel-fp-head',
+  title: 'panel-fp-title',
+  roots: 'panel-fp-roots',
+  root: 'panel-fp-root',
+  nav: 'panel-fp-nav',
+  upBtn: 'btn btn-sm panel-fp-up',
+  pathInput: 'input panel-fp-path',
+  filterInput: 'input',
+  list: 'panel-fp-list',
+  row: 'panel-fp-row',
+  icon: 'panel-fp-icon',
+  name: 'panel-fp-name',
+  meta: 'panel-fp-meta',
+  empty: 'panel-fp-empty',
+  status: 'panel-fp-status',
+  foot: 'panel-fp-foot',
+  selected: 'panel-fp-selected',
+  actions: 'panel-fp-actions',
+  btnSm: 'btn btn-sm',
+  btnPrimarySm: 'btn btn-primary btn-sm',
+}
+
+export function openPanelFilePickerModal(options) {
+  return openSharedFilePickerModal({
+    title: options?.title,
+    mode: options?.mode,
+    initialDir: options?.initialDir,
+    extensions: options?.extensions,
+    maxRoots: 8,
+    classes: PANEL_PICKER_CLASSES,
+    listDir: (input) => rpc('fs.listDir', input),
+  })
 }
 
 if (typeof document !== 'undefined') {

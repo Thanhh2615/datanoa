@@ -586,6 +586,25 @@ html.light .btn-danger-solid {
   color: var(--t1);
 }
 
+#globalBanner {
+  margin: 8px 12px 0;
+  flex-shrink: 0;
+  z-index: 25;
+}
+
+.form-notice-sticky {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  flex-shrink: 0;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.24);
+}
+
+html.light .form-notice-sticky,
+body.light .form-notice-sticky {
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+}
+
 .banner.success {
   border-color: color-mix(in srgb, var(--ok) 45%, var(--border));
   background: color-mix(in srgb, var(--ok) 9%, var(--bg));
@@ -2844,4 +2863,195 @@ html.light .modal-backdrop {
   color: var(--t2);
   max-height: 56vh;
   overflow-y: auto;
+}
+
+/* In-app File & Folder Picker Modal */
+.panel-fp-backdrop {
+  z-index: 10020;
+}
+
+.panel-fp-card {
+  max-width: none;
+  width: min(480px, calc(100vw - 24px));
+  max-height: 82vh;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 16px;
+}
+
+.panel-fp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.panel-fp-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--t1);
+}
+
+.panel-fp-roots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.panel-fp-root {
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  background: var(--surface);
+  color: var(--t2);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.panel-fp-root:hover {
+  background: var(--hover);
+  color: var(--t1);
+}
+
+.panel-fp-root.is-active {
+  background: var(--hover);
+  color: var(--t1);
+  border-color: var(--info);
+}
+
+.panel-fp-root:focus-visible,
+.panel-fp-row:focus-visible {
+  outline: 1.5px solid var(--info);
+  outline-offset: -1.5px;
+}
+
+.panel-fp-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel-fp-up {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.panel-fp-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+.panel-fp-list {
+  flex: 1 1 auto;
+  min-height: 180px;
+  max-height: 300px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.panel-fp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--t1);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.panel-fp-row:hover {
+  background: var(--hover);
+}
+
+.panel-fp-row.is-selected {
+  background: color-mix(in srgb, var(--info) 12%, var(--surface));
+  border-color: var(--info);
+}
+
+.panel-fp-icon {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--t3);
+  flex-shrink: 0;
+}
+
+.panel-fp-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel-fp-meta {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--t3);
+  font-variant-numeric: tabular-nums;
+}
+
+.panel-fp-empty {
+  padding: 20px 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--t3);
+}
+
+.panel-fp-status {
+  font-size: 11px;
+  color: var(--t3);
+  font-variant-numeric: tabular-nums;
+}
+
+.panel-fp-status.is-error {
+  color: var(--danger);
+}
+
+.panel-fp-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.panel-fp-selected {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--t2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel-fp-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
 }

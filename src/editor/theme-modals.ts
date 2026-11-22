@@ -1240,6 +1240,15 @@ export const EDITOR_MODALS_STYLE = `
     background: color-mix(in srgb, var(--ok) 10%, var(--bg));
   }
 
+  .datanoa-modal-box.is-pinned,
+  .datanoa-saved-notice.is-pinned {
+    margin: 10px 14px 0;
+    flex-shrink: 0;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--text);
+  }
+
   .datanoa-add-conn-btn,
   .datanoa-edit-conn-btn {
     flex-shrink: 0;
@@ -1800,6 +1809,204 @@ export const EDITOR_MODALS_STYLE = `
   html.light .datanoa-saved-notice:not(.error),
   body.light .datanoa-saved-notice:not(.error) {
     background: var(--surface);
+  }
+
+  /* In-app File & Folder Picker Modal */
+  .datanoa-fp-overlay {
+    z-index: 10020;
+  }
+
+  .datanoa-fp-modal {
+    width: min(620px, 94vw);
+    max-height: 82vh;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    background: var(--card);
+    box-shadow: var(--menu-shadow);
+    overflow: hidden;
+  }
+
+  .datanoa-fp-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .datanoa-fp-roots {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .datanoa-fp-root {
+    height: 24px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+  }
+
+  .datanoa-fp-root:hover {
+    background: var(--hover);
+    color: var(--text);
+    border-color: var(--border-strong);
+  }
+
+  .datanoa-fp-root.is-active {
+    background: var(--hover);
+    color: var(--text);
+    border-color: var(--info);
+  }
+
+  .datanoa-fp-root:focus-visible,
+  .datanoa-fp-row:focus-visible {
+    outline: 1.5px solid var(--info);
+    outline-offset: -1.5px;
+  }
+
+  .datanoa-fp-nav {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .datanoa-fp-up {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+
+  .datanoa-fp-path {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: 12px;
+  }
+
+  .datanoa-fp-filter {
+    width: 100%;
+    font-size: 12px;
+  }
+
+  .datanoa-fp-list {
+    flex: 1 1 auto;
+    min-height: 220px;
+    max-height: 360px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .datanoa-fp-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    height: 32px;
+    padding: 0 8px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text);
+    font-size: 12.5px;
+    font-weight: 400;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color 100ms ease, border-color 100ms ease;
+  }
+
+  .datanoa-fp-row:hover {
+    background: var(--hover);
+  }
+
+  .datanoa-fp-row.is-selected {
+    background: color-mix(in srgb, var(--info) 12%, var(--surface));
+    border-color: var(--info);
+  }
+
+  .datanoa-fp-icon {
+    width: 16px;
+    height: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    flex-shrink: 0;
+  }
+
+  .datanoa-fp-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .datanoa-fp-meta {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .datanoa-fp-empty {
+    padding: 24px 12px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .datanoa-fp-status {
+    font-size: 11px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .datanoa-fp-status.is-error {
+    color: var(--danger);
+  }
+
+  .datanoa-fp-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  .datanoa-fp-selected {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-family: var(--mono-font);
+    font-size: 11.5px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .datanoa-fp-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
   }
 
   @media (prefers-reduced-motion: reduce) {

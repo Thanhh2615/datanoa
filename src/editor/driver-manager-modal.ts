@@ -116,10 +116,9 @@ export function openStudioDriverManagerModal(ctx: StudioDriverManagerModalContex
   body.className = 'datanoa-modal-body'
 
   const notice = document.createElement('div')
-  notice.className = 'datanoa-modal-box'
+  notice.className = 'datanoa-modal-box is-pinned'
   notice.setAttribute('role', 'status')
   notice.style.display = 'none'
-  body.appendChild(notice)
 
   const loading = document.createElement('div')
   loading.className = 'datanoa-driver-mgr-meta'
@@ -128,7 +127,7 @@ export function openStudioDriverManagerModal(ctx: StudioDriverManagerModalContex
   body.appendChild(loading)
 
   const showNotice = (kind: 'error' | 'success' | 'neutral' | 'warn', text: string): void => {
-    notice.className = `datanoa-modal-box${kind === 'neutral' ? '' : ` ${kind}`}`
+    notice.className = `datanoa-modal-box is-pinned${kind === 'neutral' ? '' : ` ${kind}`}`
     notice.setAttribute('role', kind === 'error' || kind === 'warn' ? 'alert' : 'status')
     notice.textContent = text
     notice.style.display = 'block'
@@ -155,7 +154,7 @@ export function openStudioDriverManagerModal(ctx: StudioDriverManagerModalContex
   const guideIntro = document.createElement('p')
   guideIntro.className = 'datanoa-driver-mgr-meta'
   guideIntro.textContent =
-    'Heavy drivers like Microsoft SQL Server (mssql), Oracle (oracledb), and MongoDB (mongodb) are loaded via BYOD local paths so Datanoa stays under Orca’s 1 MiB/file limit with zero unsolicited downloads. Once you inspect SHA-256 and click Trust & Verify below, select SQL Server, Oracle, MongoDB, or Custom BYOD in New Database Connection to connect, browse tables/collections, and run queries.'
+    'Configure a local driver folder for Microsoft SQL Server (mssql), Oracle (oracledb), MongoDB (mongodb), or a custom adapter, verify its SHA-256 digest below, then select it in New Database Connection.'
 
   const guideSteps = document.createElement('ol')
   guideSteps.className = 'datanoa-driver-mgr-guide-steps'
@@ -207,6 +206,7 @@ export function openStudioDriverManagerModal(ctx: StudioDriverManagerModalContex
   body.appendChild(byodGuide)
   body.appendChild(byodList)
   modal.appendChild(head)
+  modal.appendChild(notice)
   modal.appendChild(body)
 
   const setBusy = (busy: boolean, writeActive = false): void => {

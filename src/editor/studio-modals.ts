@@ -889,7 +889,7 @@ export function openStudioShortcutsModal(ctx: StudioModalMountContext): void {
       items: [
         ['Arrow / Shift+Arrow', 'Navigate cells & extend rectangular selection'],
         ['Ctrl+A', 'Select all visible cells'],
-        ['Ctrl+C / Ctrl+V', 'Copy selection as TSV / Smart Paste (overwrite + overflow, or new rows if empty)'],
+        ['Ctrl+C / Ctrl+V', 'Copy selected cells / Paste into cells or new rows'],
         ['Ctrl+Shift+V', 'Paste clipboard rows as new staged row(s)'],
         ['Enter / F2', 'Edit focused cell inline'],
         ['Delete / Backspace', 'Set selected cells to NULL'],

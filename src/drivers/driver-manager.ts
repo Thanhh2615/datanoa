@@ -7,7 +7,6 @@ import * as fs from 'node:fs'
 import * as moduleApi from 'node:module'
 import * as path from 'node:path'
 import { pathToFileURL } from 'node:url'
-import * as vm from 'node:vm'
 import type { JsonValue, OrcaWorkerApi } from 'orca/worker'
 import { CUSTOM_DRIVERS_STORAGE_KEY } from '../shared-constants'
 import {
@@ -87,17 +86,6 @@ function normalizeSha256(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const normalized = value.trim().toLowerCase()
   return SHA256_HEX_RE.test(normalized) ? normalized : null
-}
-
-function hasNonBuiltinEsmImport(source: string): boolean {
-  if (/\b(?:require|createRequire)\s*\(/.test(source)) return true
-  const importRe = /\b(?:import|export)\s+(?:[^'"]*?\s+from\s+)?['"]([^'"]+)['"]|\bimport\s*\(\s*['"]([^'"]+)['"]/g
-  let match: RegExpExecArray | null
-  while ((match = importRe.exec(source)) !== null) {
-    const spec = (match[1] ?? match[2] ?? '').trim()
-    if (!spec.startsWith('node:')) return true
-  }
-  return false
 }
 
 function looksLikeEsmSyntax(source: string): boolean {
@@ -411,6 +399,20 @@ export class DriverManager {
     )
   }
 
+  private async verifyPostLoadSha256(
+    entryPath: string,
+    expectedSha256: string,
+    onMismatch?: () => void
+  ): Promise<void> {
+    const afterSha = await this.computeFileSha256(entryPath)
+    if (afterSha !== expectedSha256) {
+      onMismatch?.()
+      throw new Error(
+        `Local driver entry changed during load (expected ${expectedSha256.slice(0, 12)}..., observed ${afterSha.slice(0, 12)}...). Re-inspect and re-trust the driver.`
+      )
+    }
+  }
+
   private async importVerifiedEntryBytes(
     entryPath: string,
     bytes: Buffer,
@@ -426,29 +428,19 @@ export class DriverManager {
 
     if (isCjs) {
       const cjsRequire = moduleApi.createRequire(entryPath)
-      const moduleObj: { exports: Record<string, unknown> } = { exports: {} }
-      const compiled = vm.compileFunction(
-        sourceText,
-        ['exports', 'require', 'module', '__filename', '__dirname'],
-        { filename: entryPath }
-      ) as (
-        exports: Record<string, unknown>,
-        req: NodeRequire,
-        mod: { exports: Record<string, unknown> },
-        filename: string,
-        dirname: string
-      ) => void
-      compiled(moduleObj.exports, cjsRequire, moduleObj, entryPath, path.dirname(entryPath))
-      return { default: moduleObj.exports, ...moduleObj.exports }
+      const resolvedPath = cjsRequire.resolve(entryPath)
+      const evictCache = (): void => {
+        if (cjsRequire.cache && resolvedPath in cjsRequire.cache) {
+          delete cjsRequire.cache[resolvedPath]
+        }
+      }
+      evictCache()
+      const exported: unknown = cjsRequire(resolvedPath)
+      await this.verifyPostLoadSha256(entryPath, expectedSha256, evictCache)
+      return isRecord(exported) ? { default: exported, ...exported } : { default: exported }
     }
 
-    // Standalone ESM (no relative/package imports): import exact verified bytes via data: URL
-    if (!hasNonBuiltinEsmImport(sourceText)) {
-      const dataUrl = `data:text/javascript;base64,${bytes.toString('base64')}`
-      return await import(dataUrl)
-    }
-
-    // ESM with local/package imports: serve verified in-memory bytes via Node registerHooks (zero entry TOCTOU)
+    // ESM: serve verified in-memory bytes via Node registerHooks (zero entry TOCTOU)
     const pinnedUrl = `${pathToFileURL(entryPath).href}?v=${expectedSha256}`
     const registerHooksFn = (
       moduleApi as unknown as {
@@ -480,12 +472,7 @@ export class DriverManager {
 
     // Fallback when registerHooks is unavailable: verify digest immediately after import
     const mod: unknown = await import(pinnedUrl)
-    const afterSha = await this.computeFileSha256(entryPath)
-    if (afterSha !== expectedSha256) {
-      throw new Error(
-        `Local driver entry changed during load (expected ${expectedSha256.slice(0, 12)}..., observed ${afterSha.slice(0, 12)}...). Re-inspect and re-trust the driver.`
-      )
-    }
+    await this.verifyPostLoadSha256(entryPath, expectedSha256)
     return mod
   }
 

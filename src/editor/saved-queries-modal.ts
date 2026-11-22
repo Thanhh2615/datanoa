@@ -72,10 +72,10 @@ export function openStudioSavedQueriesModal(ctx: StudioSavedQueriesModalContext)
   body.className = 'datanoa-modal-body'
 
   const noticeEl = document.createElement('div')
-  noticeEl.className = 'datanoa-saved-notice'
+  noticeEl.className = 'datanoa-saved-notice is-pinned'
   noticeEl.setAttribute('role', 'status')
   noticeEl.style.display = 'none'
-  body.appendChild(noticeEl)
+  modal.appendChild(noticeEl)
 
   const setNotice = (kind: NoticeKind, text: string): void => {
     noticeEl.setAttribute('role', kind)

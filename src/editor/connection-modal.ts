@@ -27,6 +27,7 @@ import {
   getByodNpmPackage,
   getByodStarterTemplate,
 } from './driver-manager-modal.js'
+import { openStudioFilePickerModal } from './file-picker-modal.js'
 
 import { DEFAULT_RPC_TIMEOUT_MS } from '../shared-constants.js'
 
@@ -280,16 +281,15 @@ export function openStudioConnectionModal(
   body.className = 'datanoa-modal-body'
 
   const noticeBox = document.createElement('div')
-  noticeBox.className = 'datanoa-modal-box'
+  noticeBox.className = 'datanoa-modal-box is-pinned'
   noticeBox.style.display = 'none'
   noticeBox.setAttribute('role', 'status')
   const showNotice = (kind: 'error' | 'success' | 'neutral', text: string): void => {
-    noticeBox.className = `datanoa-modal-box${kind === 'neutral' ? '' : ` ${kind}`}`
+    noticeBox.className = `datanoa-modal-box is-pinned${kind === 'neutral' ? '' : ` ${kind}`}`
     noticeBox.setAttribute('role', kind === 'error' ? 'alert' : 'status')
     noticeBox.textContent = text
     noticeBox.style.display = 'block'
   }
-  body.appendChild(noticeBox)
 
   // ---- Quick URI bar ----
   const uriBar = document.createElement('div')
@@ -329,11 +329,11 @@ export function openStudioConnectionModal(
   const scanBtn = createButton('Scan Folder')
   browseScanFolderBtn.addEventListener('click', () => {
     if (isBusy) return
-    void ctx
-      .requestPlugin<{ ok: boolean; path?: string }>('fs.pickFolder', {
-        title: 'Select Folder to Scan for .env & SQLite Databases',
-        initialDir: folderInp.value.trim() || undefined,
-      })
+    void openStudioFilePickerModal(ctx, {
+      title: 'Select folder to scan',
+      mode: 'folder',
+      initialDir: folderInp.value.trim() || undefined,
+    })
       .then((res) => {
         if (!isModalOpen()) return
         if (res?.ok && res.path) {
@@ -489,7 +489,9 @@ export function openStudioConnectionModal(
     guideDesc.className = 'datanoa-driver-mgr-meta'
     guideDesc.textContent = isVerified
       ? `Driver is verified and active from "${item?.resolvedEntry || defaultFolder}". You can enter your ${meta.label} host/credentials below and click Test Connection or Save & Connect.`
-      : `Step 1: Choose a local folder to store the ${meta.label} driver adapter (pre-filled below, or click Browse Folder). Step 2: Click "1-Click Auto-Setup & Install Driver" (or run the terminal command below and click "Inspect SHA-256" -> "Trust & Verify").`
+      : npmPkg
+        ? `Choose a local folder for the ${meta.label} adapter, click "Create Folder & Copy Cmd", run the copied npm install command in Orca Terminal, then click "Inspect SHA-256" and "Trust & Verify".`
+        : `Choose a local folder for your custom adapter, click "Create Folder & Starter", edit index.mjs if needed, then click "Inspect SHA-256" and "Trust & Verify".`
     byodStatusBanner.appendChild(guideDesc)
 
     // Folder input + Browse Folder button
@@ -539,11 +541,11 @@ export function openStudioConnectionModal(
 
     browseDriverDirBtn.addEventListener('click', () => {
       if (isBusy) return
-      void ctx
-        .requestPlugin<{ ok: boolean; path?: string }>('fs.pickFolder', {
-          title: `Select Folder for ${meta.label} Local Driver`,
-          initialDir: folderPathInp.value.trim() || undefined,
-        })
+      void openStudioFilePickerModal(ctx, {
+        title: `Select folder for ${meta.label} driver`,
+        mode: 'folder',
+        initialDir: folderPathInp.value.trim() || undefined,
+      })
         .then((res) => {
           if (!isModalOpen()) return
           if (res?.ok && res.path) {
@@ -569,9 +571,7 @@ export function openStudioConnectionModal(
     const btnRow = document.createElement('div')
     btnRow.className = 'datanoa-conn-row is-wrap'
     const autoSetupBtn = createButton(
-      npmPkg
-        ? `1-Click Auto-Setup & Install (${npmPkg})`
-        : '1-Click Write Starter & Verify',
+      npmPkg ? `Create Folder & Copy Cmd (${npmPkg})` : 'Create Folder & Starter',
       'datanoa-btn-primary'
     )
     const copyStarterBtn = createButton('Copy Starter index.mjs')
@@ -583,11 +583,8 @@ export function openStudioConnectionModal(
       if (isBusy) return
       const targetDir = folderPathInp.value.trim() || defaultFolder
       setBusy(true)
-      setButtonLoading(autoSetupBtn, true, npmPkg ? `Installing ${npmPkg}...` : 'Setting up...')
-      showNotice(
-        'neutral',
-        `Setting up ${meta.label} driver in "${targetDir}"${npmPkg ? ` and running npm install ${npmPkg}` : ''}...`
-      )
+      setButtonLoading(autoSetupBtn, true, 'Creating folder...')
+      showNotice('neutral', `Creating ${meta.label} driver folder in "${targetDir}"...`)
       void ctx
         .requestPlugin<{
           ok: boolean
@@ -595,30 +592,35 @@ export function openStudioConnectionModal(
           inspect: DriverInspectResult
           item?: DriverRegistryItem
           wroteCanonicalEntry?: boolean
+          installPackage?: string
         }>(
           'drivers.setupLocal',
           {
             driverId,
             localPath: targetDir,
-            runNpmInstall: Boolean(npmPkg),
             autoTrust: true,
           },
-          { timeoutMs: 120_000 }
+          { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
         )
         .then(async (res) => {
           if (!isModalOpen()) return
           if (!res?.ok || !res.inspect?.ok || !res.inspect.sha256) {
-            showNotice('error', 'Failed to set up local driver.')
+            showNotice('error', 'Failed to set up local driver folder.')
             return
           }
           byodCustomFolderInputs.set(driverId, res.dirPath)
+          const installCmd = buildByodInstallCommand(driverId, res.dirPath, byodHostPlatform)
+          cmdInp.value = installCmd
+          if (res.installPackage && res.item?.status !== 'local-verified') {
+            copyTextFallback(installCmd)
+          }
           if (res.item?.status === 'local-verified') {
             byodPendingInspects.delete(driverId)
             await refreshByodRegistry()
             if (!isModalOpen()) return
             showNotice(
               'success',
-              `${meta.label} driver installed and verified in "${res.dirPath}" (SHA-256: ${res.inspect.sha256.slice(0, 12)}…).`
+              `${meta.label} driver verified in "${res.dirPath}" (SHA-256: ${res.inspect.sha256.slice(0, 12)}…).`
             )
           } else {
             byodPendingInspects.set(driverId, { rawPath: res.dirPath, result: res.inspect })
@@ -626,7 +628,9 @@ export function openStudioConnectionModal(
             if (!isModalOpen()) return
             showNotice(
               'neutral',
-              `Custom entry detected in "${res.dirPath}" (SHA-256: ${res.inspect.sha256.slice(0, 12)}…). Review and click "Trust & Verify" to activate.`
+              res.installPackage
+                ? `Folder created and install command copied. Run it in Orca Terminal, then click "Trust & Verify" (SHA-256: ${res.inspect.sha256.slice(0, 12)}…).`
+                : `Folder created in "${res.dirPath}" (SHA-256: ${res.inspect.sha256.slice(0, 12)}…). Review and click "Trust & Verify" to activate.`
             )
           }
         })
@@ -634,7 +638,7 @@ export function openStudioConnectionModal(
           if (!isModalOpen()) return
           showNotice(
             'error',
-            `Auto-setup failed: ${err instanceof Error ? err.message : String(err)}`
+            `Setup failed: ${err instanceof Error ? err.message : String(err)}`
           )
         })
         .finally(() => {
@@ -671,7 +675,6 @@ export function openStudioConnectionModal(
             }>('drivers.setupLocal', {
               driverId,
               localPath: targetDir,
-              runNpmInstall: false,
               autoTrust: false,
             })
             if (setupRes?.ok && setupRes.inspect?.ok) {
@@ -1050,11 +1053,12 @@ export function openStudioConnectionModal(
   const browseSqliteFileBtn = createButton('Browse File...')
   const handlePickLocalSqliteFile = (): void => {
     if (isBusy) return
-    void ctx
-      .requestPlugin<{ ok: boolean; path?: string }>('fs.pickFile', {
-        title: 'Select SQLite Database File (.db, .sqlite, .sqlite3)',
-        initialDir: filePathInp.value.trim() || undefined,
-      })
+    void openStudioFilePickerModal(ctx, {
+      title: 'Select SQLite database file',
+      mode: 'file',
+      initialDir: filePathInp.value.trim() || undefined,
+      extensions: ['.db', '.sqlite', '.sqlite3', '.db3'],
+    })
       .then((res) => {
         if (!isModalOpen()) return
         if (res?.ok && res.path) {
@@ -1866,7 +1870,6 @@ export function openStudioConnectionModal(
         showNotice('error', message)
         noticeBox.setAttribute('role', 'alert')
         focusEl?.focus?.()
-        noticeBox.scrollIntoView?.({ block: 'nearest' })
         return false
       }
       const injected: Array<[string, string, HTMLElement]> = [
@@ -2241,6 +2244,7 @@ export function openStudioConnectionModal(
   syncStudioSelectTooltip(sshAuthSel, 'SSH Auth Method')
 
   modal.appendChild(head)
+  modal.appendChild(noticeBox)
   modal.appendChild(body)
   modal.appendChild(actions)
   backdropRef = ctx.mountModal(modal, () => !isBusy)

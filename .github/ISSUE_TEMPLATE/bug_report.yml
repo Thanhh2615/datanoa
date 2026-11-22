@@ -32,7 +32,10 @@ body:
         - Redis
         - LibSQL / Turso
         - Cloudflare D1
-        - Local Custom Driver (BYOD)
+        - SQL Server (MSSQL)
+        - Oracle
+        - MongoDB
+        - Custom Local Driver
         - Multiple / General UI
     validations:
       required: true

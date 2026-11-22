@@ -78,6 +78,7 @@ import {
   extractQueriedTableName,
   copyTextFallback,
   enhanceStudioCollapsibleSelect,
+  groupConnectionsForSelector,
   syncStudioSelectTooltip,
   bindStudioSelectTooltipsInRoot,
   isStudioCollapsibleDropdownOpen,
@@ -2761,13 +2762,16 @@ export class DatanoaStudioEditor {
     defaultOpt.textContent = 'Select Connection...'
     connSel.appendChild(defaultOpt)
 
-    const buildOption = (conn: ConnectionProfile, withFolderLabel = false): HTMLOptionElement => {
+    const scope = this.currentWorkspaceScope.trim()
+    const buildOption = (conn: ConnectionProfile): HTMLOptionElement => {
       const opt = document.createElement('option')
       opt.value = conn.id
       const envSuffix = conn.colorTag && conn.colorTag !== 'none' ? ` [${conn.colorTag.toUpperCase()}]` : ''
       const roSuffix = conn.readOnly ? ' [RO]' : ''
       const sshSuffix = conn.sshEnabled ? ' [SSH]' : ''
-      const folderSuffix = withFolderLabel && conn.folder ? ` [${conn.folder}]` : ''
+      const folderTrimmed = (conn.folder || '').trim()
+      const connScope = (conn.workspaceScope || '').trim()
+      const isCurrentScope = Boolean(connScope && scope && connScope === scope)
       const mtlsSuffix =
         conn.sslCertPath || conn.sslKeyPath
           ? ' [mTLS]'
@@ -2775,60 +2779,27 @@ export class DatanoaStudioEditor {
               (conn.sslMode && conn.sslMode !== 'auto' && conn.sslMode !== 'disable')
             ? ' [TLS]'
             : ''
-      opt.textContent = `${conn.name} (${conn.driver})${envSuffix}${roSuffix}${sshSuffix}${mtlsSuffix}${folderSuffix}`
+      opt.textContent = `${conn.name} (${conn.driver})${envSuffix}${roSuffix}${sshSuffix}${mtlsSuffix}`
       if (opt.dataset) {
         opt.dataset.driver = conn.driver
+        if (isCurrentScope) opt.dataset.isCurrent = '1'
         const sub = conn.filePath || (conn.host ? `${conn.host}:${conn.port || ''}/${conn.database || ''}` : conn.database || '')
-        opt.dataset.fullTitle = `${opt.textContent}${conn.folder ? ` — Folder: ${conn.folder}` : ''}${sub ? ` — ${sub}` : ''}`
+        opt.dataset.fullTitle = `${opt.textContent}${folderTrimmed ? ` — Folder: ${folderTrimmed}` : ''}${isCurrentScope ? ' — Current Workspace' : ''}${sub ? ` — ${sub}` : ''}`
       }
       if (conn.id === (targetId || '')) opt.selected = true
       return opt
     }
 
-    const hasGrouping = this.connections.some((c) => c.folder || c.workspaceScope)
-    if (!hasGrouping) {
+    const { grouped, groups } = groupConnectionsForSelector(this.connections, this.currentWorkspaceScope)
+    if (!grouped) {
       this.connections.forEach((conn) => connSel.appendChild(buildOption(conn)))
     } else {
-      const scope = this.currentWorkspaceScope.trim()
-      const currentWorkspace: ConnectionProfile[] = []
-      const otherWorkspace: ConnectionProfile[] = []
-      const general: ConnectionProfile[] = []
-      const byFolder = new Map<string, ConnectionProfile[]>()
-
-      for (const conn of this.connections) {
-        const connScope = (conn.workspaceScope || '').trim()
-        if (connScope && scope && connScope === scope) {
-          currentWorkspace.push(conn)
-        } else if (connScope) {
-          otherWorkspace.push(conn)
-        } else if (conn.folder) {
-          const key = conn.folder
-          const list = byFolder.get(key)
-          if (list) list.push(conn)
-          else byFolder.set(key, [conn])
-        } else {
-          general.push(conn)
-        }
-      }
-
-      const appendGroup = (
-        label: string,
-        list: ConnectionProfile[],
-        withFolderLabel = false
-      ): void => {
-        if (list.length === 0) return
+      for (const grp of groups) {
         const group = document.createElement('optgroup')
-        group.label = label
-        list.forEach((conn) => group.appendChild(buildOption(conn, withFolderLabel)))
+        group.label = grp.label
+        grp.items.forEach((conn) => group.appendChild(buildOption(conn)))
         connSel.appendChild(group)
       }
-
-      appendGroup('Current Workspace', currentWorkspace, true)
-      for (const folder of Array.from(byFolder.keys()).sort((a, b) => a.localeCompare(b))) {
-        appendGroup(folder, byFolder.get(folder) || [])
-      }
-      appendGroup('Other Workspaces', otherWorkspace)
-      appendGroup('General (Ungrouped)', general)
     }
 
     connSel.value = targetId || ''
@@ -5912,6 +5883,7 @@ export class DatanoaStudioEditor {
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
       const onKey = (ev: KeyboardEvent) => {
         if (ev.key === 'Escape') {
+          if (document.querySelector('.datanoa-fp-overlay')) return
           ev.preventDefault()
           ev.stopPropagation()
           if (canClose()) {

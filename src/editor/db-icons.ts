@@ -519,6 +519,68 @@ export function syncStudioSelectTooltip(
   }
 }
 
+export interface ConnectionSelectorGroup<T> {
+  label: string
+  items: T[]
+}
+
+/**
+ * Partition connections for the Studio selector with explicit user folders taking
+ * precedence over workspace pins so a connection assigned to a folder always lands inside it.
+ */
+export function groupConnectionsForSelector<
+  T extends { folder?: string; workspaceScope?: string },
+>(
+  connections: readonly T[],
+  currentWorkspaceScope = ''
+): { grouped: boolean; groups: ConnectionSelectorGroup<T>[] } {
+  const scope = currentWorkspaceScope.trim()
+  const currentWorkspace: T[] = []
+  const otherWorkspace: T[] = []
+  const general: T[] = []
+  const byFolder = new Map<string, T[]>()
+  let hasGrouping = false
+
+  for (const conn of connections) {
+    const folder = (conn.folder || '').trim()
+    const connScope = (conn.workspaceScope || '').trim()
+    if (folder || connScope) hasGrouping = true
+    if (folder) {
+      const list = byFolder.get(folder)
+      if (list) list.push(conn)
+      else byFolder.set(folder, [conn])
+    } else if (connScope && scope && connScope === scope) {
+      currentWorkspace.push(conn)
+    } else if (connScope) {
+      otherWorkspace.push(conn)
+    } else {
+      general.push(conn)
+    }
+  }
+
+  if (!hasGrouping) {
+    return { grouped: false, groups: [] }
+  }
+
+  const groups: ConnectionSelectorGroup<T>[] = []
+  if (currentWorkspace.length > 0) {
+    groups.push({ label: 'Current Workspace', items: currentWorkspace })
+  }
+  for (const folder of Array.from(byFolder.keys()).sort((a, b) => a.localeCompare(b))) {
+    const list = byFolder.get(folder)
+    if (list && list.length > 0) {
+      groups.push({ label: folder, items: list })
+    }
+  }
+  if (otherWorkspace.length > 0) {
+    groups.push({ label: 'Other Workspaces', items: otherWorkspace })
+  }
+  if (general.length > 0) {
+    groups.push({ label: 'General (Ungrouped)', items: general })
+  }
+  return { grouped: true, groups }
+}
+
 let activeStudioDropdownClose: (() => void) | null = null
 
 export function isStudioCollapsibleDropdownOpen(): boolean {
