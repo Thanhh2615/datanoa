@@ -115,10 +115,12 @@ export class QueryHistoryDrawerController {
       const baseMeta = entry.isError
         ? `${entry.connectionName} · ERROR`
         : `${entry.connectionName} · ${entry.durationMs}ms · ${entry.rowCount} rows`
-      metaSpan.textContent = relTime ? `${baseMeta} · ${relTime}` : baseMeta
+      const fullMeta = relTime ? `${baseMeta} · ${relTime}` : baseMeta
+      metaSpan.textContent = fullMeta
+      metaSpan.title = fullMeta
 
       const actions = document.createElement('div')
-      actions.className = 'datanoa-btn-group'
+      actions.className = 'datanoa-history-actions'
 
       const insertBtn = document.createElement('button')
       insertBtn.type = 'button'

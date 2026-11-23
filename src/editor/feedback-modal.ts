@@ -3,8 +3,11 @@
 
 import type { DatabaseDriverType } from '../protocol.js'
 import { DATANOA_APP_VERSION } from '../shared-constants.js'
+import { sanitizeDiagnosticErrorText } from '../shared-grid-paste.js'
 import { copyTextFallback } from './db-icons.js'
 import type { StudioModalMountContext } from './studio-modals.js'
+
+export { sanitizeDiagnosticErrorText }
 
 const GITHUB_NEW_ISSUE_BASE_URL = 'https://github.com/Thanhh2615/datanoa/issues/new'
 
@@ -14,26 +17,6 @@ export interface StudioFeedbackModalContext extends StudioModalMountContext {
   isReadOnly: boolean
   lastQueryErrorText: string
   updateStatus: (stateText: string, metricsText?: string) => void
-}
-
-/**
- * Strips any URI credentials, hostnames, file paths, or bearer/password tokens
- * from an error string before including it in the diagnostic block.
- */
-export function sanitizeDiagnosticErrorText(rawError: string): string {
-  const raw = String(rawError || '').trim()
-  if (!raw) return ''
-  return raw
-    .replace(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s'"<>]+/g, '<redacted-uri>')
-    .replace(/\b(?:password|passwd|pwd|user|username|token|secret|authToken|api_key|apikey)\s*[:=]\s*[^\s,;'"<>]+/gi, '<redacted-secret>')
-    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer <redacted-token>')
-    .replace(/[A-Za-z]:\\[^\s'"<>]+/g, '<redacted-path>')
-    .replace(/\/(?:Users|home|var|tmp|etc|opt|private|mnt|srv)\/[^\s'"<>]+/g, '<redacted-path>')
-    .replace(/[^\s@'"<>]+@[^\s@'"<>]+\.[^\s@'"<>]+/g, '<redacted-endpoint>')
-    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, '<redacted-ip>')
-    .replace(/\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.(?:co|com|io|net|org|dev|tech|cloud|app|local|internal|lan)(?::\d+)?\b/gi, '<redacted-host>')
-    .replace(/\s+/g, ' ')
-    .slice(0, 280)
 }
 
 function detectOrcaApiVersion(): string {

@@ -500,15 +500,99 @@ function buildTypographyExtension(typography: EditorTypography = {}): Extension 
   })
 }
 
+function buildEditorThemeExtension(isDark: boolean): Extension {
+  return EditorView.theme(
+    {
+      '&': {
+        height: '100%',
+        width: '100%',
+        maxWidth: '100%',
+        backgroundColor: 'var(--bg, var(--orca-background, #000000))',
+        color: 'var(--text, var(--orca-foreground, #e6e6e6))',
+      },
+      '.cm-scroller': {
+        overflow: 'auto',
+      },
+      '.cm-content': {
+        caretColor: 'var(--primary, var(--orca-primary, #e6e6e6))',
+        padding: '6px 0',
+      },
+      '.cm-activeLine': {
+        backgroundColor: 'color-mix(in srgb, var(--text, #e6e6e6) 5%, transparent)',
+      },
+      '.cm-activeLineGutter': {
+        backgroundColor: 'color-mix(in srgb, var(--text, #e6e6e6) 8%, transparent)',
+        color: 'var(--text, #e6e6e6)',
+      },
+      '&.cm-focused .cm-cursor': {
+        borderLeftColor: 'var(--primary, var(--orca-primary, #e6e6e6))',
+      },
+      '.cm-selectionBackground': {
+        backgroundColor: 'color-mix(in srgb, var(--accent-ring, var(--primary, #e6e6e6)) 16%, transparent)',
+      },
+      '&.cm-focused .cm-selectionBackground, ::selection': {
+        backgroundColor: 'color-mix(in srgb, var(--accent-ring, var(--primary, #e6e6e6)) 24%, transparent)',
+      },
+      '.cm-gutters': {
+        backgroundColor:
+          'var(--surface, color-mix(in srgb, var(--orca-foreground, #e6e6e6) 3.5%, var(--orca-background, #000000)))',
+        color: 'var(--muted-dim, #8c8c8c)',
+        borderRight: '1px solid var(--border, var(--orca-border, #1f1f1f))',
+      },
+      '.cm-tooltip': {
+        backgroundColor:
+          'var(--popover, var(--orca-popover, color-mix(in srgb, var(--orca-foreground, #e6e6e6) 8%, var(--orca-background, #000000))))',
+        border: '1px solid var(--border-strong, #2a2a2a)',
+        borderRadius: 'var(--radius, 6px)',
+        boxShadow: 'var(--menu-shadow, 0 8px 24px rgba(0, 0, 0, 0.56))',
+        color: 'var(--text, #e6e6e6)',
+      },
+      '.cm-tooltip.cm-tooltip-autocomplete > ul': {
+        fontFamily: 'var(--mono-font, monospace)',
+        fontSize: '12px',
+        padding: '4px',
+        maxHeight: '240px',
+      },
+      '.cm-tooltip.cm-tooltip-autocomplete > ul > li': {
+        padding: '4px 8px',
+        borderRadius: '4px',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: '12px',
+      },
+      '.cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected]': {
+        backgroundColor:
+          'color-mix(in srgb, var(--accent-ring, var(--primary, #e6e6e6)) 18%, var(--popover, var(--orca-popover, var(--bg, #000000))))',
+        color: 'var(--text, #e6e6e6)',
+      },
+      '.cm-completionMatchedText': {
+        color: 'var(--accent-ring, var(--primary, #e6e6e6))',
+        fontWeight: '600',
+        textDecoration: 'none',
+      },
+      '.cm-completionDetail': {
+        marginLeft: 'auto',
+        color: 'var(--muted, #a3a3a3)',
+        fontStyle: 'normal',
+        fontSize: '12px',
+      },
+    },
+    { dark: isDark }
+  )
+}
+
 export class SqlConsoleController {
   private view: EditorView | null = null
   private readonly langCompartment = new Compartment()
   private readonly completionCompartment = new Compartment()
   private readonly typographyCompartment = new Compartment()
+  private readonly themeModeCompartment = new Compartment()
   private currentDialect: SqlDialectType = 'sqlite'
   private currentSchema: Record<string, string[]> = {}
   private currentDefaultTable?: string = undefined
   private currentTypography: EditorTypography = {}
+  private isDarkTheme = true
   private readonly onExecute?: (sql: string) => void
   private readonly onExecuteAll?: (sql: string) => void
   private readonly onFormatSql?: () => void
@@ -518,6 +602,11 @@ export class SqlConsoleController {
     this.currentDialect = options.dialect || 'sqlite'
     this.currentSchema = options.schema || {}
     this.currentTypography = options.typography || {}
+    this.isDarkTheme = !(
+      typeof document !== 'undefined' &&
+      (document.documentElement.classList.contains('light') ||
+        document.body?.classList.contains('light'))
+    )
     this.onExecute = options.onExecute
     this.onExecuteAll = options.onExecuteAll
     this.onFormatSql = options.onFormatSql
@@ -597,79 +686,7 @@ export class SqlConsoleController {
       ),
       this.typographyCompartment.of(buildTypographyExtension(this.currentTypography)),
       docChangeListener,
-      EditorView.theme(
-        {
-        '&': {
-          height: '100%',
-          width: '100%',
-          maxWidth: '100%',
-          backgroundColor: 'var(--bg, var(--orca-background, #000000))',
-          color: 'var(--text, var(--orca-foreground, #e6e6e6))',
-        },
-        '.cm-scroller': {
-          overflow: 'auto',
-        },
-        '.cm-content': {
-          caretColor: 'var(--primary, var(--orca-primary, #e6e6e6))',
-          padding: '6px 0',
-        },
-        '.cm-activeLine': {
-          backgroundColor: 'rgba(128, 128, 128, 0.08)',
-        },
-        '.cm-activeLineGutter': {
-          backgroundColor: 'rgba(128, 128, 128, 0.12)',
-          color: 'var(--text, #e6e6e6)',
-        },
-        '&.cm-focused .cm-cursor': {
-          borderLeftColor: 'var(--primary, var(--orca-primary, #e6e6e6))',
-        },
-        '&.cm-focused .cm-selectionBackground, ::selection': {
-          backgroundColor: 'rgba(56, 189, 248, 0.26)',
-        },
-        '.cm-gutters': {
-          backgroundColor: 'var(--surface, var(--orca-editor-surface, #0a0a0a))',
-          color: 'var(--muted-dim, #8c8c8c)',
-          borderRight: '1px solid var(--border, var(--orca-border, #1f1f1f))',
-        },
-        '.cm-tooltip': {
-          backgroundColor: 'var(--raised, #141414)',
-          border: '1px solid var(--border-strong, #2a2a2a)',
-          borderRadius: '6px',
-          boxShadow: 'var(--menu-shadow, 0 8px 24px rgba(0, 0, 0, 0.6))',
-          color: 'var(--text, #e6e6e6)',
-        },
-        '.cm-tooltip.cm-tooltip-autocomplete > ul': {
-          fontFamily: 'var(--mono-font, monospace)',
-          fontSize: '12px',
-          padding: '4px',
-          maxHeight: '240px',
-        },
-        '.cm-tooltip.cm-tooltip-autocomplete > ul > li': {
-          padding: '4px 8px',
-          borderRadius: '4px',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          gap: '12px',
-        },
-        '.cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected]': {
-          backgroundColor: 'var(--hover, #1f2937)',
-          color: 'var(--info, #38bdf8)',
-        },
-        '.cm-completionMatchedText': {
-          color: 'var(--info, #38bdf8)',
-          fontWeight: '600',
-          textDecoration: 'none',
-        },
-        '.cm-completionDetail': {
-          marginLeft: 'auto',
-          color: 'var(--muted, #a3a3a3)',
-          fontStyle: 'normal',
-          fontSize: '12px',
-        },
-        },
-        { dark: true }
-      ),
+      this.themeModeCompartment.of(buildEditorThemeExtension(this.isDarkTheme)),
     ]
 
     const state = EditorState.create({
@@ -714,6 +731,19 @@ export class SqlConsoleController {
       effects: this.completionCompartment.reconfigure(
         buildCompletionExtension(this.currentDialect, this.currentSchema, this.currentDefaultTable)
       ),
+    })
+  }
+
+  /**
+   * Synchronizes CodeMirror dark/light theme facet with the active Orca host color scheme.
+   */
+  public setColorScheme(isLight: boolean): void {
+    const nextDark = !isLight
+    if (this.isDarkTheme === nextDark) return
+    this.isDarkTheme = nextDark
+    if (!this.view) return
+    this.view.dispatch({
+      effects: this.themeModeCompartment.reconfigure(buildEditorThemeExtension(this.isDarkTheme)),
     })
   }
 
@@ -769,6 +799,23 @@ export class SqlConsoleController {
   public getExecutableSql(): string {
     if (!this.view) return ''
     return extractExecutableSql(this.view.state)
+  }
+
+  /**
+   * Returns trimmed selected SQL if non-empty, otherwise ''.
+   */
+  public getSelectedSql(): string {
+    if (!this.view) return ''
+    const sel = this.view.state.selection.main
+    if (sel.empty) return ''
+    return this.view.state.sliceDoc(sel.from, sel.to).trim()
+  }
+
+  /**
+   * Returns true when the editor currently has a non-empty text selection.
+   */
+  public hasSelection(): boolean {
+    return this.getSelectedSql().length > 0
   }
 
   /**

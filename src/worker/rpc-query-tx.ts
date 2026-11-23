@@ -1,11 +1,14 @@
 import type { JsonValue, OrcaWorkerApi } from 'orca/worker'
 import {
   sanitizeJsonPayload,
+  type DatabaseDriverType,
   type QueryHistoryEntry,
   type QueryResult,
+  type QueryResultSet,
 } from '../protocol'
 import { detectRecognizableSqlCredential } from '../drivers/common/sql-credentials'
 import {
+  compactSql,
   hasExplainAnalyzeOption,
   isExplainTargetMutating,
   isMutatingStatement,
@@ -42,6 +45,43 @@ export interface QueryTxHandlersDeps {
   registerHandler: WorkerRegisterHandler
   sessionManager: SessionManager
   tracker: QueryRuntimeTracker
+}
+
+interface ExplainPlanItem {
+  rawStmt: string
+  explainSql: string
+}
+
+/**
+ * Wraps a single SQL statement in dialect-appropriate EXPLAIN syntax and enforces
+ * read-only and non-mutating EXPLAIN ANALYZE safety rules.
+ */
+function buildExplainPlanForStatement(
+  rawText: string,
+  driver: DatabaseDriverType,
+  readOnly: boolean
+): ExplainPlanItem {
+  const sqlBody = rawText.replace(/;+\s*$/, '').trim()
+  const leadingStripped = stripLeadingSqlComments(sqlBody, driver)
+  const explainSql = /^EXPLAIN\b/i.test(leadingStripped)
+    ? sqlBody
+    : driver === 'sqlite' || driver === 'libsql' || driver === 'd1'
+      ? `EXPLAIN QUERY PLAN ${sqlBody}`
+      : `EXPLAIN ${sqlBody}`
+
+  if (readOnly && isMutatingStatement(explainSql, driver)) {
+    throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
+  }
+  if (
+    hasExplainAnalyzeOption(explainSql, driver) &&
+    isExplainTargetMutating(sqlBody, driver)
+  ) {
+    throw createHostError(
+      'not_permitted',
+      'EXPLAIN ANALYZE is not permitted for mutating statements in Explain mode.'
+    )
+  }
+  return { rawStmt: rawText.trim(), explainSql }
 }
 
 export function registerQueryAndTxHandlers({
@@ -222,33 +262,10 @@ export function registerQueryAndTxHandlers({
     if (explainStmts.length === 0) {
       throw createHostError('invalid_params', 'SQL statement cannot be empty')
     }
-    if (explainStmts.length > 1) {
-      throw createHostError(
-        'invalid_params',
-        'EXPLAIN only supports a single SQL statement at a time.'
-      )
-    }
 
-    const sqlBody = explainStmts[0].text.replace(/;+\s*$/, '').trim()
-    const leadingStripped = stripLeadingSqlComments(sqlBody, profile.driver)
-    const explainSql = /^EXPLAIN\b/i.test(leadingStripped)
-      ? sqlBody
-      : profile.driver === 'sqlite' || profile.driver === 'libsql' || profile.driver === 'd1'
-        ? `EXPLAIN QUERY PLAN ${sqlBody}`
-        : `EXPLAIN ${sqlBody}`
-
-    if (profile.readOnly && isMutatingStatement(explainSql, profile.driver)) {
-      throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
-    }
-    if (
-      hasExplainAnalyzeOption(explainSql, profile.driver) &&
-      isExplainTargetMutating(sqlBody, profile.driver)
-    ) {
-      throw createHostError(
-        'not_permitted',
-        'EXPLAIN ANALYZE is not permitted for mutating statements in Explain mode.'
-      )
-    }
+    const explainPlans = explainStmts.map((stmt) =>
+      buildExplainPlanForStatement(stmt.text, profile.driver, Boolean(profile.readOnly))
+    )
 
     const explainQueryId =
       typeof input.queryId === 'string' && input.queryId.trim().length > 0
@@ -265,15 +282,61 @@ export function registerQueryAndTxHandlers({
       throw createHostError('cancelled', 'Explain execution was cancelled')
     }
 
-    return await executeSessionQuery(
-      tracker,
-      session,
-      explainQueryId,
-      explainSql,
-      DEFAULT_MAX_QUERY_ROWS,
-      timeoutSeconds,
-      signal
-    )
+    if (explainPlans.length === 1) {
+      return await executeSessionQuery(
+        tracker,
+        session,
+        explainQueryId,
+        explainPlans[0].explainSql,
+        DEFAULT_MAX_QUERY_ROWS,
+        timeoutSeconds,
+        signal
+      )
+    }
+
+    const totalStart = performance.now()
+    const collectedSets: QueryResultSet[] = []
+    let lastPlanResult: QueryResult | null = null
+    for (let i = 0; i < explainPlans.length; i++) {
+      if (signal.aborted || tracker.consumePreCancelledQuery(explainQueryId)) {
+        throw createHostError('cancelled', 'Explain execution was cancelled')
+      }
+      const plan = explainPlans[i]
+      const stmtStart = performance.now()
+      const res = await executeSessionQuery(
+        tracker,
+        session,
+        explainQueryId,
+        plan.explainSql,
+        DEFAULT_MAX_QUERY_ROWS,
+        timeoutSeconds,
+        signal
+      )
+      const stmtMs = Math.round(performance.now() - stmtStart)
+      lastPlanResult = res
+      collectedSets.push({
+        index: i,
+        sqlPreview: compactSql(plan.rawStmt),
+        sql: plan.rawStmt,
+        executionTimeMs: stmtMs,
+        columns: res.columns,
+        rows: res.rows,
+        rowCount: res.rowCount,
+        truncated: res.truncated,
+        isSelect: true,
+      })
+    }
+
+    const totalMs = Math.round(performance.now() - totalStart)
+    return {
+      columns: lastPlanResult?.columns ?? [],
+      rows: lastPlanResult?.rows ?? [],
+      rowCount: lastPlanResult?.rowCount ?? 0,
+      executionTimeMs: totalMs,
+      truncated: Boolean(lastPlanResult?.truncated),
+      isSelect: true,
+      resultSets: collectedSets,
+    }
   })
 
   registerHandler('query.history.list', async (input) => {

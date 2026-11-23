@@ -15,6 +15,8 @@ export interface StudioDomRefs {
   addConnBtn: HTMLButtonElement
   editConnBtn: HTMLButtonElement
   cautionStripEl: HTMLDivElement
+  cautionStripTextEl: HTMLSpanElement
+  cautionStripCloseBtn: HTMLButtonElement
   runBtn: HTMLButtonElement
   runAllBtn: HTMLButtonElement
   explainBtn: HTMLButtonElement
@@ -179,7 +181,7 @@ export function createStudioDomTree(
 
   const addConnBtn = document.createElement('button')
   addConnBtn.type = 'button'
-  addConnBtn.className = 'datanoa-btn datanoa-btn-primary datanoa-btn-sm datanoa-add-conn-btn'
+  addConnBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-add-conn-btn'
   addConnBtn.textContent = '+ Connect'
   addConnBtn.title = 'Add a new database connection'
 
@@ -303,6 +305,19 @@ export function createStudioDomTree(
   const cautionStripEl = document.createElement('div')
   cautionStripEl.className = 'datanoa-caution-strip'
   cautionStripEl.style.display = 'none'
+
+  const cautionStripTextEl = document.createElement('span')
+  cautionStripTextEl.className = 'datanoa-caution-strip-text'
+
+  const cautionStripCloseBtn = document.createElement('button')
+  cautionStripCloseBtn.type = 'button'
+  cautionStripCloseBtn.className = 'datanoa-caution-strip-close'
+  cautionStripCloseBtn.setAttribute('aria-label', 'Dismiss warning')
+  cautionStripCloseBtn.title = 'Dismiss warning'
+  cautionStripCloseBtn.textContent = '×'
+
+  cautionStripEl.appendChild(cautionStripTextEl)
+  cautionStripEl.appendChild(cautionStripCloseBtn)
 
   // 2. Three-Pane Studio Body
   const workspaceBody = document.createElement('div')
@@ -456,6 +471,7 @@ export function createStudioDomTree(
   historyHead.appendChild(historyHeadActions)
 
   const historyListEl = document.createElement('div')
+  historyListEl.className = 'datanoa-history-list'
   historyDrawerEl.appendChild(historyHead)
   historyDrawerEl.appendChild(historyListEl)
 
@@ -870,6 +886,8 @@ export function createStudioDomTree(
     addConnBtn,
     editConnBtn,
     cautionStripEl,
+    cautionStripTextEl,
+    cautionStripCloseBtn,
     runBtn,
     runAllBtn,
     explainBtn,

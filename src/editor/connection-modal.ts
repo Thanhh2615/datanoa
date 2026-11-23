@@ -5,6 +5,7 @@ import type {
   ConnectionColorTag,
   ConnectionProfile,
   DatabaseDriverType,
+  DiscoveredDockerComposeConnection,
   DriverInspectResult,
   DriverRegistryItem,
 } from '../protocol.js'
@@ -12,6 +13,7 @@ import {
   BYOD_ENGINES,
   CONNECTION_ENV_TAGS,
   STUDIO_ENGINES,
+  closeActiveStudioCollapsibleDropdown,
   copyTextFallback,
   createDbLogoSvg,
   createFolderIconSvg,
@@ -90,6 +92,7 @@ export interface DiscoveredEnvConnection {
 export interface WorkspaceDetectResponse {
   sqliteFiles?: DiscoveredSqliteFile[]
   envConnections?: DiscoveredEnvConnection[]
+  dockerComposeConnections?: DiscoveredDockerComposeConnection[]
 }
 
 export interface StudioConnectionModalContext {
@@ -130,8 +133,14 @@ export function openStudioConnectionModal(
   let parseSeq = 0
   let detectSeq = 0
   let discoveredEnvs: DiscoveredEnvConnection[] = []
+  let discoveredDocker: DiscoveredDockerComposeConnection[] = []
   let discoveredFiles: DiscoveredSqliteFile[] = []
-  let discoveredFilter = ''
+  let discoveredSearch = ''
+  const discoveryCollapsed: Record<'env' | 'docker' | 'sqlite', boolean | null> = {
+    env: null,
+    docker: null,
+    sqlite: null,
+  }
   let deleteArmed = false
   let deleteTimer: ReturnType<typeof setTimeout> | null = null
   const clearDeleteTimer = (): void => {
@@ -145,6 +154,7 @@ export function openStudioConnectionModal(
   const isModalOpen = (): boolean => ctx.isBackdropActive(backdropRef)
   const closeModalClean = (): void => {
     clearDeleteTimer()
+    closeActiveStudioCollapsibleDropdown()
     ctx.closeModal()
   }
 
@@ -284,7 +294,7 @@ export function openStudioConnectionModal(
   noticeBox.className = 'datanoa-modal-box is-pinned'
   noticeBox.style.display = 'none'
   noticeBox.setAttribute('role', 'status')
-  const showNotice = (kind: 'error' | 'success' | 'neutral', text: string): void => {
+  const showNotice = (kind: 'error' | 'warn' | 'success' | 'neutral', text: string): void => {
     noticeBox.className = `datanoa-modal-box is-pinned${kind === 'neutral' ? '' : ` ${kind}`}`
     noticeBox.setAttribute('role', kind === 'error' ? 'alert' : 'status')
     noticeBox.textContent = text
@@ -317,12 +327,12 @@ export function openStudioConnectionModal(
   discoverySection.style.marginTop = '8px'
   const discoveryLabel = document.createElement('div')
   discoveryLabel.className = 'datanoa-conn-section-label'
-  discoveryLabel.textContent = 'Local DB File Browser & Workspace Auto-Detect (.env & .db)'
+  discoveryLabel.textContent = 'Workspace Auto-Discovery (.env, Docker Compose & .db)'
   const detectRow = document.createElement('div')
   detectRow.className = 'datanoa-conn-row is-wrap'
   const quickBrowseDbBtn = createButton('Browse DB File...')
   quickBrowseDbBtn.title = 'Browse and pick a local SQLite database file (.db, .sqlite, .sqlite3)'
-  const detectBtn = createButton('Auto-Detect (.env & .db)')
+  const detectBtn = createButton('Auto-Detect (.env, Docker, .db)')
   const folderInp = createInput('Optional folder path to scan...', true)
   folderInp.style.flex = '1 1 160px'
   const browseScanFolderBtn = createButton('Browse Folder...')
@@ -1254,13 +1264,16 @@ export function openStudioConnectionModal(
   const deleteBtn = createButton('Delete Connection', 'datanoa-btn-danger')
   deleteBtn.style.marginRight = 'auto'
   const testBtn = createButton('Test Connection')
-  const cancelBtn = createButton('Cancel')
+  const clearBtn = createButton('Clear')
+  clearBtn.title = 'Clear all form fields to start over'
+  const cancelBtn = createButton('Cancel', 'datanoa-btn-cancel')
   const saveBtn = createButton(
     isEdit ? 'Update Connection' : 'Save & Connect',
     'datanoa-btn-primary'
   )
   if (isEdit) actions.appendChild(deleteBtn)
   actions.appendChild(testBtn)
+  actions.appendChild(clearBtn)
   actions.appendChild(cancelBtn)
   actions.appendChild(saveBtn)
 
@@ -1309,6 +1322,7 @@ export function openStudioConnectionModal(
     sshPasswordInp,
     deleteBtn,
     testBtn,
+    clearBtn,
     cancelBtn,
     saveBtn,
     tlsSection.head,
@@ -1324,132 +1338,414 @@ export function openStudioConnectionModal(
   }
 
   // ---- Discovery rendering ----
-  const filesFilterInp = createInput('Filter discovered .db files...')
-  const filesListContainer = document.createElement('div')
-  filesListContainer.className = 'datanoa-conn-chip-list'
-  const renderDiscoveredFilesList = (): void => {
-    filesListContainer.innerHTML = ''
-    const q = discoveredFilter.trim().toLowerCase()
-    const filtered = q
-      ? discoveredFiles.filter(
-          (f) => f.name.toLowerCase().includes(q) || f.filePath.toLowerCase().includes(q)
-        )
-      : discoveredFiles
-    if (filtered.length === 0) {
-      const empty = document.createElement('div')
-      empty.className = 'datanoa-cell-null'
-      empty.textContent = `No SQLite files match "${discoveredFilter}".`
-      filesListContainer.appendChild(empty)
+  const discoverySearchInp = createInput('Search .env, Docker Compose & .db files...')
+  discoverySearchInp.type = 'search'
+  discoverySearchInp.classList.add('datanoa-discovery-search')
+  const discoveryGroupsWrap = document.createElement('div')
+  discoveryGroupsWrap.className = 'datanoa-discovery-groups'
+
+  const compactStudioSource = (raw: string): string => {
+    const clean = String(raw || '').trim()
+    if (clean.length <= 44) return clean
+    const parts = clean.split(/[\\/]/).filter(Boolean)
+    return parts.length <= 2 ? clean : `.../${parts.slice(-3).join('/')}`
+  }
+
+  const resetFormAuthAndTunnels = (): void => {
+    hadPassword = false
+    hadAuthToken = false
+    lastParsedUri = ''
+    lastParsedPlaceholder = false
+    placeholderPending = false
+    uriInp.value = ''
+    authTokenInp.value = ''
+    passwordInp.value = ''
+    passwordInp.placeholder = 'Optional'
+    sslModeSel.value = 'auto'
+    sslCaPathInp.value = ''
+    sslCertPathInp.value = ''
+    sslKeyPathInp.value = ''
+    sslKeyPassphraseInp.value = ''
+    sslRejectCheck.input.checked = true
+    sshCheck.input.checked = false
+    sshHostInp.value = ''
+    sshPortInp.value = '22'
+    sshUserInp.value = ''
+    sshAuthSel.value = 'agent'
+    sshKeyPathInp.value = ''
+    sshPassphraseInp.value = ''
+    sshPasswordInp.value = ''
+    tlsSection.setExpanded(false)
+    sshSection.setExpanded(false)
+    syncStudioSelectTooltip(sslModeSel, 'SSL Mode')
+    syncStudioSelectTooltip(sshAuthSel, 'SSH Auth Method')
+    syncSshUi()
+  }
+
+  const applyDockerComposeItem = (item: DiscoveredDockerComposeConnection): void => {
+    if (!isKnownConnectionDriver(item.driver)) {
+      showNotice('error', `Unsupported driver "${String(item.driver)}" in Docker Compose.`)
       return
     }
-    for (const file of filtered) {
-      const chip = document.createElement('button')
-      chip.type = 'button'
-      chip.className = `datanoa-conn-chip${filePathInp.value.trim() === file.filePath ? ' selected' : ''}`
-      chip.title = file.filePath
-      const main = document.createElement('span')
-      main.className = 'datanoa-conn-chip-main'
-      const title = document.createElement('span')
-      title.className = 'datanoa-conn-chip-title'
-      title.appendChild(createDbLogoSvg('sqlite'))
-      const titleText = document.createElement('span')
-      titleText.textContent = file.name
-      title.appendChild(titleText)
-      const sub = document.createElement('span')
-      sub.className = 'datanoa-conn-chip-sub'
-      sub.textContent = file.filePath
-      main.appendChild(title)
-      main.appendChild(sub)
-      const size = document.createElement('span')
-      size.className = 'datanoa-badge datanoa-badge-unique'
-      size.textContent = file.sizeLabel || `${file.sizeBytes} B`
-      chip.appendChild(main)
-      chip.appendChild(size)
-      chip.addEventListener('click', () => {
-        if (isBusy) return
-        if (driver !== 'sqlite') {
-          applyDriver('sqlite', false)
-        }
-        filePathInp.value = file.filePath
-        if (!nameInp.value.trim() || nameInp.value === lastAutoName) {
-          nameInp.value = file.name
-          lastAutoName = file.name
-        }
-        renderDiscoveredFilesList()
-      })
-      filesListContainer.appendChild(chip)
+    resetFormAuthAndTunnels()
+    portInp.value = ''
+    applyDriver(item.driver, true)
+    nameInp.value = item.name || `${item.project} · ${item.service}`
+    lastAutoName = nameInp.value
+    if (item.driver === 'libsql') {
+      libsqlUrlInp.value = item.url || `http://${item.host || '127.0.0.1'}:${item.port || 8080}`
+      libsqlDbInp.value = item.database || 'main'
+    } else {
+      hostInp.value = item.host || '127.0.0.1'
+      portInp.value = String(item.port || getStudioEngineMeta(item.driver).defaultPort)
+      userInp.value = item.user || ''
+      sslCheck.input.checked = Boolean(item.ssl)
+      reconcileSslCheckWithMode()
+      syncTlsUi()
+      if (item.driver === 'redis') {
+        redisDbSel.value = String(item.redisDb ?? 0)
+        syncStudioSelectTooltip(redisDbSel, 'Redis DB Index')
+      } else {
+        databaseInp.value = item.database || getStudioEngineMeta(item.driver).defaultDb
+      }
+      if (item.driver === 'clickhouse') {
+        chUrlInp.value = item.url || `http://${item.host || '127.0.0.1'}:${item.port || 8123}`
+      }
+      if (item.password !== undefined) {
+        passwordInp.value = item.password
+      }
+      if (item.passwordFromFile) {
+        passwordInp.placeholder = `Required (${item.passwordFromFile})`
+      }
+    }
+    if (item.hint) {
+      showNotice('warn', item.hint)
+      if (item.passwordFromFile) passwordInp.focus?.()
+    } else {
+      showNotice(
+        'success',
+        `Imported ${getStudioEngineMeta(item.driver).label} service "${item.name}" from Docker Compose.`
+      )
     }
   }
-  filesFilterInp.addEventListener('input', () => {
-    discoveredFilter = filesFilterInp.value
-    renderDiscoveredFilesList()
-  })
 
-  const renderDiscovered = (): void => {
-    discoveredBox.innerHTML = ''
-    const showFiles = discoveredFiles.length > 0
-    const showEnvs = discoveredEnvs.length > 0
-    if (!showFiles && !showEnvs) {
+  const createDiscoveryGroupCard = (
+    groupKey: 'env' | 'docker' | 'sqlite',
+    pillText: string,
+    pillClass: string,
+    titleText: string,
+    totalCount: number,
+    filteredCount: number,
+    hasQuery: boolean,
+    emptyText: string,
+    buildChips: (listEl: HTMLDivElement) => void
+  ): HTMLDivElement => {
+    let collapsed: boolean
+    if (hasQuery) {
+      collapsed = filteredCount === 0
+    } else if (typeof discoveryCollapsed[groupKey] === 'boolean') {
+      collapsed = discoveryCollapsed[groupKey] === true
+    } else if (groupKey === 'sqlite' && driver !== 'sqlite') {
+      collapsed = true
+    } else {
+      collapsed = totalCount > 5
+    }
+
+    const group = document.createElement('div')
+    group.className = `datanoa-discovery-group${collapsed ? '' : ' is-expanded'}`
+    group.dataset.group = groupKey
+
+    const headBtn = document.createElement('button')
+    headBtn.type = 'button'
+    headBtn.className = 'datanoa-discovery-head'
+    const bodyEl = document.createElement('div')
+    bodyEl.className = 'datanoa-discovery-body'
+    bodyEl.id = `datanoa-discovery-body-${groupKey}`
+    headBtn.setAttribute('aria-controls', bodyEl.id)
+    headBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
+
+    const chev = document.createElement('span')
+    chev.className = 'datanoa-discovery-chevron'
+    chev.textContent = '\u25b8'
+    chev.setAttribute('aria-hidden', 'true')
+
+    const pill = document.createElement('span')
+    pill.className = `datanoa-discovery-pill ${pillClass}`
+    pill.textContent = pillText
+
+    const titleSpan = document.createElement('span')
+    titleSpan.className = 'datanoa-discovery-title'
+    titleSpan.textContent = titleText
+
+    const countSpan = document.createElement('span')
+    countSpan.className = 'datanoa-discovery-count'
+    countSpan.textContent = hasQuery ? `${filteredCount} / ${totalCount}` : `${totalCount} found`
+
+    headBtn.appendChild(chev)
+    headBtn.appendChild(pill)
+    headBtn.appendChild(titleSpan)
+    headBtn.appendChild(countSpan)
+    headBtn.addEventListener('click', () => {
+      if (isBusy) return
+      discoveryCollapsed[groupKey] = !collapsed
+      renderDiscoveredGroups()
+    })
+
+    if (collapsed) {
+      showEl(bodyEl, false)
+    } else {
+      const listEl = document.createElement('div')
+      listEl.className = 'datanoa-conn-chip-list'
+      if (filteredCount === 0) {
+        const empty = document.createElement('div')
+        empty.className = 'datanoa-cell-null'
+        empty.textContent = emptyText
+        listEl.appendChild(empty)
+      } else {
+        buildChips(listEl)
+      }
+      bodyEl.appendChild(listEl)
+    }
+
+    group.appendChild(headBtn)
+    group.appendChild(bodyEl)
+    return group
+  }
+
+  const renderDiscoveredGroups = (): void => {
+    discoveryGroupsWrap.innerHTML = ''
+    const hasEnvs = discoveredEnvs.length > 0
+    const hasDocker = discoveredDocker.length > 0
+    const hasFiles = discoveredFiles.length > 0
+    if (!hasEnvs && !hasDocker && !hasFiles) {
       showEl(discoveredBox, false)
       return
     }
     showEl(discoveredBox, true)
 
-    if (showEnvs) {
-      const label = document.createElement('div')
-      label.className = 'datanoa-conn-section-label'
-      label.textContent = `Detected .env connections (${discoveredEnvs.length})`
-      discoveredBox.appendChild(label)
-      const list = document.createElement('div')
-      list.className = 'datanoa-conn-chip-list'
-      for (const item of discoveredEnvs) {
-        const chip = document.createElement('button')
-        chip.type = 'button'
-        chip.className = 'datanoa-conn-chip'
-        const masked = maskUriSecret(item.uri)
-        chip.title = `${item.sourceFile} (${item.envKey}): ${masked}`
-        const main = document.createElement('span')
-        main.className = 'datanoa-conn-chip-main'
-        const title = document.createElement('span')
-        title.className = 'datanoa-conn-chip-title'
-        if (isKnownConnectionDriver(item.driver)) title.appendChild(createDbLogoSvg(item.driver))
-        const titleText = document.createElement('span')
-        titleText.textContent = `${item.envKey} (${item.name || item.driver})`
-        title.appendChild(titleText)
-        const sub = document.createElement('span')
-        sub.className = 'datanoa-conn-chip-sub'
-        sub.textContent = masked
-        main.appendChild(title)
-        main.appendChild(sub)
-        const badge = document.createElement('span')
-        badge.className = 'datanoa-badge'
-        badge.textContent = item.sourceFile || '.env'
-        chip.appendChild(main)
-        chip.appendChild(badge)
-        chip.addEventListener('click', () => {
-          if (isBusy) return
-          uriInp.value = item.uri
-          if (!nameInp.value.trim()) {
-            nameInp.value = item.name || item.envKey
-            lastAutoName = nameInp.value
+    const q = discoveredSearch.trim().toLowerCase()
+    const hasQuery = q.length > 0
+
+    const makeEnvGroup = (): HTMLDivElement | null => {
+      if (!hasEnvs) return null
+      const filtered = hasQuery
+        ? discoveredEnvs.filter((item) =>
+            [item.envKey, item.name, item.driver, item.sourceFile, maskUriSecret(item.uri)]
+              .join(' ')
+              .toLowerCase()
+              .includes(q)
+          )
+        : discoveredEnvs
+      return createDiscoveryGroupCard(
+        'env',
+        '.env',
+        'is-env',
+        '.env Connections',
+        discoveredEnvs.length,
+        filtered.length,
+        hasQuery,
+        `No .env connections match "${discoveredSearch}".`,
+        (list) => {
+          for (const item of filtered) {
+            const chip = document.createElement('button')
+            chip.type = 'button'
+            chip.className = 'datanoa-conn-chip'
+            const masked = maskUriSecret(item.uri)
+            chip.title = `${item.sourceFile} (${item.envKey}): ${masked}`
+            const main = document.createElement('span')
+            main.className = 'datanoa-conn-chip-main'
+            const title = document.createElement('span')
+            title.className = 'datanoa-conn-chip-title'
+            if (isKnownConnectionDriver(item.driver)) title.appendChild(createDbLogoSvg(item.driver))
+            const titleText = document.createElement('span')
+            titleText.textContent = `${item.envKey} (${item.name || item.driver})`
+            title.appendChild(titleText)
+            const sub = document.createElement('span')
+            sub.className = 'datanoa-conn-chip-sub'
+            sub.textContent = masked
+            main.appendChild(title)
+            main.appendChild(sub)
+            const badge = document.createElement('span')
+            badge.className = 'datanoa-badge datanoa-badge-neutral'
+            badge.textContent = compactStudioSource(item.sourceFile || '.env')
+            chip.appendChild(main)
+            chip.appendChild(badge)
+            chip.addEventListener('click', () => {
+              if (isBusy) return
+              uriInp.value = item.uri
+              if (!nameInp.value.trim()) {
+                nameInp.value = item.name || item.envKey
+                lastAutoName = nameInp.value
+              }
+              void parseUri(item.uri, true)
+            })
+            list.appendChild(chip)
           }
-          void parseUri(item.uri, true)
-        })
-        list.appendChild(chip)
-      }
-      discoveredBox.appendChild(list)
+        }
+      )
     }
 
-    if (showFiles) {
-      const label = document.createElement('div')
-      label.className = 'datanoa-conn-section-label'
-      label.textContent = `Detected SQLite files (${discoveredFiles.length})`
-      discoveredBox.appendChild(label)
-      filesFilterInp.value = discoveredFilter
-      discoveredBox.appendChild(filesFilterInp)
-      renderDiscoveredFilesList()
-      discoveredBox.appendChild(filesListContainer)
+    const makeDockerGroup = (): HTMLDivElement | null => {
+      if (!hasDocker) return null
+      const filtered = hasQuery
+        ? discoveredDocker.filter((item) =>
+            [
+              item.project,
+              item.service,
+              item.name,
+              item.driver,
+              item.host,
+              String(item.port || ''),
+              item.database,
+              item.user || '',
+              item.status,
+              item.sourceFile,
+            ]
+              .join(' ')
+              .toLowerCase()
+              .includes(q)
+          )
+        : discoveredDocker
+      return createDiscoveryGroupCard(
+        'docker',
+        'Docker',
+        'is-docker',
+        'Docker Compose',
+        discoveredDocker.length,
+        filtered.length,
+        hasQuery,
+        `No Docker Compose services match "${discoveredSearch}".`,
+        (list) => {
+          for (const item of filtered) {
+            const chip = document.createElement('button')
+            chip.type = 'button'
+            chip.className = 'datanoa-conn-chip'
+            chip.title = `${item.name} (${item.driver}) — ${item.host}:${item.port} [${item.status}]`
+            const main = document.createElement('span')
+            main.className = 'datanoa-conn-chip-main'
+            const title = document.createElement('span')
+            title.className = 'datanoa-conn-chip-title'
+            if (isKnownConnectionDriver(item.driver)) title.appendChild(createDbLogoSvg(item.driver))
+            const titleText = document.createElement('span')
+            titleText.textContent = item.name || `${item.project} · ${item.service}`
+            title.appendChild(titleText)
+            const sub = document.createElement('span')
+            sub.className = 'datanoa-conn-chip-sub'
+            const targetDb = item.driver === 'redis' ? `db${item.redisDb ?? 0}` : item.database || ''
+            const userPrefix = item.user ? `${item.user}@` : ''
+            sub.textContent = `${userPrefix}${item.host}:${item.port}${targetDb ? `/${targetDb}` : ''} · ${compactStudioSource(item.sourceFile)}`
+            main.appendChild(title)
+            main.appendChild(sub)
+
+            const badges = document.createElement('span')
+            badges.className = 'datanoa-discovery-badges'
+            if (item.workspaceMatched) {
+              const wsBadge = document.createElement('span')
+              wsBadge.className = 'datanoa-badge datanoa-badge-info'
+              wsBadge.textContent = 'Workspace'
+              badges.appendChild(wsBadge)
+            }
+            const statusBadge = document.createElement('span')
+            statusBadge.className = `datanoa-badge ${
+              item.status === 'running'
+                ? 'datanoa-badge-ok'
+                : item.status === 'compose file'
+                  ? 'datanoa-badge-neutral'
+                  : 'datanoa-badge-danger'
+            }`
+            statusBadge.textContent = item.status || 'live'
+            badges.appendChild(statusBadge)
+
+            chip.appendChild(main)
+            chip.appendChild(badges)
+            chip.addEventListener('click', () => {
+              if (!isBusy) applyDockerComposeItem(item)
+            })
+            list.appendChild(chip)
+          }
+        }
+      )
     }
+
+    const makeSqliteGroup = (): HTMLDivElement | null => {
+      if (!hasFiles) return null
+      const filtered = hasQuery
+        ? discoveredFiles.filter(
+            (f) => f.name.toLowerCase().includes(q) || f.filePath.toLowerCase().includes(q)
+          )
+        : discoveredFiles
+      return createDiscoveryGroupCard(
+        'sqlite',
+        'SQLite',
+        'is-sqlite',
+        'SQLite Files (.db)',
+        discoveredFiles.length,
+        filtered.length,
+        hasQuery,
+        `No SQLite files match "${discoveredSearch}".`,
+        (list) => {
+          for (const file of filtered) {
+            const chip = document.createElement('button')
+            chip.type = 'button'
+            chip.className = `datanoa-conn-chip${filePathInp.value.trim() === file.filePath ? ' selected' : ''}`
+            chip.title = file.filePath
+            const main = document.createElement('span')
+            main.className = 'datanoa-conn-chip-main'
+            const title = document.createElement('span')
+            title.className = 'datanoa-conn-chip-title'
+            title.appendChild(createDbLogoSvg('sqlite'))
+            const titleText = document.createElement('span')
+            titleText.textContent = file.name
+            title.appendChild(titleText)
+            const sub = document.createElement('span')
+            sub.className = 'datanoa-conn-chip-sub'
+            sub.textContent = file.filePath
+            main.appendChild(title)
+            main.appendChild(sub)
+            const size = document.createElement('span')
+            size.className = 'datanoa-badge datanoa-badge-unique'
+            size.textContent = file.sizeLabel || `${file.sizeBytes} B`
+            chip.appendChild(main)
+            chip.appendChild(size)
+            chip.addEventListener('click', () => {
+              if (isBusy) return
+              if (driver !== 'sqlite') {
+                applyDriver('sqlite', false)
+              }
+              filePathInp.value = file.filePath
+              if (!nameInp.value.trim() || nameInp.value === lastAutoName) {
+                nameInp.value = file.name
+                lastAutoName = file.name
+              }
+              renderDiscoveredGroups()
+            })
+            list.appendChild(chip)
+          }
+        }
+      )
+    }
+
+    const ordered =
+      driver === 'sqlite'
+        ? [makeSqliteGroup(), makeEnvGroup(), makeDockerGroup()]
+        : [makeEnvGroup(), makeDockerGroup(), makeSqliteGroup()]
+    for (const grp of ordered) {
+      if (grp) discoveryGroupsWrap.appendChild(grp)
+    }
+  }
+
+  discoverySearchInp.addEventListener('input', () => {
+    discoveredSearch = discoverySearchInp.value
+    renderDiscoveredGroups()
+  })
+
+  const renderDiscovered = (): void => {
+    if (discoveredBox.childElementCount === 0) {
+      discoveredBox.appendChild(discoverySearchInp)
+      discoveredBox.appendChild(discoveryGroupsWrap)
+    }
+    discoverySearchInp.value = discoveredSearch
+    renderDiscoveredGroups()
   }
 
   // ---- Driver switching ----
@@ -1476,6 +1772,7 @@ export function openStudioConnectionModal(
     const isLibsql = next === 'libsql'
     const isD1 = next === 'd1'
     const isServer = !isSqlite && !isLibsql && !isD1
+    showEl(quickBrowseDbBtn, isSqlite)
     showEl(rowFilePath, isSqlite)
     showEl(rowLibsqlUrl, isLibsql)
     showEl(rowAuthToken, isLibsql || isD1)
@@ -1512,6 +1809,38 @@ export function openStudioConnectionModal(
     syncTlsUi()
     syncByodBanner()
     renderDiscovered()
+  }
+
+  const clearModalFields = (): void => {
+    if (isBusy) return
+    resetFormAuthAndTunnels()
+    nameInp.value = ''
+    lastAutoName = ''
+    folderGroupInp.value = ''
+    workspaceScopeSel.value = ''
+    syncStudioSelectTooltip(workspaceScopeSel, 'Workspace Scope (Pin Connection)')
+    colorTag = 'none'
+    syncEnvPills()
+    roCheck.input.checked = false
+    filePathInp.value = ''
+    libsqlUrlInp.value = ''
+    libsqlDbInp.value = ''
+    d1AccountInp.value = ''
+    d1DatabaseInp.value = ''
+    d1EndpointInp.value = ''
+    hostInp.value = 'localhost'
+    portInp.value = ''
+    userInp.value = ''
+    databaseInp.value = ''
+    redisDbSel.value = '0'
+    syncStudioSelectTooltip(redisDbSel, 'Redis DB Index')
+    chUrlInp.value = ''
+    optionsInp.value = ''
+    discoveredSearch = ''
+    discoverySearchInp.value = ''
+    applyDriver(driver, true)
+    showNotice('neutral', 'Form cleared.')
+    nameInp.focus?.()
   }
 
   // ---- Submission ----
@@ -1955,6 +2284,9 @@ export function openStudioConnectionModal(
       ])
       if (seq !== detectSeq || !isModalOpen()) return
       discoveredEnvs = Array.isArray(wsRes?.envConnections) ? wsRes.envConnections : []
+      discoveredDocker = Array.isArray(wsRes?.dockerComposeConnections)
+        ? wsRes.dockerComposeConnections
+        : []
       const wsFiles = Array.isArray(wsRes?.sqliteFiles) ? wsRes.sqliteFiles : []
       const extraFiles = Array.isArray(folderRes?.files) ? folderRes.files : []
       const seen = new Set<string>()
@@ -1965,12 +2297,21 @@ export function openStudioConnectionModal(
           discoveredFiles.push(f)
         }
       }
-      if (manual && discoveredEnvs.length === 0 && discoveredFiles.length === 0) {
-        showNotice('neutral', 'No .env connections or SQLite database files found.')
+      discoveryCollapsed.env = null
+      discoveryCollapsed.docker = null
+      discoveryCollapsed.sqlite = null
+      if (
+        manual &&
+        discoveredEnvs.length === 0 &&
+        discoveredDocker.length === 0 &&
+        discoveredFiles.length === 0
+      ) {
+        showNotice('neutral', 'No .env connections, Docker Compose databases, or SQLite files found.')
       }
     } catch (err: unknown) {
       if (seq !== detectSeq || !isModalOpen()) return
       discoveredEnvs = []
+      discoveredDocker = []
       discoveredFiles = []
       if (manual) {
         showNotice(
@@ -2158,6 +2499,9 @@ export function openStudioConnectionModal(
   testBtn.addEventListener('click', () => {
     void runTest()
   })
+  clearBtn.addEventListener('click', () => {
+    clearModalFields()
+  })
   saveBtn.addEventListener('click', () => {
     void runSave()
   })
@@ -2247,7 +2591,11 @@ export function openStudioConnectionModal(
   modal.appendChild(noticeBox)
   modal.appendChild(body)
   modal.appendChild(actions)
-  backdropRef = ctx.mountModal(modal, () => !isBusy)
+  backdropRef = ctx.mountModal(modal, () => {
+    if (isBusy) return false
+    closeActiveStudioCollapsibleDropdown()
+    return true
+  })
   if (!backdropRef) return
   if (isEdit) {
     nameInp.focus?.()

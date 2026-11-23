@@ -234,7 +234,7 @@ export const EDITOR_MODALS_STYLE = `
     background: var(--input-bg);
     color: var(--text);
     border: 1px solid var(--input-border);
-    border-radius: var(--radius);
+    border-radius: var(--radius-control);
     padding: 0 8px;
     font-family: var(--mono-font);
     font-size: 13px;
@@ -244,7 +244,7 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-struct-title-input:focus {
-    border-color: var(--info);
+    border-color: var(--accent-ring);
   }
 
   .datanoa-struct-title-input.dirty {
@@ -384,7 +384,7 @@ export const EDITOR_MODALS_STYLE = `
 
   .datanoa-struct-cell-input:focus,
   .datanoa-struct-cell-select:focus {
-    border-color: var(--info);
+    border-color: var(--accent-ring);
     background: var(--input-bg);
   }
 
@@ -395,7 +395,7 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-struct-checkbox {
-    accent-color: var(--info);
+    accent-color: var(--accent-ring);
     width: 14px;
     height: 14px;
     cursor: pointer;
@@ -457,8 +457,8 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-col-pill.active {
-    border-color: var(--info);
-    background: color-mix(in srgb, var(--info) 16%, var(--bg));
+    border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
+    background: color-mix(in srgb, var(--accent-ring) 16%, var(--bg));
     color: var(--text);
   }
 
@@ -487,7 +487,7 @@ export const EDITOR_MODALS_STYLE = `
     flex-direction: column;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
-    background: var(--card);
+    background: var(--popover);
     box-shadow: var(--menu-shadow);
     overflow: hidden;
   }
@@ -564,7 +564,7 @@ export const EDITOR_MODALS_STYLE = `
 
   .datanoa-btn-danger-solid {
     background: var(--danger);
-    color: var(--primary-fg);
+    color: var(--danger-fg);
     border-color: var(--danger);
     font-weight: 600;
   }
@@ -619,7 +619,7 @@ export const EDITOR_MODALS_STYLE = `
     z-index: 10060;
     max-height: 224px;
     overflow-y: auto;
-    background: var(--raised);
+    background: var(--popover);
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
     box-shadow: var(--menu-shadow);
@@ -648,8 +648,8 @@ export const EDITOR_MODALS_STYLE = `
 
   .datanoa-combo-item:hover,
   .datanoa-combo-item.active {
-    background: var(--hover);
-    color: var(--info);
+    background: color-mix(in srgb, var(--accent-ring) 14%, transparent);
+    color: var(--text);
   }
 
   /* Shimmer Skeleton & Spinner Loading Primitives */
@@ -741,7 +741,7 @@ export const EDITOR_MODALS_STYLE = `
     flex-direction: column;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
-    background: var(--card);
+    background: var(--popover);
     box-shadow: var(--menu-shadow);
     overflow: hidden;
   }
@@ -794,8 +794,8 @@ export const EDITOR_MODALS_STYLE = `
 
   .datanoa-cmd-palette-item:hover,
   .datanoa-cmd-palette-item.active {
-    background: color-mix(in srgb, var(--info) 14%, transparent);
-    color: var(--info);
+    background: color-mix(in srgb, var(--accent-ring) 15%, transparent);
+    color: var(--text);
   }
 
   /* Keyboard Shortcuts Cheatsheet Modal */
@@ -807,7 +807,7 @@ export const EDITOR_MODALS_STYLE = `
     flex-direction: column;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
-    background: var(--card);
+    background: var(--popover);
     box-shadow: var(--menu-shadow);
     overflow: hidden;
   }
@@ -867,7 +867,7 @@ export const EDITOR_MODALS_STYLE = `
     flex-direction: column;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
-    background: var(--card);
+    background: var(--popover);
     box-shadow: var(--menu-shadow);
     overflow: hidden;
   }
@@ -886,7 +886,7 @@ export const EDITOR_MODALS_STYLE = `
     flex-direction: column;
     border: 1px solid var(--danger);
     border-radius: var(--radius);
-    background: var(--card);
+    background: var(--popover);
     box-shadow: var(--menu-shadow);
     overflow: hidden;
   }
@@ -899,7 +899,7 @@ export const EDITOR_MODALS_STYLE = `
     flex-direction: column;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
-    background: var(--card);
+    background: var(--popover);
     box-shadow: var(--menu-shadow);
     overflow: hidden;
   }
@@ -952,7 +952,7 @@ export const EDITOR_MODALS_STYLE = `
   .datanoa-conn-input:focus,
   .datanoa-conn-select:focus {
     outline: none;
-    border-color: var(--info);
+    border-color: var(--accent-ring);
   }
 
   .datanoa-conn-input:disabled,
@@ -1008,8 +1008,8 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-engine-tile.active {
-    border-color: var(--info);
-    background: color-mix(in srgb, var(--info) 14%, var(--bg));
+    border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
+    background: color-mix(in srgb, var(--accent-ring) 14%, var(--bg));
     font-weight: 600;
   }
 
@@ -1068,7 +1068,7 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-conn-collapsible-head:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--info) 8%, transparent);
+    background: var(--hover);
   }
 
   .datanoa-conn-collapsible-head:disabled {
@@ -1151,8 +1151,8 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-conn-env-pill.active {
-    border-color: var(--info);
-    background: color-mix(in srgb, var(--info) 14%, var(--bg));
+    border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
+    background: color-mix(in srgb, var(--accent-ring) 14%, var(--bg));
     font-weight: 600;
   }
 
@@ -1171,18 +1171,152 @@ export const EDITOR_MODALS_STYLE = `
   .datanoa-conn-discovered {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 8px;
     padding: 8px 10px;
     border: 1px dashed var(--border-strong);
     border-radius: var(--radius);
     background: var(--surface);
   }
 
+  .datanoa-discovery-search {
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .datanoa-discovery-groups {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .datanoa-discovery-group {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--card);
+    overflow: hidden;
+  }
+
+  .datanoa-discovery-head {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    width: 100%;
+    min-height: 30px;
+    padding: 5px 10px;
+    border: 0;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .datanoa-discovery-head:hover {
+    background: var(--hover);
+  }
+
+  .datanoa-discovery-chevron {
+    display: inline-block;
+    width: 10px;
+    font-size: 10px;
+    color: var(--muted);
+    transition: transform 0.12s ease;
+    flex-shrink: 0;
+  }
+
+  .datanoa-discovery-group.is-expanded .datanoa-discovery-chevron {
+    transform: rotate(90deg);
+  }
+
+  .datanoa-discovery-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: var(--mono-font);
+    font-size: 10.5px;
+    font-weight: 600;
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--muted);
+  }
+
+  .datanoa-discovery-pill.is-env {
+    border-color: color-mix(in srgb, var(--warn) 42%, var(--border));
+    color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 10%, var(--bg));
+  }
+
+  .datanoa-discovery-pill.is-docker {
+    border-color: color-mix(in srgb, var(--info) 42%, var(--border));
+    color: var(--info);
+    background: color-mix(in srgb, var(--info) 10%, var(--bg));
+  }
+
+  .datanoa-discovery-pill.is-sqlite {
+    border-color: color-mix(in srgb, var(--ok) 42%, var(--border));
+    color: var(--ok);
+    background: color-mix(in srgb, var(--ok) 10%, var(--bg));
+  }
+
+  .datanoa-discovery-title {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .datanoa-discovery-count {
+    font-family: var(--mono-font);
+    font-size: 11px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+  }
+
+  .datanoa-discovery-body {
+    padding: 8px;
+    border-top: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg) 55%, var(--surface));
+  }
+
+  .datanoa-discovery-badges {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex-shrink: 0;
+  }
+
+  .datanoa-badge-neutral {
+    background: var(--surface);
+    color: var(--muted);
+    border: 1px solid var(--border);
+  }
+
+  .datanoa-badge-ok {
+    background: color-mix(in srgb, var(--ok) 14%, transparent);
+    color: var(--ok);
+    border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent);
+  }
+
+  .datanoa-badge-info {
+    background: color-mix(in srgb, var(--info) 14%, transparent);
+    color: var(--info);
+    border: 1px solid color-mix(in srgb, var(--info) 45%, transparent);
+  }
+
+  .datanoa-badge-warn {
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    color: var(--warn);
+    border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  }
+
   .datanoa-conn-chip-list {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    max-height: 140px;
+    max-height: 180px;
     overflow-y: auto;
   }
 
@@ -1203,12 +1337,12 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-conn-chip:hover {
-    border-color: var(--info);
-    background: color-mix(in srgb, var(--info) 8%, var(--card));
+    border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
+    background: color-mix(in srgb, var(--accent-ring) 10%, var(--card));
   }
 
   .datanoa-conn-chip.selected {
-    border-color: var(--info);
+    border-color: var(--accent-ring);
   }
 
   .datanoa-conn-chip-main {
@@ -1281,7 +1415,7 @@ export const EDITOR_MODALS_STYLE = `
     flex-direction: column;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
-    background: var(--card);
+    background: var(--popover);
     box-shadow: var(--menu-shadow);
     overflow: hidden;
   }
@@ -1333,7 +1467,7 @@ export const EDITOR_MODALS_STYLE = `
     flex-direction: column;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
-    background: var(--card);
+    background: var(--popover);
     box-shadow: var(--menu-shadow);
     overflow: hidden;
   }
@@ -1352,8 +1486,8 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-import-dropzone.dragover {
-    border-color: var(--info);
-    background: color-mix(in srgb, var(--info) 12%, var(--surface));
+    border-color: var(--accent-ring);
+    background: color-mix(in srgb, var(--accent-ring) 12%, var(--surface));
   }
 
   .datanoa-import-dropzone-info {
@@ -1475,7 +1609,7 @@ export const EDITOR_MODALS_STYLE = `
     flex-direction: column;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
-    background: var(--card);
+    background: var(--popover);
     box-shadow: var(--menu-shadow);
     overflow: hidden;
   }
@@ -1628,7 +1762,7 @@ export const EDITOR_MODALS_STYLE = `
 
   html.light .datanoa-driver-mgr-modal,
   body.light .datanoa-driver-mgr-modal {
-    background: var(--card);
+    background: var(--popover);
     border-color: var(--border-strong);
   }
 
@@ -1823,7 +1957,7 @@ export const EDITOR_MODALS_STYLE = `
     flex-direction: column;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
-    background: var(--card);
+    background: var(--popover);
     box-shadow: var(--menu-shadow);
     overflow: hidden;
   }
@@ -1863,14 +1997,14 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-fp-root.is-active {
-    background: var(--hover);
+    background: color-mix(in srgb, var(--accent-ring) 14%, var(--surface));
     color: var(--text);
-    border-color: var(--info);
+    border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
   }
 
   .datanoa-fp-root:focus-visible,
   .datanoa-fp-row:focus-visible {
-    outline: 1.5px solid var(--info);
+    outline: 1.5px solid var(--accent-ring);
     outline-offset: -1.5px;
   }
 
@@ -1935,8 +2069,8 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-fp-row.is-selected {
-    background: color-mix(in srgb, var(--info) 12%, var(--surface));
-    border-color: var(--info);
+    background: color-mix(in srgb, var(--accent-ring) 14%, var(--surface));
+    border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
   }
 
   .datanoa-fp-icon {

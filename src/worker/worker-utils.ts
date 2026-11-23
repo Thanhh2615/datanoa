@@ -439,6 +439,15 @@ export async function openStudioDocumentInOrca(
       workspaceId: target.id,
       path: relPath,
     })
+    try {
+      orca.panels?.post?.('studio.opened', {
+        connectionId: resolvedConnectionId || null,
+        table: options?.table || null,
+        schema: options?.schema || null,
+      })
+    } catch {
+      // Optional event broadcast in minimal/test hosts
+    }
     return { ok: true, path: relPath }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)

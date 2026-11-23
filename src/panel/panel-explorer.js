@@ -104,6 +104,8 @@ export function createPanelExplorerController(ctx) {
     persistActiveConnectionId,
     renderConnectionsBar,
     renderSqlSafetyBanner,
+    resetSqlSafetyBannerDismissal,
+    setSqlText,
     populateFormFromProfile,
     openDeleteConfirmModal,
     savePanelViewState,
@@ -852,9 +854,11 @@ export function createPanelExplorerController(ctx) {
         openFullStudio({ connectionId: conn.id, table: obj.name, schema: obj.schema })
       )
       addItem('Jump to Console', async () => {
+        resetSqlSafetyBannerDismissal?.()
         await selectTableAndOpen(conn.id, obj.name, obj.schema, false)
         const details = state.tableDetails[makeTableKey(conn.id, obj.name, obj.schema)]
-        $('sqlEditor').value = generateSqlForTable('select', conn, obj, details)
+        setSqlText(generateSqlForTable('select', conn, obj, details))
+        renderSqlSafetyBanner()
         switchTab('sql')
       })
       addSep()
@@ -877,7 +881,7 @@ export function createPanelExplorerController(ctx) {
             ...(obj.schema ? { schema: obj.schema } : {}),
           }).catch(() => null)
         }
-        $('sqlEditor').value = generateSqlForTable('select', conn, obj, details)
+        setSqlText(generateSqlForTable('select', conn, obj, details))
         switchTab('sql')
       })
       addItem('Generate INSERT', async () => {
@@ -890,7 +894,7 @@ export function createPanelExplorerController(ctx) {
             ...(obj.schema ? { schema: obj.schema } : {}),
           }).catch(() => null)
         }
-        $('sqlEditor').value = generateSqlForTable('insert', conn, obj, details)
+        setSqlText(generateSqlForTable('insert', conn, obj, details))
         switchTab('sql')
       })
       addItem('Generate UPDATE', async () => {
@@ -903,7 +907,7 @@ export function createPanelExplorerController(ctx) {
             ...(obj.schema ? { schema: obj.schema } : {}),
           }).catch(() => null)
         }
-        $('sqlEditor').value = generateSqlForTable('update', conn, obj, details)
+        setSqlText(generateSqlForTable('update', conn, obj, details))
         switchTab('sql')
       })
       addItem('Generate CREATE DDL', async () => {
@@ -919,7 +923,7 @@ export function createPanelExplorerController(ctx) {
             { timeoutMs: QUERY_TIMEOUT_MS }
           )
           if (ddlRes?.ddl) {
-            $('sqlEditor').value = formatDdlForDisplay(ddlRes.ddl)
+            setSqlText(formatDdlForDisplay(ddlRes.ddl))
             switchTab('sql')
           }
         } catch (err) {
@@ -954,6 +958,7 @@ export function createPanelExplorerController(ctx) {
         })
       }
       addItem('Jump to Console', () => {
+        resetSqlSafetyBannerDismissal?.()
         if (state.activeConnectionId !== conn.id) {
           state.activeConnectionId = conn.id
           void persistActiveConnectionId(conn.id)

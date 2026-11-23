@@ -8,7 +8,33 @@
  * - Privacy-safe Feedback / Bug Report Markdown & GitHub Issue URL builders
  */
 
-export const DATANOA_VERSION = '1.1.1'
+import {
+  parseDelimitedClipboard as sharedParseDelimitedClipboard,
+  planGridPaste as sharedPlanGridPaste,
+  sanitizeDiagnosticErrorText as sharedSanitizeDiagnosticErrorText,
+} from '../shared-grid-paste.js'
+import {
+  FORBIDDEN_SUBQUERY_VERBS,
+  KNOWN_SQL_DEFAULT_KEYWORDS,
+  containsDdlStatement as sharedContainsDdlStatement,
+  findStatementAtOffset as sharedFindStatementAtOffset,
+  findTopLevelPostgresCastIndex as sharedFindTopLevelPostgresCastIndex,
+  formatSql as sharedFormatSql,
+  formatSqlLiteral as sharedFormatSqlLiteral,
+  hasBalancedParens as sharedHasBalancedParens,
+  isIdentContChar as sharedIsIdentContChar,
+  isIdentStartChar as sharedIsIdentStartChar,
+  isNumericOrBooleanTypeName as sharedIsNumericOrBooleanTypeName,
+  matchDollarQuoteTag as sharedMatchDollarQuoteTag,
+  normalizeSqlDefaultExpression as sharedNormalizeSqlDefaultExpression,
+  quoteIdentForDialect as sharedQuoteIdentForDialect,
+  scanQuotedSegmentEnd as sharedScanQuotedSegmentEnd,
+  splitSqlStatements as sharedSplitSqlStatements,
+  stripLeadingSqlComments as sharedStripLeadingSqlComments,
+  validateColumnTypeSpec as sharedValidateColumnTypeSpec,
+} from '../shared-sql-core.js'
+
+export const DATANOA_VERSION = '1.1.2'
 export const DATANOA_GITHUB_ISSUES_URL = 'https://github.com/Thanhh2615/datanoa/issues/new'
 
 export const ENGINES = [
@@ -97,11 +123,9 @@ export const PANEL_TYPE_SUGGESTIONS_BY_DRIVER = {
   redis: ['STRING', 'HASH', 'LIST', 'SET', 'ZSET', 'STREAM', 'JSON'],
 }
 
-export const KNOWN_SQL_DEFAULTS_RE =
-  /^(?:CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|LOCALTIME|LOCALTIMESTAMP|NOW\(\)|UUID\(\)|GEN_RANDOM_UUID\(\)|UUID_GENERATE_V1\(\)|UUID_GENERATE_V4\(\)|NEWID\(\)|UNIXEPOCH\(\)|NEXTVAL\([^;]+\)|CURRVAL\([^;]+\)|ARRAY\[[^;]*\]|DATETIME\([^;]+\)|DATE\([^;]+\)|TIME\([^;]+\)|STRFTIME\([^;]+\)|COALESCE\([^;]+\)|RANDOMBLOB\([^;]+\)|HEX\([^;]+\))$/i
+export const KNOWN_SQL_DEFAULTS_RE = KNOWN_SQL_DEFAULT_KEYWORDS
 export const FORBIDDEN_DEFAULT_TOKENS_RE = /[;\r\n\0#]|--|\/\*|\*\//
-export const FORBIDDEN_SUBQUERY_RE =
-  /\b(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|ATTACH|DETACH|PRAGMA|UNION|EXEC)\b/i
+export const FORBIDDEN_SUBQUERY_RE = FORBIDDEN_SUBQUERY_VERBS
 
 // ============================================================================
 // Pure Serialization, Color & Formatting Utilities
@@ -173,10 +197,7 @@ export function maskConnectionUriSecret(rawUri) {
 // ============================================================================
 
 export function quoteIdent(ident, driver) {
-  if (BACKTICK_DRIVERS.has(driver)) {
-    return '`' + String(ident).replace(/`/g, '``') + '`'
-  }
-  return '"' + String(ident).replace(/"/g, '""') + '"'
+  return sharedQuoteIdentForDialect(String(ident), driver || 'postgres')
 }
 
 export function quoteTableRef(tableName, schemaName, driver) {
@@ -187,207 +208,35 @@ export function quoteTableRef(tableName, schemaName, driver) {
   return omit ? quoteIdent(tableName, driver) : `${quoteIdent(s, driver)}.${quoteIdent(tableName, driver)}`
 }
 
-export function isIdentStart(code) {
-  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95
-}
-
-export function isIdentCont(code) {
-  return isIdentStart(code) || (code >= 48 && code <= 57)
-}
-
-export function matchDollarTag(sql, index) {
-  if (sql.charCodeAt(index) !== 36) return null
-  if (index + 1 >= sql.length) return null
-  if (sql.charCodeAt(index + 1) === 36) return '$$'
-  if (!isIdentStart(sql.charCodeAt(index + 1))) return null
-  let cursor = index + 2
-  while (cursor < sql.length && isIdentCont(sql.charCodeAt(cursor))) cursor++
-  return cursor < sql.length && sql.charCodeAt(cursor) === 36 ? sql.slice(index, cursor + 1) : null
-}
+export const isIdentStart = sharedIsIdentStartChar
+export const isIdentCont = sharedIsIdentContChar
+export const matchDollarTag = sharedMatchDollarQuoteTag
 
 export function scanQuotedEnd(sql, start, qChar, allowBackslash) {
-  let i = start + 1
-  while (i < sql.length) {
-    const ch = sql[i]
-    if (allowBackslash && ch === '\\') {
-      i += 2
-      continue
-    }
-    if (ch === qChar) {
-      if (i + 1 < sql.length && sql[i + 1] === qChar) {
-        i += 2
-        continue
-      }
-      return i + 1
-    }
-    i++
-  }
-  return sql.length
+  return sharedScanQuotedSegmentEnd(sql, start, qChar, allowBackslash).end
 }
 
 export function splitSqlStatements(script, driver) {
-  const results = []
-  const allowBackslashSingle = BACKSLASH_ESCAPE_DRIVERS.has(driver)
-  const allowHashComment = HASH_COMMENT_DRIVERS.has(driver)
-  const allowMysqlExec = MYSQL_EXEC_DRIVERS.has(driver)
-  let segStart = 0
-  let hasToken = false
-  let i = 0
-  const flush = (rawEnd) => {
-    if (hasToken) {
-      let s = segStart
-      let e = rawEnd
-      while (s < e && /\s/.test(script[s])) s++
-      while (e > s && /\s/.test(script[e - 1])) e--
-      if (e > s) results.push({ text: script.slice(s, e), start: s, end: e })
-    }
-    segStart = rawEnd + 1
-    hasToken = false
-  }
-  while (i < script.length) {
-    const ch = script[i]
-    if (ch === '-' && script[i + 1] === '-') {
-      while (i < script.length && script[i] !== '\n') i++
-      i++
-      continue
-    }
-    if (ch === '#' && allowHashComment) {
-      while (i < script.length && script[i] !== '\n') i++
-      i++
-      continue
-    }
-    if (ch === '/' && script[i + 1] === '*') {
-      if (allowMysqlExec && script[i + 2] === '!') {
-        hasToken = true
-        const closeIdx = script.indexOf('*/', i + 3)
-        i = closeIdx >= 0 ? closeIdx + 2 : script.length
-        continue
-      }
-      i += 2
-      let depth = 1
-      while (i < script.length && depth > 0) {
-        if (script[i] === '/' && script[i + 1] === '*') { depth++; i += 2; continue }
-        if (script[i] === '*' && script[i + 1] === '/') { depth--; i += 2; continue }
-        i++
-      }
-      continue
-    }
-    if (ch === "'" || ch === '"' || ch === '`') {
-      hasToken = true
-      const useBs =
-        ch === "'" &&
-        (allowBackslashSingle ||
-          ((driver === 'postgres' || driver === 'cockroachdb') &&
-            i > 0 &&
-            (script[i - 1] === 'E' || script[i - 1] === 'e') &&
-            (i === 1 || !isIdentCont(script.charCodeAt(i - 2)))))
-      i = scanQuotedEnd(script, i, ch, useBs)
-      continue
-    }
-    if (ch === '$') {
-      const tag = matchDollarTag(script, i)
-      if (tag !== null) {
-        hasToken = true
-        const closeIdx = script.indexOf(tag, i + tag.length)
-        i = closeIdx >= 0 ? closeIdx + tag.length : script.length
-        continue
-      }
-    }
-    if (ch === ';') {
-      flush(i)
-      i++
-      continue
-    }
-    if (!/\s/.test(ch)) hasToken = true
-    i++
-  }
-  if (segStart < script.length) flush(script.length)
-  return results
+  return sharedSplitSqlStatements(String(script ?? ''), driver || 'postgres')
 }
 
 export function stripLeadingSqlComments(stmt, driver) {
-  const allowHash = HASH_COMMENT_DRIVERS.has(driver)
-  const allowMysqlExec = MYSQL_EXEC_DRIVERS.has(driver)
-  let execCommentDepth = 0
-  let i = 0
-  while (i < stmt.length) {
-    while (i < stmt.length && /\s/.test(stmt[i])) i++
-    if (execCommentDepth > 0 && stmt[i] === '*' && stmt[i + 1] === '/') {
-      execCommentDepth--
-      i += 2
-      continue
-    }
-    if (stmt[i] === '-' && stmt[i + 1] === '-') {
-      while (i < stmt.length && stmt[i] !== '\n') i++
-      continue
-    }
-    if (stmt[i] === '#' && allowHash) {
-      while (i < stmt.length && stmt[i] !== '\n') i++
-      continue
-    }
-    if (stmt[i] === '/' && stmt[i + 1] === '*') {
-      if (allowMysqlExec && stmt[i + 2] === '!') {
-        execCommentDepth++
-        i += 3
-        while (i < stmt.length && stmt[i] >= '0' && stmt[i] <= '9') i++
-        continue
-      }
-      i += 2
-      let depth = 1
-      while (i < stmt.length && depth > 0) {
-        if (stmt[i] === '/' && stmt[i + 1] === '*') { depth++; i += 2; continue }
-        if (stmt[i] === '*' && stmt[i + 1] === '/') { depth--; i += 2; continue }
-        i++
-      }
-      continue
-    }
-    break
-  }
-  return stmt.slice(i)
+  return sharedStripLeadingSqlComments(String(stmt ?? ''), driver)
 }
 
 export function panelContainsDdlStatement(sql, driver) {
   if (!sql || driver === 'redis') return false
-  const stmts = splitSqlStatements(sql, driver)
-  for (const s of stmts) {
-    const clean = stripLeadingSqlComments(s.text, driver).replace(/^[\s(]+/, '')
-    const m = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(clean)
-    if (m && PANEL_DDL_VERBS.has(m[1].toUpperCase())) return true
-  }
-  return false
+  return sharedContainsDdlStatement(sql, driver)
 }
 
 export function findStatementAtCaret(script, offset, driver) {
-  const stmts = splitSqlStatements(script, driver)
-  if (stmts.length === 0) return script.trim()
-  const pos = Math.max(0, Math.min(script.length, offset))
-  for (let i = 0; i < stmts.length; i++) {
-    const stmt = stmts[i]
-    if (pos <= stmt.end) return stmt.text
-    const next = stmts[i + 1]
-    if (!next) return stmt.text
-    if (pos < next.start) {
-      const gap = script.slice(stmt.end, next.start)
-      const semiRel = gap.indexOf(';')
-      const boundary = semiRel >= 0 ? stmt.end + semiRel + 1 : stmt.end
-      return pos <= boundary ? stmt.text : next.text
-    }
-  }
-  return stmts[stmts.length - 1].text
+  return sharedFindStatementAtOffset(script, offset, driver || 'postgres') || String(script || '').trim()
 }
 
 export const findStatementAtOffset = findStatementAtCaret
 
 export function formatSqlLiteral(val, driver) {
-  if (val === null || val === undefined) return 'NULL'
-  if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE'
-  if (typeof val === 'number') return Number.isFinite(val) ? String(val) : 'NULL'
-  const raw = typeof val === 'object' ? JSON.stringify(val) : String(val)
-  let esc = raw
-  if (BACKSLASH_ESCAPE_DRIVERS.has(driver)) {
-    esc = esc.replace(/\\/g, '\\\\').replace(/\0/g, '\\0')
-  }
-  return `'${esc.replace(/'/g, "''")}'`
+  return sharedFormatSqlLiteral(val, driver || 'postgres')
 }
 
 export function buildPanelExportData({ columns, rows, format, tableName, schema, driver, primaryKeys }) {
@@ -570,654 +419,12 @@ export function formatSelectionAsOutput(
 }
 
 export function formatPanelSql(sql, driver) {
-  const raw = String(sql || '').trim()
-  if (!raw || driver === 'redis') return raw
-  const isBacktick = BACKSLASH_ESCAPE_DRIVERS.has(driver)
-  const allowHash = HASH_COMMENT_DRIVERS.has(driver)
-  const tokens = []
-  const MAJOR_KW = new Set([
-    'SELECT', 'FROM', 'WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET',
-    'UNION', 'INTERSECT', 'EXCEPT', 'INSERT', 'INTO', 'VALUES', 'UPDATE', 'SET',
-    'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'RETURNING', 'WITH', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END',
-  ])
-  const JOIN_PREFIX = new Set(['LEFT', 'RIGHT', 'INNER', 'OUTER', 'FULL', 'CROSS', 'NATURAL'])
-  const UPPER_KW = new Set([
-    ...MAJOR_KW, ...JOIN_PREFIX, 'JOIN', 'ON', 'AS', 'AND', 'OR', 'NOT', 'IN', 'IS', 'NULL',
-    'TRUE', 'FALSE', 'BY', 'ASC', 'DESC', 'DISTINCT', 'ALL', 'EXISTS', 'BETWEEN', 'LIKE', 'ILIKE',
-    'TABLE', 'VIEW', 'INDEX', 'PRIMARY', 'KEY', 'FOREIGN', 'REFERENCES', 'DEFAULT', 'CONSTRAINT',
-    'UNIQUE', 'CHECK', 'CASCADE', 'RESTRICT', 'IF', 'BEGIN', 'COMMIT', 'ROLLBACK', 'EXPLAIN',
-  ])
-  const UNARY_AFTER_PUNCT = new Set(['(', ',', ';', '=', '<', '>', '+', '-', '*', '/', '%'])
-  const NON_UNARY_KW = new Set(['TRUE', 'FALSE', 'NULL', 'END'])
-  const isUnaryPosition = () => {
-    for (let k = tokens.length - 1; k >= 0; k--) {
-      if (tokens[k].type === 'ws') continue
-      const p = tokens[k]
-      if (p.type === 'op' || p.type === 'cast') return true
-      if (p.type === 'punct') return UNARY_AFTER_PUNCT.has(p.value)
-      if (p.type === 'word') {
-        const pu = p.value.toUpperCase()
-        return UPPER_KW.has(pu) && !NON_UNARY_KW.has(pu)
-      }
-      return false
-    }
-    return true
-  }
-
-  let i = 0
-  while (i < raw.length) {
-    const ch = raw[i]
-    if (/\s/.test(ch)) {
-      while (i < raw.length && /\s/.test(raw[i])) i++
-      tokens.push({ type: 'ws', value: ' ' })
-      continue
-    }
-    if (ch === '-' && raw[i + 1] === '-') {
-      let j = i + 2
-      while (j < raw.length && raw[j] !== '\n') j++
-      tokens.push({ type: 'line_comment', value: raw.slice(i, j).replace(/\r$/, '') })
-      i = j
-      continue
-    }
-    if (ch === '#' && allowHash) {
-      let j = i + 1
-      while (j < raw.length && raw[j] !== '\n') j++
-      tokens.push({ type: 'line_comment', value: raw.slice(i, j).replace(/\r$/, '') })
-      i = j
-      continue
-    }
-    if (ch === '/' && raw[i + 1] === '*') {
-      const end = raw.indexOf('*/', i + 2)
-      const j = end >= 0 ? end + 2 : raw.length
-      tokens.push({ type: 'block_comment', value: raw.slice(i, j) })
-      i = j
-      continue
-    }
-    if (ch === "'" || ch === '"' || ch === '`') {
-      const useBs =
-        ch === "'" &&
-        (isBacktick ||
-          ((driver === 'postgres' || driver === 'cockroachdb') &&
-            i > 0 &&
-            (raw[i - 1] === 'E' || raw[i - 1] === 'e') &&
-            (i === 1 || !isIdentCont(raw.charCodeAt(i - 2)))))
-      const j = scanQuotedEnd(raw, i, ch, useBs)
-      tokens.push({ type: 'quoted', value: raw.slice(i, j) })
-      i = j
-      continue
-    }
-    if (ch === '$') {
-      const tag = matchDollarTag(raw, i)
-      if (tag !== null) {
-        const closeIdx = raw.indexOf(tag, i + tag.length)
-        const j = closeIdx >= 0 ? closeIdx + tag.length : raw.length
-        tokens.push({ type: 'quoted', value: raw.slice(i, j) })
-        i = j
-        continue
-      }
-    }
-    if (ch === ':' && raw[i + 1] === ':') {
-      tokens.push({ type: 'cast', value: '::' })
-      i += 2
-      continue
-    }
-    if (
-      (ch === '-' || ch === '+') &&
-      isUnaryPosition() &&
-      i + 1 < raw.length &&
-      (/[0-9]/.test(raw[i + 1]) || (raw[i + 1] === '.' && /[0-9]/.test(raw[i + 2] || '')))
-    ) {
-      let j = i + 1
-      while (j < raw.length && /[0-9._eE+-]/.test(raw[j])) {
-        if ((raw[j] === '+' || raw[j] === '-') && !/[eE]/.test(raw[j - 1])) break
-        j++
-      }
-      tokens.push({ type: 'number', value: raw.slice(i, j) })
-      i = j
-      continue
-    }
-    if (/[0-9]/.test(ch)) {
-      let j = i + 1
-      while (j < raw.length && /[0-9._eE+-]/.test(raw[j])) {
-        if ((raw[j] === '+' || raw[j] === '-') && !/[eE]/.test(raw[j - 1])) break
-        j++
-      }
-      tokens.push({ type: 'number', value: raw.slice(i, j) })
-      i = j
-      continue
-    }
-    if (/[A-Za-z_]/.test(ch)) {
-      let j = i + 1
-      while (j < raw.length && /[A-Za-z0-9_$]/.test(raw[j])) j++
-      tokens.push({ type: 'word', value: raw.slice(i, j) })
-      i = j
-      continue
-    }
-    const two = raw.slice(i, i + 2)
-    if (two === '->' && raw[i + 2] === '>') {
-      tokens.push({ type: 'op', value: '->>' })
-      i += 3
-      continue
-    }
-    if (two === '<=' || two === '>=' || two === '<>' || two === '!=' || two === '||' || two === '->') {
-      tokens.push({ type: 'op', value: two })
-      i += 2
-      continue
-    }
-    tokens.push({ type: 'punct', value: ch })
-    i++
-  }
-
-  const NEWLINE_BEFORE = new Set([
-    'SELECT', 'FROM', 'WHERE', 'HAVING', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT',
-    'VALUES', 'SET', 'RETURNING', 'JOIN',
-  ])
-
-  let out = ''
-  let parenDepth = 0
-  let inBetween = false
-  const meaningful = tokens.filter((t) => t.type !== 'ws')
-  for (let idx = 0; idx < meaningful.length; idx++) {
-    const t = meaningful[idx]
-    const prev = idx > 0 ? meaningful[idx - 1] : null
-    const next = idx + 1 < meaningful.length ? meaningful[idx + 1] : null
-    const afterDot = prev?.type === 'punct' && prev.value === '.'
-    const upper = t.type === 'word' ? t.value.toUpperCase() : ''
-    const prevUpper = prev?.type === 'word' ? prev.value.toUpperCase() : ''
-    const nextUpper = next?.type === 'word' ? next.value.toUpperCase() : ''
-
-    if (t.type === 'punct' && t.value === ';') {
-      out = out.trimEnd() + ';\n\n'
-      parenDepth = 0
-      inBetween = false
-      continue
-    }
-    if (t.type === 'cast') {
-      out = out.trimEnd() + '::'
-      continue
-    }
-    if (t.type === 'punct' && t.value === '(') {
-      if (out && !out.endsWith(' ') && !out.endsWith('\n') && !out.endsWith('(') && prev?.type === 'word' && UPPER_KW.has(prevUpper)) {
-        out += ' '
-      }
-      out += '('
-      parenDepth++
-      continue
-    }
-    if (t.type === 'punct' && t.value === ')') {
-      parenDepth = Math.max(0, parenDepth - 1)
-      out = out.trimEnd() + ')'
-      continue
-    }
-    if (t.type === 'punct' && t.value === ',') {
-      out = out.trimEnd() + ','
-      out += parenDepth === 0 ? '\n  ' : ' '
-      continue
-    }
-    if (t.type === 'punct' && t.value === '.') {
-      out = out.trimEnd() + '.'
-      continue
-    }
-
-    const text = t.type === 'word' && !afterDot && UPPER_KW.has(upper) ? upper : t.value
-    const startsJoin = !afterDot && parenDepth === 0 && JOIN_PREFIX.has(upper) && (nextUpper === 'JOIN' || nextUpper === 'OUTER')
-    const startsGroupOrOrder = !afterDot && parenDepth === 0 && (upper === 'GROUP' || upper === 'ORDER') && nextUpper === 'BY'
-    const isPlainJoin = !afterDot && parenDepth === 0 && upper === 'JOIN' && !JOIN_PREFIX.has(prevUpper) && prevUpper !== 'OUTER'
-    const isBetweenAnd = !afterDot && parenDepth === 0 && upper === 'AND' && inBetween
-    if (!afterDot && parenDepth === 0 && upper === 'BETWEEN') {
-      inBetween = true
-    } else if (isBetweenAnd) {
-      inBetween = false
-    }
-    const isAndOr = !afterDot && parenDepth === 0 && (upper === 'AND' || upper === 'OR') && !isBetweenAnd
-    const isMajorBreak =
-      !afterDot &&
-      parenDepth === 0 &&
-      (startsJoin ||
-        startsGroupOrOrder ||
-        isPlainJoin ||
-        (NEWLINE_BEFORE.has(upper) && upper !== 'JOIN' && !(upper === 'SELECT' && prevUpper === 'AS')))
-
-    if (isMajorBreak) {
-      inBetween = false
-    }
-
-    if (out.length > 0 && !out.endsWith('\n') && !out.endsWith('\n  ')) {
-      if (isMajorBreak) {
-        out = out.trimEnd() + '\n'
-      } else if (isAndOr) {
-        out = out.trimEnd() + '\n  '
-      } else if (prev && prev.value !== '(' && prev.value !== '.' && prev.type !== 'cast') {
-        out += ' '
-      }
-    }
-    out += text
-    if (t.type === 'line_comment') {
-      out += '\n'
-    }
-  }
-  return out.trim()
+  return sharedFormatSql(String(sql || ''), driver || 'postgres')
 }
 
-function looksLikePanelJsonLiteral(trimmed) {
-  if (
-    (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
-    (trimmed.startsWith('[') && trimmed.endsWith(']'))
-  ) {
-    try {
-      const parsed = JSON.parse(trimmed)
-      return parsed !== null && typeof parsed === 'object'
-    } catch {
-      return false
-    }
-  }
-  return false
-}
-
-function detectPanelClipboardDelimiter(raw) {
-  const trimmed = raw.trim()
-  if (looksLikePanelJsonLiteral(trimmed)) {
-    return '\t'
-  }
-
-  let inQuotes = false
-  let atFieldStart = true
-  let hasQuotedCommaBoundary = false
-  const lineCommaCounts = []
-  let currentCommas = 0
-  let currentLineHasChars = false
-
-  for (let k = 0; k < raw.length; k++) {
-    const c = raw[k]
-    if (inQuotes) {
-      if (c === '"') {
-        if (raw[k + 1] === '"') {
-          k++
-          continue
-        }
-        inQuotes = false
-        if (raw[k + 1] === ',') {
-          hasQuotedCommaBoundary = true
-        }
-        continue
-      }
-      continue
-    }
-
-    if (atFieldStart && c === '"') {
-      inQuotes = true
-      atFieldStart = false
-      currentLineHasChars = true
-      continue
-    }
-
-    if (c === '\t') {
-      return '\t'
-    }
-
-    if (c === ',') {
-      currentCommas++
-      atFieldStart = true
-      currentLineHasChars = true
-      continue
-    }
-
-    if (c === '\r' || c === '\n') {
-      if (currentLineHasChars) {
-        lineCommaCounts.push(currentCommas)
-      }
-      currentCommas = 0
-      currentLineHasChars = false
-      atFieldStart = true
-      if (c === '\r' && raw[k + 1] === '\n') k++
-      continue
-    }
-
-    atFieldStart = false
-    currentLineHasChars = true
-  }
-
-  if (currentLineHasChars) {
-    lineCommaCounts.push(currentCommas)
-  }
-
-  if (lineCommaCounts.length === 0) return '\t'
-  if (lineCommaCounts.length >= 2) {
-    const first = lineCommaCounts[0]
-    if (first >= 1 && lineCommaCounts.every((count) => count === first)) {
-      return ','
-    }
-    return '\t'
-  }
-  if (hasQuotedCommaBoundary && lineCommaCounts[0] >= 1) {
-    return ','
-  }
-  return '\t'
-}
-
-export function parsePanelDelimitedText(text, options = {}) {
-  const raw = String(text ?? '')
-  if (!raw) return []
-  if (!options?.delimiter) {
-    const trimmed = raw.trim()
-    if (looksLikePanelJsonLiteral(trimmed)) {
-      return [[trimmed]]
-    }
-  }
-  const delim = options?.delimiter || detectPanelClipboardDelimiter(raw)
-  const rows = []
-  let row = []
-  let field = ''
-  let inQuotes = false
-  let atFieldStart = true
-  let i = 0
-  while (i < raw.length) {
-    const ch = raw[i]
-    if (inQuotes) {
-      if (ch === '"') {
-        if (raw[i + 1] === '"') {
-          field += '"'
-          i += 2
-        } else {
-          inQuotes = false
-          i++
-        }
-      } else {
-        field += ch
-        i++
-      }
-    } else if (atFieldStart && ch === '"') {
-      inQuotes = true
-      atFieldStart = false
-      i++
-    } else if (ch === delim) {
-      row.push(field)
-      field = ''
-      atFieldStart = true
-      i++
-    } else if (ch === '\r' || ch === '\n') {
-      if (ch === '\r' && raw[i + 1] === '\n') i++
-      row.push(field)
-      rows.push(row)
-      row = []
-      field = ''
-      atFieldStart = true
-      i++
-    } else {
-      field += ch
-      atFieldStart = false
-      i++
-    }
-  }
-  if (!atFieldStart || row.length > 0) {
-    row.push(field)
-    rows.push(row)
-  }
-  if (rows.length === 1 && rows[0].length === 1 && rows[0][0] === '' && /^[\r\n]+$/.test(raw)) {
-    return []
-  }
-  return rows
-}
-
+export const parsePanelDelimitedText = sharedParseDelimitedClipboard
 export const parseDelimitedClipboard = parsePanelDelimitedText
-
-function isPanelAutoOrGeneratedCol(col) {
-  return Boolean(col && (col.isAutoIncrement === true || col.isGenerated === true))
-}
-
-function detectPanelHeaderColMapping(firstRow, allColumns, rowCount, explicitHasHeaders) {
-  if (rowCount < 2 || !Array.isArray(firstRow) || firstRow.length === 0) return null
-  const lookup = new Map()
-  allColumns.forEach((col, idx) => lookup.set(String(col.name || '').trim().toLowerCase(), idx))
-  const mapped = []
-  for (const cell of firstRow) {
-    if (typeof cell !== 'string') return null
-    const key = cell.trim().toLowerCase()
-    if (!key) return null
-    const idx = lookup.get(key)
-    if (idx === undefined) return null
-    mapped.push(idx)
-  }
-  if (mapped.length === 1 && !explicitHasHeaders) return null
-  return mapped
-}
-
-function resolvePanelSourceHeaderMapping(sourceHeaders, clipWidth, allColumns) {
-  if (!Array.isArray(sourceHeaders) || sourceHeaders.length === 0 || sourceHeaders.length < clipWidth) {
-    return null
-  }
-  const lookup = new Map()
-  allColumns.forEach((col, idx) => lookup.set(String(col.name || '').trim().toLowerCase(), idx))
-  const mapped = []
-  for (let i = 0; i < sourceHeaders.length; i++) {
-    const idx = lookup.get(String(sourceHeaders[i] || '').trim().toLowerCase())
-    if (idx === undefined) return null
-    mapped.push(idx)
-  }
-  if (!mapped.some((idx) => !isPanelAutoOrGeneratedCol(allColumns[idx]))) {
-    return null
-  }
-  return mapped
-}
-
-export function planPanelGridPaste(input) {
-  const {
-    matrix,
-    hasSelection,
-    selectionBBox,
-    selectedCellCount,
-    existingRowCount,
-    visibleColIndices,
-    allColumns,
-    forceNewRows,
-    explicitHasHeaders = false,
-    sourceHeaders,
-  } = input
-
-  if (!Array.isArray(matrix) || matrix.length === 0 || !visibleColIndices?.length || !allColumns?.length) {
-    return {
-      mode: 'empty',
-      hadHeaders: false,
-      overwrites: [],
-      inserts: [],
-      startVisRow: 0,
-      startVisCol: 0,
-    }
-  }
-
-  const headerColMapping = detectPanelHeaderColMapping(
-    matrix[0],
-    allColumns,
-    matrix.length,
-    Boolean(explicitHasHeaders)
-  )
-  const hadHeaders = headerColMapping !== null
-  const dataRows = hadHeaders ? matrix.slice(1) : matrix
-  if (dataRows.length === 0) {
-    return {
-      mode: 'empty',
-      hadHeaders,
-      overwrites: [],
-      inserts: [],
-      startVisRow: 0,
-      startVisCol: 0,
-    }
-  }
-
-  const visColPosByModelIdx = new Map()
-  visibleColIndices.forEach((modelColIdx, visIdx) => visColPosByModelIdx.set(modelColIdx, visIdx))
-
-  let maxClipCols = 0
-  for (const row of dataRows) {
-    if (row.length > maxClipCols) maxClipCols = row.length
-  }
-
-  const isSingleScalar = dataRows.length === 1 && dataRows[0].length === 1
-  if (
-    !forceNewRows &&
-    hasSelection &&
-    existingRowCount > 0 &&
-    !hadHeaders &&
-    isSingleScalar &&
-    selectedCellCount > 1
-  ) {
-    return {
-      mode: 'fill',
-      hadHeaders: false,
-      fillValue: dataRows[0][0],
-      overwrites: [],
-      inserts: [],
-      startVisRow: selectionBBox?.startRow ?? 0,
-      startVisCol: selectionBBox?.startCol ?? 0,
-    }
-  }
-
-  const buildInsertCells = (rowCells, colResolver) => {
-    const cells = []
-    for (let dc = 0; dc < rowCells.length; dc++) {
-      const target = colResolver(dc)
-      if (!target) continue
-      const col = allColumns[target.modelColIdx]
-      if (!col || isPanelAutoOrGeneratedCol(col)) continue
-      cells.push({
-        modelColIdx: target.modelColIdx,
-        visColIdx: target.visColIdx,
-        rawValue: rowCells[dc],
-      })
-    }
-    return cells
-  }
-
-  if (!hasSelection || !selectionBBox || forceNewRows || existingRowCount <= 0) {
-    let insertColResolver
-    if (headerColMapping) {
-      insertColResolver = (dc) => {
-        const modelColIdx = headerColMapping[dc]
-        if (modelColIdx === undefined || modelColIdx < 0 || modelColIdx >= allColumns.length) {
-          return null
-        }
-        return { modelColIdx, visColIdx: visColPosByModelIdx.get(modelColIdx) ?? -1 }
-      }
-    } else {
-      const anchorCol =
-        hasSelection && selectionBBox && maxClipCols < visibleColIndices.length
-          ? Math.max(0, selectionBBox.startCol)
-          : 0
-      const canUseSourceMapping =
-        !hasSelection ||
-        !selectionBBox ||
-        (forceNewRows && anchorCol === 0 && maxClipCols < visibleColIndices.length)
-      const sourceMapping = canUseSourceMapping
-        ? resolvePanelSourceHeaderMapping(sourceHeaders, maxClipCols, allColumns)
-        : null
-
-      if (sourceMapping) {
-        insertColResolver = (dc) => {
-          const modelColIdx = sourceMapping[dc]
-          if (modelColIdx === undefined || modelColIdx < 0 || modelColIdx >= allColumns.length) {
-            return null
-          }
-          return { modelColIdx, visColIdx: visColPosByModelIdx.get(modelColIdx) ?? -1 }
-        }
-      } else {
-        const writableVisibleCols = visibleColIndices.filter(
-          (modelColIdx) => !isPanelAutoOrGeneratedCol(allColumns[modelColIdx])
-        )
-        const shouldSkipLeadingAuto =
-          anchorCol === 0 &&
-          maxClipCols < visibleColIndices.length &&
-          writableVisibleCols.length > 0 &&
-          isPanelAutoOrGeneratedCol(allColumns[visibleColIndices[0]])
-        if (shouldSkipLeadingAuto) {
-          insertColResolver = (dc) => {
-            const modelColIdx = writableVisibleCols[dc]
-            if (modelColIdx === undefined) return null
-            return { modelColIdx, visColIdx: visColPosByModelIdx.get(modelColIdx) ?? -1 }
-          }
-        } else {
-          insertColResolver = (dc) => {
-            const visColIdx = anchorCol + dc
-            const modelColIdx = visibleColIndices[visColIdx]
-            if (modelColIdx === undefined) return null
-            return { modelColIdx, visColIdx }
-          }
-        }
-      }
-    }
-
-    const inserts = dataRows.map((rowCells) => ({
-      cells: buildInsertCells(rowCells, insertColResolver),
-    }))
-    return {
-      mode: 'insert',
-      hadHeaders,
-      overwrites: [],
-      inserts,
-      startVisRow: existingRowCount,
-      startVisCol: 0,
-    }
-  }
-
-  const startVisRow = Math.max(0, selectionBBox.startRow)
-  const effectiveStartCol = headerColMapping
-    ? 0
-    : maxClipCols >= visibleColIndices.length
-      ? 0
-      : Math.max(0, selectionBBox.startCol)
-
-  const resolveColumn = (dc) => {
-    if (headerColMapping) {
-      const modelColIdx = headerColMapping[dc]
-      if (modelColIdx === undefined || modelColIdx < 0 || modelColIdx >= allColumns.length) {
-        return null
-      }
-      return { modelColIdx, visColIdx: visColPosByModelIdx.get(modelColIdx) ?? -1 }
-    }
-    const visColIdx = effectiveStartCol + dc
-    const modelColIdx = visibleColIndices[visColIdx]
-    if (modelColIdx === undefined) return null
-    return { modelColIdx, visColIdx }
-  }
-
-  const overwrites = []
-  const inserts = []
-
-  for (let dr = 0; dr < dataRows.length; dr++) {
-    const targetVisRow = startVisRow + dr
-    const rowCells = dataRows[dr]
-    if (targetVisRow < existingRowCount) {
-      const cells = []
-      for (let dc = 0; dc < rowCells.length; dc++) {
-        const target = resolveColumn(dc)
-        if (!target) continue
-        cells.push({
-          modelColIdx: target.modelColIdx,
-          visColIdx: target.visColIdx,
-          rawValue: rowCells[dc],
-        })
-      }
-      overwrites.push({ targetVisRow, cells })
-    } else {
-      inserts.push({ cells: buildInsertCells(rowCells, resolveColumn) })
-    }
-  }
-
-  const mode =
-    overwrites.length > 0 && inserts.length > 0
-      ? 'overwrite-and-insert'
-      : overwrites.length > 0
-        ? 'overwrite'
-        : 'insert'
-
-  return {
-    mode,
-    hadHeaders,
-    overwrites,
-    inserts,
-    startVisRow,
-    startVisCol: effectiveStartCol,
-  }
-}
+export const planPanelGridPaste = sharedPlanGridPaste
 
 export function normalizeCellRange(r1, c1, r2, c2) {
   return {
@@ -1493,133 +700,11 @@ export function buildTruncateOrDropSql(action, obj, driver) {
 // Pure Visual Structure Designer Validators & Migration SQL Builders
 // ============================================================================
 
-export function findPanelTopLevelCastIdx(input) {
-  let depth = 0
-  let inSingle = false
-  let inDouble = false
-  let lastIdx = -1
-  for (let i = 0; i < input.length; i++) {
-    const ch = input[i]
-    if (ch === "'" && !inDouble) {
-      if (inSingle && input[i + 1] === "'") { i++; continue }
-      inSingle = !inSingle
-      continue
-    }
-    if (ch === '"' && !inSingle) {
-      if (inDouble && input[i + 1] === '"') { i++; continue }
-      inDouble = !inDouble
-      continue
-    }
-    if (inSingle || inDouble) continue
-    if (ch === '(' || ch === '[') depth++
-    else if (ch === ')' || ch === ']') {
-      if (depth > 0) depth--
-    } else if (depth === 0 && ch === ':' && input[i + 1] === ':') {
-      lastIdx = i
-      i++
-    }
-  }
-  return lastIdx
-}
-
-export function panelHasBalancedParens(input, singleOuterGroupOnly = false) {
-  let depth = 0
-  let inSingle = false
-  for (let i = 0; i < input.length; i++) {
-    const ch = input[i]
-    if (ch === "'") {
-      if (inSingle && input[i + 1] === "'") { i++; continue }
-      inSingle = !inSingle
-      continue
-    }
-    if (inSingle) continue
-    if (ch === '(') depth++
-    else if (ch === ')') {
-      depth--
-      if (depth < 0) return false
-      if (singleOuterGroupOnly && depth === 0 && i < input.length - 1) return false
-    }
-  }
-  return !inSingle && depth === 0
-}
-
-export function isPanelNumericOrBoolType(dataType) {
-  return /^(?:INT|BIGINT|SMALLINT|TINYINT|MEDIUMINT|SERIAL|BIGSERIAL|REAL|FLOAT|DOUBLE|DEC|NUMERIC|BOOL|BIT)/i.test(
-    String(dataType || '').trim()
-  )
-}
-
-export function validatePanelTypeSpec(rawType) {
-  const cleaned = String(rawType || '').trim()
-  if (!cleaned) throw new Error('Column data type is required.')
-  if (!/^[A-Za-z][A-Za-z0-9_(),\s[\]]*$/.test(cleaned) || !panelHasBalancedParens(cleaned)) {
-    throw new Error(`Invalid SQL column type: ${rawType}`)
-  }
-  if (FORBIDDEN_SUBQUERY_RE.test(cleaned)) {
-    throw new Error(`Invalid SQL keyword in column type: ${rawType}`)
-  }
-  return cleaned
-}
-
-export function normalizePanelDefaultExpr(rawDef, dataType = 'TEXT') {
-  const trimmed = String(rawDef ?? '').trim()
-  if (!trimmed) return ''
-  if (/[;\r\n\0]|--|\/\*|\*\//.test(trimmed)) {
-    throw new Error('Default value contains invalid SQL tokens.')
-  }
-  if (/^'(?:[^']|'')*'$/.test(trimmed)) {
-    if (isPanelNumericOrBoolType(dataType)) {
-      const inner = trimmed.slice(1, -1).replace(/''/g, "'").trim()
-      if (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(inner) && !/^(?:TRUE|FALSE)$/i.test(inner)) {
-        throw new Error(`Invalid default ${trimmed} for numeric/boolean type "${dataType}".`)
-      }
-    }
-    return trimmed
-  }
-  if (trimmed.startsWith('(') && trimmed.endsWith(')')) {
-    if (!panelHasBalancedParens(trimmed, true) || FORBIDDEN_SUBQUERY_RE.test(trimmed)) {
-      throw new Error('Invalid parenthesized default expression.')
-    }
-    return trimmed
-  }
-  if (/^X'[0-9A-Fa-f]*'$/i.test(trimmed)) {
-    return trimmed
-  }
-  const castIdx = findPanelTopLevelCastIdx(trimmed)
-  if (castIdx > 0) {
-    const rhs = validatePanelTypeSpec(trimmed.slice(castIdx + 2).trim())
-    const lhs = normalizePanelDefaultExpr(trimmed.slice(0, castIdx).trim(), rhs)
-    return `${lhs}::${rhs}`
-  }
-  if (/^NULL$/i.test(trimmed) || /^(?:TRUE|FALSE)$/i.test(trimmed) || /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(trimmed)) {
-    return trimmed
-  }
-  if (KNOWN_SQL_DEFAULTS_RE.test(trimmed)) {
-    if (!panelHasBalancedParens(trimmed) || FORBIDDEN_SUBQUERY_RE.test(trimmed)) {
-      throw new Error('Invalid SQL default function.')
-    }
-    return trimmed
-  }
-  if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
-    if (isPanelNumericOrBoolType(dataType)) {
-      throw new Error(`Numeric/boolean column cannot use string default ${trimmed}.`)
-    }
-    return `'${trimmed.slice(1, -1).replace(/'/g, "''")}'`
-  }
-  if (trimmed.includes('#') || trimmed.includes("'")) {
-    if (!trimmed.startsWith("'") && !isPanelNumericOrBoolType(dataType) && !/\b(?:OR|AND|SELECT|UNION)\b/i.test(trimmed)) {
-      return `'${trimmed.replace(/'/g, "''")}'`
-    }
-    throw new Error(`Invalid SQL default expression: ${trimmed}`)
-  }
-  if (isPanelNumericOrBoolType(dataType)) {
-    throw new Error(`Invalid default "${trimmed}" for numeric/boolean type "${dataType}".`)
-  }
-  if (FORBIDDEN_SUBQUERY_RE.test(trimmed)) {
-    throw new Error(`Invalid SQL keyword in default: ${trimmed}`)
-  }
-  return `'${trimmed.replace(/'/g, "''")}'`
-}
+export const findPanelTopLevelCastIdx = sharedFindTopLevelPostgresCastIndex
+export const panelHasBalancedParens = sharedHasBalancedParens
+export const isPanelNumericOrBoolType = sharedIsNumericOrBooleanTypeName
+export const validatePanelTypeSpec = sharedValidateColumnTypeSpec
+export const normalizePanelDefaultExpr = sharedNormalizeSqlDefaultExpression
 
 export function createPanelStructDraft(details) {
   const columns = (details.columns || []).map((c, idx) => {
@@ -2243,23 +1328,7 @@ export function validatePanelStructDraft(draft, driver, knownTableNames = []) {
 // ============================================================================
 
 export function sanitizeFeedbackError(rawError) {
-  const raw = String(rawError || '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').trim()
-  if (!raw) return ''
-  let clean = raw
-    .replace(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s'"<>]+/g, '<redacted-uri>')
-    .replace(/\b(?:password|passwd|pwd|user|username|token|secret|authToken|api_?key)\s*[:=]\s*[^\s,;'"<>]+/gi, '<redacted-secret>')
-    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer <redacted-token>')
-    .replace(/[A-Za-z]:\\[^\s'"<>]+/g, '<redacted-path>')
-    .replace(/\/(?:Users|home|var|tmp|etc|opt|private|mnt|srv)\/[^\s'"<>]+/g, '<redacted-path>')
-    .replace(/[^\s@'"<>]+@[^\s@'"<>]+\.[^\s@'"<>]+/g, '<redacted-endpoint>')
-    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, '<redacted-ip>')
-    .replace(/\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.(?:co|com|io|net|org|dev|tech|cloud|app|local|internal|lan)(?::\d+)?\b/gi, '<redacted-host>')
-    .replace(/\s+/g, ' ')
-    .trim()
-  if (clean.length > 280) {
-    clean = `${clean.slice(0, 277)}...`
-  }
-  return clean
+  return sharedSanitizeDiagnosticErrorText(rawError, { stripControlChars: true, ellipsis: true })
 }
 
 export function buildPanelFeedbackMarkdown({
@@ -2341,3 +1410,11 @@ export function buildGithubIssueUrl({ kind = 'bug', title = '', markdownBody = '
   }
   return `${DATANOA_GITHUB_ISSUES_URL}?${params.toString()}`
 }
+
+export {
+  createPanelConsoleTabsManager,
+  computePanelSqlCompletions,
+  encodePanelTableSelectValue,
+  decodePanelTableSelectValue,
+} from './panel-sql-tabs.js'
+

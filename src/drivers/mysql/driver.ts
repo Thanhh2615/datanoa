@@ -1021,6 +1021,7 @@ export class MysqlSession implements IDatabaseSession {
             throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', this.driverType)
           }
           const trimmedStmt = stmtSql.trim()
+          const stmtStart = performance.now()
           const normalizedStmt = stripLeadingSqlComments(trimmedStmt, this.driverType).trim()
           const isStandaloneBegin = /^(?:BEGIN|START\s+TRANSACTION)\b/i.test(normalizedStmt)
 
@@ -1051,11 +1052,14 @@ export class MysqlSession implements IDatabaseSession {
             throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
           }
           const parsed = parseMysqlQueryResult(rows, fields, maxRows)
+          const stmtDurationMs = Math.round(performance.now() - stmtStart)
           if (parsed.isSelect) {
             lastSelect = parsed.result
             collectedSets.push({
               index: execIndex,
               sqlPreview: compactSql(trimmedStmt),
+              sql: trimmedStmt,
+              executionTimeMs: stmtDurationMs,
               columns: parsed.result.columns,
               rows: parsed.result.rows,
               rowCount: parsed.result.rowCount,
@@ -1067,6 +1071,8 @@ export class MysqlSession implements IDatabaseSession {
             collectedSets.push({
               index: execIndex,
               sqlPreview: compactSql(trimmedStmt),
+              sql: trimmedStmt,
+              executionTimeMs: stmtDurationMs,
               columns: [{ name: 'affected_rows', type: 'INTEGER' }],
               rows: [[parsed.affectedRows]],
               rowCount: 1,
@@ -1079,6 +1085,8 @@ export class MysqlSession implements IDatabaseSession {
             collectedSets.push({
               index: execIndex,
               sqlPreview: compactSql(trimmedStmt),
+              sql: trimmedStmt,
+              executionTimeMs: stmtDurationMs,
               columns: [{ name: 'affected_rows', type: 'INTEGER' }],
               rows: [[parsed.affectedRows]],
               rowCount: 1,

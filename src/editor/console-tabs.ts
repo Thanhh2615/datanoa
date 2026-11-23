@@ -2,7 +2,46 @@
 // Pure state manager for Phase 2: Multi-Tab SQL Console
 // Zero-DOM, zero-dependency, manages independent SQL docs, cursors, and multi-result sets
 
-import type { QueryResult } from '../protocol.js'
+import type { ColumnInfo, QueryResult } from '../protocol.js'
+import type { GridRuntimeSnapshot } from './grid.js'
+
+export interface ResultBannerState {
+  kind: 'success' | 'error'
+  title: string
+  detail: string
+  dismissed: boolean
+  showBackToTable?: boolean
+  errorText?: string
+  isExplain?: boolean
+}
+
+export interface EditableSqlTargetMeta {
+  table: string
+  schema?: string
+  primaryKey: string[]
+  columns: ColumnInfo[]
+  originTabId?: string
+  originResultSetIndex?: number
+  originConnectionId?: string
+}
+
+export interface ResultSetTabRuntimeState {
+  resultSetIndex: number
+  baseStatementSql: string
+  statementSql: string
+  banner: ResultBannerState | null
+  whereClause: string
+  orderByClause: string
+  searchMode: 'filter' | 'find'
+  clientSearchText: string
+  gridSnapshot: GridRuntimeSnapshot | null
+  editableSqlTarget: EditableSqlTargetMeta | null
+  activeEditableStmtSql: string
+  currentCanEdit: boolean
+  gridSubbarTitle: string
+  gridPageInfo: string
+  emptyMessage: string
+}
 
 export interface SqlConsoleTabState {
   id: string
@@ -10,9 +49,11 @@ export interface SqlConsoleTabState {
   sql: string
   cursorOffset?: number
   lastResult?: QueryResult | null
+  lastResultMode?: 'query' | 'explain'
   activeResultSetIndex: number
   executedSql?: string
   executedConnectionId?: string
+  resultStates?: Record<number, ResultSetTabRuntimeState>
 }
 
 export interface PersistedConsoleTabsState {
@@ -137,9 +178,11 @@ export class ConsoleTabsManager {
       onlyTab.sql = ''
       onlyTab.cursorOffset = 0
       onlyTab.lastResult = null
+      onlyTab.lastResultMode = undefined
       onlyTab.activeResultSetIndex = 0
       onlyTab.executedSql = ''
       onlyTab.executedConnectionId = undefined
+      onlyTab.resultStates = {}
       return true
     }
 
@@ -189,16 +232,25 @@ export class ConsoleTabsManager {
     result: QueryResult | null,
     activeResultSetIndex = 0,
     executedSql?: string,
-    executedConnectionId?: string
+    executedConnectionId?: string,
+    mode: 'query' | 'explain' = 'query'
   ): void {
     const tab = this.getActiveTab()
+    if (tab.lastResult !== result) {
+      tab.resultStates = {}
+    }
     tab.lastResult = result
     tab.activeResultSetIndex = Math.max(0, activeResultSetIndex)
     if (executedSql !== undefined) tab.executedSql = executedSql
     if (result === null) {
+      tab.lastResultMode = undefined
       tab.executedConnectionId = undefined
-    } else if (executedConnectionId !== undefined) {
-      tab.executedConnectionId = executedConnectionId
+      tab.resultStates = {}
+    } else {
+      tab.lastResultMode = mode
+      if (executedConnectionId !== undefined) {
+        tab.executedConnectionId = executedConnectionId
+      }
     }
   }
 
@@ -211,7 +263,9 @@ export class ConsoleTabsManager {
     result: QueryResult | null,
     activeResultSetIndex = 0,
     executedSql?: string,
-    executedConnectionId?: string
+    executedConnectionId?: string,
+    resultStates?: Record<number, ResultSetTabRuntimeState>,
+    mode: 'query' | 'explain' = 'query'
   ): boolean {
     const tab = this.tabs.find((t) => t.id === tabId)
     if (!tab) {
@@ -221,11 +275,44 @@ export class ConsoleTabsManager {
     tab.activeResultSetIndex = Math.max(0, activeResultSetIndex)
     if (executedSql !== undefined) tab.executedSql = executedSql
     if (result === null) {
+      tab.lastResultMode = undefined
       tab.executedConnectionId = undefined
-    } else if (executedConnectionId !== undefined) {
-      tab.executedConnectionId = executedConnectionId
+      tab.resultStates = {}
+    } else {
+      tab.lastResultMode = mode
+      if (executedConnectionId !== undefined) {
+        tab.executedConnectionId = executedConnectionId
+      }
+      tab.resultStates = resultStates ? { ...resultStates } : {}
     }
     return true
+  }
+
+  getResultTabState(resultIndex: number, tabId?: string): ResultSetTabRuntimeState | undefined {
+    const tab = tabId ? this.tabs.find((t) => t.id === tabId) : this.getActiveTab()
+    return tab?.resultStates?.[resultIndex]
+  }
+
+  setResultTabState(
+    resultIndex: number,
+    state: ResultSetTabRuntimeState,
+    tabId?: string
+  ): void {
+    const tab = tabId ? this.tabs.find((t) => t.id === tabId) : this.getActiveTab()
+    if (!tab) return
+    if (!tab.resultStates) {
+      tab.resultStates = {}
+    }
+    tab.resultStates[resultIndex] = state
+  }
+
+  setResultStatesForTab(
+    tabId: string,
+    states: Record<number, ResultSetTabRuntimeState>
+  ): void {
+    const tab = this.tabs.find((t) => t.id === tabId)
+    if (!tab) return
+    tab.resultStates = { ...states }
   }
 
   /**

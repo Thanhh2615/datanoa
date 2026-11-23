@@ -67,12 +67,20 @@ datanoa/
 ├── build/
 │   ├── bundle-drivers.mjs                # esbuild bundler + size & CSP static auditor
 │   └── check-package-size.mjs            # Package payload & vendor size budget guard
-├── images/                               # 1600x1000 (16:10) screenshots & cover
+├── images/                               # 960x600 cover & 1280x800/1600x1000 (16:10) screenshots
 ├── src/
 │   ├── protocol.ts                       # Canonical IPC contracts & payload sanitizer
+│   ├── shared-collapsible-select.js      # Shared searchable & collapsible select dropdown controller
+│   ├── shared-collapsible-select.d.ts    # TypeScript declaration for shared-collapsible-select.js
 │   ├── shared-constants.ts               # Shared version, timeout, chunk & storage constants
+│   ├── shared-db-icons.js                # Shared DB engine, folder & workspace SVG icons (Studio & Side Panel)
+│   ├── shared-db-icons.d.ts              # TypeScript declaration for shared-db-icons.js
 │   ├── shared-file-picker.js             # Shared in-app file/folder picker modal (Studio & Side Panel)
 │   ├── shared-file-picker.d.ts           # TypeScript declaration for shared-file-picker.js
+│   ├── shared-grid-paste.js              # Shared delimited clipboard, paste planner & error sanitizer
+│   ├── shared-grid-paste.d.ts            # TypeScript declaration for shared-grid-paste.js
+│   ├── shared-sql-core.js                # Shared SQL lexer, splitter, formatter, DDL guard & type/default validators
+│   ├── shared-sql-core.d.ts              # TypeScript declaration for shared-sql-core.js
 │   ├── assets/
 │   │   ├── geist-font.js                 # Embedded WOFF2 data URI for Studio & Side Panel
 │   │   ├── geist-font.d.ts               # TypeScript declaration for geist-font.js
@@ -108,7 +116,8 @@ datanoa/
 │   │   ├── studio-columns-popover.ts     # Column visibility & pin popover
 │   │   ├── studio-export.ts              # Export dropdown & file download orchestration
 │   │   ├── db-icons.ts                   # Engine SVG icons & select dropdown helpers
-│   │   ├── connection-modal.ts           # Connection Manager Modal (SSH, TLS/mTLS, local drivers)
+│   │   ├── connection-modal.ts           # Connection Manager Modal (SSH, TLS/mTLS, local drivers, auto-discovery)
+│   │   ├── result-set-controller.ts      # Shared multi-result tab bar, filtering & inline edit controller
 │   │   ├── driver-manager-modal.ts       # Built-in & local Driver Manager Modal
 │   │   ├── file-picker-modal.ts          # In-app file and folder picker modal
 │   │   ├── studio-modals.ts              # Command Palette, Shortcuts, Create/Drop & modal types
@@ -145,10 +154,13 @@ datanoa/
 │   │   ├── panel-core.js                 # Side Panel SQL, clipboard paste, migration & feedback helpers
 │   │   ├── panel-utils.js                # Brand SVGs, RPC bridge, clipboard & virtual window
 │   │   ├── panel-selection.js            # Side Panel multi-cell selection & aggregates
-│   │   ├── panel-connection-form.js      # Connection form, URI parser & workspace discovery
+│   │   ├── panel-connection-form.js      # Connection form, URI parser & .env / Docker Compose / .db discovery
 │   │   ├── panel-explorer.js             # Schema explorer tree & context menus
 │   │   ├── panel-data-grid.js            # Virtualized data grid, staging & inspector
-│   │   ├── panel-sql.js                  # SQL runner, autocomplete, EXPLAIN & history
+│   │   ├── panel-cm.js                   # CodeMirror 6 SQL adapter & schema completion for Side Panel
+│   │   ├── panel-sql-tabs.js             # Side Panel multi-tab SQL state & persistence
+│   │   ├── panel-result-sets.js          # Side Panel multi-result tab controller
+│   │   ├── panel-sql.js                  # SQL runner, multi-EXPLAIN, autocomplete & history
 │   │   ├── panel-structure.js            # Visual Table Designer & type combobox
 │   │   └── panel-feedback-palette.js     # Command Palette, confirmation modals & shortcuts
 │   └── worker/
@@ -158,7 +170,8 @@ datanoa/
 │       ├── rpc-data-schema.ts            # Schema introspection & data browse/mutation RPCs
 │       ├── rpc-query-tx.ts               # Query execution, cancellation, history & transactions
 │       ├── session-manager.ts            # Connection profile storage & secrets vault manager
-│       └── discovery.ts                  # Bounded .env parser & async BFS SQLite scanner
+│       ├── discovery.ts                  # Bounded .env parser & async BFS SQLite scanner
+│       └── docker-compose-discovery.ts   # Hybrid Docker CLI & static Compose YAML discovery parser
 ```
 
 ---

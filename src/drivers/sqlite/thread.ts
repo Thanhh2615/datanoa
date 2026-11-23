@@ -385,6 +385,7 @@ workerPort.on('message', (msg: WorkerRequest) => {
           const rawSql = execList[execIndex]
           const trimmedStmt = rawSql.trim()
           if (!trimmedStmt) continue
+          const stmtStart = performance.now()
           const normalizedStmt = stripLeadingSqlComments(trimmedStmt)
           const isStandaloneBegin = /^(?:BEGIN|START\s+TRANSACTION)\b/i.test(normalizedStmt)
 
@@ -428,6 +429,8 @@ workerPort.on('message', (msg: WorkerRequest) => {
             collectedSets.push({
               index: execIndex,
               sqlPreview: compactSql(trimmedStmt),
+              sql: trimmedStmt,
+              executionTimeMs: Math.round(performance.now() - stmtStart),
               columns: cols,
               rows,
               rowCount: rows.length,
@@ -441,6 +444,8 @@ workerPort.on('message', (msg: WorkerRequest) => {
             collectedSets.push({
               index: execIndex,
               sqlPreview: compactSql(trimmedStmt),
+              sql: trimmedStmt,
+              executionTimeMs: Math.round(performance.now() - stmtStart),
               columns: [{ name: 'affected_rows', type: 'INTEGER' }],
               rows: [[changes]],
               rowCount: 1,

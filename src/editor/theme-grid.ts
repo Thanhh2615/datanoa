@@ -87,7 +87,7 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-filter-input:focus {
-    border-color: var(--info);
+    border-color: var(--accent-ring);
   }
 
   .datanoa-filter-input:disabled {
@@ -110,7 +110,7 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-client-search:focus {
-    border-color: var(--info);
+    border-color: var(--accent-ring);
   }
 
   /* DML Preview Inline Drawer */
@@ -150,7 +150,7 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-grid-container:focus-visible {
-    outline: 2px solid var(--info);
+    outline: 2px solid var(--accent-ring);
     outline-offset: -2px;
   }
 
@@ -231,14 +231,14 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-th.datanoa-th-selected {
-    color: rgba(186, 230, 253, 0.92);
-    background: color-mix(in srgb, var(--info) 8%, var(--card));
+    color: var(--text);
+    background: color-mix(in srgb, var(--accent-ring) 14%, var(--card));
   }
 
   html.light .datanoa-th.datanoa-th-selected,
   body.light .datanoa-th.datanoa-th-selected {
-    color: var(--info);
-    background: color-mix(in srgb, var(--info) 9%, var(--card));
+    color: var(--text);
+    background: color-mix(in srgb, var(--accent-ring) 12%, var(--card));
   }
 
   .datanoa-th-inner {
@@ -268,7 +268,7 @@ export const EDITOR_GRID_STYLE = `
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
-    color: var(--info);
+    color: var(--accent-ring);
     font-size: 10px;
     opacity: 0.9;
   }
@@ -304,13 +304,13 @@ export const EDITOR_GRID_STYLE = `
   .datanoa-col-select-btn:hover {
     background: var(--hover);
     border-color: var(--border-strong);
-    color: var(--info);
+    color: var(--text);
   }
 
   .datanoa-col-filter-btn.active {
-    color: var(--info);
-    background: color-mix(in srgb, var(--info) 14%, transparent);
-    border-color: color-mix(in srgb, var(--info) 38%, transparent);
+    color: var(--text);
+    background: color-mix(in srgb, var(--accent-ring) 16%, transparent);
+    border-color: color-mix(in srgb, var(--accent-ring) 55%, transparent);
   }
 
   .datanoa-col-filter-popover {
@@ -321,7 +321,7 @@ export const EDITOR_GRID_STYLE = `
     display: flex;
     flex-direction: column;
     gap: 6px;
-    background: var(--card);
+    background: var(--popover);
     color: var(--text);
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
@@ -353,7 +353,7 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-th.datanoa-th-selected .datanoa-col-select-btn {
-    color: var(--info);
+    color: var(--text);
   }
 
   .datanoa-th-row-label {
@@ -405,7 +405,7 @@ export const EDITOR_GRID_STYLE = `
 
   .datanoa-resize-handle:hover::after,
   .datanoa-resize-handle.resizing::after {
-    background: var(--info);
+    background: var(--accent-ring);
   }
 
   .datanoa-tr {
@@ -416,12 +416,7 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-tr.datanoa-tr-even {
-    background: rgba(255, 255, 255, 0.02);
-  }
-
-  html.light .datanoa-tr.datanoa-tr-even,
-  body.light .datanoa-tr.datanoa-tr-even {
-    background: rgba(15, 23, 42, 0.02);
+    background: color-mix(in srgb, var(--text) 2.5%, var(--bg));
   }
 
   .datanoa-tr:hover {
@@ -429,22 +424,17 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-tr.datanoa-row-selected {
-    background: rgba(255, 255, 255, 0.028);
-  }
-
-  html.light .datanoa-tr.datanoa-row-selected,
-  body.light .datanoa-tr.datanoa-row-selected {
-    background: rgba(15, 23, 42, 0.03);
+    background: color-mix(in srgb, var(--text) 4%, var(--bg));
   }
 
   .datanoa-tr.datanoa-row-inserted,
   .datanoa-tr.datanoa-row-inserted:hover {
-    background: rgba(74, 222, 128, 0.12);
+    background: color-mix(in srgb, var(--ok) 12%, transparent);
   }
 
   .datanoa-tr.datanoa-row-deleted,
   .datanoa-tr.datanoa-row-deleted:hover {
-    background: rgba(248, 113, 113, 0.14);
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
   }
 
   .datanoa-tr.datanoa-row-deleted .datanoa-td {
@@ -483,15 +473,9 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-td.datanoa-cell-in-range.datanoa-cell-selected {
-    background: rgba(56, 189, 248, 0.025);
-    outline: 1px solid rgba(56, 189, 248, 0.5);
+    background: color-mix(in srgb, var(--accent-ring) 6%, transparent);
+    outline: 1px solid var(--sel-focus);
     outline-offset: -1px;
-  }
-
-  html.light .datanoa-td.datanoa-cell-in-range.datanoa-cell-selected,
-  body.light .datanoa-td.datanoa-cell-in-range.datanoa-cell-selected {
-    background: rgba(3, 105, 161, 0.03);
-    outline: 1px solid rgba(3, 105, 161, 0.55);
   }
 
   .datanoa-td.datanoa-range-top {
@@ -511,22 +495,22 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-td.datanoa-cell-staged {
-    background: rgba(56, 189, 248, 0.18);
+    background: color-mix(in srgb, var(--info) 16%, transparent);
     font-weight: 500;
   }
 
   .datanoa-td.datanoa-cell-match {
-    background: rgba(251, 191, 36, 0.22);
+    background: color-mix(in srgb, var(--warn) 22%, transparent);
   }
 
   .datanoa-td.datanoa-cell-match-active {
-    background: rgba(251, 191, 36, 0.42);
+    background: color-mix(in srgb, var(--warn) 42%, transparent);
     outline: 1.5px solid var(--warn);
     outline-offset: -1.5px;
     z-index: 3;
   }
 
-  /* Pinned / Frozen Columns (strictly opaque color-mix in Dark OLED & Light modes) */
+  /* Pinned / Frozen Columns (strictly opaque color-mix in Dark & Light modes) */
   .datanoa-col-pinned {
     position: sticky;
     z-index: 5;
@@ -537,66 +521,48 @@ export const EDITOR_GRID_STYLE = `
     background: color-mix(in srgb, var(--text) 2.5%, var(--bg));
   }
 
-  html.light .datanoa-tr.datanoa-tr-even .datanoa-col-pinned {
-    background: color-mix(in srgb, var(--text) 2.5%, var(--bg));
-  }
-
-  .datanoa-tr:hover .datanoa-col-pinned,
-  html.light .datanoa-tr:hover .datanoa-col-pinned {
+  .datanoa-tr:hover .datanoa-col-pinned {
     background: color-mix(in srgb, var(--text) 7%, var(--bg));
   }
 
-  .datanoa-tr.datanoa-row-selected .datanoa-col-pinned,
-  html.light .datanoa-tr.datanoa-row-selected .datanoa-col-pinned {
-    background: color-mix(in srgb, var(--info) 12%, var(--bg));
+  .datanoa-tr.datanoa-row-selected .datanoa-col-pinned {
+    background: color-mix(in srgb, var(--accent-ring) 12%, var(--bg));
   }
 
-  .datanoa-tr.datanoa-row-inserted .datanoa-col-pinned,
-  html.light .datanoa-tr.datanoa-row-inserted .datanoa-col-pinned {
+  .datanoa-tr.datanoa-row-inserted .datanoa-col-pinned {
     background: color-mix(in srgb, var(--ok) 12%, var(--bg));
   }
 
-  .datanoa-tr.datanoa-row-deleted .datanoa-col-pinned,
-  html.light .datanoa-tr.datanoa-row-deleted .datanoa-col-pinned {
+  .datanoa-tr.datanoa-row-deleted .datanoa-col-pinned {
     background: color-mix(in srgb, var(--danger) 14%, var(--bg));
   }
 
-  .datanoa-td.datanoa-col-pinned.datanoa-cell-in-range,
-  html.light .datanoa-td.datanoa-col-pinned.datanoa-cell-in-range {
-    background: color-mix(in srgb, var(--info) 9%, var(--bg));
+  .datanoa-td.datanoa-col-pinned.datanoa-cell-in-range {
+    background: color-mix(in srgb, var(--accent-ring) 10%, var(--bg));
   }
 
   .datanoa-td.datanoa-col-pinned.datanoa-cell-selected,
-  .datanoa-td.datanoa-col-pinned.datanoa-cell-in-range.datanoa-cell-selected,
-  html.light .datanoa-td.datanoa-col-pinned.datanoa-cell-selected,
-  html.light .datanoa-td.datanoa-col-pinned.datanoa-cell-in-range.datanoa-cell-selected,
-  body.light .datanoa-td.datanoa-col-pinned.datanoa-cell-selected,
-  body.light .datanoa-td.datanoa-col-pinned.datanoa-cell-in-range.datanoa-cell-selected {
-    background: color-mix(in srgb, var(--info) 12%, var(--bg));
+  .datanoa-td.datanoa-col-pinned.datanoa-cell-in-range.datanoa-cell-selected {
+    background: color-mix(in srgb, var(--accent-ring) 14%, var(--bg));
   }
 
-  .datanoa-td.datanoa-col-pinned.datanoa-cell-staged,
-  html.light .datanoa-td.datanoa-col-pinned.datanoa-cell-staged {
+  .datanoa-td.datanoa-col-pinned.datanoa-cell-staged {
     background: color-mix(in srgb, var(--info) 20%, var(--bg));
   }
 
-  .datanoa-td.datanoa-col-pinned.datanoa-cell-match,
-  html.light .datanoa-td.datanoa-col-pinned.datanoa-cell-match {
+  .datanoa-td.datanoa-col-pinned.datanoa-cell-match {
     background: color-mix(in srgb, var(--warn) 22%, var(--bg));
   }
 
-  .datanoa-td.datanoa-col-pinned.datanoa-cell-match-active,
-  html.light .datanoa-td.datanoa-col-pinned.datanoa-cell-match-active {
+  .datanoa-td.datanoa-col-pinned.datanoa-cell-match-active {
     background: color-mix(in srgb, var(--warn) 42%, var(--bg));
   }
 
-  .datanoa-td.datanoa-col-pinned.datanoa-cell-saving,
-  html.light .datanoa-td.datanoa-col-pinned.datanoa-cell-saving {
+  .datanoa-td.datanoa-col-pinned.datanoa-cell-saving {
     background: color-mix(in srgb, var(--info) 24%, var(--bg)) !important;
   }
 
-  .datanoa-td.datanoa-col-pinned.datanoa-cell-conflict,
-  html.light .datanoa-td.datanoa-col-pinned.datanoa-cell-conflict {
+  .datanoa-td.datanoa-col-pinned.datanoa-cell-conflict {
     background: color-mix(in srgb, var(--danger) 26%, var(--bg)) !important;
   }
 
@@ -612,7 +578,7 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-th.datanoa-col-pinned.datanoa-th-selected {
-    background: color-mix(in srgb, var(--info) 16%, var(--card));
+    background: color-mix(in srgb, var(--accent-ring) 16%, var(--card));
   }
 
   .datanoa-col-pinned-last {
@@ -651,8 +617,8 @@ export const EDITOR_GRID_STYLE = `
     height: 16px;
     padding: 0;
     border-radius: 3px;
-    border: 1px solid rgba(56, 189, 248, 0.35);
-    background: rgba(56, 189, 248, 0.12);
+    border: 1px solid color-mix(in srgb, var(--info) 38%, transparent);
+    background: color-mix(in srgb, var(--info) 12%, transparent);
     color: var(--info);
     font-size: 10px;
     line-height: 1;
@@ -665,7 +631,7 @@ export const EDITOR_GRID_STYLE = `
   .datanoa-fk-badge:hover,
   .datanoa-fk-badge:focus-visible {
     opacity: 1;
-    background: rgba(56, 189, 248, 0.24);
+    background: color-mix(in srgb, var(--info) 24%, transparent);
     border-color: var(--info);
   }
 
@@ -704,17 +670,9 @@ export const EDITOR_GRID_STYLE = `
 
   .datanoa-td-rownum.row-selected,
   .datanoa-tr.datanoa-row-selected .datanoa-td-rownum.row-selected {
-    color: rgba(147, 197, 253, 0.92);
-    background: color-mix(in srgb, var(--info) 14%, var(--surface));
+    color: var(--text);
+    background: color-mix(in srgb, var(--accent-ring) 16%, var(--surface));
     font-weight: 600;
-  }
-
-  html.light .datanoa-td-rownum.row-selected,
-  html.light .datanoa-tr.datanoa-row-selected .datanoa-td-rownum.row-selected,
-  body.light .datanoa-td-rownum.row-selected,
-  body.light .datanoa-tr.datanoa-row-selected .datanoa-td-rownum.row-selected {
-    color: var(--info);
-    background: color-mix(in srgb, var(--info) 12%, var(--surface));
   }
 
   .datanoa-tr.datanoa-row-inserted .datanoa-td-rownum {
@@ -732,9 +690,9 @@ export const EDITOR_GRID_STYLE = `
     font-weight: 700;
     letter-spacing: 0.03em;
     line-height: 14px;
-    background: rgba(74, 222, 128, 0.18);
+    background: color-mix(in srgb, var(--ok) 18%, transparent);
     color: var(--ok);
-    border: 1px solid rgba(74, 222, 128, 0.42);
+    border: 1px solid color-mix(in srgb, var(--ok) 42%, transparent);
     vertical-align: middle;
   }
 
@@ -751,7 +709,7 @@ export const EDITOR_GRID_STYLE = `
     font-size: 12px;
     padding: 0 7px;
     margin: 0;
-    border: 1.5px solid var(--info);
+    border: 1.5px solid var(--accent-ring);
     background: var(--input-bg);
     color: var(--text);
     user-select: text;
@@ -790,17 +748,17 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-cell-saving {
-    background: rgba(56, 189, 248, 0.22) !important;
+    background: color-mix(in srgb, var(--info) 22%, transparent) !important;
   }
 
   .datanoa-cell-conflict {
-    background: rgba(248, 113, 113, 0.26) !important;
+    background: color-mix(in srgb, var(--danger) 26%, transparent) !important;
     animation: flash-conflict 0.9s ease-out;
   }
 
   @keyframes flash-conflict {
-    0% { background: var(--danger); color: var(--primary-fg); }
-    100% { background: rgba(248, 113, 113, 0.26); }
+    0% { background: var(--danger); color: var(--danger-fg); }
+    100% { background: color-mix(in srgb, var(--danger) 26%, transparent); }
   }
 
   /* Dockable Bottom Value / JSON Inspector Drawer */
@@ -840,7 +798,7 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-value-textarea:focus {
-    border-color: var(--info);
+    border-color: var(--accent-ring);
   }
 
   /* Fixed Right-Click Context Menu (Escapes overflow ancestors) */
@@ -853,7 +811,7 @@ export const EDITOR_GRID_STYLE = `
     padding: 4px;
     border-radius: var(--radius);
     border: 1px solid var(--border-strong);
-    background: var(--raised);
+    background: var(--popover);
     box-shadow: var(--menu-shadow);
     display: flex;
     flex-direction: column;
@@ -914,31 +872,17 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-query-banner.success {
-    background: rgba(74, 222, 128, 0.08);
-    border-color: rgba(74, 222, 128, 0.28);
+    background: color-mix(in srgb, var(--ok) 9%, var(--bg));
+    border-color: color-mix(in srgb, var(--ok) 30%, var(--border));
     border-left: 3px solid var(--ok);
     color: var(--text);
-  }
-
-  html.light .datanoa-query-banner.success,
-  body.light .datanoa-query-banner.success {
-    background: rgba(22, 163, 74, 0.07);
-    border-color: rgba(22, 163, 74, 0.25);
-    border-left: 3px solid var(--ok);
   }
 
   .datanoa-query-banner.error {
-    background: rgba(248, 113, 113, 0.08);
-    border-color: rgba(248, 113, 113, 0.28);
+    background: color-mix(in srgb, var(--danger) 9%, var(--bg));
+    border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
     border-left: 3px solid var(--danger);
     color: var(--text);
-  }
-
-  html.light .datanoa-query-banner.error,
-  body.light .datanoa-query-banner.error {
-    background: rgba(220, 38, 38, 0.06);
-    border-color: rgba(220, 38, 38, 0.25);
-    border-left: 3px solid var(--danger);
   }
 
   .datanoa-query-banner-body {
@@ -1017,7 +961,7 @@ export const EDITOR_GRID_STYLE = `
     max-height: 360px;
     display: flex;
     flex-direction: column;
-    background: var(--raised);
+    background: var(--popover);
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
     box-shadow: var(--menu-shadow);
@@ -1081,7 +1025,7 @@ export const EDITOR_GRID_STYLE = `
     padding: 10px;
     border-radius: var(--radius);
     border: 1px solid var(--border-strong);
-    background: var(--raised);
+    background: var(--popover);
     box-shadow: var(--menu-shadow);
     display: flex;
     flex-direction: column;
@@ -1131,19 +1075,22 @@ export const EDITOR_GRID_STYLE = `
 
   .datanoa-json-status.valid {
     color: var(--ok);
-    border: 1px solid rgba(74, 222, 128, 0.4);
-    background: rgba(74, 222, 128, 0.12);
+    border: 1px solid color-mix(in srgb, var(--ok) 40%, transparent);
+    background: color-mix(in srgb, var(--ok) 12%, transparent);
   }
 
   .datanoa-json-status.invalid {
     color: var(--danger);
-    border: 1px solid rgba(248, 113, 113, 0.45);
-    background: rgba(248, 113, 113, 0.12);
+    border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
   }
 
   .datanoa-history-search {
     height: 22px;
+    flex: 1 1 180px;
     width: 180px;
+    max-width: 180px;
+    min-width: 48px;
     padding: 0 7px;
     border-radius: 4px;
     border: 1px solid var(--input-border);
@@ -1172,16 +1119,16 @@ export const EDITOR_GRID_STYLE = `
   .datanoa-filter-clear-btn:hover:not(:disabled) {
     color: var(--danger);
     border-color: var(--danger);
-    background: rgba(248, 113, 113, 0.1);
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
   }
 
   .datanoa-error-retry-btn {
-    border-color: var(--info);
-    color: var(--info);
+    border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
+    color: var(--text);
   }
 
   .datanoa-error-retry-btn:hover:not(:disabled) {
-    background: rgba(56, 189, 248, 0.14);
+    background: color-mix(in srgb, var(--accent-ring) 14%, transparent);
   }
 
 
@@ -1214,6 +1161,11 @@ export const EDITOR_GRID_STYLE = `
       flex-wrap: nowrap;
       flex-shrink: 0;
       gap: 4px;
+    }
+
+    .datanoa-grid-subbar .datanoa-btn-group {
+      flex-wrap: nowrap;
+      flex-shrink: 0;
     }
 
     .datanoa-grid-subbar .datanoa-btn-sm,

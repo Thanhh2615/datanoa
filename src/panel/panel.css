@@ -1,44 +1,49 @@
 /**
  * src/panel/panel.css
- * Datanoa Side Panel Stylesheet — True OLED Dark (#000000) & High-Contrast Light Theme
+ * Datanoa Side Panel Stylesheet — Adaptive Dark & High-Contrast Light Theme
  */
 
 :root {
   --bg: var(--orca-background, #000000);
-  --surface: var(--orca-editor-surface, #0a0a0a);
-  --card: var(--orca-secondary, #0f0f0f);
-  --raised: #141414;
-  --hover: var(--orca-accent, #1a1a1a);
-  --active: #1a1a1a;
-  --border: var(--orca-border, #1f1f1f);
-  --border-hi: var(--orca-input, #2a2a2a);
-  --border-strong: #3f3f46;
-  --sel-row-bg: color-mix(in srgb, #ffffff 5%, var(--bg));
-  --sel-range-bg: color-mix(in srgb, #38bdf8 13%, var(--bg));
-  --sel-focus-bg: color-mix(in srgb, #38bdf8 8%, var(--bg));
   --fg: var(--orca-foreground, #e6e6e6);
-  --t1: #e6e6e6;
-  --t2: #a3a3a3;
-  --t3: #8c8c8c;
+  --t1: var(--orca-foreground, #e6e6e6);
+  --t2: var(--orca-muted-foreground, color-mix(in srgb, var(--t1) 68%, var(--bg)));
+  --t3: color-mix(in srgb, var(--t2) 78%, var(--bg));
+  --surface: color-mix(in srgb, var(--t1) 3.5%, var(--bg));
+  --card: color-mix(in srgb, var(--t1) 6%, var(--bg));
+  --raised: color-mix(in srgb, var(--t1) 9%, var(--bg));
+  --popover: var(--orca-popover, color-mix(in srgb, var(--t1) 8%, var(--bg)));
+  --hover: color-mix(in srgb, var(--t1) 7%, var(--bg));
+  --active: color-mix(in srgb, var(--t1) 11%, var(--bg));
+  --border: var(--orca-border, color-mix(in srgb, var(--t1) 12%, var(--bg)));
+  --border-hi: color-mix(in srgb, var(--t1) 18%, var(--bg));
+  --border-strong: color-mix(in srgb, var(--t1) 24%, var(--bg));
   --primary: var(--orca-primary, #e6e6e6);
   --primary-fg: var(--orca-primary-foreground, #000000);
-  --btn-bg: #171717;
-  --btn-border: #303030;
-  --btn-hover-bg: #242424;
-  --btn-hover-border: #474747;
-  --btn-ghost-bg: #111111;
-  --btn-ghost-border: #262626;
-  --btn-ghost-fg: #d4d4d4;
-  --btn-disabled-bg: #0d0d0d;
-  --btn-disabled-border: #1e1e1e;
-  --btn-disabled-fg: #595959;
+  --accent-ring: var(--orca-ring, var(--primary));
+  --sel-row-bg: color-mix(in srgb, var(--t1) 5%, var(--bg));
+  --sel-range-bg: color-mix(in srgb, var(--accent-ring) 13%, var(--bg));
+  --sel-focus-bg: color-mix(in srgb, var(--accent-ring) 8%, var(--bg));
+  --sel-edge: color-mix(in srgb, var(--accent-ring) 55%, transparent);
+  --sel-focus: color-mix(in srgb, var(--accent-ring) 78%, transparent);
+  --btn-bg: color-mix(in srgb, var(--t1) 6.5%, var(--bg));
+  --btn-border: color-mix(in srgb, var(--t1) 16%, var(--bg));
+  --btn-hover-bg: color-mix(in srgb, var(--t1) 11%, var(--bg));
+  --btn-hover-border: color-mix(in srgb, var(--t1) 26%, var(--bg));
+  --btn-ghost-bg: color-mix(in srgb, var(--t1) 3.5%, var(--bg));
+  --btn-ghost-border: color-mix(in srgb, var(--t1) 12%, var(--bg));
+  --btn-ghost-fg: color-mix(in srgb, var(--t1) 84%, var(--bg));
+  --btn-disabled-bg: color-mix(in srgb, var(--t1) 2.5%, var(--bg));
+  --btn-disabled-border: color-mix(in srgb, var(--t1) 9%, var(--bg));
+  --btn-disabled-fg: color-mix(in srgb, var(--t1) 36%, var(--bg));
   --ok: #4ade80;
   --warn: #fbbf24;
-  --danger: #f87171;
+  --danger: var(--orca-destructive, #f87171);
+  --danger-fg: var(--orca-destructive-foreground, #1a0606);
   --info: #38bdf8;
   --env-dev: #38bdf8;
   --env-staging: #fbbf24;
-  --env-prod: #f87171;
+  --env-prod: var(--danger);
   --db-sqlite: #38bdf8;
   --db-postgres: #5b8def;
   --db-mysql: #f29111;
@@ -48,51 +53,65 @@
   --db-redis: #dc382d;
   --db-libsql: #4ff8d2;
   --db-d1: #f38020;
-  --radius: var(--orca-radius, 6px);
-  --r-sm: 5px;
+  --radius: min(var(--orca-radius, 6px), 10px);
+  --r-sm: clamp(4px, calc(var(--orca-radius, 6px) - 4px), 6px);
   --r-xs: 4px;
-  --sans: var(--app-font-family, 'OrcaDesktopSans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', 'Noto Sans', Arial, sans-serif);
+  --sans: var(--orca-font-sans, 'Geist', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', 'Noto Sans', Arial, sans-serif);
   --mono: var(--orca-font-mono, 'SF Mono', SFMono-Regular, ui-monospace, 'Cascadia Code', Menlo, Consolas, 'Liberation Mono', monospace);
-  --menu-shadow: 0 10px 28px rgba(0, 0, 0, 0.72), 0 2px 6px rgba(0, 0, 0, 0.48);
+  --menu-shadow: 0 10px 28px rgba(0, 0, 0, 0.56), 0 2px 6px rgba(0, 0, 0, 0.36);
+  --radius-control: var(--r-sm);
+  --cm-keyword: #c7a8ff;
+  --cm-string: #9ee39e;
+  --cm-number: #ffb070;
+  --cm-function: #7cc4ff;
+  --cm-type: #f2cc7e;
+  --cm-comment: #6b7280;
+  --cm-operator: #9ca3af;
+  --cm-sel-match-bg: rgba(255, 255, 255, 0.14);
   color-scheme: dark;
 }
 
 html.light, body.light {
   --bg: var(--orca-background, #ffffff);
-  --surface: var(--orca-editor-surface, #f8fafc);
-  --card: var(--orca-secondary, #f6f8fa);
-  --raised: #f0f3f6;
-  --hover: var(--orca-accent, #eaeef2);
-  --active: #eaeef2;
-  --border: var(--orca-border, #d0d7de);
-  --border-hi: var(--orca-input, #afb8c1);
-  --border-strong: #8c959f;
-  --sel-row-bg: color-mix(in srgb, #0f172a 5%, var(--bg));
-  --sel-range-bg: color-mix(in srgb, #0369a1 14%, var(--bg));
-  --sel-focus-bg: color-mix(in srgb, #0369a1 9%, var(--bg));
   --fg: var(--orca-foreground, #0f172a);
-  --t1: #0f172a;
-  --t2: #475569;
-  --t3: #57606a;
+  --t1: var(--orca-foreground, #0f172a);
+  --t2: var(--orca-muted-foreground, color-mix(in srgb, var(--t1) 66%, var(--bg)));
+  --t3: color-mix(in srgb, var(--t2) 78%, var(--bg));
+  --surface: color-mix(in srgb, var(--t1) 3.5%, var(--bg));
+  --card: color-mix(in srgb, var(--t1) 6%, var(--bg));
+  --raised: color-mix(in srgb, var(--t1) 9%, var(--bg));
+  --popover: var(--orca-popover, color-mix(in srgb, var(--t1) 4%, var(--bg)));
+  --hover: color-mix(in srgb, var(--t1) 7%, var(--bg));
+  --active: color-mix(in srgb, var(--t1) 11%, var(--bg));
+  --border: var(--orca-border, color-mix(in srgb, var(--t1) 14%, var(--bg)));
+  --border-hi: color-mix(in srgb, var(--t1) 20%, var(--bg));
+  --border-strong: color-mix(in srgb, var(--t1) 28%, var(--bg));
   --primary: var(--orca-primary, #0f172a);
   --primary-fg: var(--orca-primary-foreground, #ffffff);
-  --btn-bg: #f1f5f9;
-  --btn-border: #cbd5e1;
-  --btn-hover-bg: #e2e8f0;
-  --btn-hover-border: #94a3b8;
-  --btn-ghost-bg: #f8fafc;
-  --btn-ghost-border: #cbd5e1;
-  --btn-ghost-fg: #334155;
-  --btn-disabled-bg: #f1f5f9;
-  --btn-disabled-border: #e2e8f0;
-  --btn-disabled-fg: #94a3b8;
+  --accent-ring: var(--orca-ring, var(--primary));
+  --sel-row-bg: color-mix(in srgb, var(--t1) 5%, var(--bg));
+  --sel-range-bg: color-mix(in srgb, var(--accent-ring) 14%, var(--bg));
+  --sel-focus-bg: color-mix(in srgb, var(--accent-ring) 9%, var(--bg));
+  --sel-edge: color-mix(in srgb, var(--accent-ring) 55%, transparent);
+  --sel-focus: color-mix(in srgb, var(--accent-ring) 78%, transparent);
+  --btn-bg: color-mix(in srgb, var(--t1) 5%, var(--bg));
+  --btn-border: color-mix(in srgb, var(--t1) 18%, var(--bg));
+  --btn-hover-bg: color-mix(in srgb, var(--t1) 9%, var(--bg));
+  --btn-hover-border: color-mix(in srgb, var(--t1) 28%, var(--bg));
+  --btn-ghost-bg: color-mix(in srgb, var(--t1) 2.5%, var(--bg));
+  --btn-ghost-border: color-mix(in srgb, var(--t1) 14%, var(--bg));
+  --btn-ghost-fg: color-mix(in srgb, var(--t1) 82%, var(--bg));
+  --btn-disabled-bg: color-mix(in srgb, var(--t1) 3%, var(--bg));
+  --btn-disabled-border: color-mix(in srgb, var(--t1) 10%, var(--bg));
+  --btn-disabled-fg: color-mix(in srgb, var(--t1) 40%, var(--bg));
   --ok: #15803d;
   --warn: #b45309;
-  --danger: #b91c1c;
+  --danger: var(--orca-destructive, #b91c1c);
+  --danger-fg: var(--orca-destructive-foreground, #ffffff);
   --info: #0369a1;
   --env-dev: #0369a1;
   --env-staging: #b45309;
-  --env-prod: #b91c1c;
+  --env-prod: var(--danger);
   --db-sqlite: #003b57;
   --db-postgres: #336791;
   --db-mysql: #00758f;
@@ -103,6 +122,15 @@ html.light, body.light {
   --db-libsql: #0f766e;
   --db-d1: #f38020;
   --menu-shadow: 0 10px 28px rgba(15, 23, 42, 0.14), 0 2px 6px rgba(15, 23, 42, 0.08);
+  --radius-control: var(--r-sm);
+  --cm-keyword: #6d28d9;
+  --cm-string: #15803d;
+  --cm-number: #c2410c;
+  --cm-function: #0369a1;
+  --cm-type: #a16207;
+  --cm-comment: #64748b;
+  --cm-operator: #475569;
+  --cm-sel-match-bg: rgba(37, 99, 235, 0.14);
   color-scheme: light;
 }
 
@@ -126,7 +154,7 @@ html, body {
 }
 
 ::selection {
-  background: color-mix(in srgb, var(--primary) 26%, transparent);
+  background: color-mix(in srgb, var(--accent-ring) 26%, transparent);
   color: var(--t1);
 }
 
@@ -158,7 +186,7 @@ button, input, select, textarea {
 }
 
 :focus-visible {
-  outline: 1.5px solid var(--info);
+  outline: 1.5px solid var(--accent-ring);
   outline-offset: 1px;
 }
 
@@ -172,7 +200,7 @@ button, input, select, textarea {
 .struct-cell-select:focus-visible,
 .struct-title-input:focus-visible,
 .grid-wrap:focus-visible {
-  outline: 1.5px solid var(--info);
+  outline: 1.5px solid var(--accent-ring);
   outline-offset: 1px;
 }
 
@@ -182,12 +210,12 @@ html.light .col-popover {
 }
 
 html.light .btn-danger {
-  background: rgba(185, 28, 28, 0.08);
-  border-color: rgba(185, 28, 28, 0.35);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 35%, transparent);
 }
 
 html.light .btn-danger:hover:not(:disabled) {
-  background: rgba(185, 28, 28, 0.16);
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
 }
 
 @keyframes panel-spin {
@@ -371,25 +399,47 @@ svg {
 
 .btn-danger {
   color: var(--danger);
-  background: rgba(248, 113, 113, 0.08);
-  border-color: rgba(248, 113, 113, 0.35);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 35%, transparent);
 }
 
 .btn-danger:hover:not(:disabled) {
-  background: rgba(248, 113, 113, 0.16);
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
   border-color: var(--danger);
   color: var(--danger);
 }
 
-.btn-danger-solid {
-  background: var(--danger);
-  color: #000000;
-  border-color: var(--danger);
+.btn-cancel {
+  color: color-mix(in srgb, var(--danger) 76%, var(--t1));
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+  border-color: color-mix(in srgb, var(--danger) 42%, var(--border-strong));
   font-weight: 600;
 }
 
-html.light .btn-danger-solid {
-  color: #ffffff;
+.btn-cancel:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 20%, var(--surface));
+  border-color: var(--danger);
+  color: var(--t1);
+}
+
+html.light .btn-cancel,
+body.light .btn-cancel {
+  color: color-mix(in srgb, var(--danger) 85%, var(--t1));
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface));
+  border-color: color-mix(in srgb, var(--danger) 42%, var(--border));
+}
+
+html.light .btn-cancel:hover:not(:disabled),
+body.light .btn-cancel:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 18%, var(--surface));
+  border-color: var(--danger);
+}
+
+.btn-danger-solid {
+  background: var(--danger);
+  color: var(--danger-fg);
+  border-color: var(--danger);
+  font-weight: 600;
 }
 
 .btn-danger-solid:hover:not(:disabled) {
@@ -400,6 +450,7 @@ html.light .btn-danger-solid {
 .btn:disabled,
 .btn-primary:disabled,
 .btn-ghost:disabled,
+.btn-cancel:disabled,
 .btn-danger:disabled,
 .btn-danger-solid:disabled {
   opacity: 1;
@@ -410,9 +461,9 @@ html.light .btn-danger-solid {
 }
 
 .btn-active {
-  background: var(--raised);
-  border-color: var(--info);
-  color: var(--info);
+  background: color-mix(in srgb, var(--accent-ring) 15%, var(--bg));
+  border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
+  color: var(--t1);
   font-weight: 600;
 }
 
@@ -617,16 +668,45 @@ body.light .form-notice-sticky {
   color: var(--warn);
 }
 
+html.light .banner.warn,
+body.light .banner.warn {
+  color: color-mix(in srgb, var(--warn) 78%, var(--t1));
+}
+
 .banner.danger {
   border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
   background: color-mix(in srgb, var(--danger) 10%, var(--bg));
-  color: var(--danger);
+  color: color-mix(in srgb, var(--danger) 74%, var(--t1));
+}
+
+html.light .banner.danger,
+body.light .banner.danger {
+  color: color-mix(in srgb, var(--danger) 76%, var(--t1));
 }
 
 .banner-text {
   flex: 1;
   min-width: 0;
   word-break: break-word;
+}
+
+.banner .banner-close-btn {
+  width: 20px;
+  height: 20px;
+  background: transparent;
+  border-color: transparent;
+  color: inherit;
+  opacity: 0.78;
+  font-size: 14px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.banner .banner-close-btn:hover:not(:disabled) {
+  opacity: 1;
+  background: color-mix(in srgb, currentColor 14%, transparent);
+  border-color: color-mix(in srgb, currentColor 28%, transparent);
+  color: inherit;
 }
 
 /* Form Controls */
@@ -719,7 +799,7 @@ body.light .form-notice-sticky {
 }
 
 .custom-select-trigger:focus-visible {
-  outline: 1.5px solid var(--info);
+  outline: 1.5px solid var(--accent-ring);
   outline-offset: 1px;
 }
 
@@ -756,7 +836,7 @@ body.light .form-notice-sticky {
   padding: 8px;
   border-radius: var(--radius);
   border: 1px solid var(--border-strong);
-  background: var(--card);
+  background: var(--popover);
   box-shadow: var(--menu-shadow);
   overflow: hidden;
 }
@@ -825,7 +905,7 @@ body.light .form-notice-sticky {
 .custom-select-folder-icon {
   display: inline-flex;
   align-items: center;
-  color: var(--info);
+  color: var(--accent-ring);
   flex-shrink: 0;
 }
 
@@ -911,7 +991,7 @@ body.light .form-notice-sticky {
 }
 
 .custom-select-item-check {
-  color: var(--info);
+  color: var(--accent-ring);
   font-size: 11px;
   font-weight: 700;
   flex-shrink: 0;
@@ -934,7 +1014,7 @@ body.light .form-notice-sticky {
 }
 
 .input:focus, .select:focus {
-  border-color: var(--primary);
+  border-color: var(--accent-ring);
   background: var(--bg);
 }
 
@@ -956,7 +1036,7 @@ body.light .form-notice-sticky {
 }
 
 .textarea:focus {
-  border-color: var(--primary);
+  border-color: var(--accent-ring);
   background: var(--bg);
 }
 
@@ -975,7 +1055,7 @@ body.light .form-notice-sticky {
 }
 
 .checkbox-row input[type="checkbox"] {
-  accent-color: var(--primary);
+  accent-color: var(--accent-ring);
   width: 14px;
   height: 14px;
   margin: 0;
@@ -1073,6 +1153,13 @@ body.light .form-notice-sticky {
   color: var(--t3);
 }
 
+.panel-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
 .panel-head {
   display: flex;
   align-items: center;
@@ -1134,8 +1221,8 @@ body.light .form-notice-sticky {
 }
 
 .engine-tile.active {
-  background: var(--raised);
-  border-color: var(--primary);
+  background: color-mix(in srgb, var(--accent-ring) 14%, var(--bg));
+  border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
   color: var(--t1);
   font-weight: 600;
 }
@@ -1185,8 +1272,8 @@ body.light .form-notice-sticky {
 }
 
 .env-pill.active {
-  background: var(--raised);
-  border-color: var(--primary);
+  background: color-mix(in srgb, var(--accent-ring) 14%, var(--bg));
+  border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
   color: var(--t1);
   font-weight: 600;
 }
@@ -1258,12 +1345,138 @@ body.light .form-notice-sticky {
 .db-libsql { color: var(--db-libsql); }
 .db-d1 { color: var(--db-d1); }
 
-/* Discovered .env & .db Chips */
+/* Discovered .env, Docker Compose & .db Groups */
+.discovery-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.discovery-search {
+  height: 26px;
+  font-size: 12px;
+}
+
+.discovery-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.discovery-group {
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  overflow: hidden;
+  min-width: 0;
+}
+
+.discovery-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 29px;
+  padding: 5px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--t1);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+.discovery-group-head:hover {
+  background: var(--hover);
+}
+
+.discovery-chevron {
+  display: inline-block;
+  width: 10px;
+  font-size: 10px;
+  color: var(--t3);
+  transition: transform 0.12s ease;
+  flex-shrink: 0;
+}
+
+.discovery-group.is-expanded .discovery-chevron {
+  transform: rotate(90deg);
+}
+
+.discovery-source-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: var(--r-xs);
+  font-size: 10.5px;
+  font-weight: 600;
+  font-family: var(--mono);
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--t2);
+}
+
+.discovery-source-pill.is-env {
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, var(--bg));
+}
+
+.discovery-source-pill.is-docker {
+  border-color: color-mix(in srgb, var(--info) 40%, var(--border));
+  color: var(--info);
+  background: color-mix(in srgb, var(--info) 10%, var(--bg));
+}
+
+.discovery-source-pill.is-sqlite {
+  border-color: color-mix(in srgb, var(--ok) 40%, var(--border));
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 10%, var(--bg));
+}
+
+.discovery-group-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.discovery-group-count {
+  font-size: 11px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--t3);
+  flex-shrink: 0;
+}
+
+.discovery-group-body {
+  padding: 6px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg) 55%, var(--surface));
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.discovery-chip-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
 .chip-list {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  max-height: 220px;
+  max-height: 190px;
   overflow-y: auto;
 }
 
@@ -1321,10 +1534,10 @@ body.light .form-notice-sticky {
   max-height: 210px;
   overflow-y: auto;
   overflow-x: hidden;
-  background: var(--raised);
+  background: var(--popover);
   border: 1px solid var(--border-hi);
   border-radius: var(--r-sm);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+  box-shadow: var(--menu-shadow);
   padding: 3px;
   display: flex;
   flex-direction: column;
@@ -1350,8 +1563,8 @@ body.light .form-notice-sticky {
 
 .struct-combo-item:hover,
 .struct-combo-item.active {
-  background: var(--hover);
-  color: var(--primary);
+  background: color-mix(in srgb, var(--accent-ring) 14%, transparent);
+  color: var(--t1);
 }
 
 .file-chip {
@@ -1473,8 +1686,8 @@ button.file-chip.selected {
 }
 
 .tree-conn-item.active {
-  background: var(--raised);
-  border-color: var(--primary);
+  background: color-mix(in srgb, var(--accent-ring) 14%, var(--bg));
+  border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
 }
 
 .tree-folder-group {
@@ -1500,7 +1713,7 @@ button.file-chip.selected {
 .tree-folder-icon {
   display: inline-flex;
   align-items: center;
-  color: var(--info);
+  color: var(--accent-ring);
   flex-shrink: 0;
 }
 
@@ -1572,11 +1785,13 @@ button.file-chip.selected {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .mini-btn:hover {
   color: var(--t1);
-  border-color: var(--primary);
+  border-color: var(--accent-ring);
   background: var(--hover);
 }
 
@@ -1644,9 +1859,10 @@ button.file-chip.selected {
   flex-shrink: 0;
 }
 
-#sqlEditor {
-  min-height: 76px;
-  max-height: 40%;
+#sqlEditor,
+#sqlEditorMount {
+  min-height: 92px;
+  max-height: 70vh;
   flex-shrink: 0;
 }
 
@@ -1787,7 +2003,7 @@ button.file-chip.selected {
 .data-table th:hover .th-col-grip,
 .th-col-grip:hover {
   opacity: 1;
-  color: var(--info);
+  color: var(--t1);
   background: var(--hover);
 }
 
@@ -1814,7 +2030,7 @@ button.file-chip.selected {
 
 .col-resize-handle:hover,
 .col-resize-handle.resizing {
-  background: var(--info);
+  background: var(--accent-ring);
 }
 
 .data-table td {
@@ -1901,7 +2117,7 @@ button.file-chip.selected {
 .data-table tr.row-even td,
 .data-table.transposed tr:nth-child(even) td,
 #structureColTable tr:nth-child(even) td {
-  background: var(--surface);
+  background: color-mix(in srgb, var(--t1) 2.5%, var(--bg));
 }
 
 .data-table tr:hover td {
@@ -1915,7 +2131,7 @@ html.light .data-table tr.row-selected td {
 
 .data-table tr.row-selected td.td-rownum,
 html.light .data-table tr.row-selected td.td-rownum {
-  background: color-mix(in srgb, var(--info) 12%, var(--surface));
+  background: color-mix(in srgb, var(--accent-ring) 14%, var(--surface));
 }
 
 .data-table th.col-pinned {
@@ -1932,7 +2148,7 @@ html.light .data-table tr.row-selected td.td-rownum {
 }
 
 .data-table tr.row-even td.col-pinned {
-  background: var(--surface);
+  background: color-mix(in srgb, var(--t1) 2.5%, var(--bg));
 }
 
 .data-table tr:hover td.col-pinned {
@@ -2000,39 +2216,23 @@ html.light .data-table tr.row-selected td.col-pinned.cell-in-range {
 }
 
 .data-table td.range-top {
-  --rt: inset 0 1px 0 0 rgba(56, 189, 248, 0.42);
+  --rt: inset 0 1px 0 0 var(--sel-edge);
 }
 
 .data-table td.range-right {
-  --rr: inset -1px 0 0 0 rgba(56, 189, 248, 0.42);
+  --rr: inset -1px 0 0 0 var(--sel-edge);
 }
 
 .data-table td.range-bottom {
-  --rb: inset 0 -1px 0 0 rgba(56, 189, 248, 0.42);
+  --rb: inset 0 -1px 0 0 var(--sel-edge);
 }
 
 .data-table td.range-left {
-  --rl: inset 1px 0 0 0 rgba(56, 189, 248, 0.42);
-}
-
-html.light .data-table td.range-top {
-  --rt: inset 0 1px 0 0 rgba(3, 105, 161, 0.48);
-}
-
-html.light .data-table td.range-right {
-  --rr: inset -1px 0 0 0 rgba(3, 105, 161, 0.48);
-}
-
-html.light .data-table td.range-bottom {
-  --rb: inset 0 -1px 0 0 rgba(3, 105, 161, 0.48);
-}
-
-html.light .data-table td.range-left {
-  --rl: inset 1px 0 0 0 rgba(3, 105, 161, 0.48);
+  --rl: inset 1px 0 0 0 var(--sel-edge);
 }
 
 .data-table td.cell-selected {
-  outline: 1px solid rgba(56, 189, 248, 0.62);
+  outline: 1px solid var(--sel-focus);
   outline-offset: -1px;
 }
 
@@ -2043,13 +2243,7 @@ html.light .data-table td.cell-in-range.cell-selected,
 html.light .data-table tr.row-selected td.cell-in-range.cell-selected,
 html.light .data-table tr.row-selected td.col-pinned.cell-in-range.cell-selected {
   background: var(--sel-focus-bg);
-  outline: 1px solid rgba(56, 189, 248, 0.55);
-}
-
-html.light .data-table td.cell-selected,
-html.light .data-table tr.row-selected td.cell-in-range.cell-selected,
-html.light .data-table tr.row-selected td.col-pinned.cell-in-range.cell-selected {
-  outline: 1px solid rgba(3, 105, 161, 0.65);
+  outline: 1px solid var(--sel-focus);
 }
 
 .data-table th.col-pinned-last,
@@ -2130,7 +2324,7 @@ html.light .data-table tr.row-selected td.cell-match-active {
 }
 
 .sel-stats-strip:hover {
-  border-color: var(--info);
+  border-color: var(--accent-ring);
   color: var(--t1);
 }
 
@@ -2164,7 +2358,7 @@ html.light .data-table tr.row-selected td.cell-match-active {
   max-height: 280px;
   border: 1px solid var(--border-hi);
   border-radius: var(--radius);
-  background: var(--card);
+  background: var(--popover);
   box-shadow: var(--menu-shadow);
   padding: 8px;
   display: flex;
@@ -2227,12 +2421,22 @@ html.light .data-table tr.row-selected td.cell-match-active {
   align-items: center;
   justify-content: space-between;
   gap: 6px;
+  min-width: 0;
+}
+
+.history-card-foot .input-group {
+  flex-shrink: 0;
+  flex-wrap: nowrap;
 }
 
 .history-time {
   font-size: 11px;
   color: var(--t3);
   font-family: var(--mono);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .inspector-meta-row {
@@ -2317,7 +2521,7 @@ html.light .data-table tr.row-selected td.cell-match-active {
 }
 
 .struct-title-input:focus {
-  border-color: var(--info);
+  border-color: var(--accent-ring);
 }
 
 .struct-title-input.dirty {
@@ -2351,7 +2555,7 @@ html.light .data-table tr.row-selected td.cell-match-active {
 
 .struct-cell-input:focus,
 .struct-cell-select:focus {
-  border-color: var(--info);
+  border-color: var(--accent-ring);
   background: var(--bg);
 }
 
@@ -2366,7 +2570,7 @@ html.light .data-table tr.row-selected td.cell-match-active {
 }
 
 .struct-checkbox {
-  accent-color: var(--info);
+  accent-color: var(--accent-ring);
   width: 14px;
   height: 14px;
   cursor: pointer;
@@ -2426,8 +2630,8 @@ html.light .data-table tr.row-selected td.cell-match-active {
 }
 
 .struct-col-pill.active {
-  border-color: var(--info);
-  background: color-mix(in srgb, var(--info) 16%, var(--bg));
+  border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
+  background: color-mix(in srgb, var(--accent-ring) 16%, var(--bg));
   color: var(--t1);
 }
 
@@ -2489,7 +2693,7 @@ html.light .data-table tr.row-selected td.cell-match-active {
   min-width: 90px;
   height: 22px;
   padding: 0 5px;
-  border: 1px solid var(--primary);
+  border: 1px solid var(--accent-ring);
   border-radius: 3px;
   background: var(--bg);
   color: var(--t1);
@@ -2650,7 +2854,7 @@ html.light .data-table tr.row-selected td.cell-match-active {
   padding: 4px;
   border-radius: var(--radius);
   border: 1px solid var(--border-hi);
-  background: var(--card);
+  background: var(--popover);
   box-shadow: var(--menu-shadow);
   display: flex;
   flex-direction: column;
@@ -2721,7 +2925,7 @@ html.light .modal-backdrop {
   max-width: 320px;
   border: 1px solid var(--border-hi);
   border-radius: var(--radius);
-  background: var(--card);
+  background: var(--popover);
   box-shadow: var(--menu-shadow);
   padding: 14px;
   display: flex;
@@ -2775,8 +2979,8 @@ html.light .modal-backdrop {
 }
 
 .feedback-kind-pill.active {
-  background: color-mix(in srgb, var(--info) 16%, var(--card));
-  border-color: var(--info);
+  background: color-mix(in srgb, var(--accent-ring) 16%, var(--popover));
+  border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
   color: var(--t1);
   font-weight: 600;
 }
@@ -2917,14 +3121,14 @@ html.light .modal-backdrop {
 }
 
 .panel-fp-root.is-active {
-  background: var(--hover);
+  background: color-mix(in srgb, var(--accent-ring) 14%, var(--surface));
   color: var(--t1);
-  border-color: var(--info);
+  border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
 }
 
 .panel-fp-root:focus-visible,
 .panel-fp-row:focus-visible {
-  outline: 1.5px solid var(--info);
+  outline: 1.5px solid var(--accent-ring);
   outline-offset: -1.5px;
 }
 
@@ -2983,8 +3187,8 @@ html.light .modal-backdrop {
 }
 
 .panel-fp-row.is-selected {
-  background: color-mix(in srgb, var(--info) 12%, var(--surface));
-  border-color: var(--info);
+  background: color-mix(in srgb, var(--accent-ring) 14%, var(--surface));
+  border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
 }
 
 .panel-fp-icon {
@@ -3054,4 +3258,298 @@ html.light .modal-backdrop {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+}
+
+/* Schema Table Bar (pinned below Connection Switcher when Schema tab is active) */
+.struct-table-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.struct-table-bar[hidden] {
+  display: none !important;
+}
+
+.struct-table-picker-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--t2);
+  text-transform: none;
+  letter-spacing: 0;
+  flex-shrink: 0;
+}
+
+.struct-table-bar .custom-select-trigger,
+.struct-table-bar .select {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* Side Panel SQL Console Tabs, CodeMirror Host & Result Tabs */
+.sql-console-tabs-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  overflow-x: auto;
+  flex-shrink: 0;
+  scrollbar-width: thin;
+}
+
+.sql-console-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--t2);
+  font-size: 11.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.sql-console-tab:hover {
+  background: var(--hover);
+  color: var(--t1);
+}
+
+.sql-console-tab.active {
+  background: var(--bg);
+  color: var(--t1);
+  border-color: var(--border);
+  font-weight: 600;
+  box-shadow: inset 0 -2px 0 var(--accent-ring);
+}
+
+.sql-console-tab-title {
+  max-width: 112px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sql-console-tab-rename {
+  width: 96px;
+  height: 18px;
+  padding: 0 4px;
+  font-size: 11.5px;
+  border: 1px solid var(--accent-ring);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--t1);
+  outline: none;
+}
+
+.sql-console-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--t3);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.sql-console-tab-close:hover {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--danger);
+}
+
+.sql-console-tab-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--t2);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.sql-console-tab-add:hover {
+  background: var(--hover);
+  border-color: var(--border);
+  color: var(--t1);
+}
+
+.sql-cm-mount {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  overflow: hidden;
+  height: 132px;
+  min-height: 92px;
+  max-height: 70vh;
+  flex-shrink: 0;
+  transition: border-color 140ms ease;
+}
+
+.sql-cm-mount .cm-editor {
+  height: 100%;
+}
+
+.sql-cm-mount .cm-scroller {
+  overflow: auto;
+}
+
+.sql-editor-resizer {
+  position: relative;
+  height: 8px;
+  flex-shrink: 0;
+  margin: -2px 0;
+  cursor: row-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+  user-select: none;
+  border-radius: 4px;
+}
+
+.sql-editor-resizer::before {
+  content: '';
+  width: 36px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--border-strong);
+  transform-origin: center;
+  transition: background-color 140ms ease, transform 140ms ease;
+}
+
+.sql-editor-resizer:hover::before,
+.sql-editor-resizer:focus-visible::before,
+.sql-editor-resizer.is-resizing::before {
+  background: var(--accent-ring);
+  transform: scaleX(1.35);
+}
+
+.sql-editor-resizer:focus-visible {
+  outline: 1px solid var(--accent-ring);
+  outline-offset: 1px;
+}
+
+.sql-cm-mount:focus-within {
+  border-color: var(--accent-ring);
+}
+
+.sql-cm-mount.is-empty::after {
+  content: attr(data-placeholder);
+  position: absolute;
+  top: 7px;
+  left: 36px;
+  right: 12px;
+  pointer-events: none;
+  color: var(--t3);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sql-result-tabs-bar {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  overflow-x: auto;
+  flex-shrink: 0;
+  scrollbar-width: thin;
+}
+
+.sql-result-tabs-bar[hidden] {
+  display: none !important;
+}
+
+.sql-result-tab {
+  display: inline-flex;
+  align-items: center;
+  height: 21px;
+  padding: 0 8px;
+  border: 1px solid var(--btn-border);
+  border-radius: 4px;
+  background: var(--btn-bg);
+  color: var(--t2);
+  font-size: 11.5px;
+  white-space: nowrap;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.sql-result-tab:hover {
+  background: var(--btn-hover-bg);
+  border-color: var(--btn-hover-border);
+  color: var(--t1);
+}
+
+.sql-result-tab.active {
+  background: color-mix(in srgb, var(--accent-ring) 15%, var(--bg));
+  border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
+  color: var(--t1);
+  font-weight: 600;
+}
+
+html.light .sql-result-tab.active,
+body.light .sql-result-tab.active {
+  background: color-mix(in srgb, var(--accent-ring) 12%, var(--bg));
+}
+
+.sql-result-tab.is-error {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 42%, var(--border));
+}
+
+.sql-result-tab.is-error.active {
+  background: color-mix(in srgb, var(--danger) 12%, var(--bg));
+  border-color: var(--danger);
+}
+
+.sql-banner-stack {
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sql-banner-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.sql-banner-detail {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--t2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }

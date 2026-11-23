@@ -279,13 +279,17 @@ export function writeLocalStudioWarmCache(snapshot: StudioWarmCacheSnapshot): vo
   }
 }
 
-export function syncInitialThemeFromHost(): void {
-  if (typeof document === 'undefined' || !document.body) return
+export function syncInitialThemeFromHost(options?: { forceTokenProbe?: boolean }): boolean | null {
+  if (typeof document === 'undefined' || !document.body) return null
   if (
-    document.documentElement.classList.contains('light') ||
-    document.documentElement.classList.contains('dark')
+    !options?.forceTokenProbe &&
+    (document.documentElement.classList.contains('light') ||
+      document.documentElement.classList.contains('dark'))
   ) {
-    return
+    const isLight = document.documentElement.classList.contains('light')
+    document.body.classList.toggle('light', isLight)
+    document.body.classList.toggle('dark', !isLight)
+    return isLight
   }
   try {
     const probe = document.createElement('div')
@@ -296,7 +300,7 @@ export function syncInitialThemeFromHost(): void {
     const bg = getComputedStyle(probe).backgroundColor
     probe.remove()
     const parts = bg.match(/[\d.]+/g)
-    if (!parts || (parts.length > 3 && Number(parts[3]) === 0)) return
+    if (!parts || (parts.length > 3 && Number(parts[3]) === 0)) return null
     const toLin = (c: number) => {
       const s = c / 255
       return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4
@@ -305,8 +309,14 @@ export function syncInitialThemeFromHost(): void {
       0.2126 * toLin(Number(parts[0])) +
       0.7152 * toLin(Number(parts[1])) +
       0.0722 * toLin(Number(parts[2]))
-    document.documentElement.classList.toggle('light', lum > 0.45)
+    const isLight = lum > 0.45
+    document.documentElement.classList.toggle('light', isLight)
+    document.documentElement.classList.toggle('dark', !isLight)
+    document.body.classList.toggle('light', isLight)
+    document.body.classList.toggle('dark', !isLight)
+    return isLight
   } catch {
     // Non-browser environment
+    return null
   }
 }

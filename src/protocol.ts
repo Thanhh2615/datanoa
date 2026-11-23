@@ -164,6 +164,10 @@ export interface QueryResultSourceTable {
 export interface QueryResultSet {
   index: number
   sqlPreview?: string
+  sql?: string
+  executionTimeMs?: number
+  isError?: boolean
+  errorMessage?: string
   columns: { name: string; type: string }[]
   rows: unknown[][]
   rowCount: number
@@ -203,6 +207,35 @@ export interface TransactionState {
   supported: boolean
   reason?: string
   aborted?: boolean
+}
+
+export type DockerComposeDriverType =
+  | Exclude<DatabaseDriverType, 'sqlite' | 'd1'>
+  | 'mssql'
+  | 'oracle'
+  | 'mongodb'
+
+export interface DiscoveredDockerComposeConnection {
+  id: string
+  project: string
+  service: string
+  driver: DockerComposeDriverType
+  name: string
+  host: string
+  port: number
+  database: string
+  user?: string
+  password?: string
+  url?: string
+  redisDb?: number
+  ssl?: boolean
+  sourceKind: 'live' | 'file'
+  sourceFile: string
+  status: string
+  workspaceMatched: boolean
+  hint?: string
+  unpublishedPort?: boolean
+  passwordFromFile?: string
 }
 
 /** Storage key for persisting saved connections */
@@ -333,6 +366,7 @@ interface DatanoaPluginRequests {
         name: string
         uri: string
       }[]
+      dockerComposeConnections: DiscoveredDockerComposeConnection[]
     }
   }
   'data.applyChanges': {

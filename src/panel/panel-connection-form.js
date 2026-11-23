@@ -323,6 +323,9 @@ export function createPanelConnectionFormController(ctx) {
       $('formUser').value = meta.defaultUser
       $('formSsl').checked = valid === 'cockroachdb'
     }
+    if ($('quickBrowseDbFileBtn')) {
+      $('quickBrowseDbFileBtn').hidden = !isSqlite
+    }
     renderDiscoveredItems()
     syncPanelByodBox()
     clearFormNotice()
@@ -414,6 +417,24 @@ export function createPanelConnectionFormController(ctx) {
             }
           })
           .catch(() => {})
+      })
+    }
+
+    const toggleBindings = [
+      ['env', 'discoveredEnvToggle'],
+      ['docker', 'discoveredDockerToggle'],
+      ['sqlite', 'discoveredFileToggle'],
+    ]
+    for (const [groupKey, toggleId] of toggleBindings) {
+      const toggleBtn = $(toggleId)
+      if (!toggleBtn) continue
+      toggleBtn.addEventListener('click', () => {
+        const curCollapsed = toggleBtn.dataset.collapsed === '1'
+        if (!state.discoveryCollapsed || typeof state.discoveryCollapsed !== 'object') {
+          state.discoveryCollapsed = { env: null, docker: null, sqlite: null }
+        }
+        state.discoveryCollapsed[groupKey] = !curCollapsed
+        renderDiscoveredItems()
       })
     }
 
@@ -658,8 +679,8 @@ export function createPanelConnectionFormController(ctx) {
     state.lastParsedUri = ''
     state.formOptions = ''
     state.lastAutoFilledSqliteName = ''
-    state.discoveredFileFilter = ''
-    if ($('discoveredFileSearch')) $('discoveredFileSearch').value = ''
+    state.discoveredSearch = ''
+    if ($('discoveredSearchInput')) $('discoveredSearchInput').value = ''
     $('connFormTitle').textContent = 'New Database Connection'
     $('saveFormBtn').textContent = 'Save & Connect'
     $('uriInput').value = ''
@@ -690,6 +711,15 @@ export function createPanelConnectionFormController(ctx) {
     void refreshPanelByodAndWorkspaces()
     setFormColorTag('none')
     clearFormNotice()
+  }
+
+  function clearFormFields() {
+    const keepDriver = state.formDriver || 'sqlite'
+    resetConnectionForm()
+    setFormDriver(keepDriver, true)
+    showFormNotice('Form cleared.', 'neutral')
+    $('formName')?.focus()
+    savePanelViewState?.()
   }
 
   function populateFormFromProfile(profile, mode = 'edit') {
@@ -1085,6 +1115,9 @@ export function createPanelConnectionFormController(ctx) {
       ])
       if (seq !== detectSeq) return
       state.discoveredEnvs = Array.isArray(wsRes?.envConnections) ? wsRes.envConnections : []
+      state.discoveredDocker = Array.isArray(wsRes?.dockerComposeConnections)
+        ? wsRes.dockerComposeConnections
+        : []
       const wsFiles = Array.isArray(wsRes?.sqliteFiles) ? wsRes.sqliteFiles : []
       const extraFiles = Array.isArray(folderRes?.files) ? folderRes.files : []
       const seenPaths = new Set()
@@ -1095,15 +1128,22 @@ export function createPanelConnectionFormController(ctx) {
           state.discoveredFiles.push(f)
         }
       }
-      if (isManual && state.discoveredEnvs.length === 0 && state.discoveredFiles.length === 0) {
+      state.discoveryCollapsed = { env: null, docker: null, sqlite: null }
+      if (
+        isManual &&
+        state.discoveredEnvs.length === 0 &&
+        state.discoveredDocker.length === 0 &&
+        state.discoveredFiles.length === 0
+      ) {
         showFormNotice(
-          'No .env connections or SQLite database files found in the workspace.',
+          'No .env connections, Docker Compose databases, or SQLite files found.',
           'neutral'
         )
       }
     } catch {
       if (seq !== detectSeq) return
       state.discoveredEnvs = []
+      state.discoveredDocker = []
       state.discoveredFiles = []
       if (isManual) {
         showFormNotice('Workspace discovery failed.', 'danger')
@@ -1119,25 +1159,158 @@ export function createPanelConnectionFormController(ctx) {
     renderDiscoveredItems()
   }
 
+  function applyDiscoveredDockerCompose(item) {
+    if (!item?.driver || !ENGINE_BY_ID[item.driver]) {
+      showFormNotice(
+        `"${String(item?.driver || 'This')}" connections must be configured in Fullscreen Studio.`,
+        'warn'
+      )
+      return
+    }
+    state.sourceSecretConnId = null
+    state.formHadPassword = false
+    state.formHadAuthToken = false
+    state.placeholderPasswordPending = false
+    state.lastParsedPlaceholderUri = false
+    state.lastParsedUri = ''
+    $('uriInput').value = ''
+    $('formPassword').value = ''
+    $('formPassword').placeholder = item.passwordFromFile
+      ? `Required (${item.passwordFromFile})`
+      : 'Optional'
+    $('formAuthToken').value = ''
+    $('formAuthToken').placeholder = 'Optional Bearer token'
+
+    setFormDriver(item.driver, true)
+    $('formName').value = item.name || `${item.project} · ${item.service}`
+    if (item.driver === 'libsql') {
+      $('formLibsqlUrl').value = item.url || `http://${item.host || '127.0.0.1'}:${item.port || 8080}`
+      $('formLibsqlDb').value = item.database || 'main'
+    } else {
+      $('formHost').value = item.host || '127.0.0.1'
+      $('formPort').value = String(item.port || ENGINE_BY_ID[item.driver].defaultPort)
+      $('formUser').value = item.user || ''
+      $('formSsl').checked = Boolean(item.ssl)
+      if (item.driver === 'redis') {
+        $('formRedisDb').value = String(item.redisDb ?? 0)
+        syncSelectTooltip($('formRedisDb'))
+      } else {
+        $('formDatabase').value = item.database || ENGINE_BY_ID[item.driver].defaultDb || ''
+      }
+      if (item.driver === 'clickhouse') {
+        $('formClickhouseUrl').value = item.url || `http://${item.host || '127.0.0.1'}:${item.port || 8123}`
+      }
+      if (item.password !== undefined) {
+        $('formPassword').value = item.password
+      }
+    }
+
+    if (item.hint) {
+      showFormNotice(item.hint, 'warn')
+      if (item.passwordFromFile) $('formPassword')?.focus()
+    } else {
+      showFormNotice(
+        `Imported ${ENGINE_BY_ID[item.driver].label} service "${item.name}" from Docker Compose.`,
+        'success'
+      )
+    }
+    savePanelViewState?.()
+  }
+
+  function applyGroupCollapseState(groupKey, groupEl, toggleBtn, bodyEl, countEl, totalCount, filteredCount, hasQuery) {
+    let collapsed
+    if (hasQuery) {
+      collapsed = filteredCount === 0
+    } else if (
+      state.discoveryCollapsed &&
+      typeof state.discoveryCollapsed[groupKey] === 'boolean'
+    ) {
+      collapsed = state.discoveryCollapsed[groupKey]
+    } else if (groupKey === 'sqlite' && state.formDriver !== 'sqlite') {
+      collapsed = true
+    } else {
+      collapsed = totalCount > 5
+    }
+    groupEl.classList.toggle('is-expanded', !collapsed)
+    toggleBtn.dataset.collapsed = collapsed ? '1' : '0'
+    toggleBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true')
+    bodyEl.hidden = collapsed
+    countEl.textContent = hasQuery ? `${filteredCount} / ${totalCount}` : `${totalCount} found`
+  }
+
+  function appendDiscoveryEmptyMessage(containerEl, text) {
+    const emptyEl = document.createElement('div')
+    emptyEl.style.padding = '8px 6px'
+    emptyEl.style.color = 'var(--t3)'
+    emptyEl.style.fontSize = '11.5px'
+    emptyEl.textContent = text
+    containerEl.appendChild(emptyEl)
+  }
+
   function renderDiscoveredItems() {
     const box = $('discoveredBox')
+    const groupsWrap = $('discoveredGroupsWrap')
     const envGroup = $('discoveredEnvGroup')
     const envList = $('discoveredEnvList')
+    const dockerGroup = $('discoveredDockerGroup')
+    const dockerList = $('discoveredDockerList')
     const fileGroup = $('discoveredFileGroup')
     const fileList = $('discoveredList')
+    if (!box || !envGroup || !envList || !dockerGroup || !dockerList || !fileGroup || !fileList) {
+      return
+    }
     envList.textContent = ''
+    dockerList.textContent = ''
     fileList.textContent = ''
 
-    const hasEnv = state.discoveredEnvs.length > 0
-    const hasFiles = state.discoveredFiles.length > 0
-    box.hidden = !hasEnv && !hasFiles
+    const envs = Array.isArray(state.discoveredEnvs) ? state.discoveredEnvs : []
+    const dockers = Array.isArray(state.discoveredDocker) ? state.discoveredDocker : []
+    const files = Array.isArray(state.discoveredFiles) ? state.discoveredFiles : []
+
+    const hasEnv = envs.length > 0
+    const hasDocker = dockers.length > 0
+    const hasFiles = files.length > 0
+
+    box.hidden = !hasEnv && !hasDocker && !hasFiles
     envGroup.hidden = !hasEnv
+    dockerGroup.hidden = !hasDocker
     fileGroup.hidden = !hasFiles
-    updateViewportLayout()
+
+    if (groupsWrap) {
+      const order =
+        state.formDriver === 'sqlite'
+          ? [fileGroup, envGroup, dockerGroup]
+          : [envGroup, dockerGroup, fileGroup]
+      for (const grp of order) groupsWrap.appendChild(grp)
+    }
+
+    const q = String(state.discoveredSearch || '').trim().toLowerCase()
+    const hasQuery = q.length > 0
 
     if (hasEnv) {
-      $('discoveredEnvCount').textContent = `${state.discoveredEnvs.length} found`
-      for (const item of state.discoveredEnvs) {
+      const filteredEnvs = hasQuery
+        ? envs.filter((item) => {
+            const masked = maskConnectionUriSecret(item.uri)
+            return [item.envKey, item.name, item.driver, item.sourceFile, masked]
+              .join(' ')
+              .toLowerCase()
+              .includes(q)
+          })
+        : envs
+      applyGroupCollapseState(
+        'env',
+        envGroup,
+        $('discoveredEnvToggle'),
+        $('discoveredEnvBody'),
+        $('discoveredEnvCount'),
+        envs.length,
+        filteredEnvs.length,
+        hasQuery
+      )
+      if (filteredEnvs.length === 0) {
+        appendDiscoveryEmptyMessage(envList, `No .env connections match "${state.discoveredSearch}".`)
+      }
+      for (const item of filteredEnvs) {
         const chip = document.createElement('button')
         chip.type = 'button'
         chip.className = 'file-chip'
@@ -1157,7 +1330,7 @@ export function createPanelConnectionFormController(ctx) {
 
         const badge = document.createElement('span')
         badge.className = 'badge badge-neutral'
-        badge.textContent = item.sourceFile || '.env'
+        badge.textContent = compactPathLabel(item.sourceFile || '.env')
         top.append(title, badge)
 
         const sub = document.createElement('div')
@@ -1174,28 +1347,114 @@ export function createPanelConnectionFormController(ctx) {
       }
     }
 
+    if (hasDocker) {
+      const filteredDocker = hasQuery
+        ? dockers.filter((item) =>
+            [
+              item.project,
+              item.service,
+              item.name,
+              item.driver,
+              item.host,
+              String(item.port || ''),
+              item.database,
+              item.user || '',
+              item.status,
+              item.sourceFile,
+            ]
+              .join(' ')
+              .toLowerCase()
+              .includes(q)
+          )
+        : dockers
+      applyGroupCollapseState(
+        'docker',
+        dockerGroup,
+        $('discoveredDockerToggle'),
+        $('discoveredDockerBody'),
+        $('discoveredDockerCount'),
+        dockers.length,
+        filteredDocker.length,
+        hasQuery
+      )
+      if (filteredDocker.length === 0) {
+        appendDiscoveryEmptyMessage(
+          dockerList,
+          `No Docker Compose services match "${state.discoveredSearch}".`
+        )
+      }
+      for (const item of filteredDocker) {
+        const chip = document.createElement('button')
+        chip.type = 'button'
+        chip.className = 'file-chip'
+        chip.title = `${item.name} (${item.driver}) — ${item.host}:${item.port} [${item.status}]`
+
+        const top = document.createElement('div')
+        top.className = 'file-chip-top'
+        const title = document.createElement('span')
+        title.className = 'file-chip-title'
+        const ico = document.createElement('span')
+        setDbLogoElement(ico, item.driver, 14)
+        const nm = document.createElement('span')
+        nm.className = 'file-chip-name'
+        nm.textContent = item.name || `${item.project} · ${item.service}`
+        title.append(ico, nm)
+
+        const badges = document.createElement('span')
+        badges.className = 'discovery-chip-badges'
+        if (item.workspaceMatched) {
+          const wsBadge = document.createElement('span')
+          wsBadge.className = 'badge badge-info'
+          wsBadge.textContent = 'Workspace'
+          badges.appendChild(wsBadge)
+        }
+        const statusBadge = document.createElement('span')
+        statusBadge.className =
+          item.status === 'running'
+            ? 'badge badge-ok'
+            : item.status === 'compose file'
+              ? 'badge badge-neutral'
+              : 'badge badge-danger'
+        statusBadge.textContent = item.status || 'live'
+        badges.appendChild(statusBadge)
+        top.append(title, badges)
+
+        const sub = document.createElement('div')
+        sub.className = 'file-chip-path'
+        const targetDb = item.driver === 'redis' ? `db${item.redisDb ?? 0}` : item.database || ''
+        const userPrefix = item.user ? `${item.user}@` : ''
+        sub.textContent = `${userPrefix}${item.host}:${item.port}${targetDb ? `/${targetDb}` : ''} · ${compactPathLabel(item.sourceFile || '')}`
+        chip.append(top, sub)
+
+        chip.addEventListener('click', () => applyDiscoveredDockerCompose(item))
+        dockerList.appendChild(chip)
+      }
+    }
+
     if (hasFiles) {
-      const q = (state.discoveredFileFilter || '').trim().toLowerCase()
-      const filteredFiles = q
-        ? state.discoveredFiles.filter(
+      const filteredFiles = hasQuery
+        ? files.filter(
             (f) =>
               String(f.name || '').toLowerCase().includes(q) ||
               String(f.filePath || '').toLowerCase().includes(q)
           )
-        : state.discoveredFiles
-      $('discoveredCount').textContent = q
-        ? `${filteredFiles.length} / ${state.discoveredFiles.length} found`
-        : `${state.discoveredFiles.length} found`
-
+        : files
+      applyGroupCollapseState(
+        'sqlite',
+        fileGroup,
+        $('discoveredFileToggle'),
+        $('discoveredFileBody'),
+        $('discoveredCount'),
+        files.length,
+        filteredFiles.length,
+        hasQuery
+      )
       if (filteredFiles.length === 0) {
-        const emptyEl = document.createElement('div')
-        emptyEl.style.padding = '10px 8px'
-        emptyEl.style.color = 'var(--t3)'
-        emptyEl.style.fontSize = '12px'
-        emptyEl.textContent = `No SQLite files match "${state.discoveredFileFilter}".`
-        fileList.appendChild(emptyEl)
+        appendDiscoveryEmptyMessage(
+          fileList,
+          `No SQLite files match "${state.discoveredSearch}".`
+        )
       }
-
       for (const file of filteredFiles) {
         const chip = document.createElement('button')
         chip.type = 'button'
@@ -1242,10 +1501,12 @@ export function createPanelConnectionFormController(ctx) {
         fileList.appendChild(chip)
       }
     }
+
+    updateViewportLayout()
   }
 
   function setFormControlsBusy(busy) {
-    const ids = ['testFormBtn', 'saveFormBtn', 'uriInput', 'parseUriBtn', 'detectWorkspaceBtn']
+    const ids = ['testFormBtn', 'saveFormBtn', 'clearFormBtn', 'uriInput', 'parseUriBtn', 'detectWorkspaceBtn']
     for (const id of ids) {
       const el = $(id)
       if (el) el.disabled = Boolean(busy)
@@ -1298,6 +1559,7 @@ export function createPanelConnectionFormController(ctx) {
     setFormColorTag,
     setFormDriver,
     resetConnectionForm,
+    clearFormFields,
     populateFormFromProfile,
     buildFormSubmission,
     handleParseUri,

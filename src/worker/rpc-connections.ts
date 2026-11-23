@@ -22,6 +22,7 @@ import {
   scanDirectoryForSqliteFiles,
   type DiscoveredSqliteFile,
 } from './discovery'
+import { detectWorkspaceDockerComposeConnections } from './docker-compose-discovery'
 import type { SessionManager } from './session-manager'
 import {
   createHostError,
@@ -440,9 +441,12 @@ export function registerConnectionHandlers({
       sqliteFilesPromise = discoverWorkspaceSqliteFiles(orca, stored, { maxDurationMs: 750 })
     }
 
-    const [envConnections, items] = await Promise.all([
+    const [envConnections, items, dockerComposeConnections] = await Promise.all([
       detectWorkspaceEnvConnections(targetDirs),
       sqliteFilesPromise,
+      detectWorkspaceDockerComposeConnections(targetDirs, {
+        onlyMatchedWorkspaces: Boolean(rawFolder),
+      }),
     ])
 
     return {
@@ -453,6 +457,7 @@ export function registerConnectionHandlers({
         sizeLabel: d.sizeLabel || formatByteSize(d.sizeBytes ?? 0),
       })),
       envConnections,
+      dockerComposeConnections,
     }
   })
 

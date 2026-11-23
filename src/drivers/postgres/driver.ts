@@ -1255,6 +1255,7 @@ export class PostgresSession implements IDatabaseSession {
             throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', this.driverType)
           }
           const trimmedStmt = stmtSql.trim()
+          const stmtStart = performance.now()
           const normalizedStmt = stripLeadingSqlComments(trimmedStmt, this.driverType).trim()
           const isStandaloneBegin = /^(?:BEGIN|START\s+TRANSACTION)\b/i.test(normalizedStmt)
           if (isStandaloneBegin && this.txClient === null) {
@@ -1277,6 +1278,7 @@ export class PostgresSession implements IDatabaseSession {
           const commandTag = typeof res?.command === 'string' ? res.command.toUpperCase() : ''
 
           const parsed = parsePgQueryResult(res, maxRows)
+          const stmtDurationMs = Math.round(performance.now() - stmtStart)
           if (parsed.isSelect) {
             const sourceTable = await this.resolveSourceTableFromFields(client, res.fields)
             const enrichedResult: Omit<QueryResult, 'executionTimeMs'> = sourceTable
@@ -1286,6 +1288,8 @@ export class PostgresSession implements IDatabaseSession {
             collectedSets.push({
               index: execIndex,
               sqlPreview: compactSql(trimmedStmt),
+              sql: trimmedStmt,
+              executionTimeMs: stmtDurationMs,
               columns: enrichedResult.columns,
               rows: enrichedResult.rows,
               rowCount: enrichedResult.rowCount,
@@ -1298,6 +1302,8 @@ export class PostgresSession implements IDatabaseSession {
             collectedSets.push({
               index: execIndex,
               sqlPreview: compactSql(trimmedStmt),
+              sql: trimmedStmt,
+              executionTimeMs: stmtDurationMs,
               columns: [{ name: 'affected_rows', type: 'INTEGER' }],
               rows: [[parsed.affectedRows]],
               rowCount: 1,
@@ -1310,6 +1316,8 @@ export class PostgresSession implements IDatabaseSession {
             collectedSets.push({
               index: execIndex,
               sqlPreview: compactSql(trimmedStmt),
+              sql: trimmedStmt,
+              executionTimeMs: stmtDurationMs,
               columns: [{ name: 'affected_rows', type: 'INTEGER' }],
               rows: [[parsed.affectedRows]],
               rowCount: 1,

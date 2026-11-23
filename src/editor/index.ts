@@ -136,7 +136,21 @@ import {
   ConsoleTabsManager,
   type SqlConsoleTabState,
   type PersistedConsoleTabsState,
+  type ResultBannerState,
+  type ResultSetTabRuntimeState,
+  type EditableSqlTargetMeta,
 } from './console-tabs.js'
+import {
+  compactSqlPreview,
+  getEffectiveResultSets,
+  getDefaultResultSetIndex,
+  buildResultSetQueryResult,
+  buildBannerForResultSet,
+  buildInitialResultTabStates,
+  buildCombinedExplainResult,
+  shouldShowQueryBannerForMode,
+  type StudioViewMode,
+} from './result-set-controller.js'
 import {
   extractSqlParameters,
   coerceBindParamValue,
@@ -215,6 +229,7 @@ import {
   type ConnectionProfile,
   type DatabaseDriverType,
   type QueryResult,
+  type QueryResultSet,
   type TableBrowseResult,
   type TableDetails,
   type SchemaObject,
@@ -224,11 +239,13 @@ import { DEFAULT_RPC_TIMEOUT_MS } from '../shared-constants.js'
 
 const BASE_EDITOR_TOKENS = `
   :root {
-    --surface: var(--orca-editor-surface, var(--orca-card, #0a0a0a));
-    --border: var(--orca-border, #1f1f1f);
+    --bg: var(--orca-background, #000000);
     --text: var(--orca-foreground, #e6e6e6);
-    --muted: var(--orca-foreground-muted, var(--orca-muted-foreground, #a3a3a3));
-    --accent: var(--orca-accent, #1a1a1a);
+    --surface: color-mix(in srgb, var(--text) 3.5%, var(--bg));
+    --border: var(--orca-border, color-mix(in srgb, var(--text) 12%, var(--bg)));
+    --muted: var(--orca-muted-foreground, color-mix(in srgb, var(--text) 68%, var(--bg)));
+    --accent: var(--orca-accent, color-mix(in srgb, var(--text) 7%, var(--bg)));
+    --accent-ring: var(--orca-ring, var(--orca-primary, #e6e6e6));
   }
   .datanoa-editor-root { display: flex; flex-direction: column; height: 100%; width: 100%; }
   .datanoa-toolbar { display: flex; align-items: center; }
@@ -370,6 +387,10 @@ export class DatanoaStudioEditor {
   private addConnBtn: HTMLButtonElement | null = null
   private editConnBtn: HTMLButtonElement | null = null
   private cautionStripEl: HTMLDivElement | null = null
+  private cautionStripTextEl: HTMLSpanElement | null = null
+  private cautionStripCloseBtn: HTMLButtonElement | null = null
+  private dismissedCautionKey: string | null = null
+  private activeCautionKey: string | null = null
   private runBtn: HTMLButtonElement | null = null
   private runAllBtn: HTMLButtonElement | null = null
   private explainBtn: HTMLButtonElement | null = null
@@ -397,6 +418,8 @@ export class DatanoaStudioEditor {
   private resultSetsBarEl: HTMLDivElement | null = null
   private activeQueryResult: QueryResult | null = null
   private activeResultSetIndex = 0
+  private activeResultBannerState: ResultBannerState | null = null
+  private activeWorkerQueryId: string | null = null
   private rememberedBindParams: Record<string, BindParamInput> = {}
   private splitResizerEl: HTMLDivElement | null = null
   private sidebarContextMenuEl: HTMLDivElement | null = null
@@ -498,7 +521,7 @@ export class DatanoaStudioEditor {
   private totalRows = 0
   private currentPageRowCount = 0
   private pageSize = 100
-  private activeViewMode: 'split' | 'grid' | 'sql' | 'inspector' = 'split'
+  private activeViewMode: StudioViewMode = 'split'
   private customSqlPanePx: number | null = null
   private splitResizeListeners: {
     move: (e: MouseEvent) => void
@@ -1244,6 +1267,8 @@ export class DatanoaStudioEditor {
     this.addConnBtn = dom.addConnBtn
     this.editConnBtn = dom.editConnBtn
     this.cautionStripEl = dom.cautionStripEl
+    this.cautionStripTextEl = dom.cautionStripTextEl
+    this.cautionStripCloseBtn = dom.cautionStripCloseBtn
     this.runBtn = dom.runBtn
     this.runAllBtn = dom.runAllBtn
     this.explainBtn = dom.explainBtn
@@ -1338,6 +1363,14 @@ export class DatanoaStudioEditor {
     dom.editConnBtn.addEventListener('click', () => {
       const active = this.getActiveConnection()
       if (active) this.openConnectionModal(active)
+    })
+    dom.cautionStripCloseBtn.addEventListener('click', () => {
+      if (this.activeCautionKey) {
+        this.dismissedCautionKey = this.activeCautionKey
+      }
+      if (this.cautionStripEl) {
+        this.cautionStripEl.style.display = 'none'
+      }
     })
     dom.runBtn.addEventListener('click', () => {
       void this.executeSql(false)
@@ -1597,7 +1630,7 @@ export class DatanoaStudioEditor {
       this.updateStatus('Copied query error to clipboard')
     })
     dom.queryBannerReportBtn.addEventListener('click', () => this.openFeedbackModal('bug'))
-    dom.queryBannerCloseBtn.addEventListener('click', () => this.hideQueryBanner())
+    dom.queryBannerCloseBtn.addEventListener('click', () => this.dismissActiveQueryBanner())
     dom.statusSelectionEl.addEventListener('click', () => {
       const text = this.statusSelectionEl?.textContent || ''
       if (text) {
@@ -1883,6 +1916,8 @@ export class DatanoaStudioEditor {
       }
     }
 
+    this.syncQueryBannerForViewMode()
+
     if (showGridChrome) {
       this.dataGrid?.handleViewportResize()
       if (typeof requestAnimationFrame === 'function') {
@@ -2066,9 +2101,15 @@ export class DatanoaStudioEditor {
     }
   }
 
-  public applyDocumentMetadata(docText: string): void {
+  public applyDocumentMetadata(
+    docText: string,
+    options?: { resetCautionDismissal?: boolean }
+  ): void {
     const parsed = parseDatanoaDocument(docText)
     this.preservedMetadataLines = parsed.metadataLines
+    if (options?.resetCautionDismissal) {
+      this.dismissedCautionKey = null
+    }
 
     this.suppressDocSync = true
     try {
@@ -2088,6 +2129,9 @@ export class DatanoaStudioEditor {
       this.hasLoadedActiveConnection
 
     if (isAlreadyLoadedSameConnection && targetConnectionId) {
+      if (options?.resetCautionDismissal) {
+        this.applyActiveConnectionPresentation(this.getActiveConnection())
+      }
       if (
         parsed.table &&
         (parsed.table !== this.activeTable ||
@@ -2184,7 +2228,7 @@ export class DatanoaStudioEditor {
     if (typeof session.onReplace === 'function') {
       const sub = session.onReplace((next) => {
         if (typeof next === 'string') {
-          this.applyDocumentMetadata(next)
+          this.applyDocumentMetadata(next, { resetCautionDismissal: true })
         }
       })
       if (sub && typeof sub.dispose === 'function') {
@@ -2393,8 +2437,18 @@ export class DatanoaStudioEditor {
       track(
         window.orca.on('theme', (payload) => {
           if (payload && payload.colorScheme) {
-            document.documentElement.classList.toggle('light', payload.colorScheme === 'light')
-            document.documentElement.classList.toggle('dark', payload.colorScheme === 'dark')
+            const isLight = payload.colorScheme === 'light'
+            const isDark = payload.colorScheme === 'dark'
+            document.documentElement.classList.toggle('light', isLight)
+            document.documentElement.classList.toggle('dark', isDark)
+            document.body?.classList.toggle('light', isLight)
+            document.body?.classList.toggle('dark', isDark)
+            this.sqlConsole?.setColorScheme(isLight)
+          } else {
+            const isLight = detectInitialThemeFromHost({ forceTokenProbe: true })
+            if (isLight !== null) {
+              this.sqlConsole?.setColorScheme(isLight)
+            }
           }
         })
       )
@@ -2449,6 +2503,21 @@ export class DatanoaStudioEditor {
       track(
         window.orca.plugin.on('connections.changed', () => {
           void this.refreshConnections()
+        })
+      )
+      track(
+        window.orca.plugin.on('studio.opened', (payload) => {
+          const openedConnId =
+            payload &&
+            typeof payload === 'object' &&
+            'connectionId' in payload &&
+            typeof (payload as { connectionId?: unknown }).connectionId === 'string'
+              ? (payload as { connectionId: string }).connectionId
+              : null
+          if (!openedConnId || openedConnId === this.activeConnectionId) {
+            this.dismissedCautionKey = null
+            this.applyActiveConnectionPresentation(this.getActiveConnection())
+          }
         })
       )
       track(
@@ -2514,23 +2583,37 @@ export class DatanoaStudioEditor {
     }
 
     if (this.cautionStripEl) {
+      let cautionKind: 'prod-ro' | 'prod' | 'ro' | null = null
+      let cautionClass = 'datanoa-caution-strip'
+      let cautionText = ''
       if (conn?.readOnly && conn?.colorTag === 'prod') {
-        this.cautionStripEl.className = 'datanoa-caution-strip prod'
-        this.cautionStripEl.textContent =
-          'PRODUCTION (Read-Only) — Mutations and write SQL statements are locked.'
-        this.cautionStripEl.style.display = 'flex'
+        cautionKind = 'prod-ro'
+        cautionClass = 'datanoa-caution-strip prod'
+        cautionText = 'PRODUCTION (Read-Only) — Mutations and write SQL statements are locked.'
       } else if (conn?.colorTag === 'prod') {
-        this.cautionStripEl.className = 'datanoa-caution-strip prod'
-        this.cautionStripEl.textContent =
+        cautionKind = 'prod'
+        cautionClass = 'datanoa-caution-strip prod'
+        cautionText =
           'PRODUCTION environment — Double-check WHERE clauses and DML changes before submitting.'
-        this.cautionStripEl.style.display = 'flex'
       } else if (conn?.readOnly) {
-        this.cautionStripEl.className = 'datanoa-caution-strip'
-        this.cautionStripEl.textContent =
+        cautionKind = 'ro'
+        cautionClass = 'datanoa-caution-strip'
+        cautionText =
           'Read-Only connection — Inline edits, staged DML, and write statements are disabled.'
-        this.cautionStripEl.style.display = 'flex'
-      } else {
+      }
+
+      const cautionKey = conn && cautionKind ? `${conn.id}:${cautionKind}` : null
+      this.activeCautionKey = cautionKey
+
+      if (!cautionKey) {
         this.cautionStripEl.style.display = 'none'
+      } else {
+        this.cautionStripEl.className = cautionClass
+        if (this.cautionStripTextEl) {
+          this.cautionStripTextEl.textContent = cautionText
+        }
+        this.cautionStripEl.style.display =
+          this.dismissedCautionKey === cautionKey ? 'none' : 'flex'
       }
     }
 
@@ -2849,6 +2932,7 @@ export class DatanoaStudioEditor {
     const prevConnId = this.activeConnectionId
     const changed = connectionId !== this.activeConnectionId
     if (changed) {
+      this.dismissedCautionKey = null
       this.closeActiveModal()
       this.txToolbar.resetForConnectionSwitch(prevConnId)
     }
@@ -3891,39 +3975,99 @@ export class DatanoaStudioEditor {
     }
   }
 
+  private renderQueryBannerDom(banner: ResultBannerState, onRetry?: (() => void) | null): void {
+    if (!this.queryBannerEl || !this.queryBannerTitleEl || !this.queryBannerDetailEl) return
+    this.queryBannerEl.className = `datanoa-query-banner ${banner.kind}`
+    this.queryBannerEl.setAttribute('role', banner.kind === 'error' ? 'alert' : 'status')
+    this.queryBannerTitleEl.textContent = banner.title
+    this.queryBannerDetailEl.textContent = banner.detail
+    this.queryBannerDetailEl.style.display = banner.detail ? 'block' : 'none'
+    if (this.queryBannerCopyBtn) {
+      this.lastQueryErrorText = banner.kind === 'error' ? banner.errorText || banner.detail || banner.title : ''
+      this.queryBannerCopyBtn.style.display = banner.kind === 'error' ? 'inline-flex' : 'none'
+    }
+    if (this.queryBannerReportBtn) {
+      this.queryBannerReportBtn.style.display = banner.kind === 'error' ? 'inline-flex' : 'none'
+    }
+    this.queryBannerRetryHandler = onRetry ?? null
+    if (this.queryBannerRetryBtn) {
+      this.queryBannerRetryBtn.style.display = onRetry ? 'inline-flex' : 'none'
+    }
+    if (this.queryBannerBackBtn) {
+      const canReturn = Boolean(
+        banner.showBackToTable && this.activeConnectionId && this.activeTable
+      )
+      this.queryBannerBackBtn.style.display = canReturn ? 'inline-flex' : 'none'
+    }
+  }
+
+  private setQueryBannerVisible(visible: boolean): void {
+    if (!this.queryBannerEl) return
+    const wasVisible = this.queryBannerEl.style.display !== 'none'
+    this.queryBannerEl.style.display = visible ? 'flex' : 'none'
+    if (wasVisible !== visible && this.activeViewMode !== 'inspector') {
+      this.dataGrid?.handleViewportResize()
+    }
+  }
+
+  private shouldShowActiveBannerInViewMode(): boolean {
+    return shouldShowQueryBannerForMode(
+      this.activeViewMode,
+      this.isShowingSqlResult,
+      this.activeResultBannerState
+    )
+  }
+
+  private syncQueryBannerForViewMode(): void {
+    if (!this.queryBannerEl) return
+    if (!this.shouldShowActiveBannerInViewMode() || !this.activeResultBannerState) {
+      this.setQueryBannerVisible(false)
+      return
+    }
+    this.renderQueryBannerDom(this.activeResultBannerState, this.queryBannerRetryHandler)
+    this.setQueryBannerVisible(true)
+  }
+
+  private dismissActiveQueryBanner(): void {
+    if (this.activeResultBannerState) {
+      this.activeResultBannerState = { ...this.activeResultBannerState, dismissed: true }
+      if (this.isShowingSqlResult) {
+        const curState = this.consoleTabs.getResultTabState(this.activeResultSetIndex)
+        if (curState) {
+          this.consoleTabs.setResultTabState(this.activeResultSetIndex, {
+            ...curState,
+            banner: { ...this.activeResultBannerState },
+          })
+        }
+      }
+    }
+    this.setQueryBannerVisible(false)
+  }
+
   private showQueryBanner(
     kind: 'success' | 'error',
     title: string,
     detail = '',
-    opts?: { onRetry?: () => void; showBackToTable?: boolean }
+    opts?: { onRetry?: () => void; showBackToTable?: boolean; isExplain?: boolean }
   ): void {
-    if (!this.queryBannerEl || !this.queryBannerTitleEl || !this.queryBannerDetailEl) return
-    this.queryBannerEl.className = `datanoa-query-banner ${kind}`
-    this.queryBannerEl.setAttribute('role', kind === 'error' ? 'alert' : 'status')
-    this.queryBannerTitleEl.textContent = title
-    this.queryBannerDetailEl.textContent = detail
-    this.queryBannerDetailEl.style.display = detail ? 'block' : 'none'
-    if (this.queryBannerCopyBtn) {
-      this.lastQueryErrorText = kind === 'error' ? detail || title : ''
-      this.queryBannerCopyBtn.style.display = kind === 'error' ? 'inline-flex' : 'none'
+    const banner: ResultBannerState = {
+      kind,
+      title,
+      detail,
+      dismissed: false,
+      showBackToTable: opts?.showBackToTable,
+      errorText: kind === 'error' ? detail || title : undefined,
+      isExplain: opts?.isExplain,
     }
-    if (this.queryBannerReportBtn) {
-      this.queryBannerReportBtn.style.display = kind === 'error' ? 'inline-flex' : 'none'
-    }
+    this.activeResultBannerState = banner
     this.queryBannerRetryHandler = opts?.onRetry ?? null
-    if (this.queryBannerRetryBtn) {
-      this.queryBannerRetryBtn.style.display = opts?.onRetry ? 'inline-flex' : 'none'
-    }
-    if (this.queryBannerBackBtn) {
-      const canReturn = Boolean(
-        opts?.showBackToTable && this.activeConnectionId && this.activeTable
-      )
-      this.queryBannerBackBtn.style.display = canReturn ? 'inline-flex' : 'none'
-    }
-    this.queryBannerEl.style.display = 'flex'
+    if (!this.queryBannerEl || !this.queryBannerTitleEl || !this.queryBannerDetailEl) return
+    this.renderQueryBannerDom(banner, opts?.onRetry ?? null)
+    this.setQueryBannerVisible(this.shouldShowActiveBannerInViewMode())
   }
 
   private hideQueryBanner(): void {
+    this.activeResultBannerState = null
     this.lastQueryErrorText = ''
     this.queryBannerRetryHandler = null
     if (this.queryBannerReportBtn) {
@@ -3935,16 +4079,68 @@ export class DatanoaStudioEditor {
     if (this.queryBannerBackBtn) {
       this.queryBannerBackBtn.style.display = 'none'
     }
-    if (this.queryBannerEl) {
-      const wasVisible = this.queryBannerEl.style.display !== 'none'
-      this.queryBannerEl.style.display = 'none'
-      if (wasVisible) {
-        this.dataGrid?.handleViewportResize()
-      }
-    }
+    this.setQueryBannerVisible(false)
   }
 
   private async applyServerFilters(): Promise<void> {
+    if (this.isShowingSqlResult) {
+      if (!this.activeConnectionId) {
+        this.updateStatus('Select an active connection first')
+        return
+      }
+      const driver = this.getActiveConnection()?.driver || 'sqlite'
+      let sanitizedWhere: string | undefined
+      let sanitizedOrderBy: string | undefined
+      try {
+        sanitizedWhere = sanitizeFilterClause(this.whereInputEl?.value, driver)
+        sanitizedOrderBy = sanitizeFilterClause(this.orderByInputEl?.value, driver)
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err)
+        this.showQueryBanner('error', 'Invalid Filter Clause', msg)
+        this.updateStatus(msg)
+        return
+      }
+      const curState = this.consoleTabs.getResultTabState(this.activeResultSetIndex)
+      if (curState) {
+        curState.whereClause = sanitizedWhere || ''
+        curState.orderByClause = sanitizedOrderBy || ''
+        this.consoleTabs.setResultTabState(this.activeResultSetIndex, curState)
+      }
+      const rs = this.activeQueryResult?.resultSets?.[this.activeResultSetIndex]
+      const baseSql = (curState?.baseStatementSql || this.activeExecutedSql || '').trim()
+      const cleanBase = baseSql.replace(/;+\s*$/, '').trim()
+      const isExplainTab = Boolean(curState?.banner?.isExplain)
+      const canWrapSelect =
+        !isExplainTab &&
+        (rs ? rs.isSelect : Boolean(this.activeQueryResult?.isSelect)) &&
+        /^\s*(?:WITH\b|SELECT\b)/i.test(cleanBase) &&
+        driver !== 'redis'
+      if (!canWrapSelect || !cleanBase) {
+        if (!sanitizedWhere && !sanitizedOrderBy) {
+          this.updateStatus('Cleared WHERE / ORDER BY for current result tab')
+        } else {
+          this.updateStatus('Server WHERE / ORDER BY filter only applies to SELECT result tabs')
+        }
+        return
+      }
+      const filteredSql =
+        !sanitizedWhere && !sanitizedOrderBy
+          ? cleanBase
+          : `SELECT * FROM (${cleanBase}) AS _datanoa_filter${sanitizedWhere ? ` WHERE ${sanitizedWhere}` : ''}${sanitizedOrderBy ? ` ORDER BY ${sanitizedOrderBy}` : ''}`
+      await this.refreshSingleResultSet(
+        this.consoleTabs.getActiveTabId(),
+        this.activeResultSetIndex,
+        this.activeConnectionId,
+        filteredSql,
+        {
+          preserveWhere: sanitizedWhere || '',
+          preserveOrderBy: sanitizedOrderBy || '',
+          preserveSearchMode: this.searchMode,
+          preserveClientSearch: this.clientSearchEl?.value || '',
+        }
+      )
+      return
+    }
     if (!this.activeConnectionId || !this.activeTable) {
       this.updateStatus('Select a table first to filter')
       return
@@ -3964,13 +4160,46 @@ export class DatanoaStudioEditor {
   }
 
   private async clearAllFilters(): Promise<void> {
-    this.activeWhereClause = undefined
-    this.activeOrderByClause = undefined
     if (this.whereInputEl) this.whereInputEl.value = ''
     if (this.orderByInputEl) this.orderByInputEl.value = ''
+    if (this.clientSearchEl) this.clientSearchEl.value = ''
+    this.dataGrid?.setClientFilter('')
+    this.dataGrid?.setFindQuery('')
+    this.updateFindCounter({ total: 0, activeIndex: -1 })
     this.dataGrid?.clearClientColumnFilters()
     this.dataGrid?.clearSortIndicator()
-    if (!this.isShowingSqlResult && this.activeConnectionId && this.activeTable) {
+    if (this.isShowingSqlResult) {
+      const curState = this.consoleTabs.getResultTabState(this.activeResultSetIndex)
+      const hadServerFilter = Boolean(curState?.whereClause || curState?.orderByClause)
+      if (curState) {
+        curState.whereClause = ''
+        curState.orderByClause = ''
+        curState.clientSearchText = ''
+        curState.statementSql = curState.baseStatementSql
+        this.consoleTabs.setResultTabState(this.activeResultSetIndex, curState)
+      }
+      if (hadServerFilter && curState?.baseStatementSql && this.activeConnectionId) {
+        await this.refreshSingleResultSet(
+          this.consoleTabs.getActiveTabId(),
+          this.activeResultSetIndex,
+          this.activeConnectionId,
+          curState.baseStatementSql,
+          {
+            preserveWhere: '',
+            preserveOrderBy: '',
+            preserveSearchMode: this.searchMode,
+            preserveClientSearch: '',
+          }
+        )
+        return
+      }
+      this.captureActiveResultTabState()
+      this.updateStatus('Cleared filters for current result tab')
+      return
+    }
+    this.activeWhereClause = undefined
+    this.activeOrderByClause = undefined
+    if (this.activeConnectionId && this.activeTable) {
       await this.loadTableData(this.activeConnectionId, this.activeTable, 1)
     } else {
       this.updateStatus('Cleared column filters')
@@ -3998,10 +4227,21 @@ export class DatanoaStudioEditor {
     this.isTableLoading = true
     this.updatePaginationButtons()
     try {
+      const wasShowingSqlResult = this.isShowingSqlResult
       this.isShowingSqlResult = false
       this.activeQueryResult = null
       this.activeResultSetIndex = 0
       this.editableSqlTarget = null
+      if (wasShowingSqlResult) {
+        if (this.whereInputEl) this.whereInputEl.value = this.activeWhereClause || ''
+        if (this.orderByInputEl) this.orderByInputEl.value = this.activeOrderByClause || ''
+        if (this.clientSearchEl) this.clientSearchEl.value = ''
+        this.dataGrid?.setClientFilter('')
+        this.dataGrid?.setFindQuery('')
+        this.updateFindCounter({ total: 0, activeIndex: -1 })
+        this.dataGrid?.clearClientColumnFilters()
+        this.dataGrid?.clearSortIndicator()
+      }
       this.hideResultSetsBar()
       this.hideQueryBanner()
       if (!silent) {
@@ -4431,6 +4671,16 @@ export class DatanoaStudioEditor {
     this.activeEditableStmtSql = ''
     this.editableSqlTarget = null
     this.currentCanEdit = false
+    if (this.whereInputEl) this.whereInputEl.value = ''
+    if (this.orderByInputEl) this.orderByInputEl.value = ''
+    if (this.clientSearchEl) this.clientSearchEl.value = ''
+    this.syncSearchModeUiOnly('filter')
+    this.dataGrid?.setClientFilter('')
+    this.dataGrid?.setFindQuery('')
+    this.updateFindCounter({ total: 0, activeIndex: -1 })
+    this.dataGrid?.clearClientColumnFilters()
+    this.dataGrid?.clearSortIndicator()
+    this.hideQueryBanner()
     this.hideResultSetsBar()
     this.dataGrid?.setEmptyMessage('Run a query in this tab to see results.')
     this.dataGrid?.setData({
@@ -4441,6 +4691,7 @@ export class DatanoaStudioEditor {
       truncated: false,
       isSelect: true,
     })
+    this.updateStagedActionButtons(0)
     if (this.gridSubbarTitleEl) {
       this.gridSubbarTitleEl.textContent = 'SQL Result'
     }
@@ -4451,6 +4702,7 @@ export class DatanoaStudioEditor {
 
   private switchConsoleTab(tabId: string): void {
     if (tabId === this.consoleTabs.getActiveTabId()) return
+    this.captureActiveResultTabState()
     this.saveActiveConsoleTabState()
     if (!this.consoleTabs.switchTab(tabId)) return
     this.loadActiveConsoleTab()
@@ -4459,6 +4711,7 @@ export class DatanoaStudioEditor {
   }
 
   private addConsoleTab(): void {
+    this.captureActiveResultTabState()
     this.saveActiveConsoleTabState()
     this.consoleTabs.addTab('')
     this.loadActiveConsoleTab()
@@ -4470,11 +4723,185 @@ export class DatanoaStudioEditor {
   }
 
   private closeConsoleTab(tabId: string): void {
+    this.captureActiveResultTabState()
     this.saveActiveConsoleTabState()
     if (!this.consoleTabs.closeTab(tabId)) return
     this.loadActiveConsoleTab()
     this.restoreConsoleTabResult()
     this.saveStudioViewState(false)
+  }
+
+  private syncSearchModeUiOnly(mode: 'filter' | 'find'): void {
+    this.cancelClientSearchDebounce()
+    this.searchMode = mode
+    if (this.searchModeBtn) {
+      this.searchModeBtn.textContent = mode === 'find' ? 'Mode: Find' : 'Mode: Filter'
+      this.searchModeBtn.classList.toggle('active', mode === 'find')
+    }
+    if (this.clientSearchEl) {
+      this.clientSearchEl.placeholder =
+        mode === 'find' ? 'Find & highlight (Enter)...' : 'Search rows...'
+    }
+    const showFindControls = mode === 'find'
+    if (this.findCountEl) this.findCountEl.style.display = showFindControls ? 'inline-flex' : 'none'
+    if (this.findPrevBtn) this.findPrevBtn.style.display = showFindControls ? 'inline-flex' : 'none'
+    if (this.findNextBtn) this.findNextBtn.style.display = showFindControls ? 'inline-flex' : 'none'
+  }
+
+  private captureActiveResultTabState(): void {
+    if (!this.isShowingSqlResult || !this.activeQueryResult) return
+    const idx = this.activeResultSetIndex
+    const existing = this.consoleTabs.getResultTabState(idx)
+    const fallbackStmt =
+      existing?.statementSql ||
+      this.activeQueryResult.resultSets?.[idx]?.sql ||
+      this.activeQueryResult.resultSets?.[idx]?.sqlPreview ||
+      this.activeExecutedSql ||
+      ''
+    const nextState: ResultSetTabRuntimeState = {
+      resultSetIndex: idx,
+      baseStatementSql: existing?.baseStatementSql || fallbackStmt,
+      statementSql: existing?.statementSql || fallbackStmt,
+      banner: this.activeResultBannerState ? { ...this.activeResultBannerState } : existing?.banner ?? null,
+      whereClause: this.whereInputEl?.value ?? existing?.whereClause ?? '',
+      orderByClause: this.orderByInputEl?.value ?? existing?.orderByClause ?? '',
+      searchMode: this.searchMode,
+      clientSearchText: this.clientSearchEl?.value ?? existing?.clientSearchText ?? '',
+      gridSnapshot: this.dataGrid?.exportRuntimeState() ?? existing?.gridSnapshot ?? null,
+      editableSqlTarget: this.editableSqlTarget ? { ...this.editableSqlTarget } : null,
+      activeEditableStmtSql: this.activeEditableStmtSql,
+      currentCanEdit: this.currentCanEdit,
+      gridSubbarTitle: this.gridSubbarTitleEl?.textContent ?? existing?.gridSubbarTitle ?? 'SQL Result',
+      gridPageInfo: this.gridPageInfoEl?.textContent ?? existing?.gridPageInfo ?? '0 rows',
+      emptyMessage: existing?.emptyMessage ?? 'Query returned no rows.',
+    }
+    this.consoleTabs.setResultTabState(idx, nextState)
+  }
+
+  private applyResultTabState(
+    index: number,
+    tab: SqlConsoleTabState,
+    opts?: { preserveScroll?: boolean }
+  ): void {
+    const res = tab.lastResult
+    if (!res) return
+    const sets = getEffectiveResultSets(res, tab.executedSql || '')
+    const rs = sets[index]
+    if (!rs) return
+    const existingState =
+      tab.resultStates?.[index] ??
+      buildInitialResultTabStates(
+        res,
+        [],
+        tab.executedSql || '',
+        res.executionTimeMs || 0,
+        tab.lastResultMode ?? 'query'
+      )[index]
+    if (!tab.resultStates?.[index] && existingState) {
+      this.consoleTabs.setResultTabState(index, existingState, tab.id)
+    }
+
+    this.activeResultSetIndex = index
+    this.consoleTabs.setActiveResultSetIndex(index)
+    this.activeExecutedSql = tab.executedSql || existingState?.statementSql || ''
+    if (this.dmlPreviewEl) this.dmlPreviewEl.style.display = 'none'
+
+    if (this.whereInputEl) this.whereInputEl.value = existingState?.whereClause ?? ''
+    if (this.orderByInputEl) this.orderByInputEl.value = existingState?.orderByClause ?? ''
+    if (this.clientSearchEl) this.clientSearchEl.value = existingState?.clientSearchText ?? ''
+    this.syncSearchModeUiOnly(existingState?.searchMode ?? 'filter')
+
+    if (existingState?.gridSnapshot) {
+      this.editableSqlTarget = existingState.editableSqlTarget
+        ? { ...existingState.editableSqlTarget }
+        : null
+      this.activeEditableStmtSql = existingState.activeEditableStmtSql || ''
+      this.currentCanEdit = Boolean(existingState.currentCanEdit)
+      this.dataGrid?.restoreRuntimeState(existingState.gridSnapshot)
+      this.updateFindCounter(this.dataGrid?.getFindState())
+      if (this.gridSubbarTitleEl) {
+        this.gridSubbarTitleEl.textContent = existingState.gridSubbarTitle || 'SQL Result'
+      }
+      if (this.gridPageInfoEl) {
+        this.gridPageInfoEl.textContent = existingState.gridPageInfo || '0 rows'
+      }
+      this.currentPage = 1
+      this.currentPageRowCount = existingState.gridSnapshot.model?.rows.length ?? rs.rows.length
+      this.totalRows = rs.rowCount
+      this.updatePaginationButtons()
+      this.updateExportDropdownOptions()
+      this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
+      this.renderResultSetsBar()
+      this.activeResultBannerState = existingState.banner ? { ...existingState.banner } : null
+      this.syncQueryBannerForViewMode()
+      return
+    }
+
+    this.editableSqlTarget = null
+    this.activeEditableStmtSql = ''
+    this.currentCanEdit = false
+    this.dataGrid?.setClientFilter('')
+    this.dataGrid?.setFindQuery('')
+    this.updateFindCounter({ total: 0, activeIndex: -1 })
+    this.dataGrid?.clearClientColumnFilters()
+    this.dataGrid?.clearSortIndicator()
+    this.dataGrid?.setForeignKeys([])
+    this.dataGrid?.setEmptyMessage(existingState?.emptyMessage || 'Query returned no rows.')
+
+    const isSameConnection = Boolean(
+      tab.executedConnectionId &&
+      this.activeConnectionId &&
+      tab.executedConnectionId === this.activeConnectionId
+    )
+    const isExplain = Boolean(existingState?.banner?.isExplain)
+
+    if (rs.isError) {
+      this.dataGrid?.setData({
+        columns: [],
+        rows: [],
+        rowCount: 0,
+        executionTimeMs: 0,
+        truncated: false,
+        isSelect: true,
+      })
+    } else if (!isExplain && rs.isSelect && this.activeConnectionId && isSameConnection) {
+      this.applySqlResultEditability(
+        res,
+        index,
+        this.activeConnectionId,
+        tab.id,
+        this.querySeq
+      )
+    } else {
+      this.dataGrid?.setData(buildResultSetQueryResult(res, index))
+    }
+
+    if (this.gridSubbarTitleEl && !this.editableSqlTarget) {
+      if (!isSameConnection && !isExplain && !rs.isError && tab.executedConnectionId) {
+        this.gridSubbarTitleEl.textContent =
+          sets.length > 1
+            ? `Result ${index + 1} · Read-only (another connection)`
+            : 'SQL Result · Read-only (another connection)'
+      } else if (existingState?.gridSubbarTitle) {
+        this.gridSubbarTitleEl.textContent = existingState.gridSubbarTitle
+      }
+    }
+    if (this.gridPageInfoEl && existingState?.gridPageInfo) {
+      this.gridPageInfoEl.textContent = existingState.gridPageInfo
+    }
+
+    this.currentPage = 1
+    this.currentPageRowCount = rs.isError ? 0 : rs.rows.length
+    this.totalRows = rs.isError ? 0 : rs.rowCount
+    this.updatePaginationButtons()
+    this.updateExportDropdownOptions()
+    this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
+    this.renderResultSetsBar()
+    this.activeResultBannerState = existingState?.banner ? { ...existingState.banner } : null
+    this.syncQueryBannerForViewMode()
+    if (!opts?.preserveScroll) {
+      this.captureActiveResultTabState()
+    }
   }
 
   private restoreConsoleTabResult(): void {
@@ -4488,51 +4915,10 @@ export class DatanoaStudioEditor {
       this.clearSqlResultViewForEmptyTab()
       return
     }
-    this.applyActiveQueryResult(tab.lastResult, tab.activeResultSetIndex)
-    const isSameConnection = Boolean(
-      tab.executedConnectionId &&
-      this.activeConnectionId &&
-      tab.executedConnectionId === this.activeConnectionId
-    )
-    if (tab.executedSql && this.activeConnectionId && isSameConnection) {
-      this.applySqlResultEditability(
-        tab.lastResult,
-        tab.activeResultSetIndex,
-        this.activeConnectionId,
-        tab.id,
-        this.querySeq
-      )
-    } else {
-      if (!isSameConnection && this.gridSubbarTitleEl) {
-        this.gridSubbarTitleEl.textContent = 'SQL Result · Read-only (another connection)'
-      }
-      this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
-    }
-  }
-
-  private getDefaultResultSetIndex(res: QueryResult): number {
-    const sets = res.resultSets
-    if (!sets || sets.length === 0) return 0
-    let index = 0
-    for (let i = 0; i < sets.length; i++) {
-      if (sets[i]?.isSelect) index = i
-    }
-    return index
-  }
-
-  private buildResultSetQueryResult(res: QueryResult, index: number): QueryResult {
-    const rs = res.resultSets?.[index]
-    if (!rs) return res
-    return {
-      columns: rs.columns,
-      rows: rs.rows,
-      rowCount: rs.rowCount,
-      affectedRows: rs.affectedRows,
-      executionTimeMs: res.executionTimeMs,
-      truncated: rs.truncated,
-      isSelect: rs.isSelect,
-      ...(rs.sourceTable ? { sourceTable: rs.sourceTable } : {}),
-    }
+    this.activeQueryResult = tab.lastResult
+    const sets = getEffectiveResultSets(tab.lastResult, tab.executedSql || '')
+    const clampedIndex = Math.max(0, Math.min(tab.activeResultSetIndex || 0, Math.max(0, sets.length - 1)))
+    this.applyResultTabState(clampedIndex, tab)
   }
 
   private applyActiveQueryResult(res: QueryResult, defaultIndex?: number): void {
@@ -4540,11 +4926,11 @@ export class DatanoaStudioEditor {
     this.activeEditableStmtSql = ''
     this.currentCanEdit = false
     this.activeQueryResult = res
-    const idx = defaultIndex ?? this.getDefaultResultSetIndex(res)
+    const idx = defaultIndex ?? getDefaultResultSetIndex(res)
     this.activeResultSetIndex = Math.max(0, idx)
     this.consoleTabs.setActiveResult(res, this.activeResultSetIndex)
     this.renderResultSetsBar()
-    this.dataGrid?.setData(this.buildResultSetQueryResult(res, this.activeResultSetIndex))
+    this.dataGrid?.setData(buildResultSetQueryResult(res, this.activeResultSetIndex))
   }
 
   /**
@@ -4611,8 +4997,13 @@ export class DatanoaStudioEditor {
     this.activeEditableStmtSql = ''
 
     if (isSelect && columns.length > 0) {
+      const rsState = this.consoleTabs.getResultTabState(resultSetIndex, originTabId)
       const stmts = splitSqlStatements(this.activeExecutedSql, driver)
-      const stmtSql = (stmts[resultSetIndex] || stmts[0])?.text || this.activeExecutedSql
+      const stmtSql =
+        rsState?.baseStatementSql ||
+        rs?.sql ||
+        (stmts[resultSetIndex] || stmts[0])?.text ||
+        this.activeExecutedSql
       const resolvedSourceTable = rs ? rs.sourceTable : res.sourceTable
       const analysis: EditableSelectAnalysis = analyzeEditableSelectQuery({
         sql: stmtSql,
@@ -4658,6 +5049,7 @@ export class DatanoaStudioEditor {
           targetConnId,
           analysis.schema || ''
         )
+        const existingSnap = rsState?.gridSnapshot
         this.dataGrid?.setData({
           columns: analysis.columns,
           rows: recordRows,
@@ -4667,10 +5059,37 @@ export class DatanoaStudioEditor {
           primaryKey: analysis.primaryKey,
           canEdit: true,
         })
+        if (existingSnap) {
+          if (existingSnap.sortColumn && existingSnap.sortDirection) {
+            this.dataGrid?.sortInMemoryRows(existingSnap.sortColumn, existingSnap.sortDirection)
+          }
+          if (existingSnap.clientFilter) {
+            this.dataGrid?.setClientFilter(existingSnap.clientFilter)
+          }
+          for (const cf of existingSnap.clientColumnFilters || []) {
+            this.dataGrid?.addClientColumnFilter(cf.column, cf.value, cf.op)
+          }
+          if (existingSnap.findQuery) {
+            this.dataGrid?.setFindQuery(existingSnap.findQuery)
+          }
+        }
+        const totalSets = res.resultSets?.length ?? 1
+        const nextSubbarTitle =
+          totalSets > 1
+            ? `Result ${resultSetIndex + 1} · Editable (${analysis.table})`
+            : `SQL Result · Editable (${analysis.table})`
         if (this.gridSubbarTitleEl) {
-          this.gridSubbarTitleEl.textContent = `SQL Result · Editable (${analysis.table})`
+          this.gridSubbarTitleEl.textContent = nextSubbarTitle
         }
         this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
+        if (rsState) {
+          rsState.editableSqlTarget = { ...this.editableSqlTarget }
+          rsState.activeEditableStmtSql = stmtSql
+          rsState.currentCanEdit = true
+          rsState.gridSubbarTitle = nextSubbarTitle
+          rsState.gridSnapshot = this.dataGrid?.exportRuntimeState() ?? null
+          this.consoleTabs.setResultTabState(resultSetIndex, rsState, originTabId)
+        }
         return
       }
 
@@ -4703,7 +5122,7 @@ export class DatanoaStudioEditor {
       }
     }
 
-    this.dataGrid?.setData(this.buildResultSetQueryResult(res, resultSetIndex))
+    this.dataGrid?.setData(buildResultSetQueryResult(res, resultSetIndex))
     this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
   }
 
@@ -4717,15 +5136,23 @@ export class DatanoaStudioEditor {
       bar.style.display = 'none'
       return
     }
+    const activeTab = this.consoleTabs.getActiveTab()
     bar.innerHTML = ''
     sets.forEach((rs, idx) => {
       const btn = document.createElement('button')
       btn.type = 'button'
-      btn.className = `datanoa-result-set-btn${idx === this.activeResultSetIndex ? ' active' : ''}`
-      btn.title = rs.sqlPreview || ''
-      btn.textContent = rs.isSelect
-        ? `Result ${idx + 1} · ${rs.rowCount} ${rs.rowCount === 1 ? 'row' : 'rows'}`
-        : `Result ${idx + 1} · ${rs.affectedRows ?? 0} affected`
+      btn.className = `datanoa-result-set-btn${idx === this.activeResultSetIndex ? ' active' : ''}${rs.isError ? ' is-error' : ''}`
+      const rsState = activeTab.resultStates?.[idx]
+      btn.title = rsState?.statementSql || rs.sql || rs.sqlPreview || ''
+      if (rs.isError) {
+        btn.textContent = `Result ${idx + 1} · Error`
+      } else if (rsState?.banner?.isExplain) {
+        btn.textContent = `Result ${idx + 1} · ${rs.rowCount} ${rs.rowCount === 1 ? 'step' : 'steps'}`
+      } else {
+        btn.textContent = rs.isSelect
+          ? `Result ${idx + 1} · ${rs.rowCount} ${rs.rowCount === 1 ? 'row' : 'rows'}`
+          : `Result ${idx + 1} · ${rs.affectedRows ?? 0} affected`
+      }
       btn.addEventListener('click', () => {
         this.selectResultSetIndex(idx)
       })
@@ -4740,56 +5167,18 @@ export class DatanoaStudioEditor {
     if (!res || !sets || index < 0 || index >= sets.length) return
     const rs = sets[index]
     if (!rs) return
-    this.editableSqlTarget = null
-    this.activeEditableStmtSql = ''
-    this.currentCanEdit = false
-    this.activeResultSetIndex = index
-    this.consoleTabs.setActiveResultSetIndex(index)
-    this.dataGrid?.setData(this.buildResultSetQueryResult(res, index))
-    this.currentPage = 1
-    this.currentPageRowCount = rs.rows.length
-    this.totalRows = rs.rowCount
-    this.updatePaginationButtons()
-    this.updateExportDropdownOptions()
-    const rowLabel = `${rs.rowCount} ${rs.rowCount === 1 ? 'row' : 'rows'}`
-    if (!rs.isSelect) {
-      const affectedLabel = `${rs.affectedRows ?? 0} affected`
-      if (this.gridSubbarTitleEl) {
-        this.gridSubbarTitleEl.textContent = `Result ${index + 1} · ${affectedLabel}`
-      }
-      if (this.gridPageInfoEl) {
-        this.gridPageInfoEl.textContent = affectedLabel
-      }
-    } else {
-      if (this.gridSubbarTitleEl) {
-        this.gridSubbarTitleEl.textContent = `Result ${index + 1} · ${rs.columns?.length ?? 0} cols`
-      }
-      if (this.gridPageInfoEl) {
-        this.gridPageInfoEl.textContent = rs.truncated ? `${rowLabel} (truncated)` : rowLabel
-      }
+    if (index === this.activeResultSetIndex && this.consoleTabs.getResultTabState(index)?.gridSnapshot) {
+      return
     }
-    this.updateStatus(
-      `Result ${index + 1} of ${sets.length}`,
-      rs.isSelect ? rowLabel : `${rs.affectedRows ?? 0} affected`
-    )
-    this.renderResultSetsBar()
+    this.captureActiveResultTabState()
     const activeTab = this.consoleTabs.getActiveTab()
-    const isSameConnection = Boolean(
-      activeTab.executedConnectionId &&
-      this.activeConnectionId &&
-      activeTab.executedConnectionId === this.activeConnectionId
-    )
-    if (rs.isSelect && this.activeConnectionId && isSameConnection) {
-      this.applySqlResultEditability(
-        res,
-        index,
-        this.activeConnectionId,
-        this.consoleTabs.getActiveTabId(),
-        this.querySeq
-      )
-    } else {
-      this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
-    }
+    this.applyResultTabState(index, activeTab)
+    const label = rs.isError
+      ? 'Error'
+      : rs.isSelect
+        ? `${rs.rowCount} ${rs.rowCount === 1 ? 'row' : 'rows'}`
+        : `${rs.affectedRows ?? 0} affected`
+    this.updateStatus(`Result ${index + 1} of ${sets.length}`, label)
   }
 
   private hideResultSetsBar(): void {
@@ -4927,6 +5316,7 @@ export class DatanoaStudioEditor {
     this.hideQueryBanner()
     this.updateStatus('Running 0.0s...')
     const queryId = `query_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    this.activeWorkerQueryId = queryId
     this.setQueryRunningState(queryId)
 
     const activeBtn = executeAll ? this.runAllBtn : this.runBtn
@@ -4964,13 +5354,35 @@ export class DatanoaStudioEditor {
         return
       }
 
-      const defaultIdx = this.getDefaultResultSetIndex(res)
-      this.consoleTabs.setResultForTab(originTabId, res, defaultIdx, sqlText, targetConnId)
+      const elapsed = Math.round(performance.now() - startTime)
+      const durationMs = res.executionTimeMs || elapsed
+      const rawStatements =
+        driver === 'redis'
+          ? [sqlText]
+          : splitSqlStatements(sqlText, driver)
+              .map((s) => s.text.trim())
+              .filter(Boolean)
+      const defaultIdx = getDefaultResultSetIndex(res)
+      const initialStates = buildInitialResultTabStates(
+        res,
+        rawStatements,
+        sqlText,
+        durationMs,
+        'query'
+      )
+      this.consoleTabs.setResultForTab(
+        originTabId,
+        res,
+        defaultIdx,
+        sqlText,
+        targetConnId,
+        initialStates,
+        'query'
+      )
       if (originTabId !== this.consoleTabs.getActiveTabId()) {
         return
       }
 
-      const elapsed = Math.round(performance.now() - startTime)
       const queriedTable = extractQueriedTableName(sqlText)
       if (queriedTable) {
         const matchedObj = this.schemaObjects.find(
@@ -4985,72 +5397,36 @@ export class DatanoaStudioEditor {
       }
 
       this.isShowingSqlResult = true
-      this.currentCanEdit = false
+      this.activeQueryResult = res
       this.activeExecutedSql = sqlText
+      this.currentCanEdit = false
       this.activeEditableStmtSql = ''
       this.closeValueInspector()
       const contextTable = queriedTable || this.activeTable || 'query_result'
       this.dataGrid?.setContextMeta(
         contextTable,
-        this.getActiveConnection()?.driver || 'sqlite',
+        driver,
         targetConnId,
         this.activeSchema || ''
       )
-      this.dataGrid?.setForeignKeys([])
-      const emptyMsg = res.isSelect
-        ? queriedTable
-          ? `Query on "${queriedTable}" returned no rows.`
-          : 'Query returned no rows.'
-        : `Statement executed successfully (${res.affectedRows ?? 0} affected rows).`
-      this.dataGrid?.setEmptyMessage(emptyMsg)
-      this.applyActiveQueryResult(res)
-      this.applySqlResultEditability(res, this.activeResultSetIndex, targetConnId, originTabId, seq)
-      this.updateStagedActionButtons(0)
+      this.applyResultTabState(defaultIdx, this.consoleTabs.getActiveTab())
 
-      const rowCount = res.rowCount ?? (res.rows ? res.rows.length : 0)
-      const durationMs = res.executionTimeMs || elapsed
-      this.currentPage = 1
-      this.totalRows = rowCount
-      this.currentPageRowCount = res.rows ? res.rows.length : 0
-      this.updatePaginationButtons()
-      this.updateExportDropdownOptions()
-      if (this.gridSubbarTitleEl && !this.editableSqlTarget) {
-        const tblLabel = queriedTable ? ` (${queriedTable})` : ''
-        this.gridSubbarTitleEl.textContent = res.isSelect
-          ? `SQL Result${tblLabel} · ${res.columns?.length ?? 0} cols`
-          : `Executed · ${res.affectedRows ?? 0} affected`
-      }
+      const sets = getEffectiveResultSets(res, sqlText)
+      const activeRs = sets[this.activeResultSetIndex] || sets[0]
+      const rowCount = activeRs
+        ? activeRs.rowCount ?? activeRs.rows.length
+        : (res.rowCount ?? res.rows.length)
       const rowLabel = `${rowCount} ${rowCount === 1 ? 'row' : 'rows'}`
-      if (this.gridPageInfoEl) {
-        this.gridPageInfoEl.textContent = res.truncated
-          ? `${rowLabel} (truncated)`
-          : rowLabel
-      }
-
-      const compactSql = sqlText.replace(/\s+/g, ' ').trim()
-      const sqlPreview = compactSql.length > 96 ? `${compactSql.slice(0, 93)}...` : compactSql
-      if (res.isSelect) {
-        const truncNote = res.truncated ? ' (truncated)' : ''
-        this.showQueryBanner(
-          'success',
-          `Query OK · ${rowLabel} returned in ${durationMs}ms${truncNote}`,
-          sqlPreview
-        )
-      } else {
-        this.showQueryBanner(
-          'success',
-          `Statement executed · ${res.affectedRows ?? 0} rows affected in ${durationMs}ms`,
-          sqlPreview
-        )
-      }
-
+      const activeDuration = activeRs?.executionTimeMs ?? durationMs
       this.updateStatus(
-        `Query executed in ${durationMs}ms`,
-        res.truncated ? `${rowLabel} (truncated)` : rowLabel
+        sets.length > 1
+          ? `Executed ${sets.length} statements in ${durationMs}ms`
+          : `Query executed in ${activeDuration}ms`,
+        (activeRs?.truncated ?? res.truncated) ? `${rowLabel} (truncated)` : rowLabel
       )
       this.saveStudioViewState(true)
       this.saveStudioDataCache()
-      if (containsDdlStatement(sqlText) && this.activeConnectionId === targetConnId) {
+      if (containsDdlStatement(sqlText, driver) && this.activeConnectionId === targetConnId) {
         void this.refreshSchemaObjectsOnly(targetConnId)
       }
       if (this.queryHistoryDrawer.isOpen()) {
@@ -5102,6 +5478,7 @@ export class DatanoaStudioEditor {
       stopTimer()
       this.cancelledQueryIds.delete(queryId)
       if (seq === this.querySeq) {
+        this.activeWorkerQueryId = null
         setButtonLoading(this.runBtn, false)
         setButtonLoading(this.runAllBtn, false)
         setButtonLoading(this.explainBtn, false)
@@ -5119,10 +5496,19 @@ export class DatanoaStudioEditor {
       return
     }
     const driver = this.getActiveConnection()?.driver || 'sqlite'
-    const sqlText =
-      sqlOverride ??
-      (this.sqlConsole.getCaretStatementSql(driver) || this.sqlConsole.getExecutableSql())
+    const selectedSql = sqlOverride ? '' : this.sqlConsole.getSelectedSql()
+    const sqlText = sqlOverride ?? (selectedSql || this.sqlConsole.getText().trim())
     if (!sqlText) {
+      this.updateStatus('No SQL statement to explain')
+      return
+    }
+    const explainStmts =
+      driver === 'redis'
+        ? [sqlText]
+        : splitSqlStatements(sqlText, driver)
+            .map((s) => s.text.trim())
+            .filter(Boolean)
+    if (explainStmts.length === 0) {
       this.updateStatus('No SQL statement to explain')
       return
     }
@@ -5148,8 +5534,13 @@ export class DatanoaStudioEditor {
     const targetConnId = this.activeConnectionId
     const originTabId = this.consoleTabs.getActiveTabId()
     const queryId = `explain_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    this.activeWorkerQueryId = queryId
     this.hideQueryBanner()
-    this.updateStatus('Running EXPLAIN 0.0s...')
+    this.updateStatus(
+      explainStmts.length > 1
+        ? `Running EXPLAIN (1/${explainStmts.length}) 0.0s...`
+        : 'Running EXPLAIN 0.0s...'
+    )
     this.setQueryRunningState(queryId)
 
     setButtonLoading(this.runBtn, false)
@@ -5158,68 +5549,143 @@ export class DatanoaStudioEditor {
     if (this.runBtn) this.runBtn.disabled = true
     if (this.runAllBtn) this.runAllBtn.disabled = true
     setButtonLoading(this.explainBtn, true, 'Explaining 0.0s...')
-    this.dataGrid?.setLoading(true, 'Running EXPLAIN...')
+    this.dataGrid?.setLoading(
+      true,
+      explainStmts.length > 1
+        ? `Running EXPLAIN (${explainStmts.length} statements)...`
+        : 'Running EXPLAIN...'
+    )
 
+    let currentIdx = 0
     const stopTimer = this.createElapsedTimer((elapsedText) => {
       if (seq !== this.querySeq || this.activeConnectionId !== targetConnId) return
-      setButtonLoading(this.explainBtn, true, `Explaining ${elapsedText}...`)
-      this.updateStatus(`Running EXPLAIN ${elapsedText}...`)
+      const label =
+        explainStmts.length > 1
+          ? `Explaining ${currentIdx + 1}/${explainStmts.length} (${elapsedText})...`
+          : `Explaining ${elapsedText}...`
+      setButtonLoading(this.explainBtn, true, label)
+      this.updateStatus(label)
     })
 
+    const subQueryIds: string[] = []
     try {
-      const res = await this.requestPlugin<QueryResult>(
-        'query.explain',
-        {
-          connectionId: targetConnId,
-          queryId,
-          sql: sqlText,
-        },
-        { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
-      )
-      if (
-        seq !== this.querySeq ||
-        viewSeq !== this.gridViewSeq ||
-        this.activeConnectionId !== targetConnId
-      ) {
-        return
+      const overallStart = performance.now()
+      const collectedSets: QueryResultSet[] = []
+      let firstNonError: QueryResult | null = null
+
+      for (let i = 0; i < explainStmts.length; i++) {
+        currentIdx = i
+        if (
+          seq !== this.querySeq ||
+          viewSeq !== this.gridViewSeq ||
+          this.activeConnectionId !== targetConnId ||
+          this.cancelledQueryIds.has(queryId)
+        ) {
+          return
+        }
+        const stmtSql = explainStmts[i]
+        const workerQid = explainStmts.length === 1 ? queryId : `${queryId}_${i}`
+        subQueryIds.push(workerQid)
+        this.activeWorkerQueryId = workerQid
+        const stmtStart = performance.now()
+        try {
+          const singleRes = await this.requestPlugin<QueryResult>(
+            'query.explain',
+            {
+              connectionId: targetConnId,
+              queryId: workerQid,
+              sql: stmtSql,
+            },
+            { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
+          )
+          if (
+            seq !== this.querySeq ||
+            viewSeq !== this.gridViewSeq ||
+            this.activeConnectionId !== targetConnId
+          ) {
+            return
+          }
+          const stmtMs = singleRes.executionTimeMs || Math.round(performance.now() - stmtStart)
+          if (!firstNonError) firstNonError = singleRes
+          collectedSets.push({
+            index: i,
+            sqlPreview: compactSqlPreview(stmtSql),
+            sql: stmtSql,
+            executionTimeMs: stmtMs,
+            columns: singleRes.columns || [],
+            rows: singleRes.rows || [],
+            rowCount: singleRes.rowCount ?? (singleRes.rows ? singleRes.rows.length : 0),
+            truncated: Boolean(singleRes.truncated),
+            isSelect: true,
+          })
+        } catch (stmtErr: unknown) {
+          if (
+            seq !== this.querySeq ||
+            viewSeq !== this.gridViewSeq ||
+            this.activeConnectionId !== targetConnId ||
+            this.cancelledQueryIds.has(queryId)
+          ) {
+            return
+          }
+          if (explainStmts.length === 1) {
+            throw stmtErr
+          }
+          const stmtMsg = stmtErr instanceof Error ? stmtErr.message : String(stmtErr)
+          collectedSets.push({
+            index: i,
+            sqlPreview: compactSqlPreview(stmtSql),
+            sql: stmtSql,
+            executionTimeMs: Math.round(performance.now() - stmtStart),
+            isError: true,
+            errorMessage: stmtMsg,
+            columns: [],
+            rows: [],
+            rowCount: 0,
+            truncated: false,
+            isSelect: true,
+          })
+        }
       }
+
+      const totalMs = Math.round(performance.now() - overallStart)
+      const combinedRes = buildCombinedExplainResult(collectedSets, firstNonError, totalMs)
+
+      const initialStates = buildInitialResultTabStates(
+        combinedRes,
+        explainStmts,
+        sqlText,
+        totalMs,
+        'explain'
+      )
       this.consoleTabs.setResultForTab(
         originTabId,
-        res,
-        this.getDefaultResultSetIndex(res),
-        '',
-        targetConnId
+        combinedRes,
+        0,
+        sqlText,
+        targetConnId,
+        initialStates,
+        'explain'
       )
       if (originTabId !== this.consoleTabs.getActiveTabId()) {
         return
       }
+
       this.isShowingSqlResult = true
+      this.activeQueryResult = combinedRes
+      this.activeExecutedSql = sqlText
       this.currentCanEdit = false
       this.editableSqlTarget = null
       this.activeEditableStmtSql = ''
       this.closeValueInspector()
-      this.dataGrid?.setForeignKeys([])
-      this.dataGrid?.setEmptyMessage('No execution plan rows returned.')
-      this.applyActiveQueryResult(res)
-      this.updateStagedActionButtons(0)
-      const rowCount = res.rowCount ?? res.rows.length
-      this.currentPageRowCount = res.rows.length
-      this.totalRows = rowCount
-      this.updatePaginationButtons()
-      this.updateExportDropdownOptions()
-      if (this.gridSubbarTitleEl) {
-        this.gridSubbarTitleEl.textContent = `Execution Plan · ${rowCount} steps`
-      }
-      if (this.gridPageInfoEl) {
-        this.gridPageInfoEl.textContent = `${rowCount} rows`
-      }
-      this.showQueryBanner(
-        'success',
-        `EXPLAIN OK · ${rowCount} plan steps in ${res.executionTimeMs}ms`
-      )
+      this.applyResultTabState(0, this.consoleTabs.getActiveTab())
+
+      const firstSet = collectedSets[0]
+      const errCount = collectedSets.filter((s) => s.isError).length
       this.updateStatus(
-        `EXPLAIN completed in ${res.executionTimeMs}ms`,
-        `${rowCount} ${rowCount === 1 ? 'row' : 'rows'}`
+        explainStmts.length > 1
+          ? `EXPLAIN completed (${explainStmts.length} statements${errCount > 0 ? `, ${errCount} failed` : ''}) in ${totalMs}ms`
+          : `EXPLAIN completed in ${firstSet?.executionTimeMs ?? totalMs}ms`,
+        `${firstSet?.rowCount ?? 0} ${(firstSet?.rowCount ?? 0) === 1 ? 'row' : 'rows'}`
       )
       this.saveStudioViewState(true)
       this.saveStudioDataCache()
@@ -5238,7 +5704,7 @@ export class DatanoaStudioEditor {
       this.isShowingSqlResult = true
       this.currentCanEdit = false
       this.currentPageRowCount = 0
-      this.showQueryBanner('error', 'EXPLAIN Error', msg, { showBackToTable: true })
+      this.showQueryBanner('error', 'EXPLAIN Error', msg, { showBackToTable: true, isExplain: true })
       this.activeQueryResult = null
       this.activeResultSetIndex = 0
       this.hideResultSetsBar()
@@ -5251,17 +5717,130 @@ export class DatanoaStudioEditor {
         truncated: false,
         isSelect: true,
       })
+      if (this.gridSubbarTitleEl) {
+        this.gridSubbarTitleEl.textContent = 'EXPLAIN Error'
+      }
+      if (this.gridPageInfoEl) {
+        this.gridPageInfoEl.textContent = '0 rows'
+      }
       this.updatePaginationButtons()
       this.updateExportDropdownOptions()
       this.updateStatus(`EXPLAIN error: ${msg}`)
     } finally {
       stopTimer()
       this.cancelledQueryIds.delete(queryId)
+      for (const sid of subQueryIds) {
+        this.cancelledQueryIds.delete(sid)
+      }
       if (seq === this.querySeq) {
+        this.activeWorkerQueryId = null
         setButtonLoading(this.runBtn, false)
         setButtonLoading(this.runAllBtn, false)
         setButtonLoading(this.explainBtn, false)
         this.setQueryRunningState(null)
+      }
+    }
+  }
+
+  private async refreshSingleResultSet(
+    originTabId: string,
+    resultIdx: number,
+    targetConnId: string,
+    sqlText: string,
+    opts?: {
+      preserveWhere?: string
+      preserveOrderBy?: string
+      preserveSearchMode?: 'filter' | 'find'
+      preserveClientSearch?: string
+    }
+  ): Promise<void> {
+    if (typeof window === 'undefined' || !window.orca?.plugin?.request) return
+    const queryId = `query_rs_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+    const startTime = performance.now()
+    try {
+      const fresh = await this.requestPlugin<QueryResult>(
+        'query.run',
+        {
+          connectionId: targetConnId,
+          queryId,
+          sql: sqlText,
+        },
+        { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
+      )
+      const tab = this.consoleTabs.getTabs().find((t) => t.id === originTabId)
+      if (!tab || !tab.lastResult || this.activeConnectionId !== targetConnId) return
+      const elapsed = fresh.executionTimeMs || Math.round(performance.now() - startTime)
+      const existingSets = tab.lastResult.resultSets
+      const existingState = this.consoleTabs.getResultTabState(resultIdx, originTabId)
+      const baseStmtSql = existingState?.baseStatementSql || sqlText
+
+      const updatedSet: QueryResultSet = {
+        index: resultIdx,
+        sqlPreview: compactSqlPreview(baseStmtSql),
+        sql: baseStmtSql,
+        executionTimeMs: elapsed,
+        columns: fresh.columns || [],
+        rows: fresh.rows || [],
+        rowCount: fresh.rowCount ?? (fresh.rows ? fresh.rows.length : 0),
+        affectedRows: fresh.affectedRows,
+        truncated: Boolean(fresh.truncated),
+        isSelect: Boolean(fresh.isSelect),
+        ...(fresh.sourceTable ? { sourceTable: fresh.sourceTable } : {}),
+      }
+
+      let nextResult: QueryResult
+      if (existingSets && existingSets.length > 0 && resultIdx >= 0 && resultIdx < existingSets.length) {
+        const nextSets = existingSets.map((s, i) => (i === resultIdx ? updatedSet : s))
+        nextResult = {
+          ...tab.lastResult,
+          ...(resultIdx === nextSets.length - 1 ? fresh : {}),
+          resultSets: nextSets,
+        }
+      } else {
+        nextResult = fresh
+      }
+
+      tab.lastResult = nextResult
+      const nextBanner = buildBannerForResultSet(updatedSet, baseStmtSql, elapsed, 'query')
+      const nextState: ResultSetTabRuntimeState = {
+        resultSetIndex: resultIdx,
+        baseStatementSql: baseStmtSql,
+        statementSql: sqlText,
+        banner: nextBanner,
+        whereClause: opts?.preserveWhere ?? existingState?.whereClause ?? '',
+        orderByClause: opts?.preserveOrderBy ?? existingState?.orderByClause ?? '',
+        searchMode: opts?.preserveSearchMode ?? existingState?.searchMode ?? 'filter',
+        clientSearchText: opts?.preserveClientSearch ?? existingState?.clientSearchText ?? '',
+        gridSnapshot: null,
+        editableSqlTarget: null,
+        activeEditableStmtSql: '',
+        currentCanEdit: false,
+        gridSubbarTitle:
+          nextResult.resultSets && nextResult.resultSets.length > 1
+            ? `Result ${resultIdx + 1} · ${updatedSet.columns.length} cols`
+            : `SQL Result · ${updatedSet.columns.length} cols`,
+        gridPageInfo: `${updatedSet.rowCount} ${updatedSet.rowCount === 1 ? 'row' : 'rows'}${updatedSet.truncated ? ' (truncated)' : ''}`,
+        emptyMessage: 'Query returned no rows.',
+      }
+      this.consoleTabs.setResultTabState(resultIdx, nextState, originTabId)
+
+      if (
+        originTabId === this.consoleTabs.getActiveTabId() &&
+        this.isShowingSqlResult &&
+        this.activeResultSetIndex === resultIdx
+      ) {
+        this.activeQueryResult = nextResult
+        this.applyResultTabState(resultIdx, tab)
+      }
+    } catch (err: unknown) {
+      if (
+        originTabId === this.consoleTabs.getActiveTabId() &&
+        this.isShowingSqlResult &&
+        this.activeResultSetIndex === resultIdx
+      ) {
+        const msg = err instanceof Error ? err.message : String(err)
+        this.showQueryBanner('error', 'Result Refresh Failed', msg)
+        this.updateStatus(`Refresh failed: ${msg}`)
       }
     }
   }
@@ -5276,15 +5855,17 @@ export class DatanoaStudioEditor {
       return
     }
     const qid = this.activeQueryId
+    const workerQid = this.activeWorkerQueryId || qid
     this.isCancellingQuery = true
     setButtonLoading(this.cancelQueryBtn, true, 'Cancelling...')
     this.updateStatus('Cancelling query...')
     let cancelAccepted = false
     try {
-      const res = await this.requestPlugin<{ ok: boolean }>('query.cancel', { queryId: qid })
+      const res = await this.requestPlugin<{ ok: boolean }>('query.cancel', { queryId: workerQid })
       cancelAccepted = res?.ok !== false
       if (cancelAccepted) {
         this.cancelledQueryIds.add(qid)
+        this.cancelledQueryIds.add(workerQid)
         this.updateStatus('Query cancelled')
       } else {
         this.updateStatus('Cancel request was not acknowledged')
@@ -5467,8 +6048,17 @@ export class DatanoaStudioEditor {
         void this.refreshTransactionState(targetConnId)
         if (inSqlResultMode) {
           this.dataGrid?.revertAllChanges()
-          if (this.activeEditableStmtSql) {
-            void this.executeSql(true, true, this.activeEditableStmtSql)
+          const targetTabId = this.editableSqlTarget?.originTabId || this.consoleTabs.getActiveTabId()
+          const targetResultIdx =
+            this.editableSqlTarget?.originResultSetIndex ?? this.activeResultSetIndex
+          const stmtToRefresh = this.activeEditableStmtSql
+          if (stmtToRefresh) {
+            await this.refreshSingleResultSet(
+              targetTabId,
+              targetResultIdx,
+              targetConnId,
+              stmtToRefresh
+            )
           }
         } else {
           await this.loadTableData(targetConnId, targetTable, targetPage)
@@ -5617,6 +6207,9 @@ export class DatanoaStudioEditor {
       this.dataGrid?.setFindQuery('')
       this.dataGrid?.setClientFilter(val)
       this.saveStudioViewState(false)
+    }
+    if (this.isShowingSqlResult) {
+      this.captureActiveResultTabState()
     }
   }
 
@@ -6373,6 +6966,7 @@ export class DatanoaStudioEditor {
   private async handleGridSort(column: string, direction: 'ASC' | 'DESC'): Promise<void> {
     if (this.isShowingSqlResult) {
       this.dataGrid?.sortInMemoryRows(column, direction)
+      this.captureActiveResultTabState()
       this.updateStatus(`Sorted query result by ${column} ${direction}`)
       return
     }

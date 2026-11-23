@@ -24,6 +24,7 @@ import {
   applyTypographySnapshot,
   syncOrcaTypography,
   makeTableKey,
+  encodeTableSelectValue,
   decodeTableSelectValue,
   setButtonLoading,
   updateButtonLoadingLabel,
@@ -66,6 +67,7 @@ const state = {
   structPreviewOpen: false,
   structSeq: 1,
   collapsedFolders: new Set(),
+  collapsedSchemaGroups: new Set(),
   expandedConns: new Set(),
   expandedTables: new Set(),
   expandedMeta: new Set(),
@@ -110,7 +112,9 @@ const state = {
   lastAutoFilledSqliteName: '',
   discoveredFiles: [],
   discoveredEnvs: [],
-  discoveredFileFilter: '',
+  discoveredDocker: [],
+  discoveredSearch: '',
+  discoveryCollapsed: { env: null, docker: null, sqlite: null },
   initialBootLoading: true,
   refreshingConns: false,
   testingActiveConn: false,
@@ -122,6 +126,7 @@ const state = {
   structureLoading: false,
   structureError: null,
   activeQueryId: null,
+  activeWorkerQueryId: null,
   lastSqlResult: null,
   sqlSortColIdx: null,
   sqlSortDir: 'ASC',
@@ -367,8 +372,12 @@ function savePanelViewState() {
     saveViewStateTimer = null
   }
   if (state.restoringViewState) return
-  const rawSqlDraft = $('sqlEditor')?.value || ''
+  const rawSqlDraft = typeof getSqlText === 'function' ? getSqlText() : ''
   const safeSqlDraft = sqlDraftLooksSensitive(rawSqlDraft) ? '' : rawSqlDraft
+  const consoleTabsSnapshot =
+    typeof getConsoleTabsPersistedState === 'function'
+      ? getConsoleTabsPersistedState(sqlDraftLooksSensitive)
+      : null
   const snapshot = {
     tab: state.tab,
     activeConnectionId: state.activeConnectionId,
@@ -387,6 +396,10 @@ function savePanelViewState() {
     expandedMeta: Array.from(state.expandedMeta),
     filter: state.filter,
     sqlDraft: safeSqlDraft,
+    ...(typeof getSqlEditorHeight === 'function' && Number.isFinite(getSqlEditorHeight())
+      ? { sqlEditorHeight: getSqlEditorHeight() }
+      : {}),
+    ...(consoleTabsSnapshot ? { consoleTabsState: consoleTabsSnapshot } : {}),
     scrollState: readPanelScrollState(),
     formOpen: Boolean(state.formOpen),
     editingId: state.editingId || null,
@@ -517,9 +530,18 @@ function applyPanelViewStateSnapshot(saved) {
       state.filter = saved.filter
       if ($('schemaFilter')) $('schemaFilter').value = saved.filter
     }
-    if (typeof saved.sqlDraft === 'string' && saved.sqlDraft.trim()) {
+    if (saved.consoleTabsState && Array.isArray(saved.consoleTabsState.tabs)) {
+      state.restoredSqlDraft =
+        saved.consoleTabsState.tabs.find((t) => t?.id === saved.consoleTabsState.activeTabId)?.sql ||
+        saved.sqlDraft ||
+        ''
+      restoreConsoleTabsState?.(saved.consoleTabsState, saved.sqlDraft || '')
+    } else if (typeof saved.sqlDraft === 'string' && saved.sqlDraft.trim()) {
       state.restoredSqlDraft = saved.sqlDraft
-      if ($('sqlEditor')) $('sqlEditor').value = saved.sqlDraft
+      restoreConsoleTabsState?.(null, saved.sqlDraft)
+    }
+    if (Number.isFinite(saved.sqlEditorHeight)) {
+      setSqlEditorHeight?.(saved.sqlEditorHeight, { persist: false })
     }
     if (['explorer', 'data', 'sql', 'structure'].includes(saved.tab)) {
       switchTab(saved.tab)
@@ -657,6 +679,8 @@ function restorePanelWarmCacheFromLocal() {
     }
     renderPanelFolderChips()
     renderConnectionsBar()
+    renderStructureTableSelect()
+    syncPanelSqlSchema(state.activeConnectionId)
     renderExplorer()
     renderDataToolbar()
     renderDataGrid()
@@ -787,18 +811,19 @@ function updateViewportLayout() {
   $('connFormBox').hidden = !state.formOpen
   $('activeConnCard').hidden = state.formOpen || !active
   $('connMetaRow').hidden = state.formOpen || !active || state.tab !== 'explorer'
+  if ($('structureTableBar')) {
+    $('structureTableBar').hidden = state.formOpen || !active || state.tab !== 'structure'
+  }
   $('tabExplorer').hidden = state.formOpen || state.tab !== 'explorer'
   $('tabData').hidden = state.formOpen || state.tab !== 'data'
   $('tabSql').hidden = state.formOpen || state.tab !== 'sql'
   $('tabStructure').hidden = state.formOpen || state.tab !== 'structure'
   if (viewport) {
-    const isSqliteDiscoveryOpen =
-      state.formOpen && state.formDriver === 'sqlite' && state.discoveredFiles.length > 0
     viewport.classList.toggle(
       'viewport-fill',
-      isSqliteDiscoveryOpen || (!state.formOpen && (state.tab === 'data' || state.tab === 'sql'))
+      !state.formOpen && (state.tab === 'data' || state.tab === 'sql')
     )
-    $('connFormBox').classList.toggle('form-fill-height', isSqliteDiscoveryOpen)
+    $('connFormBox').classList.remove('form-fill-height')
   }
   const connectBtn = $('newServerBtn')
   if (connectBtn) {
@@ -837,7 +862,14 @@ function switchTab(nextTab) {
     }
   }
   if (nextTab === 'sql') {
+    renderConsoleTabs()
     renderSqlSafetyBanner()
+    syncPanelSqlSchema(state.activeConnectionId)
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => applyClampedSqlEditorHeight?.())
+    } else {
+      applyClampedSqlEditorHeight?.()
+    }
     if (sqlVirt.active) {
       if (typeof requestAnimationFrame === 'function') {
         requestAnimationFrame(() => renderSqlVirtualWindow(false))
@@ -846,7 +878,10 @@ function switchTab(nextTab) {
       }
     }
   }
-  if (nextTab === 'structure') renderStructure()
+  if (nextTab === 'structure') {
+    renderStructureTableSelect()
+    renderStructure()
+  }
   savePanelViewState()
 }
 
@@ -956,11 +991,30 @@ const sqlCtrl = createPanelSqlController({
   showBanner: (...a) => showBanner(...a),
   loadSchema: (...a) => loadSchema(...a),
   savePanelViewState: () => savePanelViewState(),
+  scheduleSavePanelViewState: (ms) => scheduleSavePanelViewState(ms),
   savePanelDataCache: () => savePanelDataCache(),
+  onFormatSql: () => formatSqlInEditor(),
 })
 const {
   sqlVirt,
+  getSqlText,
+  setSqlText,
+  focusSqlEditor,
+  setSqlDialect,
+  setSqlSchema,
+  setSqlColorScheme,
+  setSqlTypography,
+  openSqlFindReplace,
+  destroySqlEditor,
+  renderConsoleTabs,
+  restoreConsoleTabsState,
+  getConsoleTabsPersistedState,
+  clearSqlResultDisplay,
   renderSqlSafetyBanner,
+  resetSqlSafetyBannerDismissal,
+  dismissSqlSafetyBanner,
+  dismissActiveSqlSuccessBanner,
+  dismissActiveSqlErrorBanner,
   getSortedSqlRows,
   renderSqlSelectionStats,
   copySqlSelection,
@@ -971,8 +1025,12 @@ const {
   runSql,
   loadQueryHistory,
   renderQueryHistory,
+  markSqlRunCancelled,
   cancelPendingSqlRun,
   bumpHistorySeq,
+  getSqlEditorHeight,
+  setSqlEditorHeight,
+  applyClampedSqlEditorHeight,
 } = sqlCtrl
 
 const structCtrl = createPanelStructureController({
@@ -1037,6 +1095,8 @@ const explorerCtrl = createPanelExplorerController({
   persistActiveConnectionId: (...a) => persistActiveConnectionId(...a),
   renderConnectionsBar: () => renderConnectionsBar(),
   renderSqlSafetyBanner: () => renderSqlSafetyBanner(),
+  resetSqlSafetyBannerDismissal: () => resetSqlSafetyBannerDismissal(),
+  setSqlText: (...a) => setSqlText(...a),
   populateFormFromProfile: (...a) => populateFormFromProfile(...a),
   openDeleteConfirmModal: (...a) => openDeleteConfirmModal(...a),
   savePanelViewState: () => savePanelViewState(),
@@ -1209,6 +1269,8 @@ async function refreshConnections(options = {}) {
     if (!isSilentWarmBoot || connsChanged || !hasActive) {
       renderPanelFolderChips()
       renderConnectionsBar()
+      renderStructureTableSelect()
+      syncPanelSqlSchema(state.activeConnectionId)
       renderExplorer()
       renderDataToolbar()
       renderDataGrid()
@@ -1261,6 +1323,7 @@ function renderConnectionsBar() {
   const active = getActiveConn()
   updateViewportLayout()
   if (!active) {
+    renderStructureTableSelect()
     return
   }
   setDbLogoElement($('activeConnLogo'), active.driver, 16)
@@ -1333,6 +1396,184 @@ function renderConnectionsBar() {
       renderExplorer()
     },
   })
+  renderStructureTableSelect()
+}
+
+let structureSchemaPrefetchSeq = 0
+
+function renderStructureTableSelect() {
+  const sel = $('structureTableSelect')
+  if (!sel) return
+  const activeConn = getActiveConn()
+  const cid = activeConn?.id
+  const objs = cid ? state.schemaObjects[cid] || [] : []
+  const tabular = objs.filter(
+    (o) => !o.kind || o.kind === 'table' || o.kind === 'view' || o.kind === 'materialized_view'
+  )
+  sel.textContent = ''
+  if (!activeConn || tabular.length === 0) {
+    const emptyOpt = document.createElement('option')
+    emptyOpt.value = ''
+    emptyOpt.textContent = !activeConn
+      ? 'No active connection'
+      : state.schemaLoading.has(cid)
+        ? 'Loading tables...'
+        : 'No tables in connection'
+    emptyOpt.disabled = true
+    emptyOpt.selected = true
+    sel.appendChild(emptyOpt)
+    sel.disabled = true
+    enhanceCollapsibleSelectDropdown(sel, {
+      tooltipPrefix: 'Schema Table',
+      searchPlaceholder: 'Search tables or schemas...',
+      collapsedFolders: state.collapsedSchemaGroups,
+    })
+    return
+  }
+
+  sel.disabled = false
+  const grouped = new Map()
+  const defaultSchemaLabel = activeConn.driver === 'sqlite' ? 'main' : 'Default'
+  for (const obj of tabular) {
+    const groupName = (obj.schema || '').trim() || defaultSchemaLabel
+    if (!grouped.has(groupName)) grouped.set(groupName, [])
+    grouped.get(groupName).push(obj)
+  }
+
+  const activeKey = state.activeTable
+    ? encodeTableSelectValue(state.activeSchema || '', state.activeTable)
+    : ''
+  let matchedSelection = false
+
+  if (!activeKey) {
+    const promptOpt = document.createElement('option')
+    promptOpt.value = ''
+    promptOpt.textContent = 'Select a table...'
+    promptOpt.disabled = true
+    promptOpt.selected = true
+    sel.appendChild(promptOpt)
+  }
+
+  const sortedSchemas = Array.from(grouped.keys()).sort((a, b) => {
+    if (a === 'public' || a === 'main') return -1
+    if (b === 'public' || b === 'main') return 1
+    return a.localeCompare(b)
+  })
+
+  for (const schemaName of sortedSchemas) {
+    const grp = document.createElement('optgroup')
+    grp.label = schemaName
+    const items = grouped.get(schemaName).slice().sort((a, b) => a.name.localeCompare(b.name))
+    for (const obj of items) {
+      const opt = document.createElement('option')
+      const val = encodeTableSelectValue(obj.schema || '', obj.name)
+      opt.value = val
+      opt.textContent = obj.name
+      const kindLabel = obj.kind && obj.kind !== 'table' ? obj.kind : 'table'
+      opt.dataset.subtitle = kindLabel
+      opt.dataset.fullTitle = obj.schema ? `${obj.schema}.${obj.name} (${kindLabel})` : `${obj.name} (${kindLabel})`
+      if (activeKey && val === activeKey) {
+        opt.selected = true
+        opt.dataset.isCurrent = '1'
+        matchedSelection = true
+      } else if (!matchedSelection && state.activeTable && obj.name === state.activeTable) {
+        opt.selected = true
+        opt.dataset.isCurrent = '1'
+        matchedSelection = true
+      }
+      grp.appendChild(opt)
+    }
+    sel.appendChild(grp)
+  }
+
+  enhanceCollapsibleSelectDropdown(sel, {
+    tooltipPrefix: 'Schema Table',
+    searchPlaceholder: 'Search tables or schemas...',
+    collapsedFolders: state.collapsedSchemaGroups,
+  })
+}
+
+function syncPanelSqlSchema(connectionId) {
+  if (!connectionId) {
+    setSqlSchema({}, undefined)
+    return
+  }
+  const schemaMap = {}
+  const objs = state.schemaObjects[connectionId] || []
+  for (const obj of objs) {
+    if (!obj?.name) continue
+    if (obj.kind && obj.kind !== 'table' && obj.kind !== 'view' && obj.kind !== 'materialized_view') {
+      continue
+    }
+    const det = state.tableDetails[makeTableKey(connectionId, obj.name, obj.schema)]
+    const cols = det?.columns ? det.columns.map((c) => c.name).filter(Boolean) : []
+    if (!Object.prototype.hasOwnProperty.call(schemaMap, obj.name) || cols.length > schemaMap[obj.name].length) {
+      schemaMap[obj.name] = cols
+    }
+    if (obj.schema) {
+      const qName = `${obj.schema}.${obj.name}`
+      if (!Object.prototype.hasOwnProperty.call(schemaMap, qName) || cols.length > schemaMap[qName].length) {
+        schemaMap[qName] = cols
+      }
+    }
+  }
+  if (
+    state.activeConnectionId === connectionId &&
+    state.activeTable &&
+    Array.isArray(state.pageData?.columns) &&
+    state.pageData.columns.length > 0
+  ) {
+    const activeCols = state.pageData.columns.map((c) => c.name).filter(Boolean)
+    if (activeCols.length > 0) {
+      schemaMap[state.activeTable] = activeCols
+      if (state.activeSchema) {
+        schemaMap[`${state.activeSchema}.${state.activeTable}`] = activeCols
+      }
+    }
+  }
+  setSqlSchema(schemaMap, state.activeConnectionId === connectionId ? state.activeTable || undefined : undefined)
+}
+
+async function prefetchPanelAutocompleteSchema(connectionId) {
+  if (!connectionId || state.activeConnectionId !== connectionId) return
+  const seq = ++structureSchemaPrefetchSeq
+  const objs = (state.schemaObjects[connectionId] || []).filter(
+    (o) => !o.kind || o.kind === 'table' || o.kind === 'view' || o.kind === 'materialized_view'
+  )
+  const missing = objs
+    .filter((o) => !state.tableDetails[makeTableKey(connectionId, o.name, o.schema)])
+    .slice(0, 30)
+  if (missing.length === 0) return
+
+  let cursor = 0
+  const workers = Array.from({ length: Math.min(3, missing.length) }, async () => {
+    while (cursor < missing.length) {
+      if (seq !== structureSchemaPrefetchSeq || state.activeConnectionId !== connectionId) return
+      const target = missing[cursor++]
+      if (!target) continue
+      const key = makeTableKey(connectionId, target.name, target.schema)
+      if (state.tableDetails[key]) continue
+      try {
+        const det = await rpc(
+          'schema.tableDetails',
+          {
+            connectionId,
+            table: target.name,
+            ...(target.schema ? { schema: target.schema } : {}),
+          },
+          { timeoutMs: QUERY_TIMEOUT_MS }
+        )
+        if (seq !== structureSchemaPrefetchSeq || state.activeConnectionId !== connectionId) return
+        if (det) {
+          state.tableDetails[key] = det
+        }
+      } catch {}
+    }
+  })
+  await Promise.all(workers)
+  if (seq === structureSchemaPrefetchSeq && state.activeConnectionId === connectionId) {
+    syncPanelSqlSchema(connectionId)
+  }
 }
 
 async function loadSchema(connectionId) {
@@ -1361,6 +1602,9 @@ async function loadSchema(connectionId) {
       if ((!state.activeTable || !matchedActive) && firstObj) {
         state.activeTable = firstObj.name
         state.activeSchema = firstObj.schema
+        renderStructureTableSelect()
+        syncPanelSqlSchema(connectionId)
+        void prefetchPanelAutocompleteSchema(connectionId)
         renderDataToolbar()
         renderExplorer()
         await Promise.all([
@@ -1371,6 +1615,9 @@ async function loadSchema(connectionId) {
         if (!state.activeSchema && matchedActive.schema) {
           state.activeSchema = matchedActive.schema
         }
+        renderStructureTableSelect()
+        syncPanelSqlSchema(connectionId)
+        void prefetchPanelAutocompleteSchema(connectionId)
         const targetPage = state.restoredPage || state.page || 1
         state.restoredPage = 1
         const canSilentRefresh = Boolean(state.pageData && state.pageData.columns?.length > 0)
@@ -1393,6 +1640,8 @@ async function loadSchema(connectionId) {
         state.structureError = null
         dataGridSel?.clear(true)
         clearStagedChanges()
+        renderStructureTableSelect()
+        syncPanelSqlSchema(connectionId)
         renderDataToolbar()
         renderDataGrid()
         renderStructure()
@@ -1442,6 +1691,7 @@ function cancelPendingDataAndSchemaLoads() {
 
 function activateConnection(connectionId) {
   cancelPendingDataAndSchemaLoads()
+  resetSqlSafetyBannerDismissal()
   state.activeConnectionId = connectionId || null
   state.activeTable = null
   state.activeSchema = undefined
@@ -1456,12 +1706,7 @@ function activateConnection(connectionId) {
   state.structDraft = null
   state.lastSqlResult = null
   state.sqlSortColIdx = null
-  if ($('sqlSuccessBanner')) $('sqlSuccessBanner').hidden = true
-  if ($('sqlErrorBanner')) $('sqlErrorBanner').hidden = true
-  if ($('sqlMetaBadge')) $('sqlMetaBadge').hidden = true
-  if ($('sqlResultWrap')) $('sqlResultWrap').hidden = true
-  if ($('sqlResultMeta')) $('sqlResultMeta').hidden = true
-  sqlVirt.active = false
+  clearSqlResultDisplay()
   dataGridSel?.clear(true)
   sqlGridSel?.clear(true)
   clearStagedChanges()
@@ -1472,6 +1717,8 @@ function activateConnection(connectionId) {
   savePanelViewState()
   savePanelDataCache()
   renderConnectionsBar()
+  renderStructureTableSelect()
+  syncPanelSqlSchema(state.activeConnectionId)
   renderExplorer()
   renderDataToolbar()
   renderDataGrid()
@@ -1543,6 +1790,7 @@ async function loadTableDetails(connectionId, table, schema) {
         state.structureError = null
         savePanelDataCache()
         renderStructure()
+        syncPanelSqlSchema(connectionId)
         if (state.pageData && prevFksJson !== nextFksJson) {
           renderDataGrid()
         }
@@ -1816,17 +2064,27 @@ function selectTableAndOpen(connectionId, tableName, schemaName, switchToData, o
   $('dataOrderInput').value = ''
   $('clearFilterBtn').hidden = !state.whereClause
 
-  const activeConn = getActiveConn()
-  if (activeConn?.driver === 'redis') {
-    $('sqlEditor').value = tableName === '(root)' ? 'SCAN 0 MATCH * COUNT 50' : `SCAN 0 MATCH ${tableName} COUNT 50`
-  } else {
-    const qTable = quoteTableRef(tableName, schemaName, activeConn?.driver || 'sqlite')
-    $('sqlEditor').value = state.whereClause
-      ? `SELECT * FROM ${qTable} WHERE ${state.whereClause} LIMIT 100;`
-      : `SELECT * FROM ${qTable} LIMIT 100;`
+  if (!options.preserveSqlEditor) {
+    const activeConn = getActiveConn()
+    if (activeConn?.driver === 'redis') {
+      setSqlText(
+        tableName === '(root)' ? 'SCAN 0 MATCH * COUNT 50' : `SCAN 0 MATCH ${tableName} COUNT 50`,
+        { skipSave: true }
+      )
+    } else {
+      const qTable = quoteTableRef(tableName, schemaName, activeConn?.driver || 'sqlite')
+      setSqlText(
+        state.whereClause
+          ? `SELECT * FROM ${qTable} WHERE ${state.whereClause} LIMIT 100;`
+          : `SELECT * FROM ${qTable} LIMIT 100;`,
+        { skipSave: true }
+      )
+    }
   }
 
   renderExplorer()
+  renderStructureTableSelect()
+  syncPanelSqlSchema(connectionId)
   renderDataToolbar()
   renderSqlSafetyBanner()
   savePanelViewState()
@@ -1851,6 +2109,7 @@ async function deleteConnectionById(id) {
       state.page = 1
       state.sortCol = null
       state.lastSqlResult = null
+      clearSqlResultDisplay()
       dataVirt.active = false
       sqlVirt.active = false
       dataGridSel?.clear(true)
@@ -2499,11 +2758,15 @@ if (typeof ResizeObserver !== 'undefined') {
   if (sqlResultWrapEl) gridResizeObserver.observe(sqlResultWrapEl)
 }
 
+$('clearFormBtn')?.addEventListener('click', () => {
+  if (!state.formBusy) connFormCtrl.clearFormFields()
+})
 $('closeFormBtn').addEventListener('click', () => {
   if (!state.formBusy) setFormOpen(false)
 })
 $('globalBannerClose').addEventListener('click', hideBanner)
 $('formNoticeClose')?.addEventListener('click', clearFormNotice)
+$('sqlProdBannerClose')?.addEventListener('click', dismissSqlSafetyBanner)
 $('refreshBtn').addEventListener('click', () => void refreshConnections({ forceLive: true }))
 $('expandAllTreeBtn')?.addEventListener('click', () => expandAllExplorer())
 $('collapseAllTreeBtn')?.addEventListener('click', () => collapseAllExplorer())
@@ -2514,8 +2777,8 @@ $('formFilePath').addEventListener('keydown', (e) => {
   }
 })
 $('detectWorkspaceBtn').addEventListener('click', () => void detectWorkspace($('formFilePath').value, true))
-$('discoveredFileSearch').addEventListener('input', () => {
-  state.discoveredFileFilter = $('discoveredFileSearch').value
+$('discoveredSearchInput')?.addEventListener('input', () => {
+  state.discoveredSearch = $('discoveredSearchInput').value
   renderDiscoveredItems()
 })
 
@@ -2631,6 +2894,7 @@ $('saveFormBtn').addEventListener('click', async () => {
     if (res?.ok) {
       const savedId = res.id || targetId
       cancelPendingDataAndSchemaLoads()
+      resetSqlSafetyBannerDismissal()
       setFormOpen(false)
       state.activeConnectionId = savedId
       void persistActiveConnectionId(savedId)
@@ -3117,7 +3381,7 @@ $('copyStructSqlBtn')?.addEventListener('click', (e) => {
 $('openStructSqlBtn')?.addEventListener('click', () => {
   const sql = $('structPreviewCode')?.textContent || ''
   if (sql && !sql.startsWith('--')) {
-    $('sqlEditor').value = sql
+    setSqlText(sql, { focus: true })
     switchTab('sql')
   }
 })
@@ -3498,48 +3762,48 @@ $('nextPageBtn').addEventListener('click', () => {
 })
 
 const formatSqlInEditor = () => {
-  const editor = $('sqlEditor')
-  const formatted = formatPanelSql(editor.value, getActiveConn()?.driver || 'sqlite')
-  if (formatted && formatted !== editor.value) {
-    editor.value = formatted
-    savePanelViewState()
+  const current = getSqlText()
+  const formatted = formatPanelSql(current, getActiveConn()?.driver || 'sqlite')
+  if (formatted && formatted !== current) {
+    setSqlText(formatted, { focus: true })
     showBanner('SQL formatted', 'success')
   }
 }
+
+$('structureTableSelect')?.addEventListener('change', (e) => {
+  const decoded = decodeTableSelectValue(e.target.value)
+  if (!decoded?.name || !state.activeConnectionId) return
+  selectTableAndOpen(state.activeConnectionId, decoded.name, decoded.schema, false, {
+    preserveSqlEditor: true,
+  })
+  renderStructure()
+})
+
+$('sqlSuccessCloseBtn')?.addEventListener('click', () => dismissActiveSqlSuccessBanner())
+$('sqlErrorCloseBtn')?.addEventListener('click', () => dismissActiveSqlErrorBanner())
 
 $('runSqlBtn').addEventListener('click', () => void runSql('caret'))
 $('runAllSqlBtn').addEventListener('click', () => void runSql('all'))
 $('explainSqlBtn').addEventListener('click', () => void runSql('explain'))
 $('formatSqlBtn')?.addEventListener('click', formatSqlInEditor)
-$('sqlEditor').addEventListener('input', () => {
-  scheduleSavePanelViewState(350)
-})
-$('sqlEditor').addEventListener('keydown', (e) => {
-  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-    e.preventDefault()
-    void runSql(e.shiftKey ? 'all' : 'caret')
-  } else if (e.shiftKey && e.altKey && e.key.toLowerCase() === 'f') {
-    e.preventDefault()
-    formatSqlInEditor()
-  }
-})
 
 $('cancelSqlBtn').addEventListener('click', async () => {
-  const targetQueryId = state.activeQueryId
+  const targetQueryId = state.activeWorkerQueryId || state.activeQueryId
   if (!targetQueryId) return
+  markSqlRunCancelled()
   const cancelBtn = $('cancelSqlBtn')
   setButtonLoading(cancelBtn, true, 'Cancelling...')
   try {
     const res = await rpc('query.cancel', { queryId: targetQueryId })
     if (res && res.ok === false) {
       showBanner(res.message || 'Unable to cancel active query', 'warn')
-      if (state.activeQueryId === targetQueryId) setButtonLoading(cancelBtn, false)
+      if (state.activeQueryId) setButtonLoading(cancelBtn, false)
     } else {
       showBanner('Query cancel requested', 'neutral')
     }
   } catch (err) {
     showBanner(err?.message || 'Cancel failed', 'danger')
-    if (state.activeQueryId === targetQueryId) setButtonLoading(cancelBtn, false)
+    if (state.activeQueryId) setButtonLoading(cancelBtn, false)
   }
 })
 
@@ -3587,7 +3851,7 @@ $('copyDdlBtn').addEventListener('click', (e) => {
   void copyText($('structureDdlCode').textContent, 'CREATE TABLE DDL copied', e.currentTarget)
 })
 $('openDdlConsoleBtn').addEventListener('click', () => {
-  $('sqlEditor').value = $('structureDdlCode').textContent
+  setSqlText($('structureDdlCode').textContent, { focus: true })
   switchTab('sql')
 })
 
@@ -3801,12 +4065,22 @@ if (window.orca?.on) {
   try {
     trackOrcaDisposable(window.orca.on('theme', (payload) => {
       if (payload?.colorScheme) {
-        document.documentElement.classList.toggle('light', payload.colorScheme === 'light')
+        const isLight = payload.colorScheme === 'light'
+        const isDark = payload.colorScheme === 'dark'
+        document.documentElement.classList.toggle('light', isLight)
+        document.documentElement.classList.toggle('dark', isDark)
+        document.body?.classList.toggle('light', isLight)
+        document.body?.classList.toggle('dark', isDark)
+        setSqlColorScheme(isLight)
       } else {
         syncThemeFromTokens()
+        setSqlColorScheme(document.documentElement.classList.contains('light'))
       }
     }))
-    trackOrcaDisposable(window.orca.on('editor.typography.changed', (typo) => applyTypographySnapshot(typo)))
+    trackOrcaDisposable(window.orca.on('editor.typography.changed', (typo) => {
+      applyTypographySnapshot(typo)
+      setSqlTypography(typo)
+    }))
   } catch {}
 }
 if (window.orca?.plugin?.on) {
@@ -3863,6 +4137,7 @@ window.addEventListener('pagehide', () => {
   }
   dataGridSel?.destroy?.()
   sqlGridSel?.destroy?.()
+  destroySqlEditor()
   while (orcaDisposables.length > 0) {
     const d = orcaDisposables.pop()
     try {
@@ -3875,6 +4150,7 @@ window.addEventListener('pagehide', () => {
 restorePanelViewStateFromLocal()
 bindSelectTooltipsInRoot(document)
 syncThemeFromTokens()
+setSqlColorScheme(document.documentElement.classList.contains('light'))
 updateViewportLayout()
 restorePanelWarmCacheFromLocal()
 void syncOrcaTypography()

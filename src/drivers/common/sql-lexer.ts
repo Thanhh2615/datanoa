@@ -1,23 +1,52 @@
 import type { DatabaseDriverType } from '../../protocol'
+import {
+  containsDdlStatement,
+  formatSqlBinaryLiteral,
+  formatSqlLiteral,
+  isIdentContChar,
+  isIdentStartChar,
+  isPostgresEscapeStringStart,
+  matchDollarQuoteTag,
+  matchMysqlExecCommentPrefix,
+  normalizeJsonValue,
+  quoteIdentForDialect,
+  quoteTableReference,
+  scanBlockCommentEnd,
+  scanLineCommentEnd,
+  scanQuotedSegmentEnd,
+  splitSqlStatements,
+  stripCommentsAndLiterals,
+  stripLeadingSqlComments,
+  supportsDollarQuoting,
+  supportsNestedBlockComments,
+  usesBackslashAndHash,
+  findStatementAtOffset,
+  type SqlStatementSlice,
+} from '../../shared-sql-core.js'
 
-const BACKTICK_DIALECTS: ReadonlySet<DatabaseDriverType> = new Set([
-  'mysql',
-  'mariadb',
-  'clickhouse',
-])
-
-const MYSQL_FAMILY_DIALECTS: ReadonlySet<DatabaseDriverType> = new Set([
-  'mysql',
-  'mariadb',
-])
-
-const POSTGRES_FAMILY_DIALECTS: ReadonlySet<DatabaseDriverType> = new Set([
-  'postgres',
-  'cockroachdb',
-])
-
-export function usesBackslashAndHash(dialect?: DatabaseDriverType): boolean {
-  return dialect !== undefined && BACKTICK_DIALECTS.has(dialect)
+export {
+  containsDdlStatement,
+  formatSqlBinaryLiteral,
+  formatSqlLiteral,
+  isIdentContChar,
+  isIdentStartChar,
+  isPostgresEscapeStringStart,
+  matchDollarQuoteTag,
+  matchMysqlExecCommentPrefix,
+  normalizeJsonValue,
+  quoteIdentForDialect,
+  quoteTableReference,
+  scanBlockCommentEnd,
+  scanLineCommentEnd,
+  scanQuotedSegmentEnd,
+  splitSqlStatements,
+  stripCommentsAndLiterals,
+  stripLeadingSqlComments,
+  supportsDollarQuoting,
+  supportsNestedBlockComments,
+  usesBackslashAndHash,
+  findStatementAtOffset,
+  type SqlStatementSlice,
 }
 
 /** Collapses SQL to a single line and bounds its length for display previews. */
@@ -26,595 +55,12 @@ export function compactSql(sql: string, maxLength = 80): string {
   return compact.length > maxLength ? `${compact.slice(0, maxLength - 3)}...` : compact
 }
 
-function usesMysqlExecutableComments(dialect?: DatabaseDriverType): boolean {
-  return dialect !== undefined && MYSQL_FAMILY_DIALECTS.has(dialect)
-}
-
-export function supportsNestedBlockComments(dialect?: DatabaseDriverType): boolean {
-  return dialect === 'postgres' || dialect === 'cockroachdb'
-}
-
-export function supportsDollarQuoting(dialect?: DatabaseDriverType): boolean {
-  return dialect === 'postgres' || dialect === 'cockroachdb'
-}
-
-export function matchMysqlExecCommentPrefix(
-  sql: string,
-  index: number,
-  dialect?: DatabaseDriverType
-): number {
-  if (!usesMysqlExecutableComments(dialect)) return 0
-  if (sql[index] !== '/' || sql[index + 1] !== '*') return 0
-  let cursor = -1
-  if (sql[index + 2] === '!') {
-    cursor = index + 3
-  } else if (dialect === 'mariadb' && (sql[index + 2] === 'M' || sql[index + 2] === 'm') && sql[index + 3] === '!') {
-    cursor = index + 4
-  } else {
-    return 0
-  }
-  while (cursor < sql.length && sql[cursor] >= '0' && sql[cursor] <= '9') {
-    cursor++
-  }
-  return cursor - index
-}
-
-export function isPostgresEscapeStringStart(
-  sql: string,
-  index: number,
-  dialect?: DatabaseDriverType
-): boolean {
-  if (dialect === undefined || !POSTGRES_FAMILY_DIALECTS.has(dialect)) return false
-  const ch = sql[index]
-  if (ch !== 'E' && ch !== 'e') return false
-  if (index + 1 >= sql.length || sql[index + 1] !== "'") return false
-  return index === 0 || !isIdentContChar(sql.charCodeAt(index - 1))
-}
-
-/**
- * Quotes a single SQL identifier according to the target database dialect,
- * preserving dots inside single-identifier names rather than splitting them.
- */
-export function quoteIdentForDialect(ident: string, dialect: DatabaseDriverType): string {
-  if (BACKTICK_DIALECTS.has(dialect)) {
-    return `\`${ident.replace(/`/g, '``')}\``
-  }
-  return `"${ident.replace(/"/g, '""')}"`
-}
-
-function tryParseQuotedTableParts(trimmed: string): string[] | null {
-  const quoteChar = trimmed[0]
-  if (quoteChar !== '"' && quoteChar !== '`') return null
-  const parts: string[] = []
-  let pos = 0
-  const len = trimmed.length
-
-  while (pos < len) {
-    if (trimmed[pos] !== quoteChar) return null
-    const seg = scanQuotedSegmentEnd(trimmed, pos, quoteChar, false)
-    if (!seg.closed) return null
-    const rawInner = trimmed.slice(pos + 1, seg.end - 1)
-    const unescaped =
-      quoteChar === '`' ? rawInner.replace(/``/g, '`') : rawInner.replace(/""/g, '"')
-    if (!unescaped) return null
-    parts.push(unescaped)
-    pos = seg.end
-    if (pos < len) {
-      if (trimmed[pos] !== '.') return null
-      pos++
-      if (pos >= len) return null
-    }
-  }
-
-  return parts.length > 0 ? parts : null
-}
-
-export function quoteTableReference(tableName: string, dialect: DatabaseDriverType): string {
-  const trimmed = tableName.trim()
-  if (!trimmed) {
-    return quoteIdentForDialect('table_name', dialect)
-  }
-  const parsedQuotedParts = tryParseQuotedTableParts(trimmed)
-  if (parsedQuotedParts) {
-    return parsedQuotedParts.map((part) => quoteIdentForDialect(part, dialect)).join('.')
-  }
-  if (!trimmed.includes('"') && !trimmed.includes('`') && trimmed.includes('.')) {
-    return trimmed
-      .split('.')
-      .filter((part) => part.length > 0)
-      .map((part) => quoteIdentForDialect(part, dialect))
-      .join('.')
-  }
-  return quoteIdentForDialect(trimmed, dialect)
-}
-
-export function normalizeJsonValue(value: unknown): unknown {
-  if (value === undefined) return null
-  if (value === null || typeof value === 'boolean' || typeof value === 'string') return value
-  if (typeof value === 'number') return Number.isFinite(value) ? value : null
-  if (typeof value === 'bigint') {
-    const num = Number(value)
-    return Number.isSafeInteger(num) ? num : value.toString()
-  }
-  if (value instanceof Date) {
-    return Number.isNaN(value.getTime()) ? null : value.toISOString()
-  }
-  if (value instanceof ArrayBuffer) {
-    return Array.from(new Uint8Array(value), (b) => b.toString(16).padStart(2, '0')).join('')
-  }
-  if (ArrayBuffer.isView(value)) {
-    const view = new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
-    return Array.from(view, (b) => b.toString(16).padStart(2, '0')).join('')
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => normalizeJsonValue(item))
-  }
-  if (typeof value === 'object') {
-    const out: Record<string, unknown> = {}
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (v !== undefined && typeof v !== 'function' && typeof v !== 'symbol') {
-        out[k] = normalizeJsonValue(v)
-      }
-    }
-    return out
-  }
-  return null
-}
-
-function formatSqlStringLiteral(raw: string, dialect: DatabaseDriverType): string {
-  if (
-    raw.includes('\0') &&
-    (dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1')
-  ) {
-    const parts = raw.split('\0').map((seg) => `'${seg.replace(/'/g, "''")}'`)
-    return parts.join(' || char(0) || ')
-  }
-  let escaped = raw
-  if (BACKTICK_DIALECTS.has(dialect)) {
-    escaped = escaped.replace(/\\/g, '\\\\').replace(/\0/g, '\\0')
-  }
-  escaped = escaped.replace(/'/g, "''")
-  return `'${escaped}'`
-}
-
-export function formatSqlBinaryLiteral(hex: string, dialect: DatabaseDriverType): string {
-  if (dialect === 'postgres' || dialect === 'cockroachdb') {
-    return `E'\\\\x${hex}'::bytea`
-  }
-  if (dialect === 'clickhouse') {
-    return `unhex('${hex}')`
-  }
-  return `X'${hex}'`
-}
-
-export function formatSqlLiteral(value: unknown, dialect: DatabaseDriverType): string {
-  if (value === null || value === undefined) return 'NULL'
-  if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE'
-  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : 'NULL'
-  if (typeof value === 'bigint') return value.toString()
-  if (value instanceof Date) {
-    return Number.isNaN(value.getTime()) ? 'NULL' : formatSqlStringLiteral(value.toISOString(), dialect)
-  }
-  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
-    const hex = String(normalizeJsonValue(value))
-    return formatSqlBinaryLiteral(hex, dialect)
-  }
-  if (typeof value === 'object') {
-    return formatSqlStringLiteral(JSON.stringify(normalizeJsonValue(value)), dialect)
-  }
-  return formatSqlStringLiteral(String(value), dialect)
-}
-
-export interface SqlStatementSlice {
-  text: string
-  start: number
-  end: number
-}
-
-export function isIdentStartChar(code: number): boolean {
-  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95
-}
-
-export function isIdentContChar(code: number): boolean {
-  return isIdentStartChar(code) || (code >= 48 && code <= 57)
-}
-
-export function matchDollarQuoteTag(sql: string, index: number): string | null {
-  if (sql.charCodeAt(index) !== 36 /* $ */) return null
-  if (index > 0 && isIdentContChar(sql.charCodeAt(index - 1))) return null
-  const len = sql.length
-  if (index + 1 >= len) return null
-  if (sql.charCodeAt(index + 1) === 36) return '$$'
-  if (!isIdentStartChar(sql.charCodeAt(index + 1))) return null
-  let cursor = index + 2
-  while (cursor < len && isIdentContChar(sql.charCodeAt(cursor))) {
-    cursor++
-  }
-  if (cursor < len && sql.charCodeAt(cursor) === 36) {
-    return sql.slice(index, cursor + 1)
-  }
-  return null
-}
-
-export function scanQuotedSegmentEnd(
-  sql: string,
-  start: number,
-  quoteChar: string,
-  allowBackslashEscape: boolean
-): { end: number; closed: boolean } {
-  let i = start + 1
-  const len = sql.length
-  while (i < len) {
-    const ch = sql[i]
-    if (allowBackslashEscape && ch === '\\') {
-      i += 2
-      continue
-    }
-    if (ch === quoteChar) {
-      if (i + 1 < len && sql[i + 1] === quoteChar) {
-        i += 2
-        continue
-      }
-      return { end: i + 1, closed: true }
-    }
-    i++
-  }
-  return { end: len, closed: false }
-}
-
-export function scanLineCommentEnd(sql: string, start: number): number {
-  let i = start + 2
-  const len = sql.length
-  while (i < len && sql[i] !== '\n') {
-    i++
-  }
-  return i < len ? i + 1 : len
-}
-
-export function scanBlockCommentEnd(sql: string, start: number, nested = true): number {
-  let i = start + 2
-  let depth = 1
-  const len = sql.length
-  while (i < len && depth > 0) {
-    if (nested && sql[i] === '/' && i + 1 < len && sql[i + 1] === '*') {
-      depth++
-      i += 2
-      continue
-    }
-    if (sql[i] === '*' && i + 1 < len && sql[i + 1] === '/') {
-      depth--
-      i += 2
-      continue
-    }
-    i++
-  }
-  return i
-}
-
-function trimSliceBounds(script: string, rawStart: number, rawEnd: number): { start: number; end: number } {
-  let start = rawStart
-  let end = rawEnd
-  while (start < end && /\s/.test(script[start])) start++
-  while (end > start && /\s/.test(script[end - 1])) end--
-  return { start, end }
-}
-
-const COMPOUND_CREATE_TARGETS: ReadonlySet<string> = new Set([
-  'TRIGGER',
-  'PROCEDURE',
-  'FUNCTION',
-  'EVENT',
-])
-
-const COMPOUND_END_SUFFIX_WORDS: ReadonlySet<string> = new Set([
-  'IF',
-  'LOOP',
-  'WHILE',
-  'REPEAT',
-  'CASE',
-])
-
-const NON_TRANSACTION_BEGIN_FOLLOWERS: ReadonlySet<string> = new Set([
-  ';',
-  'TRANSACTION',
-  'TRAN',
-  'WORK',
-  'DEFERRED',
-  'IMMEDIATE',
-  'EXCLUSIVE',
-  'CONCURRENT',
-  'ATOMIC',
-  'READ',
-  'WRITE',
-  'ISOLATION',
-])
-
-/**
- * Splits a SQL script into executable statements, preserving source offsets and ignoring
- * semicolons inside quotes, compound trigger/routine BEGIN..END blocks, MySQL DELIMITER blocks,
- * PG dollar-quoted blocks, and comments.
- */
-export function splitSqlStatements(
-  script: string,
-  dialect?: DatabaseDriverType
-): SqlStatementSlice[] {
-  const results: SqlStatementSlice[] = []
-  const len = script.length
-  const backslashAndHash = usesBackslashAndHash(dialect)
-  const nestedComments = supportsNestedBlockComments(dialect)
-  const dollarQuotes = supportsDollarQuoting(dialect)
-  const allowMysqlDelimiter = dialect !== undefined && MYSQL_FAMILY_DIALECTS.has(dialect)
-  const supportsCompoundRoutineBegin =
-    dialect === 'sqlite' ||
-    dialect === 'libsql' ||
-    dialect === 'd1' ||
-    dialect === 'mysql' ||
-    dialect === 'mariadb'
-
-  let segStart = 0
-  let hasExecutableToken = false
-  let delimiter = ';'
-  let execCommentDepth = 0
-  let i = 0
-
-  // State per active statement for CREATE TRIGGER/PROCEDURE/FUNCTION/EVENT ... BEGIN ... END
-  let stmtHeaderWords: string[] = []
-  let isCompoundHeader = false
-  let compoundDepth = 0
-  let caseDepth = 0
-  let prevWordUpper = ''
-
-  const resetStatementState = (): void => {
-    stmtHeaderWords = []
-    isCompoundHeader = false
-    compoundDepth = 0
-    caseDepth = 0
-    prevWordUpper = ''
-  }
-
-  const flushSegment = (rawEnd: number, delimLen: number): void => {
-    if (hasExecutableToken) {
-      const { start, end } = trimSliceBounds(script, segStart, rawEnd)
-      if (end > start) {
-        results.push({ text: script.slice(start, end), start, end })
-      }
-    }
-    segStart = rawEnd + delimLen
-    hasExecutableToken = false
-    resetStatementState()
-  }
-
-  const peekNextUpperWord = (fromIdx: number): string => {
-    let k = fromIdx
-    while (k < len && /\s/.test(script[k])) k++
-    if (k >= len) return ''
-    if (script[k] === ';') return ';'
-    if (!isIdentStartChar(script.charCodeAt(k))) return ''
-    let end = k + 1
-    while (end < len && isIdentContChar(script.charCodeAt(end))) end++
-    return script.slice(k, end).toUpperCase()
-  }
-
-  while (i < len) {
-    // Check MySQL DELIMITER directive when at the start of a statement (no tokens yet)
-    if (allowMysqlDelimiter && !hasExecutableToken) {
-      const atLineStart = i === 0 || script[i - 1] === '\n' || script[i - 1] === '\r'
-      if (atLineStart) {
-        let wsEnd = i
-        while (wsEnd < len && (script[wsEnd] === ' ' || script[wsEnd] === '\t')) wsEnd++
-        const delimMatch = /^DELIMITER\s+([^\s\r\n]+)[ \t]*(?:\r?\n|$)/i.exec(script.slice(wsEnd))
-        if (delimMatch && delimMatch[1]) {
-          delimiter = delimMatch[1]
-          i = wsEnd + delimMatch[0].length
-          segStart = i
-          resetStatementState()
-          continue
-        }
-      }
-    }
-
-    // Check custom or default delimiter before scanning single chars when not inside compound block
-    if (delimiter.length > 0 && compoundDepth === 0 && execCommentDepth === 0) {
-      if (script.startsWith(delimiter, i)) {
-        if (delimiter === ';' || !isIdentContChar(script.charCodeAt(i))) {
-          flushSegment(i, delimiter.length)
-          i += delimiter.length
-          continue
-        }
-      }
-    }
-
-    const ch = script[i]
-    if (ch === '-' && i + 1 < len && script[i + 1] === '-') {
-      i = scanLineCommentEnd(script, i)
-      continue
-    }
-    if (ch === '#' && backslashAndHash) {
-      i = scanLineCommentEnd(script, i - 1)
-      continue
-    }
-    if (execCommentDepth > 0 && ch === '*' && i + 1 < len && script[i + 1] === '/') {
-      execCommentDepth--
-      i += 2
-      continue
-    }
-    if (ch === '/' && i + 1 < len && script[i + 1] === '*') {
-      const execLen = matchMysqlExecCommentPrefix(script, i, dialect)
-      if (execLen > 0) {
-        hasExecutableToken = true
-        execCommentDepth++
-        i += execLen
-        continue
-      }
-      i = scanBlockCommentEnd(script, i, nestedComments)
-      continue
-    }
-    if (isPostgresEscapeStringStart(script, i, dialect)) {
-      hasExecutableToken = true
-      i = scanQuotedSegmentEnd(script, i + 1, "'", true).end
-      prevWordUpper = ''
-      continue
-    }
-    if (ch === "'" || ch === '"' || ch === '`') {
-      hasExecutableToken = true
-      const allowBackslash = ch === "'" && backslashAndHash
-      i = scanQuotedSegmentEnd(script, i, ch, allowBackslash).end
-      prevWordUpper = ''
-      continue
-    }
-    if (dollarQuotes && ch === '$') {
-      const tag = matchDollarQuoteTag(script, i)
-      if (tag !== null) {
-        hasExecutableToken = true
-        const closeIdx = script.indexOf(tag, i + tag.length)
-        i = closeIdx >= 0 ? closeIdx + tag.length : len
-        prevWordUpper = ''
-        continue
-      }
-    }
-
-    if (delimiter !== ';' && script.startsWith(delimiter, i) && compoundDepth === 0 && execCommentDepth === 0) {
-      flushSegment(i, delimiter.length)
-      i += delimiter.length
-      continue
-    }
-
-    if (ch === ';' && delimiter === ';' && compoundDepth === 0 && execCommentDepth === 0) {
-      flushSegment(i, 1)
-      i++
-      continue
-    }
-
-    if (isIdentStartChar(script.charCodeAt(i))) {
-      hasExecutableToken = true
-      let end = i + 1
-      while (end < len && isIdentContChar(script.charCodeAt(end))) end++
-      const wordUpper = script.slice(i, end).toUpperCase()
-
-      if (stmtHeaderWords.length < 10) {
-        stmtHeaderWords.push(wordUpper)
-        if (
-          supportsCompoundRoutineBegin &&
-          !isCompoundHeader &&
-          stmtHeaderWords[0] === 'CREATE' &&
-          COMPOUND_CREATE_TARGETS.has(wordUpper)
-        ) {
-          isCompoundHeader = true
-        }
-      }
-
-      if (isCompoundHeader && delimiter === ';') {
-        if (wordUpper === 'BEGIN') {
-          const nextWord = peekNextUpperWord(end)
-          if (!NON_TRANSACTION_BEGIN_FOLLOWERS.has(nextWord)) {
-            compoundDepth++
-          }
-        } else if (wordUpper === 'CASE' && prevWordUpper !== 'END') {
-          caseDepth++
-        } else if (wordUpper === 'END') {
-          const nextWord = peekNextUpperWord(end)
-          if (COMPOUND_END_SUFFIX_WORDS.has(nextWord)) {
-            if (nextWord === 'CASE' && caseDepth > 0) {
-              caseDepth--
-            }
-          } else if (caseDepth > 0 && compoundDepth === 0) {
-            caseDepth--
-          } else if (caseDepth > 0 && nextWord !== ';') {
-            caseDepth--
-          } else if (compoundDepth > 0) {
-            compoundDepth--
-          }
-        }
-      }
-
-      prevWordUpper = wordUpper
-      i = end
-      continue
-    }
-
-    if (!/\s/.test(ch)) {
-      hasExecutableToken = true
-      prevWordUpper = ''
-    }
-    i++
-  }
-
-  if (segStart < len) {
-    flushSegment(len, 0)
-  }
-
-  return results
-}
-
-/**
- * Finds the SQL statement enclosing or immediately preceding the given zero-based caret offset.
- */
-export function findStatementAtOffset(
-  script: string,
-  offset: number,
-  dialect?: DatabaseDriverType
-): string {
-  const stmts = splitSqlStatements(script, dialect)
-  if (stmts.length === 0) return ''
-
-  const pos = Math.max(0, Math.min(script.length, offset))
-  for (let i = 0; i < stmts.length; i++) {
-    const stmt = stmts[i]
-    if (pos <= stmt.end) {
-      return stmt.text
-    }
-    const next = stmts[i + 1]
-    if (!next) {
-      return stmt.text
-    }
-    if (pos < next.start) {
-      const gap = script.slice(stmt.end, next.start)
-      const semiRel = gap.indexOf(';')
-      const semiBoundary = semiRel >= 0 ? stmt.end + semiRel + 1 : stmt.end
-      return pos <= semiBoundary ? stmt.text : next.text
-    }
-  }
-
-  return stmts[stmts.length - 1].text
-}
-
 const LEADING_FILTER_KEYWORD_REGEX = /^(?:WHERE|ORDER\s+BY)\b\s*/i
 
 /**
  * Normalizes a table WHERE or ORDER BY filter clause and rejects unquoted SQL statement breakouts
  * (`;`, `--`, `/*`, dialect-specific `#`, or unclosed string/identifier quotes).
  */
-export function stripLeadingSqlComments(
-  sql: string,
-  dialect?: DatabaseDriverType
-): string {
-  const allowHash = usesBackslashAndHash(dialect)
-  const nestedComments = supportsNestedBlockComments(dialect)
-  const len = sql.length
-  let i = 0
-  while (i < len) {
-    while (i < len && /\s/.test(sql[i])) i++
-    if (i >= len) break
-    if (sql[i] === '-' && i + 1 < len && sql[i + 1] === '-') {
-      i = scanLineCommentEnd(sql, i)
-      continue
-    }
-    if (allowHash && sql[i] === '#') {
-      i = scanLineCommentEnd(sql, i - 1)
-      continue
-    }
-    if (sql[i] === '/' && i + 1 < len && sql[i + 1] === '*') {
-      if (matchMysqlExecCommentPrefix(sql, i, dialect) > 0) {
-        break
-      }
-      i = scanBlockCommentEnd(sql, i, nestedComments)
-      continue
-    }
-    break
-  }
-  return sql.slice(i)
-}
-
 export function sanitizeFilterClause(
   clause?: string,
   dialect?: DatabaseDriverType
@@ -921,78 +367,6 @@ const REDIS_WRITE_COMMANDS: ReadonlySet<string> = new Set([
   'SHUTDOWN',
 ])
 
-export function stripCommentsAndLiterals(
-  sql: string,
-  dialect?: DatabaseDriverType,
-  preserveMysqlExecComments = true
-): string {
-  const backslashAndHash = usesBackslashAndHash(dialect)
-  const nestedComments = supportsNestedBlockComments(dialect)
-  const dollarQuotes = supportsDollarQuoting(dialect)
-  let out = ''
-  let i = 0
-  let execCommentDepth = 0
-  const len = sql.length
-
-  while (i < len) {
-    const ch = sql[i]
-    if (ch === '-' && i + 1 < len && sql[i + 1] === '-') {
-      out += ' '
-      i = scanLineCommentEnd(sql, i)
-      continue
-    }
-    if (ch === '#' && backslashAndHash) {
-      out += ' '
-      i = scanLineCommentEnd(sql, i - 1)
-      continue
-    }
-    if (execCommentDepth > 0 && ch === '*' && i + 1 < len && sql[i + 1] === '/') {
-      out += ' '
-      execCommentDepth--
-      i += 2
-      continue
-    }
-    if (ch === '/' && i + 1 < len && sql[i + 1] === '*') {
-      const execLen = preserveMysqlExecComments
-        ? matchMysqlExecCommentPrefix(sql, i, dialect)
-        : 0
-      if (execLen > 0) {
-        out += ' '
-        execCommentDepth++
-        i += execLen
-        continue
-      }
-      out += ' '
-      i = scanBlockCommentEnd(sql, i, nestedComments)
-      continue
-    }
-    if (isPostgresEscapeStringStart(sql, i, dialect)) {
-      out += ' '
-      i = scanQuotedSegmentEnd(sql, i + 1, "'", true).end
-      continue
-    }
-    if (ch === "'" || ch === '"' || ch === '`') {
-      out += ' '
-      const allowBackslash = ch === "'" && backslashAndHash
-      i = scanQuotedSegmentEnd(sql, i, ch, allowBackslash).end
-      continue
-    }
-    if (dollarQuotes && ch === '$') {
-      const tag = matchDollarQuoteTag(sql, i)
-      if (tag !== null) {
-        out += ' '
-        const closeIdx = sql.indexOf(tag, i + tag.length)
-        i = closeIdx >= 0 ? closeIdx + tag.length : len
-        continue
-      }
-    }
-    out += ch
-    i++
-  }
-
-  return out
-}
-
 interface ParsedExplainInfo {
   hasAnalyze: boolean
   hasWriteOption: boolean
@@ -1209,39 +583,6 @@ export function isMutatingStatement(sql: string, driver: DatabaseDriverType): bo
     return isSingleSqlStatementMutating(sql, driver)
   }
   return statements.some((stmt) => isSingleSqlStatementMutating(stmt.text, driver))
-}
-
-const SQL_DDL_VERBS: ReadonlySet<string> = new Set([
-  'CREATE',
-  'ALTER',
-  'DROP',
-  'RENAME',
-  'TRUNCATE',
-  'VACUUM',
-  'ATTACH',
-  'DETACH',
-])
-
-/**
- * Detects whether a SQL script contains any DDL or schema-altering statement
- * (`CREATE`, `ALTER`, `DROP`, `RENAME`, `TRUNCATE`, `VACUUM`, `ATTACH`, `DETACH`),
- * ignoring comments and quoted string/identifier literals.
- */
-export function containsDdlStatement(sql: string, dialect?: DatabaseDriverType): boolean {
-  if (!sql || !sql.trim()) return false
-  const statements = splitSqlStatements(sql, dialect)
-  const list = statements.length > 0 ? statements.map((s) => s.text) : [sql]
-  return list.some((stmtText) => {
-    const stripped = stripCommentsAndLiterals(stmtText, dialect, true)
-    const parts = stripped.includes(';') ? stripped.split(';') : [stripped]
-    return parts.some((part) => {
-      const clean = part.replace(/^[\s(]+/, '').trim()
-      if (!clean) return false
-      const firstMatch = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(clean)
-      if (!firstMatch) return false
-      return SQL_DDL_VERBS.has(firstMatch[1].toUpperCase())
-    })
-  })
 }
 
 type CockroachViewTokenKind = 'word' | 'quoted' | 'string' | 'comment' | 'punct'

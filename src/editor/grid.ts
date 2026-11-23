@@ -133,6 +133,27 @@ interface RenderedWindowSnapshot {
 
 const DEFAULT_ROWNUM_WIDTH_PX = 44
 
+export interface GridRuntimeSnapshot {
+  model: GridModel | null
+  rowStates: InternalRowState[]
+  sortColumn?: string
+  sortDirection?: 'ASC' | 'DESC'
+  clientFilter: string
+  clientColumnFilters: ClientColumnFilter[]
+  findQuery: string
+  findActiveIndex: number
+  hiddenColumns: string[]
+  pinnedColumns: string[]
+  scrollTop: number
+  scrollLeft: number
+  tableName: string
+  connectionId: string
+  schemaName: string
+  dialect: DatabaseDriverType
+  emptyMessage: string
+  foreignKeys: ForeignKeyInfo[]
+}
+
 export interface VirtualDataGridOptions {
   container: HTMLElement
   data?: TableBrowseResult | QueryResult
@@ -5033,6 +5054,138 @@ export class VirtualDataGrid {
 
   public getModel(): GridModel | null {
     return this.model
+  }
+
+  public exportRuntimeState(): GridRuntimeSnapshot {
+    const model = this.model
+      ? {
+          headers: [...this.model.headers],
+          columns: this.model.columns.map((c) => ({ ...c })),
+          rows: this.model.rows.map((r) => cloneRow(r)),
+          rowCount: this.model.rowCount,
+          canEdit: this.model.canEdit,
+          primaryKey: [...this.model.primaryKey],
+        }
+      : null
+    const rowStates: InternalRowState[] = this.rowStates.map((st) => ({
+      kind: st.kind,
+      ...(st.origin ? { origin: st.origin } : {}),
+      deleted: st.deleted,
+      original: cloneRow(st.original),
+      dirtyCols: new Map(st.dirtyCols),
+    }))
+    const fkSeen = new Set<ForeignKeyInfo>(this.foreignKeyByColumn.values())
+    return {
+      model,
+      rowStates,
+      sortColumn: this.sortColumn,
+      sortDirection: this.sortDirection,
+      clientFilter: this.clientFilter,
+      clientColumnFilters: this.clientColumnFilters.map((f) => ({ ...f })),
+      findQuery: this.findQuery,
+      findActiveIndex: this.findActiveIndex,
+      hiddenColumns: Array.from(this.hiddenColumns),
+      pinnedColumns: [...this.pinnedColumns],
+      scrollTop: this.tableContainerEl?.scrollTop ?? 0,
+      scrollLeft: this.tableContainerEl?.scrollLeft ?? 0,
+      tableName: this.tableName,
+      connectionId: this.connectionId,
+      schemaName: this.schemaName,
+      dialect: this.dialect,
+      emptyMessage: this.emptyMessage,
+      foreignKeys: Array.from(fkSeen),
+    }
+  }
+
+  public restoreRuntimeState(snap: GridRuntimeSnapshot): void {
+    this.isLoading = false
+    this.cleanupColumnResize()
+    this.cleanupDragSelection()
+    this.activeEditor = null
+    this.closeContextMenu()
+    this.closeBulkFillPopover()
+    this.closeColumnFilterPopover()
+
+    this.tableName = snap.tableName || 'table_name'
+    this.connectionId = snap.connectionId || ''
+    this.schemaName = snap.schemaName || ''
+    this.dialect = snap.dialect || 'sqlite'
+    this.emptyMessage = snap.emptyMessage || 'No rows to display.'
+    this.setForeignKeys(snap.foreignKeys || [])
+
+    this.model = snap.model
+      ? {
+          headers: [...snap.model.headers],
+          columns: snap.model.columns.map((c) => ({ ...c })),
+          rows: snap.model.rows.map((r) => cloneRow(r)),
+          rowCount: snap.model.rowCount,
+          canEdit: snap.model.canEdit,
+          primaryKey: [...snap.model.primaryKey],
+        }
+      : null
+    this.rowStates = snap.rowStates.map((st) => ({
+      kind: st.kind,
+      ...(st.origin ? { origin: st.origin } : {}),
+      deleted: st.deleted,
+      original: cloneRow(st.original),
+      dirtyCols: new Map(st.dirtyCols),
+    }))
+
+    this.sortColumn = snap.sortColumn
+    this.sortDirection = snap.sortDirection
+    this.clientFilter = snap.clientFilter || ''
+    this.clientColumnFilters = (snap.clientColumnFilters || []).map((f) => ({ ...f }))
+    this.findQuery = snap.findQuery || ''
+    this.hiddenColumns = new Set(snap.hiddenColumns || [])
+    this.pinnedColumns = [...(snap.pinnedColumns || [])]
+
+    this.selection.clear()
+    this.selectedRowIndex = null
+    this.selectedColIndex = null
+    this.invalidateDataCache()
+    this.invalidateFilterCache()
+    this.invalidateColLayoutCache()
+    this.resetRowPoolMountState()
+
+    if (!this.model || this.model.headers.length === 0) {
+      this.rowNumWidth = DEFAULT_ROWNUM_WIDTH_PX
+      this.columnWidths = []
+    } else {
+      const cacheKey = this.getColumnCacheKey(this.model.headers)
+      const cached = this.columnWidthsByTable.get(cacheKey)
+      if (cached && cached.columnWidths.length === this.model.headers.length) {
+        this.rowNumWidth = cached.rowNumWidth
+        this.columnWidths = [...cached.columnWidths]
+      } else {
+        this.rowNumWidth = DEFAULT_ROWNUM_WIDTH_PX
+        this.columnWidths = this.computeInitialColumnWidths(this.model)
+      }
+    }
+
+    if (this.findQuery) {
+      this.recomputeFindMatches()
+      if (
+        snap.findActiveIndex >= 0 &&
+        snap.findActiveIndex < this.findMatches.length
+      ) {
+        this.findActiveIndex = snap.findActiveIndex
+      }
+      this.onFindStateChange?.({ total: this.findMatches.length, activeIndex: this.findActiveIndex })
+    } else {
+      this.findMatches = []
+      this.findMatchKeys.clear()
+      this.findActiveIndex = -1
+      this.onFindStateChange?.({ total: 0, activeIndex: -1 })
+    }
+
+    this.renderHeader()
+    this.renderVisibleRows()
+    if (this.tableContainerEl) {
+      this.tableContainerEl.scrollTop = snap.scrollTop || 0
+      this.tableContainerEl.scrollLeft = snap.scrollLeft || 0
+    }
+    this.onStageChange?.(this.getStagedCount())
+    this.notifyAllSelectionListeners()
   }
 
   public destroy(): void {
