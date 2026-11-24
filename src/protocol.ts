@@ -11,6 +11,9 @@ export type DatabaseDriverType =
   | 'redis'
   | 'libsql'
   | 'd1'
+  | 'mssql'
+  | 'oracle'
+  | 'mongodb'
 
 export type ConnectionColorTag = 'none' | 'dev' | 'staging' | 'prod'
 
@@ -89,6 +92,9 @@ export interface ColumnInfo {
   isPrimaryKey: boolean
   isAutoIncrement: boolean
   isGenerated?: boolean
+  generatedExpression?: string
+  generatedStorage?: 'STORED' | 'VIRTUAL'
+  collate?: string
 }
 
 export interface IndexInfo {
@@ -96,6 +102,12 @@ export interface IndexInfo {
   isUnique: boolean
   isPrimary: boolean
   columns: string[]
+  origin?: 'c' | 'u' | 'pk'
+  columnSpecs?: Array<{ name: string; collate?: string; desc?: boolean }>
+  onConflict?: string
+  whereClause?: string
+  partial?: boolean
+  isExpression?: boolean
 }
 
 export interface ForeignKeyInfo {
@@ -116,6 +128,16 @@ export interface TableDetails {
   primaryKey: string[]
   indexes: IndexInfo[]
   foreignKeys: ForeignKeyInfo[]
+  inboundForeignKeys?: Array<{
+    fromTable: string
+    fromColumn: string
+    toColumn: string
+    onDelete?: string
+  }>
+  triggers?: Array<{ name: string; sql: string }>
+  checkConstraints?: string[]
+  strict?: boolean
+  withoutRowid?: boolean
   ddl?: string
 }
 
@@ -154,6 +176,7 @@ export interface DataChangesInput {
     originalRow?: Record<string, unknown>
   }[]
   deletes?: Record<string, unknown>[]
+  deleteRows?: Record<string, unknown>[]
 }
 
 export interface QueryResultSourceTable {
@@ -207,6 +230,7 @@ export interface TransactionState {
   supported: boolean
   reason?: string
   aborted?: boolean
+  txToken?: number
 }
 
 export type DockerComposeDriverType =
@@ -217,6 +241,7 @@ export type DockerComposeDriverType =
 
 export interface DiscoveredDockerComposeConnection {
   id: string
+  candidateId?: string
   project: string
   service: string
   driver: DockerComposeDriverType
@@ -226,6 +251,7 @@ export interface DiscoveredDockerComposeConnection {
   database: string
   user?: string
   password?: string
+  hasPassword?: boolean
   url?: string
   redisDb?: number
   ssl?: boolean
@@ -236,6 +262,15 @@ export interface DiscoveredDockerComposeConnection {
   hint?: string
   unpublishedPort?: boolean
   passwordFromFile?: string
+}
+
+export interface ParsedConnectionUriResult {
+  ok: boolean
+  profile?: Partial<ConnectionProfile>
+  password?: string
+  authToken?: string
+  placeholderPassword?: boolean
+  error?: string
 }
 
 /** Storage key for persisting saved connections */
@@ -278,15 +313,8 @@ interface DatanoaPluginRequests {
     output: { ok: boolean; message?: string }
   }
   'connection.parseUri': {
-    input: { uri: string }
-    output: {
-      ok: boolean
-      profile?: Partial<ConnectionProfile>
-      password?: string
-      authToken?: string
-      placeholderPassword?: boolean
-      error?: string
-    }
+    input: { uri?: string; candidateId?: string }
+    output: ParsedConnectionUriResult
   }
   'schema.listObjects': {
     input: { connectionId: string; schema?: string }
@@ -360,6 +388,7 @@ interface DatanoaPluginRequests {
     output: {
       sqliteFiles: { name: string; filePath: string; sizeBytes: number; sizeLabel: string }[]
       envConnections: {
+        candidateId?: string
         envKey: string
         sourceFile: string
         driver: DatabaseDriverType
@@ -367,6 +396,17 @@ interface DatanoaPluginRequests {
         uri: string
       }[]
       dockerComposeConnections: DiscoveredDockerComposeConnection[]
+      scannedDirs?: string[]
+    }
+  }
+  'workspace.resolveDetectedCandidate': {
+    input: { candidateId: string }
+    output: {
+      ok: boolean
+      parsed?: ParsedConnectionUriResult
+      password?: string
+      authToken?: string
+      url?: string
     }
   }
   'data.applyChanges': {
@@ -431,7 +471,7 @@ interface DatanoaPluginRequests {
     output: TransactionState
   }
   'tx.rollback': {
-    input: { connectionId: string }
+    input: { connectionId: string; onlyIfOwner?: boolean; txToken?: number }
     output: TransactionState
   }
   'tx.setAutoCommit': {
@@ -532,6 +572,171 @@ interface DatanoaPluginRequests {
     }
     output: { ok: true; updatedAt: number }
   }
+  'ai.status.get': {
+    input?: Record<string, never>
+    output: AiStatusSnapshot
+  }
+  'ai.key.set': {
+    input: { key: string; baseUrl?: string }
+    output: { hasKey: boolean }
+  }
+  'ai.provider.test': {
+    input?: Record<string, never>
+    output: { ok: boolean; message: string; ms: number | null }
+  }
+  'ai.models.list': {
+    input: { format: AiProviderFormat; baseUrl: string; key: string }
+    output: { ok: boolean; models: string[]; message: string }
+  }
+  'ai.models.bench': {
+    input: { format: AiProviderFormat; baseUrl: string; key: string; models: string[] }
+    output: { results: { model: string; ok: boolean; ms: number | null }[]; message: string }
+  }
+  'ai.models.usage': {
+    input: { baseUrl: string }
+    output: { usage: Record<string, { ms: number; uses: number }> }
+  }
+  'ai.stats.get': {
+    input?: Record<string, never>
+    output: AiStatsSnapshot
+  }
+  'ai.stats.reset': {
+    input?: Record<string, never>
+    output: Record<string, never>
+  }
+  'ai.metrics.event': {
+    input: { id: number; kind: AiMetricKind }
+    output: Record<string, never>
+  }
+  'ai.complete': {
+    input: {
+      connectionId?: string
+      dialect: DatabaseDriverType
+      prefix: string
+      suffix: string
+      activeSchema?: string
+      activeTable?: string
+      schemaMap?: Record<string, string[]>
+      manual?: boolean
+    }
+    output: { suggestion: string; id: number; replaceChars?: number }
+  }
+  'ai.explainAnalyze': {
+    input: {
+      connectionId?: string
+      dialect: DatabaseDriverType
+      sql: string
+      planColumns: { name: string; type: string }[]
+      planRows: unknown[][]
+      language?: AiExplainLanguage
+      uiLocale?: string
+    }
+    output: AiExplainAnalysisResult
+  }
+  'ai.fixQuery': {
+    input: {
+      connectionId?: string
+      dialect: DatabaseDriverType
+      sql: string
+      errorMessage: string
+      activeSchema?: string
+      activeTable?: string
+      schemaMap?: Record<string, string[]>
+      language?: AiExplainLanguage
+      uiLocale?: string
+    }
+    output: AiFixQueryResult
+  }
+}
+
+export type AiProviderFormat = 'openai' | 'anthropic' | 'ollama' | 'mistral-fim'
+
+export type AiPresetId =
+  | 'openai'
+  | 'anthropic'
+  | 'openrouter'
+  | 'ollama'
+  | 'mistral'
+  | 'custom-openai'
+  | 'custom-anthropic'
+
+export type AiStatusState = 'on' | 'off' | 'setup' | 'slow' | 'error'
+
+export type AiExplainLanguage =
+  | 'auto'
+  | 'vi'
+  | 'en'
+  | 'ja'
+  | 'zh'
+  | 'ko'
+  | 'es'
+  | 'fr'
+  | 'de'
+  | 'pt'
+
+export type AiMetricKind = 'shown' | 'accepted' | 'partial' | 'kept' | 'undone' | 'stale'
+
+export interface AiStatusSnapshot {
+  enabled: boolean
+  state: AiStatusState
+  lastMs: number | null
+  suggested: number
+  reason: string | null
+  format: AiProviderFormat
+  baseUrl: string
+  host: string
+  model: string
+  maxTokens: number
+  explainMaxTokens: number
+  explainLanguage: AiExplainLanguage
+  hasKey: boolean
+  destination: 'none' | 'local' | 'remote'
+}
+
+export interface AiStatsSnapshot {
+  model: string
+  since: number
+  summary: {
+    shown: number
+    accepted: number
+    partial: number
+    kept: number
+    undone: number
+    stale: number
+    p50: number | null
+    p95: number | null
+    samples: number
+  }
+}
+
+export interface AiExplainBottleneck {
+  title: string
+  detail: string
+  severity: 'high' | 'medium' | 'low'
+}
+
+export interface AiExplainIndexSuggestion {
+  ddl: string
+  reason: string
+}
+
+export interface AiExplainAnalysisResult {
+  summary: string
+  bottlenecks: AiExplainBottleneck[]
+  optimizedSql: string | null
+  indexSuggestions: AiExplainIndexSuggestion[]
+  caveats: string[]
+  language: string
+  durationMs: number
+}
+
+export interface AiFixQueryResult {
+  fixedSql: string
+  explanation: string
+  changesSummary: string
+  language: string
+  model: string
+  durationMs: number
 }
 
 type WithLegacyRequestAliases<T extends { output: unknown }> = T &
@@ -602,6 +807,7 @@ interface DatanoaPluginPanelEvents {
     primaryKeys: Record<string, unknown>
     column: string
   }
+  'ai.status.changed': AiStatusSnapshot
 }
 
 export type PluginPanelEvents = DatanoaPluginPanelEvents

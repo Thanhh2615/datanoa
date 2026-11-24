@@ -9,23 +9,40 @@ import {
 import { detectRecognizableSqlCredential } from '../drivers/common/sql-credentials'
 import {
   compactSql,
+  containsDdlStatement,
   hasExplainAnalyzeOption,
   isExplainTargetMutating,
   isMutatingStatement,
   splitSqlStatements,
+  stripCommentsAndLiterals,
   stripLeadingSqlComments,
 } from '../drivers/common/sql-tools'
+import type { WorkerSchemaMetadataCache } from './ai-sql-context'
 import {
   DEFAULT_MAX_QUERY_ROWS,
   MAX_QUERY_ROWS_CEILING,
   SAVED_QUERIES_STORAGE_KEY,
 } from '../shared-constants'
+import type { IDatabaseSession } from '../drivers/common/driver'
+import {
+  hasMssqlSemicolonlessTxControl,
+  isMssqlReadOnlyBlocked,
+  splitMssqlBatches,
+} from '../drivers/common/mssql-sql'
+import { isOracleImplicitCommitStatement, splitOracleStatements } from '../drivers/common/oracle-sql'
+import {
+  isMysqlAutoCommitOffStatement,
+  isMysqlImplicitCommitStatement,
+  SQL_STANDALONE_ROLLBACK_RE,
+} from '../drivers/common/sql-lexer'
 import type { SessionManager } from './session-manager'
+import { TxOwnershipController } from './tx-ownership'
 import {
   assertMutableConnection,
   createHostError,
   createSerializedQueue,
   executeSessionQuery,
+  formatActionableWorkerErrorMessage,
   MAX_QUERY_HISTORY,
   MAX_SAVED_QUERIES,
   QUERY_HISTORY_STORAGE_KEY,
@@ -34,6 +51,7 @@ import {
   readHostConfigBackup,
   readSavedQueries,
   sanitizeSavedQueryInput,
+  scrubAndEnhanceWorkerError,
   scrubCredentialsInText,
   writeHostConfigBackupPatch,
   type QueryRuntimeTracker,
@@ -45,24 +63,414 @@ export interface QueryTxHandlersDeps {
   registerHandler: WorkerRegisterHandler
   sessionManager: SessionManager
   tracker: QueryRuntimeTracker
+  schemaCache?: WorkerSchemaMetadataCache
+  txOwnership?: TxOwnershipController
+  onHistoryChanged?: () => void
 }
 
-interface ExplainPlanItem {
+function scrubThrownError(err: unknown): unknown {
+  return scrubAndEnhanceWorkerError(err)
+}
+
+async function executeSingleExplainPlan(
+  tracker: QueryRuntimeTracker,
+  session: IDatabaseSession,
+  driver: DatabaseDriverType,
+  queryId: string,
+  explainSql: string,
+  timeoutSeconds: number,
+  signal: AbortSignal
+): Promise<QueryResult> {
+  const res = await executeSessionQuery(
+    tracker,
+    session,
+    queryId,
+    explainSql,
+    DEFAULT_MAX_QUERY_ROWS,
+    timeoutSeconds,
+    signal
+  )
+  if (
+    driver === 'oracle' &&
+    /^EXPLAIN\s+PLAN\b/i.test(stripLeadingSqlComments(explainSql, 'oracle'))
+  ) {
+    const xplanRes = await executeSessionQuery(
+      tracker,
+      session,
+      queryId,
+      'SELECT PLAN_TABLE_OUTPUT FROM TABLE(DBMS_XPLAN.DISPLAY())',
+      DEFAULT_MAX_QUERY_ROWS,
+      timeoutSeconds,
+      signal
+    )
+    return {
+      ...xplanRes,
+      executionTimeMs: (res.executionTimeMs || 0) + (xplanRes.executionTimeMs || 0),
+      isSelect: true,
+    }
+  }
+  return res
+}
+
+export interface ExplainPlanItem {
   rawStmt: string
   explainSql: string
 }
 
+const MONGODB_READONLY_EXPLAIN_CMDS: ReadonlySet<string> = new Set([
+  'find',
+  'aggregate',
+  'count',
+  'distinct',
+  'explain',
+])
+
+const MONGODB_MUTATING_SHELL_METHODS: ReadonlySet<string> = new Set([
+  'insertone',
+  'insertmany',
+  'insert',
+  'updateone',
+  'updatemany',
+  'update',
+  'replaceone',
+  'deleteone',
+  'deletemany',
+  'remove',
+  'findoneanddelete',
+  'findoneandupdate',
+  'findoneandreplace',
+  'findandmodify',
+  'bulkwrite',
+  'drop',
+  'dropdatabase',
+  'createcollection',
+  'createindex',
+  'createindexes',
+  'dropindex',
+  'dropindexes',
+  'renamecollection',
+  'save',
+])
+
+function hasMongoWriteStageValue(node: unknown): boolean {
+  if (Array.isArray(node)) {
+    return node.some((item) => hasMongoWriteStageValue(item))
+  }
+  if (node !== null && typeof node === 'object') {
+    for (const [key, val] of Object.entries(node as Record<string, unknown>)) {
+      if (key === '$out' || key === '$merge') return true
+      if (hasMongoWriteStageValue(val)) return true
+    }
+  }
+  return false
+}
+
+function stripMongoLeadingComments(raw: string): string {
+  let i = 0
+  const len = raw.length
+  while (i < len) {
+    while (i < len && /\s/.test(raw[i])) i++
+    if (raw[i] === '/' && raw[i + 1] === '/') {
+      const nl = raw.indexOf('\n', i + 2)
+      i = nl < 0 ? len : nl + 1
+      continue
+    }
+    if (raw[i] === '-' && raw[i + 1] === '-') {
+      const nl = raw.indexOf('\n', i + 2)
+      i = nl < 0 ? len : nl + 1
+      continue
+    }
+    if (raw[i] === '/' && raw[i + 1] === '*') {
+      const end = raw.indexOf('*/', i + 2)
+      i = end < 0 ? len : end + 2
+      continue
+    }
+    break
+  }
+  return raw.slice(i).trim()
+}
+
+function splitMongoStatements(script: string): Array<{ text: string; start: number; end: number }> {
+  const out: Array<{ text: string; start: number; end: number }> = []
+  let start = 0
+  let i = 0
+  const len = script.length
+  while (i < len) {
+    const ch = script[i]
+    if (ch === "'" || ch === '"' || ch === '`') {
+      i++
+      while (i < len) {
+        if (script[i] === '\\') {
+          i += 2
+          continue
+        }
+        if (script[i] === ch) {
+          i++
+          break
+        }
+        i++
+      }
+      continue
+    }
+    if (ch === '/' && script[i + 1] === '/') {
+      const nl = script.indexOf('\n', i + 2)
+      i = nl < 0 ? len : nl + 1
+      continue
+    }
+    if (ch === '/' && script[i + 1] === '*') {
+      const end = script.indexOf('*/', i + 2)
+      i = end < 0 ? len : end + 2
+      continue
+    }
+    if (ch === ';') {
+      const text = script.slice(start, i).trim()
+      if (text && stripMongoLeadingComments(text).length > 0) {
+        out.push({ text, start, end: i })
+      }
+      start = i + 1
+    }
+    i++
+  }
+  const tail = script.slice(start).trim()
+  if (tail && stripMongoLeadingComments(tail).length > 0) {
+    out.push({ text: tail, start, end: len })
+  }
+  return out
+}
+
+function findMatchingParenEnd(text: string, openIdx: number): number {
+  let depth = 0
+  let i = openIdx
+  while (i < text.length) {
+    const ch = text[i]
+    if (ch === "'" || ch === '"' || ch === '`') {
+      i++
+      while (i < text.length) {
+        if (text[i] === '\\') {
+          i += 2
+          continue
+        }
+        if (text[i] === ch) {
+          i++
+          break
+        }
+        i++
+      }
+      continue
+    }
+    if (ch === '/' && text[i + 1] === '/') {
+      const nl = text.indexOf('\n', i + 2)
+      i = nl < 0 ? text.length : nl + 1
+      continue
+    }
+    if (ch === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2)
+      i = end < 0 ? text.length : end + 2
+      continue
+    }
+    if (ch === '(') depth++
+    else if (ch === ')') {
+      depth--
+      if (depth === 0) return i
+    }
+    i++
+  }
+  return -1
+}
+
+function isMongoJsonCommandMutating(obj: Record<string, unknown>): boolean {
+  const keys = Object.keys(obj)
+  if (keys.length === 0) return true
+  const cmd = keys[0].toLowerCase()
+  if (cmd === 'aggregate') {
+    return hasMongoWriteStageValue(obj)
+  }
+  if (cmd === 'explain') {
+    const inner = obj.explain
+    if (inner === null || typeof inner !== 'object' || Array.isArray(inner)) return true
+    return isMongoJsonCommandMutating(inner as Record<string, unknown>)
+  }
+  return !MONGODB_READONLY_EXPLAIN_CMDS.has(cmd)
+}
+
+function buildMongoExplainPlan(rawText: string, sqlBody: string, readOnly: boolean): ExplainPlanItem {
+  const cleanBody = stripMongoLeadingComments(sqlBody)
+  if (!cleanBody) {
+    throw createHostError('invalid_params', 'MongoDB command cannot be empty')
+  }
+
+  if (cleanBody.startsWith('{')) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(cleanBody)
+    } catch {
+      throw createHostError('invalid_params', 'MongoDB JSON explain command must be valid JSON')
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw createHostError('invalid_params', 'MongoDB explain command must be a JSON object')
+    }
+    const obj = parsed as Record<string, unknown>
+    const firstKey = Object.keys(obj)[0]?.toLowerCase() ?? ''
+    if (firstKey === 'explain') {
+      const verbosity = typeof obj.verbosity === 'string' ? obj.verbosity : 'queryPlanner'
+      const mutatingTarget = isMongoJsonCommandMutating(obj)
+      if (
+        mutatingTarget &&
+        (readOnly || verbosity === 'executionStats' || verbosity === 'allPlansExecution')
+      ) {
+        throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
+      }
+      return { rawStmt: rawText.trim(), explainSql: sqlBody }
+    }
+    const mutating = isMongoJsonCommandMutating(obj)
+    if (readOnly && mutating) {
+      throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
+    }
+    return {
+      rawStmt: rawText.trim(),
+      explainSql: JSON.stringify({ explain: obj }),
+    }
+  }
+
+  const shellColPrefix =
+    /^db\s*(?:\.\s*getCollection\s*\(\s*(?:"[^"]*"|'[^']*')\s*\)|\[\s*(?:"[^"]*"|'[^']*')\s*\]|\.\s*[A-Za-z_][A-Za-z0-9_$-]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$-]*)*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/i
+  const prefixMatch = shellColPrefix.exec(cleanBody)
+  if (!prefixMatch) {
+    const isDropDb = /^db\s*\.\s*dropDatabase\s*\(/i.test(cleanBody)
+    if (readOnly && (isDropDb || /\.(?:insert|update|delete|remove|drop|create|bulkWrite)/i.test(cleanBody))) {
+      throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
+    }
+    throw createHostError(
+      'invalid_params',
+      'MongoDB explain requires db.<collection>.find/aggregate(...) or a JSON command object.'
+    )
+  }
+
+  const rootMethod = prefixMatch[1].toLowerCase()
+  const argsOpenIdx = cleanBody.indexOf('(', prefixMatch[0].length - 1)
+  const argsCloseIdx = argsOpenIdx >= 0 ? findMatchingParenEnd(cleanBody, argsOpenIdx) : -1
+  const rootArgsText = argsOpenIdx >= 0 && argsCloseIdx > argsOpenIdx ? cleanBody.slice(argsOpenIdx + 1, argsCloseIdx) : ''
+  const hasAggWriteStage =
+    rootMethod === 'aggregate' && /(?:^|[{,]\s*)(?:["'])?\$(?:out|merge)(?:["'])?\s*:/i.test(rootArgsText)
+  const isMutatingShell =
+    MONGODB_MUTATING_SHELL_METHODS.has(rootMethod) || hasAggWriteStage
+
+  const hasTrailingExplain = /\.explain\s*\(\s*([^)]*)\)\s*$/i.exec(cleanBody)
+  if (hasTrailingExplain) {
+    const explainArg = hasTrailingExplain[1]
+    const runsExecutionStats = /executionStats|allPlansExecution/i.test(explainArg)
+    if (isMutatingShell && (readOnly || runsExecutionStats)) {
+      throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
+    }
+    return { rawStmt: rawText.trim(), explainSql: sqlBody }
+  }
+
+  if (isMutatingShell) {
+    if (readOnly) {
+      throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
+    }
+    throw createHostError(
+      'invalid_params',
+      'MongoDB explain only supports find and aggregate queries or JSON command objects.'
+    )
+  }
+
+  if (rootMethod !== 'find' && rootMethod !== 'aggregate') {
+    if (readOnly) {
+      throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
+    }
+    throw createHostError(
+      'invalid_params',
+      `MongoDB explain is not supported for .${prefixMatch[1]}(). Use find() or aggregate().`
+    )
+  }
+
+  const normalizedShell = sqlBody.replace(/\.toArray\s*\(\s*\)\s*$/i, '')
+  return {
+    rawStmt: rawText.trim(),
+    explainSql: `${normalizedShell}.explain("queryPlanner")`,
+  }
+}
+
+function hasStandaloneBatchGo(sqlBody: string): boolean {
+  const clean = stripCommentsAndLiterals(sqlBody, 'mssql')
+  return /(?:^|\r?\n)[ \t]*GO[ \t]*(?:;|$|\r?\n)/i.test(clean)
+}
+
 /**
- * Wraps a single SQL statement in dialect-appropriate EXPLAIN syntax and enforces
+ * Wraps a single SQL or MongoDB statement in dialect-appropriate EXPLAIN syntax and enforces
  * read-only and non-mutating EXPLAIN ANALYZE safety rules.
  */
-function buildExplainPlanForStatement(
+export function buildExplainPlanForStatement(
   rawText: string,
   driver: DatabaseDriverType,
   readOnly: boolean
 ): ExplainPlanItem {
   const sqlBody = rawText.replace(/;+\s*$/, '').trim()
+  if (driver === 'mongodb') {
+    return buildMongoExplainPlan(rawText, sqlBody, readOnly)
+  }
+
   const leadingStripped = stripLeadingSqlComments(sqlBody, driver)
+  if (hasExplainAnalyzeOption(sqlBody, driver) && isExplainTargetMutating(sqlBody, driver)) {
+    throw createHostError(
+      'not_permitted',
+      'EXPLAIN ANALYZE is not permitted for mutating statements in Explain mode.'
+    )
+  }
+
+  if (driver === 'mssql') {
+    const cleanMssql = stripCommentsAndLiterals(sqlBody, 'mssql')
+    const batches = splitMssqlBatches(sqlBody)
+    const checkBatches = batches.length > 0 ? batches : [sqlBody]
+    if (readOnly && checkBatches.some((batch) => isMssqlReadOnlyBlocked(batch))) {
+      throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
+    }
+    if (/^SET\s+(?:SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+ON\b/i.test(leadingStripped)) {
+      return { rawStmt: rawText.trim(), explainSql: rawText.trim() }
+    }
+    if (
+      splitSqlStatements(sqlBody, 'mssql').length > 1 ||
+      hasStandaloneBatchGo(sqlBody) ||
+      /\bSET\s+(?:SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+OFF\b/i.test(cleanMssql)
+    ) {
+      throw createHostError(
+        'invalid_params',
+        'Multi-statement SHOWPLAN is not supported for SQL Server; explain one statement at a time.'
+      )
+    }
+    return {
+      rawStmt: rawText.trim(),
+      explainSql: `SET SHOWPLAN_ALL ON;\nGO\n${sqlBody}\nGO\nSET SHOWPLAN_ALL OFF;`,
+    }
+  }
+
+  if (driver === 'oracle') {
+    const oracleChunks = splitOracleStatements(sqlBody)
+    if (oracleChunks.length === 0) {
+      throw createHostError('invalid_params', 'SQL statement cannot be empty')
+    }
+    if (oracleChunks.length > 1) {
+      throw createHostError(
+        'invalid_params',
+        'Oracle EXPLAIN PLAN supports only a single SQL statement at a time.'
+      )
+    }
+    const singleChunk = oracleChunks[0]
+    if (singleChunk.isPlSql) {
+      throw createHostError('invalid_params', 'EXPLAIN PLAN does not support PL/SQL blocks')
+    }
+    const singleSql = singleChunk.text
+    const singleLeading = stripLeadingSqlComments(singleSql, 'oracle')
+    const explainSql = /^EXPLAIN\s+PLAN\b/i.test(singleLeading)
+      ? singleSql
+      : `EXPLAIN PLAN FOR ${singleSql}`
+    if (readOnly && isMutatingStatement(explainSql, driver)) {
+      throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
+    }
+    return { rawStmt: rawText.trim(), explainSql }
+  }
+
   const explainSql = /^EXPLAIN\b/i.test(leadingStripped)
     ? sqlBody
     : driver === 'sqlite' || driver === 'libsql' || driver === 'd1'
@@ -72,15 +480,6 @@ function buildExplainPlanForStatement(
   if (readOnly && isMutatingStatement(explainSql, driver)) {
     throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
   }
-  if (
-    hasExplainAnalyzeOption(explainSql, driver) &&
-    isExplainTargetMutating(sqlBody, driver)
-  ) {
-    throw createHostError(
-      'not_permitted',
-      'EXPLAIN ANALYZE is not permitted for mutating statements in Explain mode.'
-    )
-  }
   return { rawStmt: rawText.trim(), explainSql }
 }
 
@@ -89,10 +488,102 @@ export function registerQueryAndTxHandlers({
   registerHandler,
   sessionManager,
   tracker,
+  schemaCache,
+  txOwnership,
+  onHistoryChanged,
 }: QueryTxHandlersDeps): void {
   const historyQueue = createSerializedQueue()
   const savedQueriesQueue = createSerializedQueue()
   const isLiveDesktopHost = Boolean(orca.host && typeof orca.host.call === 'function')
+  const tx = txOwnership ?? new TxOwnershipController()
+
+  const readSessionTxState = (session: IDatabaseSession) =>
+    typeof session.getTransactionState === 'function'
+      ? session.getTransactionState()
+      : { supported: false, active: false, autoCommit: true, statementCount: 0 }
+
+  const isStandaloneTxEndStatement = (stmtText: string, driver: DatabaseDriverType): boolean => {
+    const clean = stripLeadingSqlComments(stmtText, driver).trim()
+    if (
+      /^(?:COMMIT|END(?:\s+TRANSACTION|\s+WORK)?)\b/i.test(clean) ||
+      SQL_STANDALONE_ROLLBACK_RE.test(clean)
+    ) {
+      return true
+    }
+    if (driver === 'postgres' || driver === 'cockroachdb') {
+      return (
+        /^ABORT(?:\s+(?:WORK|TRANSACTION))?\b/i.test(clean) ||
+        /^PREPARE\s+TRANSACTION\b/i.test(clean)
+      )
+    }
+    if (driver === 'mysql' || driver === 'mariadb') {
+      return isMysqlImplicitCommitStatement(stmtText)
+    }
+    if (driver === 'oracle') {
+      return isOracleImplicitCommitStatement(stmtText)
+    }
+    return false
+  }
+
+  const isStandaloneTxControlStatement = (
+    stmtText: string,
+    driver: DatabaseDriverType
+  ): boolean => {
+    const clean = stripLeadingSqlComments(stmtText, driver).trim()
+    if (/^(?:BEGIN|START\s+TRANSACTION)\b/i.test(clean)) {
+      return true
+    }
+    if ((driver === 'mysql' || driver === 'mariadb') && isMysqlAutoCommitOffStatement(stmtText)) {
+      return true
+    }
+    if (driver === 'oracle' && /^SET\s+TRANSACTION\b/i.test(clean)) {
+      return true
+    }
+    return isStandaloneTxEndStatement(stmtText, driver)
+  }
+
+  const classifyTxScript = (
+    trimmed: string,
+    driver: DatabaseDriverType
+  ): { hasTxControl: boolean; hasTxEnd: boolean } => {
+    if (driver === 'redis' || driver === 'mongodb') {
+      return { hasTxControl: false, hasTxEnd: false }
+    }
+    if (driver === 'mssql') {
+      return hasMssqlSemicolonlessTxControl(trimmed)
+    }
+    if (driver === 'oracle') {
+      const chunks = splitOracleStatements(trimmed)
+      const list = chunks.length > 0 ? chunks : [{ text: trimmed, isPlSql: false }]
+      let hasTxControl = false
+      let hasTxEnd = false
+      for (const chunk of list) {
+        if (chunk.isPlSql) {
+          const strippedBody = stripCommentsAndLiterals(chunk.text, 'oracle')
+          if (/\b(?:COMMIT|ROLLBACK)\b(?!\s+(?:TO|WORK\s+TO)\b)/i.test(strippedBody)) {
+            hasTxControl = true
+            hasTxEnd = true
+          } else if (/\bSET\s+TRANSACTION\b/i.test(strippedBody)) {
+            hasTxControl = true
+          }
+        } else {
+          if (isStandaloneTxEndStatement(chunk.text, 'oracle')) {
+            hasTxControl = true
+            hasTxEnd = true
+          } else if (isStandaloneTxControlStatement(chunk.text, 'oracle')) {
+            hasTxControl = true
+          }
+        }
+      }
+      return { hasTxControl, hasTxEnd }
+    }
+    const parsedStmts = splitSqlStatements(trimmed, driver).map((s) => s.text)
+    const stmtsToInspect = parsedStmts.length > 0 ? parsedStmts : [trimmed]
+    const hasTxEnd = stmtsToInspect.some((s) => isStandaloneTxEndStatement(s, driver))
+    const hasTxControl =
+      hasTxEnd || stmtsToInspect.some((s) => isStandaloneTxControlStatement(s, driver))
+    return { hasTxControl, hasTxEnd }
+  }
 
   const recordQueryHistory = (entry: QueryHistoryEntry): Promise<void> => {
     try {
@@ -113,8 +604,9 @@ export function registerQueryAndTxHandlers({
           QUERY_HISTORY_STORAGE_KEY,
           sanitizeJsonPayload(next) as unknown as JsonValue
         )
+        onHistoryChanged?.()
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err)
+        const msg = scrubCredentialsInText(err instanceof Error ? err.message : String(err))
         orca.log(`[Worker] Failed to persist query history: ${msg}`)
       }
     })
@@ -164,22 +656,95 @@ export function registerQueryAndTxHandlers({
       throw createHostError('cancelled', 'Query execution was cancelled')
     }
 
-    const session = await sessionManager.getSession(input.connectionId)
+    let session: IDatabaseSession
+    try {
+      session = await sessionManager.getSession(input.connectionId)
+    } catch (err: unknown) {
+      throw scrubThrownError(err)
+    }
     if (signal.aborted || tracker.consumePreCancelledQuery(queryId)) {
       throw createHostError('cancelled', 'Query execution was cancelled')
     }
 
+    const panelId = tx.getPanelId(ctx)
+    const { hasTxControl: hasTxControlStmt, hasTxEnd: hasTxEndStmt } = classifyTxScript(
+      trimmed,
+      profile.driver
+    )
+
     const startedAt = Date.now()
+    let executionStarted = false
     try {
-      const res = await executeSessionQuery(
-        tracker,
-        session,
-        queryId,
-        trimmed,
-        maxRows,
-        timeoutSeconds,
-        signal
-      )
+      let ranSerialized = false
+      let serializedResult: QueryResult | undefined
+
+      await tx.withLock(profile.id, async () => {
+        const preState = readSessionTxState(session)
+        const wasActive = Boolean(preState.active)
+        const owner = tx.syncForSession(profile.id, session, preState)
+        if (owner && owner.panelId !== panelId && (preState.active || !preState.autoCommit)) {
+          throw createHostError(
+            'forbidden',
+            hasTxEndStmt
+              ? 'Cannot commit or roll back a transaction opened by another editor panel.'
+              : 'Another editor panel owns an active transaction on this connection. Commit or roll back that transaction before running queries from this panel.'
+          )
+        }
+        const needsSerializedTx = Boolean(
+          hasTxControlStmt || preState.active || !preState.autoCommit || owner
+        )
+        if (!needsSerializedTx) {
+          return
+        }
+        ranSerialized = true
+        executionStarted = true
+        try {
+          serializedResult = await executeSessionQuery(
+            tracker,
+            session,
+            queryId,
+            trimmed,
+            maxRows,
+            timeoutSeconds,
+            signal
+          )
+        } finally {
+          const postState = readSessionTxState(session)
+          tx.reconcileAfterWrite(profile.id, session, panelId, wasActive, postState)
+        }
+      })
+
+      let res: QueryResult
+      if (ranSerialized && serializedResult !== undefined) {
+        res = serializedResult
+      } else {
+        executionStarted = true
+        try {
+          res = await executeSessionQuery(
+            tracker,
+            session,
+            queryId,
+            trimmed,
+            maxRows,
+            timeoutSeconds,
+            signal
+          )
+        } finally {
+          const postState = readSessionTxState(session)
+          if (postState.active || !postState.autoCommit) {
+            await tx.withLock(profile.id, async () => {
+              tx.reconcileAfterWrite(
+                profile.id,
+                session,
+                panelId,
+                false,
+                readSessionTxState(session)
+              )
+            })
+          }
+        }
+      }
+
       await recordQueryHistory({
         id: queryId,
         timestamp: Date.now(),
@@ -192,10 +757,17 @@ export function registerQueryAndTxHandlers({
         rowCount: typeof res.rowCount === 'number' ? res.rowCount : 0,
         isError: false,
       })
+      if (containsDdlStatement(trimmed, profile.driver)) {
+        schemaCache?.invalidateConnection(profile.id)
+      }
       return res
     } catch (err: unknown) {
-      const errorMessage = scrubCredentialsInText(
-        err instanceof Error ? err.message : String(err)
+      if (!executionStarted) {
+        throw scrubThrownError(err)
+      }
+      const errorMessage = formatActionableWorkerErrorMessage(
+        err instanceof Error ? err.message : String(err),
+        err
       )
       await recordQueryHistory({
         id: queryId,
@@ -209,7 +781,7 @@ export function registerQueryAndTxHandlers({
         isError: true,
         errorMessage,
       })
-      throw err
+      throw scrubThrownError(err)
     }
   })
 
@@ -258,7 +830,18 @@ export function registerQueryAndTxHandlers({
       }
     }
 
-    const explainStmts = splitSqlStatements(trimmed, profile.driver)
+    let explainStmts: Array<{ text: string }>
+    if (profile.driver === 'mongodb') {
+      explainStmts = splitMongoStatements(trimmed)
+    } else if (profile.driver === 'oracle') {
+      const oracleChunks = splitOracleStatements(trimmed)
+      if (oracleChunks.some((chunk) => chunk.isPlSql)) {
+        throw createHostError('invalid_params', 'EXPLAIN PLAN does not support PL/SQL blocks')
+      }
+      explainStmts = oracleChunks
+    } else {
+      explainStmts = splitSqlStatements(trimmed, profile.driver)
+    }
     if (explainStmts.length === 0) {
       throw createHostError('invalid_params', 'SQL statement cannot be empty')
     }
@@ -277,65 +860,107 @@ export function registerQueryAndTxHandlers({
     }
 
     const timeoutSeconds = await readClampedTimeoutSeconds(orca)
-    const session = await sessionManager.getSession(input.connectionId)
+    let session: IDatabaseSession
+    try {
+      session = await sessionManager.getSession(input.connectionId)
+    } catch (err: unknown) {
+      throw scrubThrownError(err)
+    }
     if (signal.aborted || tracker.consumePreCancelledQuery(explainQueryId)) {
       throw createHostError('cancelled', 'Explain execution was cancelled')
     }
 
-    if (explainPlans.length === 1) {
-      return await executeSessionQuery(
-        tracker,
-        session,
-        explainQueryId,
-        explainPlans[0].explainSql,
-        DEFAULT_MAX_QUERY_ROWS,
-        timeoutSeconds,
-        signal
-      )
-    }
-
-    const totalStart = performance.now()
-    const collectedSets: QueryResultSet[] = []
-    let lastPlanResult: QueryResult | null = null
-    for (let i = 0; i < explainPlans.length; i++) {
-      if (signal.aborted || tracker.consumePreCancelledQuery(explainQueryId)) {
-        throw createHostError('cancelled', 'Explain execution was cancelled')
+    const panelId = tx.getPanelId(ctx)
+    const executeExplainPlans = async (): Promise<QueryResult> => {
+      if (explainPlans.length === 1) {
+        return await executeSingleExplainPlan(
+          tracker,
+          session,
+          profile.driver,
+          explainQueryId,
+          explainPlans[0].explainSql,
+          timeoutSeconds,
+          signal
+        )
       }
-      const plan = explainPlans[i]
-      const stmtStart = performance.now()
-      const res = await executeSessionQuery(
-        tracker,
-        session,
-        explainQueryId,
-        plan.explainSql,
-        DEFAULT_MAX_QUERY_ROWS,
-        timeoutSeconds,
-        signal
-      )
-      const stmtMs = Math.round(performance.now() - stmtStart)
-      lastPlanResult = res
-      collectedSets.push({
-        index: i,
-        sqlPreview: compactSql(plan.rawStmt),
-        sql: plan.rawStmt,
-        executionTimeMs: stmtMs,
-        columns: res.columns,
-        rows: res.rows,
-        rowCount: res.rowCount,
-        truncated: res.truncated,
+
+      const totalStart = performance.now()
+      const collectedSets: QueryResultSet[] = []
+      let lastPlanResult: QueryResult | null = null
+      for (let i = 0; i < explainPlans.length; i++) {
+        if (signal.aborted || tracker.consumePreCancelledQuery(explainQueryId)) {
+          throw createHostError('cancelled', 'Explain execution was cancelled')
+        }
+        const plan = explainPlans[i]
+        const stmtStart = performance.now()
+        const res = await executeSingleExplainPlan(
+          tracker,
+          session,
+          profile.driver,
+          explainQueryId,
+          plan.explainSql,
+          timeoutSeconds,
+          signal
+        )
+        const stmtMs = Math.round(performance.now() - stmtStart)
+        lastPlanResult = res
+        collectedSets.push({
+          index: i,
+          sqlPreview: compactSql(plan.rawStmt),
+          sql: plan.rawStmt,
+          executionTimeMs: stmtMs,
+          columns: res.columns,
+          rows: res.rows,
+          rowCount: res.rowCount,
+          truncated: res.truncated,
+          isSelect: true,
+        })
+      }
+
+      const totalMs = Math.round(performance.now() - totalStart)
+      return {
+        columns: lastPlanResult?.columns ?? [],
+        rows: lastPlanResult?.rows ?? [],
+        rowCount: lastPlanResult?.rowCount ?? 0,
+        executionTimeMs: totalMs,
+        truncated: Boolean(lastPlanResult?.truncated),
         isSelect: true,
-      })
+        resultSets: collectedSets,
+      }
     }
 
-    const totalMs = Math.round(performance.now() - totalStart)
-    return {
-      columns: lastPlanResult?.columns ?? [],
-      rows: lastPlanResult?.rows ?? [],
-      rowCount: lastPlanResult?.rowCount ?? 0,
-      executionTimeMs: totalMs,
-      truncated: Boolean(lastPlanResult?.truncated),
-      isSelect: true,
-      resultSets: collectedSets,
+    try {
+      let ranSerialized = false
+      let serializedResult: QueryResult | undefined
+      await tx.withLock(profile.id, async () => {
+        const preState = readSessionTxState(session)
+        const wasActive = Boolean(preState.active)
+        const owner = tx.syncForSession(profile.id, session, preState)
+        if (owner && owner.panelId !== panelId && (preState.active || !preState.autoCommit)) {
+          throw createHostError(
+            'forbidden',
+            'Another editor panel owns an active transaction on this connection. Commit or roll back that transaction before running queries from this panel.'
+          )
+        }
+        const needsSerializedTx = Boolean(preState.active || !preState.autoCommit || owner)
+        if (!needsSerializedTx) {
+          return
+        }
+        ranSerialized = true
+        try {
+          serializedResult = await executeExplainPlans()
+        } finally {
+          const postState = readSessionTxState(session)
+          tx.reconcileAfterWrite(profile.id, session, panelId, wasActive, postState)
+        }
+      })
+
+      if (ranSerialized && serializedResult !== undefined) {
+        return serializedResult
+      }
+      return await executeExplainPlans()
+    } catch (err: unknown) {
+      throw scrubThrownError(err)
     }
   })
 
@@ -355,6 +980,7 @@ export function registerQueryAndTxHandlers({
     await historyQueue.run(async () => {
       await orca.storage.set(QUERY_HISTORY_STORAGE_KEY, [])
     })
+    onHistoryChanged?.()
     return { ok: true }
   })
 
@@ -474,54 +1100,147 @@ export function registerQueryAndTxHandlers({
     return { ok: true }
   })
 
-  registerHandler('tx.status', async (input) => {
+  registerHandler('tx.status', async (input, ctx) => {
     if (typeof input?.connectionId !== 'string' || input.connectionId.trim().length === 0) {
       throw createHostError('invalid_params', 'connectionId parameter is required')
     }
-    const session = await sessionManager.getSession(input.connectionId)
-    return sanitizeJsonPayload(session.getTransactionState())
+    const connId = input.connectionId
+    const session = await sessionManager.getSession(connId)
+    const state = readSessionTxState(session)
+    const owner = tx.syncForSession(connId, session, state)
+    const panelId = tx.getPanelId(ctx)
+    const withToken =
+      owner && Boolean(panelId && owner.panelId === panelId)
+        ? { ...state, txToken: owner.txToken }
+        : state
+    return sanitizeJsonPayload(withToken)
   })
 
-  registerHandler('tx.begin', async (input) => {
+  registerHandler('tx.begin', async (input, ctx) => {
     if (typeof input?.connectionId !== 'string' || input.connectionId.trim().length === 0) {
       throw createHostError('invalid_params', 'connectionId parameter is required')
     }
-    await assertMutableConnection(sessionManager, input.connectionId)
-    const session = await sessionManager.getSession(input.connectionId)
-    const state = await session.beginTransaction()
+    const connId = input.connectionId
+    const panelId = tx.requirePanelId(ctx)
+    return await tx.withLock(connId, async () => {
+      await assertMutableConnection(sessionManager, connId)
+      const session = await sessionManager.getSession(connId)
+      const owner = tx.syncForSession(connId, session, readSessionTxState(session))
+      if (owner && owner.panelId !== panelId) {
+        throw createHostError(
+          'forbidden',
+          'Cannot begin a transaction while another editor panel owns a transaction on this connection.'
+        )
+      }
+      const state = await session.beginTransaction()
+      if (state.active || !state.autoCommit) {
+        const txToken = tx.setOwner(connId, panelId, session)
+        return sanitizeJsonPayload({ ...state, txToken })
+      }
+      tx.syncForSession(connId, session, state)
+      return sanitizeJsonPayload(state)
+    })
+  })
+
+  const settleTxOwnershipAfterEnd = (
+    connId: string,
+    panelId: string,
+    session: IDatabaseSession,
+    state: ReturnType<IDatabaseSession['getTransactionState']>
+  ) => {
+    if (!state.autoCommit) {
+      const txToken = tx.setOwner(connId, panelId, session)
+      return sanitizeJsonPayload({ ...state, txToken })
+    }
+    tx.clearOwner(connId)
     return sanitizeJsonPayload(state)
-  })
+  }
 
-  registerHandler('tx.commit', async (input) => {
+  registerHandler('tx.commit', async (input, ctx) => {
     if (typeof input?.connectionId !== 'string' || input.connectionId.trim().length === 0) {
       throw createHostError('invalid_params', 'connectionId parameter is required')
     }
-    await assertMutableConnection(sessionManager, input.connectionId)
-    const session = await sessionManager.getSession(input.connectionId)
-    const state = await session.commitTransaction()
-    return sanitizeJsonPayload(state)
+    const connId = input.connectionId
+    const panelId = tx.requirePanelId(ctx)
+    return await tx.withLock(connId, async () => {
+      await assertMutableConnection(sessionManager, connId)
+      const session = await sessionManager.getSession(connId)
+      const owner = tx.syncForSession(connId, session, readSessionTxState(session))
+      if (owner && owner.panelId !== panelId) {
+        throw createHostError(
+          'forbidden',
+          'Cannot commit a transaction opened by another editor panel.'
+        )
+      }
+      const state = await session.commitTransaction()
+      return settleTxOwnershipAfterEnd(connId, panelId, session, state)
+    })
   })
 
-  registerHandler('tx.rollback', async (input) => {
+  registerHandler('tx.rollback', async (input, ctx) => {
     if (typeof input?.connectionId !== 'string' || input.connectionId.trim().length === 0) {
       throw createHostError('invalid_params', 'connectionId parameter is required')
     }
-    await assertMutableConnection(sessionManager, input.connectionId)
-    const session = await sessionManager.getSession(input.connectionId)
-    const state = await session.rollbackTransaction()
-    return sanitizeJsonPayload(state)
+    const connId = input.connectionId
+    const panelId = input.onlyIfOwner === true ? tx.getPanelId(ctx) : tx.requirePanelId(ctx)
+    return await tx.withLock(connId, async () => {
+      await assertMutableConnection(sessionManager, connId)
+      const session = await sessionManager.getSession(connId)
+      const currentState = readSessionTxState(session)
+      const owner = tx.syncForSession(connId, session, currentState)
+      if (input.onlyIfOwner === true) {
+        const tokenMatches =
+          input.txToken === undefined || (owner !== undefined && owner.txToken === input.txToken)
+        if (!panelId || !owner || owner.panelId !== panelId || !tokenMatches) {
+          return sanitizeJsonPayload(currentState)
+        }
+        let state = currentState
+        if (currentState.active) {
+          state = await session.rollbackTransaction()
+        }
+        if (!state.autoCommit) {
+          state = await session.setAutoCommit(true)
+        }
+        tx.clearOwner(connId)
+        return sanitizeJsonPayload(state)
+      }
+      if (owner && owner.panelId !== panelId) {
+        throw createHostError(
+          'forbidden',
+          'Cannot roll back a transaction opened by another editor panel.'
+        )
+      }
+      const state = await session.rollbackTransaction()
+      return settleTxOwnershipAfterEnd(connId, panelId ?? tx.requirePanelId(ctx), session, state)
+    })
   })
 
-  registerHandler('tx.setAutoCommit', async (input) => {
+  registerHandler('tx.setAutoCommit', async (input, ctx) => {
     if (typeof input?.connectionId !== 'string' || input.connectionId.trim().length === 0) {
       throw createHostError('invalid_params', 'connectionId parameter is required')
     }
     if (typeof input.enabled !== 'boolean') {
       throw createHostError('invalid_params', 'enabled parameter must be a boolean')
     }
-    await assertMutableConnection(sessionManager, input.connectionId)
-    const session = await sessionManager.getSession(input.connectionId)
-    const state = await session.setAutoCommit(input.enabled)
-    return sanitizeJsonPayload(state)
+    const connId = input.connectionId
+    const panelId = tx.requirePanelId(ctx)
+    return await tx.withLock(connId, async () => {
+      await assertMutableConnection(sessionManager, connId)
+      const session = await sessionManager.getSession(connId)
+      const owner = tx.syncForSession(connId, session, readSessionTxState(session))
+      if (owner && owner.panelId !== panelId) {
+        throw createHostError(
+          'forbidden',
+          'Cannot change Auto-Commit mode while another editor panel owns a transaction on this connection.'
+        )
+      }
+      const state = await session.setAutoCommit(input.enabled)
+      if (input.enabled || (!state.active && state.autoCommit)) {
+        tx.clearOwner(connId)
+        return sanitizeJsonPayload(state)
+      }
+      const txToken = tx.setOwner(connId, panelId, session)
+      return sanitizeJsonPayload({ ...state, txToken })
+    })
   })
 }

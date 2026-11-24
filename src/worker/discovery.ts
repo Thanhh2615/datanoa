@@ -513,6 +513,13 @@ const KNOWN_DB_ENV_KEYS = new Set([
   'D1_DATABASE_URL',
   'CLOUDFLARE_D1_URL',
   'SQLITE_URL',
+  'MSSQL_URL',
+  'SQLSERVER_URL',
+  'ORACLE_URL',
+  'MONGODB_URL',
+  'MONGO_URL',
+  'MONGODB_URI',
+  'MONGO_URI',
 ])
 
 const EXPLICIT_DB_SCHEMES = new Set([
@@ -532,6 +539,12 @@ const EXPLICIT_DB_SCHEMES = new Set([
   'd1+https',
   'sqlite',
   'file',
+  'mssql',
+  'sqlserver',
+  'oracle',
+  'oracledb',
+  'mongodb',
+  'mongodb+srv',
 ])
 
 function stripEnvValueQuotes(raw: string): string {

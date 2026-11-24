@@ -38,6 +38,7 @@ export interface GridChangesPayload {
   inserts: Record<string, unknown>[]
   updates: StagedRowUpdate[]
   deletes: Record<string, unknown>[]
+  deleteRows?: Record<string, unknown>[]
 }
 
 export interface SelectedCellInfo {
@@ -462,9 +463,10 @@ export function buildGridChangesPayload(
   const inserts: Record<string, unknown>[] = []
   const updates: StagedRowUpdate[] = []
   const deletes: Record<string, unknown>[] = []
+  const deleteRows: Record<string, unknown>[] = []
 
   if (!model) {
-    return { inserts, updates, deletes }
+    return { inserts, updates, deletes, deleteRows }
   }
 
   const headers = model.headers
@@ -491,6 +493,7 @@ export function buildGridChangesPayload(
 
     if (state.deleted) {
       deletes.push(primaryKeys)
+      deleteRows.push(rowToPlainRecord(headers, state.original, false))
       return
     }
 
@@ -505,7 +508,7 @@ export function buildGridChangesPayload(
     })
   })
 
-  return { inserts, updates, deletes }
+  return { inserts, updates, deletes, deleteRows }
 }
 
 export function countGridStagedChanges(rowStates: readonly InternalRowState[]): number {

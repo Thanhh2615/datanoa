@@ -78,24 +78,25 @@ export function createCollapsibleSelectController(adapter) {
     }
 
     if (adapter.apiProp && selectEl[adapter.apiProp]) {
-      selectEl[adapter.apiProp].refresh()
+      selectEl[adapter.apiProp].refresh(options)
       return selectEl[adapter.apiProp]
     }
     if (adapter.mountedProp) {
       if (selectEl[adapter.mountedProp]) {
-        selectEl[adapter.syncProp]?.()
+        selectEl[adapter.syncProp]?.(options)
         return null
       }
       selectEl[adapter.mountedProp] = true
     }
 
+    let currentOptions = options || {}
     const c = adapter.classes
-    const tooltipPrefix = options?.tooltipPrefix || selectEl.getAttribute?.('aria-label') || 'Select'
-    const searchPlaceholder = options?.searchPlaceholder || 'Search...'
-    const collapsedFolders = options?.collapsedFolders || new Set()
-    const defaultCollapseNonActive = Boolean(options?.defaultCollapseNonActiveFolders)
-    const onFolderToggle = typeof options?.onFolderToggle === 'function' ? options.onFolderToggle : null
-    const leadingIconType = options?.leadingIconType || 'none'
+    const tooltipPrefix = currentOptions.tooltipPrefix || selectEl.getAttribute?.('aria-label') || 'Select'
+    const searchPlaceholder = currentOptions.searchPlaceholder || 'Search...'
+    const collapsedFolders = currentOptions.collapsedFolders || new Set()
+    const defaultCollapseNonActive = Boolean(currentOptions.defaultCollapseNonActiveFolders)
+    const onFolderToggle = typeof currentOptions.onFolderToggle === 'function' ? currentOptions.onFolderToggle : null
+    const leadingIconType = currentOptions.leadingIconType || 'none'
 
     selectEl.classList.add(c.srOnly)
     const triggerBtn = document.createElement('button')
@@ -119,6 +120,7 @@ export function createCollapsibleSelectController(adapter) {
     selectEl.parentElement.insertBefore(triggerBtn, selectEl.nextSibling)
 
     let popoverEl = null
+    let refreshOpenPopover = null
     let searchQuery = ''
     let initializedDefaults = false
     let focusTimer = null
@@ -148,6 +150,7 @@ export function createCollapsibleSelectController(adapter) {
     }
 
     const closePopover = () => {
+      refreshOpenPopover = null
       if (focusTimer !== null) {
         clearTimeout(focusTimer)
         focusTimer = null
@@ -185,7 +188,7 @@ export function createCollapsibleSelectController(adapter) {
       activeClose = closePopover
       searchQuery = ''
 
-      const model = extractSelectModel(selectEl)
+      let model = extractSelectModel(selectEl)
       if (defaultCollapseNonActive && !initializedDefaults && model.groups.length > 1) {
         initializedDefaults = true
         const curVal = selectEl.value
@@ -203,41 +206,59 @@ export function createCollapsibleSelectController(adapter) {
       const headerRow = document.createElement('div')
       headerRow.className = c.head
 
+      const activePlaceholder = currentOptions.searchPlaceholder || searchPlaceholder
+      const activeSearchAriaLabel =
+        currentOptions.searchAriaLabel ||
+        selectEl.dataset?.searchAriaLabel ||
+        activePlaceholder ||
+        'Search options'
+
       const searchInp = document.createElement('input')
       searchInp.type = 'search'
       searchInp.className = c.search
-      searchInp.placeholder = searchPlaceholder
+      searchInp.placeholder = activePlaceholder
+      searchInp.setAttribute('aria-label', activeSearchAriaLabel)
       searchInp.value = searchQuery
       headerRow.appendChild(searchInp)
 
-      if (model.groups.length > 0) {
-        const expandBtn = document.createElement('button')
-        expandBtn.type = 'button'
-        expandBtn.className = c.actionBtn
-        expandBtn.title = adapter.expandTitle
-        if (adapter.setActionAriaLabel) expandBtn.setAttribute('aria-label', adapter.expandTitle)
-        adapter.renderExpandIcon(expandBtn)
-        expandBtn.addEventListener('click', (e) => {
-          e.stopPropagation()
-          collapsedFolders.clear()
-          onFolderToggle?.(collapsedFolders)
-          renderList()
-        })
+      let expandBtn = null
+      let collapseBtn = null
+      const syncGroupButtons = () => {
+        if (model.groups.length > 0 && !expandBtn) {
+          expandBtn = document.createElement('button')
+          expandBtn.type = 'button'
+          expandBtn.className = c.actionBtn
+          expandBtn.title = adapter.expandTitle
+          if (adapter.setActionAriaLabel) expandBtn.setAttribute('aria-label', adapter.expandTitle)
+          adapter.renderExpandIcon(expandBtn)
+          expandBtn.addEventListener('click', (e) => {
+            e.stopPropagation()
+            collapsedFolders.clear()
+            onFolderToggle?.(collapsedFolders)
+            renderList()
+          })
 
-        const collapseBtn = document.createElement('button')
-        collapseBtn.type = 'button'
-        collapseBtn.className = c.actionBtn
-        collapseBtn.title = adapter.collapseTitle
-        if (adapter.setActionAriaLabel) collapseBtn.setAttribute('aria-label', adapter.collapseTitle)
-        adapter.renderCollapseIcon(collapseBtn)
-        collapseBtn.addEventListener('click', (e) => {
-          e.stopPropagation()
-          for (const g of model.groups) collapsedFolders.add(g.folderName)
-          onFolderToggle?.(collapsedFolders)
-          renderList()
-        })
-        headerRow.append(expandBtn, collapseBtn)
+          collapseBtn = document.createElement('button')
+          collapseBtn.type = 'button'
+          collapseBtn.className = c.actionBtn
+          collapseBtn.title = adapter.collapseTitle
+          if (adapter.setActionAriaLabel) collapseBtn.setAttribute('aria-label', adapter.collapseTitle)
+          adapter.renderCollapseIcon(collapseBtn)
+          collapseBtn.addEventListener('click', (e) => {
+            e.stopPropagation()
+            for (const g of model.groups) collapsedFolders.add(g.folderName)
+            onFolderToggle?.(collapsedFolders)
+            renderList()
+          })
+          headerRow.append(expandBtn, collapseBtn)
+        } else if (model.groups.length === 0 && expandBtn) {
+          expandBtn.remove()
+          collapseBtn?.remove()
+          expandBtn = null
+          collapseBtn = null
+        }
       }
+      syncGroupButtons()
 
       const listBox = document.createElement('div')
       listBox.className = c.list
@@ -374,6 +395,11 @@ export function createCollapsibleSelectController(adapter) {
       })
 
       renderList()
+      refreshOpenPopover = () => {
+        model = extractSelectModel(selectEl)
+        syncGroupButtons()
+        renderList()
+      }
       document.body.appendChild(popoverEl)
       triggerBtn.setAttribute('aria-expanded', 'true')
 
@@ -423,6 +449,9 @@ export function createCollapsibleSelectController(adapter) {
           searchInp.focus?.()
         }
       }, 10)
+      if (typeof currentOptions?.onOpen === 'function') {
+        currentOptions.onOpen()
+      }
     }
 
     triggerBtn.addEventListener('click', (e) => {
@@ -433,10 +462,20 @@ export function createCollapsibleSelectController(adapter) {
       syncTriggerDisplay()
     })
 
-    selectEl[adapter.syncProp] = syncTriggerDisplay
+    const syncAll = (nextOpts) => {
+      if (nextOpts && typeof nextOpts === 'object') {
+        currentOptions = { ...currentOptions, ...nextOpts }
+      }
+      syncTriggerDisplay()
+      if (popoverEl && !adapter.closeOnRefresh && refreshOpenPopover) {
+        refreshOpenPopover()
+      }
+    }
+
+    selectEl[adapter.syncProp] = syncAll
     const api = {
-      refresh: () => {
-        syncTriggerDisplay()
+      refresh: (nextOpts) => {
+        syncAll(nextOpts)
         if (adapter.closeOnRefresh && popoverEl) {
           closePopover()
         }

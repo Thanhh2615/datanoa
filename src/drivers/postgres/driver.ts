@@ -1,11 +1,5 @@
 import * as dns from 'node:dns'
-import {
-  Client,
-  Pool,
-  type PoolConfig,
-  type PoolClient,
-  types,
-} from '../../../vendor/pg.js'
+import type { Pool, PoolConfig, PoolClient } from '../../../vendor/pg.js'
 import {
   isCloudDatabaseHost,
   isSupabaseDirectHost,
@@ -31,7 +25,7 @@ import type {
 } from '../common/driver'
 import { DatabaseDriverError, runDriverConnectionTest } from '../common/driver'
 import type { DriverTlsOptions } from '../common/tls-and-tunnel'
-import { resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
+import { buildDefaultTlsOptions, resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
 import {
   assembleTableBrowseResult,
   buildBatchStatements,
@@ -53,14 +47,36 @@ import {
   reconstructTableDdl,
   splitSqlStatements,
 } from '../common/sql-tools'
-import { compactSql, stripLeadingSqlComments } from '../common/sql-lexer'
+import {
+  SQL_STANDALONE_ROLLBACK_RE,
+  compactSql,
+  stripLeadingSqlComments,
+} from '../common/sql-lexer'
 
-// Preserve DATE/TIME/TIMESTAMP/INTERVAL as canonical text without JS Date TZ distortion or microsecond truncation
-if (types && typeof types.setTypeParser === 'function') {
-  const preserveText = (val: string): string => val
-  for (const oid of [1082, 1083, 1266, 1114, 1184, 1186]) {
-    types.setTypeParser(oid, preserveText)
+type PgVendorModule = typeof import('../../../vendor/pg.js')
+let pgVendorPromise: Promise<PgVendorModule> | null = null
+let pgTypeParsersRegistered = false
+
+async function loadPgVendor(): Promise<PgVendorModule> {
+  if (!pgVendorPromise) {
+    pgVendorPromise = import('../../../vendor/pg.js')
+      .then((mod) => {
+        // Preserve DATE/TIME/TIMESTAMP/INTERVAL as canonical text without JS Date TZ distortion or microsecond truncation
+        if (!pgTypeParsersRegistered && mod.types && typeof mod.types.setTypeParser === 'function') {
+          pgTypeParsersRegistered = true
+          const preserveText = (val: string): string => val
+          for (const oid of [1082, 1083, 1266, 1114, 1184, 1186]) {
+            mod.types.setTypeParser(oid, preserveText)
+          }
+        }
+        return mod
+      })
+      .catch((err: unknown) => {
+        pgVendorPromise = null
+        throw err
+      })
   }
+  return pgVendorPromise
 }
 
 const PG_OID_TYPE_NAMES: Readonly<Record<number, string>> = {
@@ -469,6 +485,7 @@ export class PostgresSession implements IDatabaseSession {
       if (this.isClosed) {
         throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
       }
+      const { Pool } = await loadPgVendor()
       const nextPool = new Pool(poolerConfig)
       attachPoolErrorHandler(nextPool)
       if (this.isClosed) {
@@ -512,6 +529,7 @@ export class PostgresSession implements IDatabaseSession {
       return false
     }
     if (this.activeConfig) {
+      const { Client } = await loadPgVendor()
       const cancelClient = new Client({
         host: this.activeConfig.host,
         port: this.activeConfig.port,
@@ -741,7 +759,7 @@ export class PostgresSession implements IDatabaseSession {
     }
     const schema = params.schema || 'public'
 
-    if (!this.autoCommit || this.txLease !== null) {
+    if (!params.bypassTransaction && (!this.autoCommit || this.txLease !== null)) {
       return this.runExclusiveTxOp(async () => {
         if (this.isClosed) {
           throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
@@ -876,32 +894,46 @@ export class PostgresSession implements IDatabaseSession {
       if (this.txLease === null) {
         return null
       }
+      const client = this.txLease.client
+      let savepointCreated = false
       let res: { rowCount?: number | null; rows: Record<string, unknown>[] }
       try {
-        res = (await this.txLease.client.query(`${sql} RETURNING *;`, updateParams)) as {
+        await client.query('SAVEPOINT datanoa_update_cell;')
+        savepointCreated = true
+        res = (await client.query(`${sql} RETURNING *;`, updateParams)) as {
           rowCount?: number | null
           rows: Record<string, unknown>[]
         }
+        const affectedRows = res.rowCount ?? 0
+        if (affectedRows === 0) {
+          throw new DatabaseDriverError(
+            'Record was modified or deleted by another session (optimistic lock conflict)',
+            'conflict',
+            this.driverType
+          )
+        }
+        await client.query('RELEASE SAVEPOINT datanoa_update_cell;')
+        this.statementCount++
+        this.tableDetailsCache.clear()
+        return {
+          ok: true,
+          affectedRows,
+          updatedRecord: res.rows[0],
+        }
       } catch (err) {
-        if (!this.txClientBroken && isPgSqlStateError(err)) {
+        if (savepointCreated && !this.txClientBroken && this.txLease !== null) {
+          try {
+            await client.query('ROLLBACK TO SAVEPOINT datanoa_update_cell;')
+            await client.query('RELEASE SAVEPOINT datanoa_update_cell;')
+          } catch (rbErr) {
+            if (!this.txClientBroken && isPgSqlStateError(rbErr)) {
+              this.txAborted = true
+            }
+          }
+        } else if (!this.txClientBroken && isPgSqlStateError(err)) {
           this.txAborted = true
         }
         throw err
-      }
-      const affectedRows = res.rowCount ?? 0
-      if (affectedRows === 0) {
-        throw new DatabaseDriverError(
-          'Record was modified or deleted by another session (optimistic lock conflict)',
-          'conflict',
-          this.driverType
-        )
-      }
-      this.statementCount++
-      this.tableDetailsCache.clear()
-      return {
-        ok: true,
-        affectedRows,
-        updatedRecord: res.rows[0],
       }
     })
     if (pinnedResult !== null) {
@@ -1271,8 +1303,12 @@ export class PostgresSession implements IDatabaseSession {
             throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
           }
 
-          const isCommit = /^(?:COMMIT|END(?:\s+TRANSACTION)?)\b/i.test(normalizedStmt)
-          const isRollback = /^ROLLBACK\b(?!\s+TO\b)/i.test(normalizedStmt)
+          const isCommit =
+            /^(?:COMMIT|END(?:\s+(?:TRANSACTION|WORK))?)\b/i.test(normalizedStmt) ||
+            /^PREPARE\s+TRANSACTION\b/i.test(normalizedStmt)
+          const isRollback =
+            SQL_STANDALONE_ROLLBACK_RE.test(normalizedStmt) ||
+            /^ABORT(?:\s+(?:WORK|TRANSACTION))?\b/i.test(normalizedStmt)
           const isAndChain = /\bAND\s+CHAIN\b/i.test(normalizedStmt)
           const txStatus = (client as unknown as { _txStatus?: string | null })._txStatus
           const commandTag = typeof res?.command === 'string' ? res.command.toUpperCase() : ''
@@ -1331,10 +1367,10 @@ export class PostgresSession implements IDatabaseSession {
             if (!isStandaloneBegin) {
               this.statementCount++
             }
-            if (/^ROLLBACK\s+TO\s+(?:SAVEPOINT\s+)?/i.test(normalizedStmt)) {
+            if (/^ROLLBACK\s+(?:(?:WORK|TRANSACTION)\s+)?TO\s+(?:SAVEPOINT\s+)?/i.test(normalizedStmt)) {
               this.txAborted = false
             }
-            if (isCommit || isRollback) {
+            if (isCommit || isRollback || (!isStandaloneBegin && txStatus === 'I')) {
               const staysInTx = isAndChain || txStatus === 'T' || txStatus === 'E'
               if (staysInTx) {
                 this.statementCount = 0
@@ -1634,6 +1670,7 @@ export async function resolveSupabasePoolerConfig(
     `aws-1-${region}.pooler.supabase.com`,
   ]
 
+  const { Pool } = await loadPgVendor()
   for (const poolerHost of candidateHosts) {
     const candidateConfig: PoolConfig = {
       ...baseConfig,
@@ -1717,7 +1754,7 @@ export class PostgresDriver implements IDatabaseDriver {
         profile.ssl !== undefined
           ? Boolean(profile.ssl)
           : isCockroach || isCloudDatabaseHost(host)
-      sslConfig = useSsl ? { rejectUnauthorized: false } : undefined
+      sslConfig = useSsl ? buildDefaultTlsOptions(extraSecrets?.tlsServername) : undefined
     }
 
     const rawOptions =
@@ -1742,6 +1779,7 @@ export class PostgresDriver implements IDatabaseDriver {
       ...(effectiveOptions ? { options: effectiveOptions } : {}),
     }
 
+    const { Pool } = await loadPgVendor()
     const pool = new Pool(baseConfig)
     attachPoolErrorHandler(pool)
     return new PostgresSession(pool, { ...profile, driver: effectiveDriver }, baseConfig)

@@ -10,12 +10,14 @@ import {
 } from '../drivers/common/sql-tools.js'
 import type {
   ConnectionProfile,
+  DatabaseDriverType,
   QueryResult,
   SchemaObject,
   SchemaObjectKind,
 } from '../protocol.js'
 import { fuzzyMatchScore, setButtonLoading } from './db-icons.js'
 import { DEFAULT_RPC_TIMEOUT_MS } from '../shared-constants.js'
+import { bindCtrlWheelHorizontalScroll } from '../shared-wheel-scroll.js'
 
 export {
   sanitizeDiagnosticErrorText,
@@ -103,12 +105,16 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
     return
   }
   const driver = conn.driver
+  const isMongo = driver === 'mongodb'
   let isCreating = false
 
+  const idType = driver === 'oracle' ? 'NUMBER(10)' : driver === 'mssql' ? 'INT' : 'INTEGER'
+  const textType =
+    driver === 'oracle' ? 'VARCHAR2(255)' : driver === 'mssql' ? 'NVARCHAR(255)' : 'TEXT'
   const columns: CreateTableColumnDraft[] = [
     {
       name: 'id',
-      dataType: 'INTEGER',
+      dataType: idType,
       nullable: false,
       defaultValue: '',
       isPrimaryKey: true,
@@ -116,7 +122,7 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
     },
     {
       name: 'name',
-      dataType: 'TEXT',
+      dataType: textType,
       nullable: false,
       defaultValue: '',
       isPrimaryKey: false,
@@ -130,7 +136,9 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
   const head = document.createElement('div')
   head.className = 'datanoa-modal-head'
   const headTitle = document.createElement('span')
-  headTitle.textContent = 'Create New Table'
+  headTitle.id = 'datanoa-create-table-modal-title'
+  headTitle.textContent = isMongo ? 'Create New Collection' : 'Create New Table'
+  modal.setAttribute('aria-labelledby', headTitle.id)
   const badge = document.createElement('span')
   badge.className = 'datanoa-badge datanoa-badge-pk'
   badge.textContent = driver.toUpperCase()
@@ -151,19 +159,25 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
 
   const tableNameInput = document.createElement('input')
   tableNameInput.type = 'text'
+  tableNameInput.id = 'datanoa-create-table-name-input'
   tableNameInput.className = 'datanoa-filter-input'
-  tableNameInput.placeholder = 'Table name (e.g. users)'
-  tableNameInput.value = 'new_table'
+  tableNameInput.placeholder = isMongo ? 'Collection name (e.g. users)' : 'Table name (e.g. users)'
+  tableNameInput.setAttribute('aria-label', isMongo ? 'Collection name' : 'Table name')
+  tableNameInput.value = isMongo ? 'new_collection' : 'new_table'
   tableNameInput.style.flex = '2'
 
   const schemaInput = document.createElement('input')
   schemaInput.type = 'text'
+  schemaInput.id = 'datanoa-create-table-schema-input'
   schemaInput.className = 'datanoa-filter-input'
   schemaInput.placeholder = 'Schema (optional)'
+  schemaInput.setAttribute('aria-label', 'Schema name')
   schemaInput.value =
-    driver !== 'sqlite' && driver !== 'libsql' && driver !== 'd1' ? ctx.activeSchema || '' : ''
+    driver !== 'sqlite' && driver !== 'libsql' && driver !== 'd1' && !isMongo
+      ? ctx.activeSchema || ''
+      : ''
   schemaInput.style.flex = '1'
-  if (driver === 'sqlite' || driver === 'libsql' || driver === 'd1') {
+  if (driver === 'sqlite' || driver === 'libsql' || driver === 'd1' || isMongo) {
     schemaInput.style.display = 'none'
   }
 
@@ -172,7 +186,7 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
   body.appendChild(topFields)
 
   const colsHeader = document.createElement('div')
-  colsHeader.style.display = 'flex'
+  colsHeader.style.display = isMongo ? 'none' : 'flex'
   colsHeader.style.justifyContent = 'space-between'
   colsHeader.style.alignItems = 'center'
   const colsTitle = document.createElement('strong')
@@ -187,6 +201,9 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
 
   const colTableWrap = document.createElement('div')
   colTableWrap.className = 'datanoa-matrix-scroll'
+  if (isMongo) {
+    colTableWrap.style.display = 'none'
+  }
   const colTable = document.createElement('table')
   colTable.className = 'datanoa-matrix-table datanoa-struct-grid'
   colTable.innerHTML =
@@ -195,10 +212,11 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
   colTable.appendChild(colTbody)
   colTableWrap.appendChild(colTable)
   body.appendChild(colTableWrap)
+  bindCtrlWheelHorizontalScroll(colTableWrap)
 
   const ddlLabel = document.createElement('div')
   ddlLabel.style.fontWeight = '600'
-  ddlLabel.textContent = 'Live CREATE TABLE Preview:'
+  ddlLabel.textContent = isMongo ? 'Command Preview:' : 'Live CREATE TABLE Preview:'
   const ddlPre = document.createElement('pre')
   ddlPre.className = 'datanoa-modal-sql'
   body.appendChild(ddlLabel)
@@ -213,21 +231,29 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
   const createBtn = document.createElement('button')
   createBtn.type = 'button'
   createBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-btn-primary'
-  createBtn.textContent = 'Create Table'
+  createBtn.textContent = isMongo ? 'Create Collection' : 'Create Table'
   actions.appendChild(cancelBtn)
   actions.appendChild(createBtn)
 
   let currentSql = ''
   const updatePreview = () => {
     try {
-      currentSql = buildCreateTableSql(
-        {
-          tableName: tableNameInput.value,
-          schema: schemaInput.value.trim() || undefined,
-          columns,
-        },
-        driver
-      )
+      if (isMongo) {
+        const colName = tableNameInput.value.trim()
+        if (!colName) {
+          throw new Error('Collection name is required.')
+        }
+        currentSql = `db.createCollection(${JSON.stringify(colName)});`
+      } else {
+        currentSql = buildCreateTableSql(
+          {
+            tableName: tableNameInput.value,
+            schema: schemaInput.value.trim() || undefined,
+            columns,
+          },
+          driver
+        )
+      }
       ddlPre.textContent = currentSql
       createBtn.disabled = isCreating || !currentSql
     } catch (err: unknown) {
@@ -249,6 +275,7 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
       nameInp.className = 'datanoa-struct-cell-input'
       nameInp.value = col.name
       nameInp.placeholder = 'column_name'
+      nameInp.setAttribute('aria-label', `Column ${idx + 1} name`)
       nameInp.addEventListener('input', () => {
         col.name = nameInp.value
         updatePreview()
@@ -261,6 +288,7 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
       typeInp.className = 'datanoa-struct-cell-input'
       typeInp.value = col.dataType
       typeInp.placeholder = 'TEXT / INTEGER'
+      typeInp.setAttribute('aria-label', `Column ${idx + 1} type`)
       typeInp.addEventListener('input', () => {
         col.dataType = typeInp.value
         updatePreview()
@@ -271,6 +299,7 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
       const pkCb = document.createElement('input')
       pkCb.type = 'checkbox'
       pkCb.checked = Boolean(col.isPrimaryKey)
+      pkCb.setAttribute('aria-label', `Column ${idx + 1} primary key`)
       pkCb.addEventListener('change', () => {
         col.isPrimaryKey = pkCb.checked
         if (col.isPrimaryKey) col.nullable = false
@@ -283,6 +312,7 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
       const aiCb = document.createElement('input')
       aiCb.type = 'checkbox'
       aiCb.checked = Boolean(col.isAutoIncrement)
+      aiCb.setAttribute('aria-label', `Column ${idx + 1} auto increment`)
       aiCb.addEventListener('change', () => {
         col.isAutoIncrement = aiCb.checked
         updatePreview()
@@ -294,6 +324,7 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
       nullCb.type = 'checkbox'
       nullCb.checked = col.nullable !== false
       nullCb.disabled = Boolean(col.isPrimaryKey)
+      nullCb.setAttribute('aria-label', `Column ${idx + 1} nullable`)
       nullCb.addEventListener('change', () => {
         col.nullable = nullCb.checked
         updatePreview()
@@ -306,6 +337,7 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
       defInp.className = 'datanoa-struct-cell-input'
       defInp.value = col.defaultValue || ''
       defInp.placeholder = 'Default...'
+      defInp.setAttribute('aria-label', `Column ${idx + 1} default value`)
       defInp.addEventListener('input', () => {
         col.defaultValue = defInp.value
         updatePreview()
@@ -317,6 +349,7 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
       rmBtn.type = 'button'
       rmBtn.className = 'datanoa-btn datanoa-btn-sm'
       rmBtn.textContent = '×'
+      rmBtn.setAttribute('aria-label', `Remove column ${col.name || idx + 1}`)
       rmBtn.disabled = columns.length <= 1
       rmBtn.addEventListener('click', () => {
         if (columns.length <= 1) return
@@ -422,6 +455,24 @@ export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): 
 
 export const openCreateTableModal = openStudioCreateTableModal
 
+export function buildDangerTableCommand(
+  action: 'truncate' | 'drop',
+  item: SchemaObject,
+  driver: DatabaseDriverType
+): string {
+  if (driver === 'mongodb') {
+    const cleanName = String(item.name || '').trim()
+    if (!cleanName) {
+      throw new Error('Collection name is required.')
+    }
+    const colCall = `db.getCollection(${JSON.stringify(cleanName)})`
+    return action === 'truncate' ? `${colCall}.deleteMany({});` : `${colCall}.drop();`
+  }
+  return action === 'truncate'
+    ? buildTruncateTableSql(item.name, driver, item.schema)
+    : buildDropTableSql(item.name, item.kind, driver, item.schema)
+}
+
 export function openStudioDangerTableModal(
   ctx: StudioDangerTableModalContext,
   action: 'truncate' | 'drop',
@@ -433,12 +484,10 @@ export function openStudioDangerTableModal(
     return
   }
   const driver = conn.driver
+  const isMongo = driver === 'mongodb'
   let sql = ''
   try {
-    sql =
-      action === 'truncate'
-        ? buildTruncateTableSql(item.name, driver, item.schema)
-        : buildDropTableSql(item.name, item.kind, driver, item.schema)
+    sql = buildDangerTableCommand(action, item, driver)
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
     ctx.showQueryBanner('error', 'Operation Unavailable', msg)
@@ -446,12 +495,11 @@ export function openStudioDangerTableModal(
   }
 
   let isExecuting = false
+  const objectLabel = isMongo ? 'Collection' : item.kind === 'view' ? 'View' : 'Table'
   const actionTitle =
     action === 'truncate'
-      ? `Truncate Table "${item.name}"`
-      : item.kind === 'view'
-        ? `Drop View "${item.name}"`
-        : `Drop Table "${item.name}"`
+      ? `Truncate ${objectLabel} "${item.name}"`
+      : `Drop ${objectLabel} "${item.name}"`
 
   const modal = document.createElement('div')
   modal.className = 'datanoa-danger-modal'
@@ -459,11 +507,18 @@ export function openStudioDangerTableModal(
   const head = document.createElement('div')
   head.className = 'datanoa-modal-head'
   const titleEl = document.createElement('span')
+  titleEl.id = 'datanoa-danger-table-modal-title'
   titleEl.textContent = actionTitle
+  modal.setAttribute('aria-labelledby', titleEl.id)
   const badge = document.createElement('span')
   badge.className = 'datanoa-badge'
   badge.style.color = 'var(--danger)'
-  badge.textContent = action === 'truncate' ? 'DELETE ALL ROWS' : 'PERMANENT DROP'
+  badge.textContent =
+    action === 'truncate'
+      ? isMongo
+        ? 'DELETE ALL DOCUMENTS'
+        : 'DELETE ALL ROWS'
+      : 'PERMANENT DROP'
   head.appendChild(titleEl)
   head.appendChild(badge)
 
@@ -481,8 +536,8 @@ export function openStudioDangerTableModal(
   const desc = document.createElement('div')
   desc.textContent =
     action === 'truncate'
-      ? `This will permanently remove all rows from "${item.name}". Type the exact table name below to confirm.`
-      : `This will permanently drop ${item.kind} "${item.name}" and its data. Type the exact name below to confirm.`
+      ? `This will permanently remove all ${isMongo ? 'documents' : 'rows'} from "${item.name}". Type the exact ${objectLabel.toLowerCase()} name below to confirm.`
+      : `This will permanently drop ${objectLabel.toLowerCase()} "${item.name}" and its data. Type the exact name below to confirm.`
   body.appendChild(desc)
 
   const sqlPre = document.createElement('pre')
@@ -492,8 +547,10 @@ export function openStudioDangerTableModal(
 
   const confirmInput = document.createElement('input')
   confirmInput.type = 'text'
+  confirmInput.id = 'datanoa-danger-table-confirm-input'
   confirmInput.className = 'datanoa-filter-input'
   confirmInput.placeholder = `Type "${item.name}" to enable confirmation`
+  confirmInput.setAttribute('aria-label', `Confirm ${objectLabel.toLowerCase()} name "${item.name}"`)
   body.appendChild(confirmInput)
 
   const execErrBox = document.createElement('div')
@@ -511,7 +568,7 @@ export function openStudioDangerTableModal(
   confirmBtn.type = 'button'
   confirmBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-btn-danger-solid'
   confirmBtn.textContent =
-    action === 'truncate' ? 'Truncate Table' : `Drop ${item.kind === 'view' ? 'View' : 'Table'}`
+    action === 'truncate' ? `Truncate ${objectLabel}` : `Drop ${objectLabel}`
   confirmBtn.disabled = true
   actions.appendChild(cancelBtn)
   actions.appendChild(confirmBtn)
@@ -760,11 +817,14 @@ export function openStudioCommandPalette(ctx: StudioCommandPaletteContext): void
 
   const modal = document.createElement('div')
   modal.className = 'datanoa-cmd-palette'
+  modal.setAttribute('aria-label', 'Command Palette')
 
   const searchInp = document.createElement('input')
   searchInp.type = 'search'
+  searchInp.id = 'datanoa-cmd-palette-search'
   searchInp.className = 'datanoa-cmd-palette-input datanoa-filter-input'
   searchInp.placeholder = 'Jump to table, connection, or command...'
+  searchInp.setAttribute('aria-label', 'Search tables, connections, or commands')
 
   const listEl = document.createElement('div')
   listEl.className = 'datanoa-cmd-palette-list'
@@ -858,7 +918,9 @@ export function openStudioShortcutsModal(ctx: StudioModalMountContext): void {
   const head = document.createElement('div')
   head.className = 'datanoa-modal-head'
   const titleEl = document.createElement('span')
+  titleEl.id = 'datanoa-shortcuts-modal-title'
   titleEl.textContent = 'Keyboard Shortcuts'
+  modal.setAttribute('aria-labelledby', titleEl.id)
   const closeBtn = document.createElement('button')
   closeBtn.type = 'button'
   closeBtn.className = 'datanoa-btn datanoa-btn-sm'

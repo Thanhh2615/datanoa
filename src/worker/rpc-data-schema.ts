@@ -8,11 +8,14 @@ import {
 } from '../protocol'
 import { sanitizeSchemaFileName } from '../drivers/common/schema'
 import { reconstructTableDdl, sanitizeFilterClause } from '../drivers/common/sql-tools'
+import type { WorkerSchemaMetadataCache } from './ai-sql-context'
 import type { SessionManager } from './session-manager'
+import { TxOwnershipController } from './tx-ownership'
 import {
   assertMutableConnection,
   assertNoCompactedPreviewOverwrite,
   createHostError,
+  scrubAndEnhanceWorkerError,
   type WorkerRegisterHandler,
 } from './worker-utils'
 
@@ -20,6 +23,8 @@ export interface DataSchemaHandlersDeps {
   orca: OrcaWorkerApi
   registerHandler: WorkerRegisterHandler
   sessionManager: SessionManager
+  schemaCache?: WorkerSchemaMetadataCache
+  txOwnership?: TxOwnershipController
 }
 
 const ALLOWED_SCHEMA_OBJECT_KINDS: readonly SchemaObjectKind[] = [
@@ -35,9 +40,24 @@ const ALLOWED_SCHEMA_OBJECT_KINDS: readonly SchemaObjectKind[] = [
 
 export function registerDataAndSchemaHandlers({
   orca,
-  registerHandler,
+  registerHandler: rawRegisterHandler,
   sessionManager,
+  schemaCache,
+  txOwnership,
 }: DataSchemaHandlersDeps): void {
+  const tx = txOwnership ?? new TxOwnershipController()
+  const registerHandler = ((
+    name: Parameters<WorkerRegisterHandler>[0],
+    handler: (input: never, ctx: never) => unknown
+  ) =>
+    rawRegisterHandler(name as never, (async (input: never, ctx: never) => {
+      try {
+        return await handler(input, ctx)
+      } catch (err: unknown) {
+        throw scrubAndEnhanceWorkerError(err)
+      }
+    }) as never)) as WorkerRegisterHandler
+
   registerHandler(
     'schema.listObjects',
     async (input): Promise<SchemaObject[]> => {
@@ -45,7 +65,9 @@ export function registerDataAndSchemaHandlers({
         throw createHostError('invalid_params', 'connectionId parameter is required')
       }
       const session = await sessionManager.getSession(input.connectionId)
-      return await session.listObjects(input.schema)
+      const objects = await session.listObjects(input.schema)
+      schemaCache?.setObjects(input.connectionId, objects, input.schema)
+      return objects
     }
   )
 
@@ -70,6 +92,7 @@ export function registerDataAndSchemaHandlers({
           details.ddl = reconstructTableDdl(details, session.driverType)
         }
       }
+      schemaCache?.setTableDetails(input.connectionId, details)
       return details
     }
   )
@@ -151,7 +174,7 @@ export function registerDataAndSchemaHandlers({
 
   registerHandler(
     'data.fetchPage',
-    async (input): Promise<TableBrowseResult> => {
+    async (input, ctx): Promise<TableBrowseResult> => {
       if (!input?.connectionId) {
         throw createHostError('invalid_params', 'connectionId parameter is required')
       }
@@ -178,6 +201,14 @@ export function registerDataAndSchemaHandlers({
           ? Math.max(1, Math.min(10000, Math.floor(rawPageSize)))
           : 50
       const session = await sessionManager.getSession(input.connectionId)
+      const txState =
+        typeof session.getTransactionState === 'function' ? session.getTransactionState() : undefined
+      const bypassTransaction = tx.isForeignOwned(
+        input.connectionId,
+        session,
+        tx.getPanelId(ctx),
+        txState
+      )
       return await session.fetchPage({
         table: input.table,
         schema: input.schema,
@@ -187,11 +218,12 @@ export function registerDataAndSchemaHandlers({
         sortDirection: input.sortDirection,
         whereClause,
         orderByClause,
+        bypassTransaction,
       })
     }
   )
 
-  registerHandler('data.updateCell', async (input) => {
+  registerHandler('data.updateCell', async (input, ctx) => {
     if (!input?.connectionId) {
       throw createHostError('invalid_params', 'connectionId parameter is required')
     }
@@ -209,13 +241,37 @@ export function registerDataAndSchemaHandlers({
     await assertMutableConnection(sessionManager, input.connectionId)
     assertNoCompactedPreviewOverwrite(input.newValue, input.column)
     const session = await sessionManager.getSession(input.connectionId)
-    const result = await session.updateCell({
-      table: input.table,
-      schema: input.schema,
-      primaryKeys: input.primaryKeys,
-      column: input.column,
-      newValue: input.newValue,
-      originalValue: input.originalValue,
+    const panelId = tx.getPanelId(ctx)
+    const result = await tx.withLock(input.connectionId, async () => {
+      const preState =
+        typeof session.getTransactionState === 'function' ? session.getTransactionState() : undefined
+      if (tx.isForeignOwned(input.connectionId, session, panelId, preState)) {
+        throw createHostError(
+          'forbidden',
+          'Cannot modify data while another editor panel owns a transaction on this connection.'
+        )
+      }
+      const wasActive = Boolean(preState?.active)
+      try {
+        return await session.updateCell({
+          table: input.table,
+          schema: input.schema,
+          primaryKeys: input.primaryKeys,
+          column: input.column,
+          newValue: input.newValue,
+          originalValue: input.originalValue,
+        })
+      } finally {
+        if (typeof session.getTransactionState === 'function') {
+          tx.reconcileAfterWrite(
+            input.connectionId,
+            session,
+            panelId,
+            wasActive,
+            session.getTransactionState()
+          )
+        }
+      }
     })
 
     orca.panels.post(
@@ -246,10 +302,11 @@ export function registerDataAndSchemaHandlers({
       inserts: input.inserts,
       updates: input.updates,
       deletes: input.deletes,
+      deleteRows: input.deleteRows,
     })
   })
 
-  registerHandler('data.applyChanges', async (input) => {
+  registerHandler('data.applyChanges', async (input, ctx) => {
     if (!input?.connectionId) {
       throw createHostError('invalid_params', 'connectionId parameter is required')
     }
@@ -276,12 +333,37 @@ export function registerDataAndSchemaHandlers({
       }
     }
     const session = await sessionManager.getSession(input.connectionId)
-    const res = await session.applyChanges({
-      table: input.table,
-      schema: input.schema,
-      inserts: input.inserts,
-      updates: input.updates,
-      deletes: input.deletes,
+    const panelId = tx.getPanelId(ctx)
+    const res = await tx.withLock(input.connectionId, async () => {
+      const preState =
+        typeof session.getTransactionState === 'function' ? session.getTransactionState() : undefined
+      if (tx.isForeignOwned(input.connectionId, session, panelId, preState)) {
+        throw createHostError(
+          'forbidden',
+          'Cannot modify data while another editor panel owns a transaction on this connection.'
+        )
+      }
+      const wasActive = Boolean(preState?.active)
+      try {
+        return await session.applyChanges({
+          table: input.table,
+          schema: input.schema,
+          inserts: input.inserts,
+          updates: input.updates,
+          deletes: input.deletes,
+          deleteRows: input.deleteRows,
+        })
+      } finally {
+        if (typeof session.getTransactionState === 'function') {
+          tx.reconcileAfterWrite(
+            input.connectionId,
+            session,
+            panelId,
+            wasActive,
+            session.getTransactionState()
+          )
+        }
+      }
     })
 
     const firstUpdate = input.updates?.[0]

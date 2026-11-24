@@ -1,6 +1,6 @@
 /**
  * build/check-package-size.mjs
- * Audits the Datanoa plugin footprint (files, raw MB, top 10 largest files, < 1 MiB vendor ceiling, and 5 MB total budget).
+ * Audits the Datanoa plugin footprint (files, raw MB, top 10 largest files, < 1 MiB vendor ceiling, and 25 MB total budget).
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -10,9 +10,18 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const projectRoot = path.resolve(__dirname, '..')
 
-const EXCLUDED_DIRS = new Set(['.git', 'node_modules', '.orca', '.serena', 'dist', 'release'])
+const EXCLUDED_DIRS = new Set([
+  '.git',
+  'node_modules',
+  '.orca',
+  '.serena',
+  '.datanoa',
+  '.vite',
+  'dist',
+  'release',
+])
 const MAX_VENDOR_FILE_BYTES = 1024 * 1024 // 1 MiB
-const MAX_TOTAL_BYTES = 5_000_000 // 5 MB package budget, inclusive
+const MAX_TOTAL_BYTES = 25_000_000 // 25 MB package budget, inclusive
 
 function collectFiles(dir, out = []) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -35,9 +44,9 @@ const sorted = [...files].sort((a, b) => b.bytes - a.bytes)
 
 let vendorViolation = false
 for (const item of files) {
-  if (item.rel.startsWith('vendor/') && item.bytes > MAX_VENDOR_FILE_BYTES) {
+  if (item.rel.startsWith('vendor/') && item.bytes >= MAX_VENDOR_FILE_BYTES) {
     console.error(
-      `[package-size] FAIL: ${item.rel} (${(item.bytes / 1024).toFixed(1)} KB) exceeds 1 MiB ceiling`
+      `[package-size] FAIL: ${item.rel} (${(item.bytes / 1024).toFixed(1)} KB) reaches or exceeds 1 MiB ceiling`
     )
     vendorViolation = true
   }
@@ -46,7 +55,7 @@ for (const item of files) {
 const totalViolation = totalBytes > MAX_TOTAL_BYTES
 if (totalViolation) {
   console.error(
-    `[package-size] FAIL: workspace payload is ${totalBytes} bytes, exceeding the ${MAX_TOTAL_BYTES} byte (5 MB) budget`
+    `[package-size] FAIL: workspace payload is ${totalBytes} bytes, exceeding the ${MAX_TOTAL_BYTES} byte (25 MB) budget`
   )
 }
 

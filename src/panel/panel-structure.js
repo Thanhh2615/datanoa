@@ -22,6 +22,59 @@ import {
   syncSelectTooltip,
 } from './panel-utils.js'
 
+const MSSQL_PANEL_TYPE_SUGGESTIONS = [
+  'INT',
+  'BIGINT',
+  'SMALLINT',
+  'TINYINT',
+  'BIT',
+  'DECIMAL(10,2)',
+  'NUMERIC(10,2)',
+  'MONEY',
+  'FLOAT',
+  'NVARCHAR(255)',
+  'NVARCHAR(MAX)',
+  'VARCHAR(255)',
+  'DATE',
+  'DATETIME2',
+  'DATETIMEOFFSET',
+  'UNIQUEIDENTIFIER',
+  'VARBINARY(MAX)',
+  'XML',
+]
+
+const ORACLE_PANEL_TYPE_SUGGESTIONS = [
+  'NUMBER(10)',
+  'NUMBER(19)',
+  'NUMBER(10,2)',
+  'VARCHAR2(255)',
+  'NVARCHAR2(255)',
+  'CHAR(1)',
+  'CLOB',
+  'NCLOB',
+  'BLOB',
+  'DATE',
+  'TIMESTAMP',
+  'RAW(16)',
+  'FLOAT',
+]
+
+export function canEditDriverStructure(details, conn) {
+  return (
+    Boolean(details) &&
+    details.kind !== 'view' &&
+    conn?.driver !== 'redis' &&
+    conn?.driver !== 'mongodb' &&
+    !conn?.readOnly
+  )
+}
+
+export function getPanelDriverColumnTypes(driver) {
+  if (driver === 'mssql') return MSSQL_PANEL_TYPE_SUGGESTIONS
+  if (driver === 'oracle') return ORACLE_PANEL_TYPE_SUGGESTIONS
+  return PANEL_TYPE_SUGGESTIONS_BY_DRIVER[driver || 'sqlite'] || PANEL_COL_TYPES
+}
+
 export function createPanelStructureController(ctx) {
   const {
     state,
@@ -300,6 +353,37 @@ export function createPanelStructureController(ctx) {
     if ($('cancelMigrationBtn')) $('cancelMigrationBtn').disabled = false
     if ($('copyMigrationSqlModalBtn')) $('copyMigrationSqlModalBtn').disabled = false
     $('confirmMigrationModal').hidden = false
+
+    const isSqliteRebuild =
+      (driver === 'sqlite' || driver === 'libsql') &&
+      (Boolean(plan.isRebuild) ||
+        plan.statements.some((s) => /PRAGMA\s+(?:foreign_keys\s*=\s*OFF|defer_foreign_keys)/i.test(s)))
+    if (isSqliteRebuild && state.activeConnectionId) {
+      const checkConnId = state.activeConnectionId
+      void rpc('tx.status', { connectionId: checkConnId })
+        .then((txStatus) => {
+          if (
+            $('confirmMigrationModal').hidden ||
+            pendingMigrationPlan !== plan ||
+            state.activeConnectionId !== checkConnId
+          ) {
+            return
+          }
+          if (txStatus && (txStatus.active || (txStatus.supported && !txStatus.autoCommit))) {
+            const txErr =
+              'Cannot rebuild SQLite/LibSQL table while a manual transaction is active (SQLite ignores PRAGMA foreign_keys = OFF inside a transaction). Commit or rollback the transaction first.'
+            if (!plan.errors.includes(txErr)) {
+              plan.errors.push(txErr)
+            }
+            plan.valid = false
+            errEl.hidden = false
+            errEl.textContent = `Blocking Errors:\n• ${plan.errors.join('\n• ')}`
+            execBtn.disabled = true
+            execBtn.textContent = 'Fix Errors to Apply'
+          }
+        })
+        .catch(() => {})
+    }
   }
 
   async function executeConfirmedPanelMigration() {
@@ -318,6 +402,11 @@ export function createPanelStructureController(ctx) {
     const targetTable = state.activeTable
     const targetSchema = state.activeSchema
     const nextTable = state.structDraft.tableName.trim()
+    const driver = getActiveConn()?.driver || 'sqlite'
+    const isSqliteRebuild =
+      (driver === 'sqlite' || driver === 'libsql') &&
+      (Boolean(plan.isRebuild) ||
+        plan.statements.some((s) => /PRAGMA\s+(?:foreign_keys\s*=\s*OFF|defer_foreign_keys)/i.test(s)))
     state.isMigrating = true
     const execBtn = $('confirmMigrationExecuteBtn')
     const cancelBtn = $('cancelMigrationBtn')
@@ -338,6 +427,21 @@ export function createPanelStructureController(ctx) {
     })
     const sql = plan.statements.join('\n')
     try {
+      if (isSqliteRebuild) {
+        let txStatus
+        try {
+          txStatus = await rpc('tx.status', { connectionId: targetConnId })
+        } catch (err) {
+          throw new Error(
+            `Cannot verify transaction status before SQLite/LibSQL table rebuild (${err?.message || String(err)}). Ensure no manual transaction is active and retry.`
+          )
+        }
+        if (txStatus && (txStatus.active || (txStatus.supported && !txStatus.autoCommit))) {
+          throw new Error(
+            'Cannot rebuild SQLite/LibSQL table while a manual transaction is active (SQLite ignores PRAGMA foreign_keys = OFF inside a transaction). Commit or rollback the transaction first.'
+          )
+        }
+      }
       const queryId = `panel_migrate_${Date.now()}`
       await rpc(
         'query.run',
@@ -497,13 +601,63 @@ export function createPanelStructureController(ctx) {
 
     if (state.structDraftKey !== detailsKey || !state.structDraft) {
       state.structDraftKey = detailsKey
-      state.structDraft = createPanelStructDraft(details)
+      const nextDraft = createPanelStructDraft(details)
+      if (Array.isArray(details.columns) && Array.isArray(nextDraft.columns)) {
+        nextDraft.columns.forEach((col, i) => {
+          const origCol = details.columns[i]
+          if (!origCol) return
+          if (origCol.collate && !col.collate) col.collate = origCol.collate
+          if (origCol.isGenerated && !col.isGenerated) col.isGenerated = true
+          if (origCol.generatedExpression !== undefined && col.generatedExpression === undefined) {
+            col.generatedExpression = origCol.generatedExpression
+          }
+          if (origCol.generatedStorage !== undefined && col.generatedStorage === undefined) {
+            col.generatedStorage = origCol.generatedStorage
+          }
+        })
+      }
+      if (Array.isArray(details.indexes) && Array.isArray(nextDraft.indexes)) {
+        nextDraft.indexes.forEach((idx, i) => {
+          const orig = details.indexes[i]
+          if (!orig) return
+          if (orig.origin && !idx.origin) idx.origin = orig.origin
+          if (Array.isArray(orig.columnSpecs) && !idx.columnSpecs) {
+            idx.columnSpecs = orig.columnSpecs.map((s) => ({ ...s }))
+          }
+          if (orig.onConflict && !idx.onConflict) idx.onConflict = orig.onConflict
+          if (orig.whereClause !== undefined && idx.whereClause === undefined) {
+            idx.whereClause = orig.whereClause
+          }
+          if (orig.partial !== undefined && idx.partial === undefined) {
+            idx.partial = Boolean(orig.partial)
+          }
+          if (orig.isExpression !== undefined && idx.isExpression === undefined) {
+            idx.isExpression = Boolean(orig.isExpression)
+          }
+        })
+      }
+      if (Array.isArray(details.triggers) && !nextDraft.triggers) {
+        nextDraft.triggers = details.triggers.map((t) => ({ name: t.name, sql: t.sql }))
+      }
+      if (Array.isArray(details.inboundForeignKeys) && !nextDraft.inboundForeignKeys) {
+        nextDraft.inboundForeignKeys = details.inboundForeignKeys.map((fk) => ({ ...fk }))
+      }
+      if (Array.isArray(details.checkConstraints) && !nextDraft.checkConstraints) {
+        nextDraft.checkConstraints = [...details.checkConstraints]
+      }
+      if (details.strict !== undefined && nextDraft.strict === undefined) {
+        nextDraft.strict = Boolean(details.strict)
+      }
+      if (details.withoutRowid !== undefined && nextDraft.withoutRowid === undefined) {
+        nextDraft.withoutRowid = Boolean(details.withoutRowid)
+      }
+      state.structDraft = nextDraft
       state.structPreviewOpen = false
     }
 
     const activeConn = getActiveConn()
-    const canEditStructure =
-      details.kind !== 'view' && activeConn?.driver !== 'redis' && !activeConn?.readOnly
+    const isMongo = activeConn?.driver === 'mongodb'
+    const canEditStructure = canEditDriverStructure(details, activeConn)
 
     const structToolbar = $('structureToolbar')
     const titleInp = $('structureTableNameInput')
@@ -515,7 +669,7 @@ export function createPanelStructureController(ctx) {
     const kv = $('structureKv')
     kv.textContent = ''
     const kvData = [
-      ['Table', details.name],
+      [isMongo ? 'Collection' : 'Table', details.name],
       ['Primary Key', (details.primaryKey || []).join(', ') || 'None'],
       [
         'Cols / Idx / FK',
@@ -537,7 +691,9 @@ export function createPanelStructureController(ctx) {
 
     $('structureDdlCode').textContent = details.ddl
       ? formatDdlForDisplay(details.ddl)
-      : '-- DDL unavailable for this object.'
+      : isMongo
+        ? '-- MongoDB collections are schemaless; inferred fields and indexes are shown below.'
+        : '-- DDL unavailable for this object.'
 
     const colTbl = $('structureColTable')
     colTbl.textContent = ''
@@ -607,7 +763,7 @@ export function createPanelStructureController(ctx) {
         typeTd.className = 'struct-td-input'
         const { wrap: typeComboWrap } = createPanelComboInput(
           col.dataType,
-          PANEL_TYPE_SUGGESTIONS_BY_DRIVER[getActiveConn()?.driver || 'sqlite'] || PANEL_COL_TYPES,
+          getPanelDriverColumnTypes(getActiveConn()?.driver || 'sqlite'),
           isDel,
           (nextVal) => {
             col.dataType = nextVal
@@ -859,7 +1015,17 @@ export function createPanelStructureController(ctx) {
               ? 'UNIQUE'
               : 'INDEX'
           grp.appendChild(b)
-          if (canEditStructure && !idx.isPrimary && !/^sqlite_autoindex_/i.test(idx.name)) {
+          const isUniqueAutoIndex =
+            idx.origin === 'u' ||
+            (!idx.isPrimary &&
+              Boolean(idx.isUnique ?? idx.unique) &&
+              /^sqlite_autoindex_/i.test(idx.name))
+          const isPkLocked = Boolean(
+            idx.isPrimary ||
+              idx.origin === 'pk' ||
+              (/^sqlite_autoindex_/i.test(idx.name) && !isUniqueAutoIndex)
+          )
+          if (canEditStructure && !isPkLocked) {
             const dropBtn = document.createElement('button')
             dropBtn.type = 'button'
             dropBtn.className = 'btn btn-sm'

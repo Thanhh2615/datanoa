@@ -226,16 +226,13 @@ export function formatSqlInList(
     if (nonNullLiterals.length > 0) {
       return `${qCol} IN (${nonNullLiterals.join(', ')})`
     }
-    if (hasNull) {
-      return `${qCol} IS NULL`
-    }
-    return ''
+    return `${qCol} IS NULL`
   }
 
   if (nonNullLiterals.length > 0) {
     return `(${nonNullLiterals.join(', ')})`
   }
-  return hasNull ? '(NULL)' : ''
+  return '(NULL)'
 }
 
 /**

@@ -32,15 +32,155 @@ import {
 import { openStudioFilePickerModal } from './file-picker-modal.js'
 
 import { DEFAULT_RPC_TIMEOUT_MS } from '../shared-constants.js'
+import {
+  findCredentialAuthorityAtIndex,
+  isCloudDatabaseHost,
+  maskConnectionUriSecret as sharedMaskConnectionUriSecret,
+} from '../shared-sql-safety.js'
 
 export function maskUriSecret(rawUri: string): string {
-  return String(rawUri || '').replace(
-    /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^:/?#\s@]*:)([^@]+)(@)/,
-    '$1***$3'
-  )
+  return sharedMaskConnectionUriSecret(rawUri)
 }
 
 export const maskConnectionUriSecret = maskUriSecret
+
+const SENSITIVE_LIBSQL_QUERY_PARAM_RE =
+  /^(?:api[-_]?key|apikey|auth[-_]?token|authtoken|access[-_]?token|refresh[-_]?token|id[-_]?token|client[-_]?secret|private[-_]?key|credentials?|authorization|sig(?:nature)?|token|pass(?:word|wd|phrase)?|pwd|secret|key|jwt|bearer)$/i
+
+const FALLBACK_SECRET_QUERY_KV_RE =
+  /([?&#])(?:[^=&\s#]*(?:api[-_]?key|apikey|auth[-_]?token|authtoken|access[-_]?token|refresh[-_]?token|id[-_]?token|client[-_]?secret|private[-_]?key|token|jwt|secret|pass(?:word|wd|phrase)?|pwd|bearer|credentials?|authorization|key)|sig(?:nature)?)=[^&\s#]*/gi
+
+function stripEmbeddedSchemeCredentials(raw: string): string {
+  return raw.replace(
+    /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^\s'"<>(),;]+)/g,
+    (full, scheme: string, rest: string) => {
+      const delimIdx = rest.search(/[:/?#@]/)
+      if (delimIdx < 0 || rest[delimIdx] !== ':') return full
+      const atIdx = findCredentialAuthorityAtIndex(scheme, rest, delimIdx)
+      return atIdx > 0 ? `${scheme}${rest.slice(atIdx + 1)}` : full
+    }
+  )
+}
+
+function scrubFallbackSecretUrlText(raw: string): string {
+  return stripEmbeddedSchemeCredentials(raw)
+    .replace(FALLBACK_SECRET_QUERY_KV_RE, '$1')
+    .replace(/\?&+/g, '?')
+    .replace(/#&+/g, '#')
+    .replace(/[?&]+#/g, '#')
+    .replace(/&{2,}/g, '&')
+    .replace(/[?&#]+(?=$|\s)/g, '')
+}
+
+function scrubParsedUrlSecrets(parsed: URL): void {
+  parsed.username = ''
+  parsed.password = ''
+  for (const key of Array.from(parsed.searchParams.keys())) {
+    if (SENSITIVE_LIBSQL_QUERY_PARAM_RE.test(key)) {
+      parsed.searchParams.delete(key)
+    }
+  }
+  if (parsed.hash.length > 1) {
+    const rawFrag = parsed.hash.slice(1)
+    const qIdx = rawFrag.indexOf('?')
+    const cleanPairs = (seg: string): string =>
+      seg
+        .split('&')
+        .filter((pair) => {
+          const eqIdx = pair.indexOf('=')
+          if (eqIdx <= 0) return true
+          const rawKey = pair.slice(0, eqIdx).trim()
+          let decodedKey = rawKey
+          try {
+            decodedKey = decodeURIComponent(rawKey)
+          } catch {
+            // Keep rawKey when percent-decoding fails
+          }
+          return !(
+            SENSITIVE_LIBSQL_QUERY_PARAM_RE.test(rawKey) ||
+            SENSITIVE_LIBSQL_QUERY_PARAM_RE.test(decodedKey)
+          )
+        })
+        .join('&')
+    const cleaned =
+      qIdx >= 0
+        ? (() => {
+            const pfx = cleanPairs(rawFrag.slice(0, qIdx))
+            const tail = cleanPairs(rawFrag.slice(qIdx + 1))
+            return tail ? `${pfx}?${tail}` : pfx
+          })()
+        : cleanPairs(rawFrag)
+    parsed.hash = cleaned ? `#${cleaned}` : ''
+  }
+}
+
+function parseNetworkUrlSafely(rawWithScheme: string): URL | null {
+  try {
+    const direct = new URL(rawWithScheme)
+    if (direct.username === '' && direct.password === '' && direct.port !== '') {
+      const recovered = stripEmbeddedSchemeCredentials(rawWithScheme)
+      if (recovered !== rawWithScheme) {
+        return new URL(recovered)
+      }
+    }
+    return direct
+  } catch {
+    return null
+  }
+}
+
+function sanitizeLibsqlFormUrlAndName(rawUrl: string): { cleanUrl: string; defaultName: string } {
+  const trimmed = rawUrl.trim()
+  if (!trimmed) return { cleanUrl: '', defaultName: 'LibSQL' }
+  const withScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed) ? trimmed : `https://${trimmed}`
+  const parsed = parseNetworkUrlSafely(withScheme)
+  if (!parsed) {
+    return { cleanUrl: scrubFallbackSecretUrlText(trimmed), defaultName: 'LibSQL' }
+  }
+  const hostname = parsed.hostname || 'LibSQL'
+  scrubParsedUrlSecrets(parsed)
+  const cleanPath =
+    parsed.pathname && parsed.pathname !== '/' ? parsed.pathname.replace(/\/+$/, '') : ''
+  const cleanSearch = parsed.searchParams.toString()
+  const cleanUrl = `${parsed.protocol}//${parsed.host}${cleanPath}${cleanSearch ? `?${cleanSearch}` : ''}`
+  return { cleanUrl, defaultName: hostname }
+}
+
+function scrubStudioNetworkFormUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim()
+  if (!trimmed) return ''
+  const parsed = parseNetworkUrlSafely(trimmed)
+  if (!parsed) {
+    return scrubFallbackSecretUrlText(trimmed)
+  }
+  scrubParsedUrlSecrets(parsed)
+  return parsed.toString()
+}
+
+const STUDIO_OPTIONS_DRIVERS: ReadonlySet<string> = new Set([
+  'postgres',
+  'cockroachdb',
+  'snowflake',
+  'bigquery',
+  'cassandra',
+])
+
+const STUDIO_FILE_DB_DRIVERS: ReadonlySet<string> = new Set(['sqlite', 'duckdb'])
+
+function isStudioOptionsDriver(d: string): boolean {
+  return STUDIO_OPTIONS_DRIVERS.has(d)
+}
+
+function isStudioFileDbDriver(d: string): boolean {
+  return STUDIO_FILE_DB_DRIVERS.has(d)
+}
+
+function extractScannedFolderName(rawPath: string): string {
+  const trimmed = String(rawPath || '').trim().replace(/[\\/]+$/, '')
+  if (!trimmed) return String(rawPath || '').trim()
+  const parts = trimmed.split(/[\\/]/).filter(Boolean)
+  return parts[parts.length - 1] || trimmed
+}
 
 export function compactFilePath(filePath: string, maxLen = 48): string {
   const raw = String(filePath || '').trim()
@@ -82,6 +222,7 @@ export interface DiscoveredSqliteFile {
 }
 
 export interface DiscoveredEnvConnection {
+  candidateId?: string
   envKey: string
   sourceFile: string
   driver: DatabaseDriverType
@@ -93,6 +234,10 @@ export interface WorkspaceDetectResponse {
   sqliteFiles?: DiscoveredSqliteFile[]
   envConnections?: DiscoveredEnvConnection[]
   dockerComposeConnections?: DiscoveredDockerComposeConnection[]
+  scannedDirs?: string[]
+  folderScoped?: boolean
+  dockerIsLocal?: boolean
+  dockerScopeLabel?: string
 }
 
 export interface StudioConnectionModalContext {
@@ -126,6 +271,21 @@ export function openStudioConnectionModal(
   let hadPassword = Boolean(editProfile?.hasPassword)
   let hadAuthToken = Boolean(editProfile?.hasAuthToken)
   let lastParsedUri = ''
+  let lastParsedDisplayUri = ''
+  let lastParsedCandidateId = ''
+  let activeAutoCandidateId: string | null = null
+  let activeAutoRawUri: string | null = null
+  let activeAutoDisplayUri: string | null = null
+  let dockerApplySeq = 0
+  const clearActiveAutoUri = (): void => {
+    activeAutoCandidateId = null
+    activeAutoRawUri = null
+    activeAutoDisplayUri = null
+  }
+  let lastOracleParsedUrl =
+    editProfile?.driver === 'oracle' && typeof editProfile.url === 'string'
+      ? scrubStudioNetworkFormUrl(editProfile.url)
+      : ''
   let lastParsedPlaceholder = false
   let placeholderPending = false
   let lastAutoName = ''
@@ -135,6 +295,7 @@ export function openStudioConnectionModal(
   let discoveredEnvs: DiscoveredEnvConnection[] = []
   let discoveredDocker: DiscoveredDockerComposeConnection[] = []
   let discoveredFiles: DiscoveredSqliteFile[] = []
+  let discoveredDockerScopeLabel = 'Local Docker'
   let discoveredSearch = ''
   const discoveryCollapsed: Record<'env' | 'docker' | 'sqlite', boolean | null> = {
     env: null,
@@ -169,15 +330,27 @@ export function openStudioConnectionModal(
   }
 
   let fieldSeq = 0
-  const createField = (labelText: string, control: HTMLElement, full = false): HTMLDivElement => {
+  const createField = (
+    labelText: string,
+    control: HTMLElement,
+    full = false,
+    labelTarget?: HTMLElement
+  ): HTMLDivElement => {
     const wrap = document.createElement('div')
     wrap.className = `datanoa-conn-field${full ? ' is-full' : ''}`
-    // Checkbox wrappers already contain their own <label>; a second <label> would be orphaned
+    const targetEl =
+      labelTarget ??
+      (control.tagName === 'INPUT' ||
+      control.tagName === 'SELECT' ||
+      control.tagName === 'TEXTAREA'
+        ? control
+        : null)
     const isCheckWrapper = control.classList.contains('datanoa-conn-check')
-    const label = document.createElement(isCheckWrapper ? 'span' : 'label')
-    if (!isCheckWrapper) {
-      const id = control.id || `datanoa-conn-field-${++fieldSeq}`
-      control.id = id
+    const useLabel = !isCheckWrapper && targetEl !== null
+    const label = document.createElement(useLabel ? 'label' : 'span')
+    if (useLabel && targetEl) {
+      const id = targetEl.id || `datanoa-conn-field-${++fieldSeq}`
+      targetEl.id = id
       label.setAttribute('for', id)
     }
     label.textContent = labelText
@@ -313,6 +486,7 @@ export function openStudioConnectionModal(
     'Paste connection URI (postgres://, mysql://, mssql://, mongodb://, redis://, libsql://, sqlite://)...',
     true
   )
+  uriInp.setAttribute('aria-label', 'Paste connection URI')
   uriInp.classList.add('datanoa-conn-uri-input')
   const parseBtn = createButton('Parse URI')
   uriRow.appendChild(uriInp)
@@ -327,13 +501,21 @@ export function openStudioConnectionModal(
   discoverySection.style.marginTop = '8px'
   const discoveryLabel = document.createElement('div')
   discoveryLabel.className = 'datanoa-conn-section-label'
-  discoveryLabel.textContent = 'Workspace Auto-Discovery (.env, Docker Compose & .db)'
+  discoveryLabel.textContent = 'Local Workspace & Docker Auto-Discovery (.env, Docker Compose & .db)'
+  const discoveryScopeNote = document.createElement('div')
+  discoveryScopeNote.className = 'datanoa-conn-hint'
+  discoveryScopeNote.style.marginBottom = '4px'
+  discoveryScopeNote.textContent =
+    'Scans local workspace folders for .env / .db files · Plus local Docker containers (non-workspace labeled "Other Local Docker").'
   const detectRow = document.createElement('div')
   detectRow.className = 'datanoa-conn-row is-wrap'
   const quickBrowseDbBtn = createButton('Browse DB File...')
   quickBrowseDbBtn.title = 'Browse and pick a local SQLite database file (.db, .sqlite, .sqlite3)'
   const detectBtn = createButton('Auto-Detect (.env, Docker, .db)')
+  detectBtn.title =
+    'Scan current workspace folder(s) for .env & .db files plus local Docker Compose containers'
   const folderInp = createInput('Optional folder path to scan...', true)
+  folderInp.setAttribute('aria-label', 'Folder path to scan')
   folderInp.style.flex = '1 1 160px'
   const browseScanFolderBtn = createButton('Browse Folder...')
   const scanBtn = createButton('Scan Folder')
@@ -362,6 +544,7 @@ export function openStudioConnectionModal(
   discoveredBox.className = 'datanoa-conn-discovered'
   discoveredBox.style.display = 'none'
   discoverySection.appendChild(discoveryLabel)
+  discoverySection.appendChild(discoveryScopeNote)
   discoverySection.appendChild(detectRow)
   discoverySection.appendChild(discoveredBox)
 
@@ -399,9 +582,12 @@ export function openStudioConnectionModal(
   byodEngineGrid.className = 'datanoa-engine-grid'
   const byodRegistryStatus = new Map<string, DriverRegistryItem>()
   const byodDefaultFolders = new Map<string, string>([
-    ['mssql', 'C:\\datanoa-drivers\\mssql'],
-    ['oracle', 'C:\\datanoa-drivers\\oracle'],
-    ['mongodb', 'C:\\datanoa-drivers\\mongodb'],
+    ['duckdb', 'C:\\datanoa-drivers\\duckdb'],
+    ['snowflake', 'C:\\datanoa-drivers\\snowflake'],
+    ['bigquery', 'C:\\datanoa-drivers\\bigquery'],
+    ['cassandra', 'C:\\datanoa-drivers\\cassandra'],
+    ['elasticsearch', 'C:\\datanoa-drivers\\elasticsearch'],
+    ['neo4j', 'C:\\datanoa-drivers\\neo4j'],
     ['custom', 'C:\\datanoa-drivers\\custom'],
   ])
   let byodHostPlatform = 'win32'
@@ -508,6 +694,7 @@ export function openStudioConnectionModal(
     const folderRow = document.createElement('div')
     folderRow.className = 'datanoa-conn-row'
     const folderPathInp = createInput(defaultFolder, true)
+    folderPathInp.setAttribute('aria-label', `${meta.label} local driver folder path`)
     folderPathInp.value = defaultFolder
     folderPathInp.style.flex = '1 1 220px'
     const browseDriverDirBtn = createButton('Browse Folder...')
@@ -528,6 +715,7 @@ export function openStudioConnectionModal(
     const cmdRow = document.createElement('div')
     cmdRow.className = 'datanoa-conn-row'
     const cmdInp = createInput('', true)
+    cmdInp.setAttribute('aria-label', `${meta.label} terminal setup command`)
     cmdInp.readOnly = true
     cmdInp.style.flex = '1 1 220px'
     cmdInp.value = buildByodInstallCommand(driverId, folderPathInp.value, byodHostPlatform)
@@ -890,7 +1078,12 @@ export function openStudioConnectionModal(
   const folderGroupWrap = document.createElement('div')
   folderGroupWrap.appendChild(folderGroupInp)
   folderGroupWrap.appendChild(folderPresetsRow)
-  const rowFolderGroup = createField('Folder / Group (Organize Connections)', folderGroupWrap, true)
+  const rowFolderGroup = createField(
+    'Folder / Group (Organize Connections)',
+    folderGroupWrap,
+    true,
+    folderGroupInp
+  )
   const currentScope = (ctx.currentWorkspaceScope || '').trim()
   const storedScope = (editProfile?.workspaceScope || '').trim()
   const formatScopeFallbackLabel = (rawId: string): string => {
@@ -1005,6 +1198,7 @@ export function openStudioConnectionModal(
     }
 
     workspaceScopeSel.value = prevVal && seenIds.has(prevVal) ? prevVal : ''
+    workspaceScopeSel.dataset.searchAriaLabel = 'Search workspaces'
     enhanceStudioCollapsibleSelect(workspaceScopeSel, {
       tooltipPrefix: 'Workspace Scope (Pin Connection)',
       searchPlaceholder: 'Search workspaces by name, branch, or project folder...',
@@ -1063,16 +1257,18 @@ export function openStudioConnectionModal(
   const browseSqliteFileBtn = createButton('Browse File...')
   const handlePickLocalSqliteFile = (): void => {
     if (isBusy) return
+    const currentDriver: string = driver
+    const isDuck = currentDriver === 'duckdb'
     void openStudioFilePickerModal(ctx, {
-      title: 'Select SQLite database file',
+      title: isDuck ? 'Select DuckDB database file' : 'Select SQLite database file',
       mode: 'file',
       initialDir: filePathInp.value.trim() || undefined,
-      extensions: ['.db', '.sqlite', '.sqlite3', '.db3'],
+      extensions: isDuck ? ['.duckdb', '.ddb', '.db'] : ['.db', '.sqlite', '.sqlite3', '.db3'],
     })
       .then((res) => {
         if (!isModalOpen()) return
         if (res?.ok && res.path) {
-          if (driver !== 'sqlite') {
+          if (!isStudioFileDbDriver(driver)) {
             applyDriver('sqlite', false)
           }
           filePathInp.value = res.path
@@ -1089,7 +1285,8 @@ export function openStudioConnectionModal(
   quickBrowseDbBtn.addEventListener('click', handlePickLocalSqliteFile)
   sqliteFileRowWrap.appendChild(filePathInp)
   sqliteFileRowWrap.appendChild(browseSqliteFileBtn)
-  const rowFilePath = createField('SQLite File Path', sqliteFileRowWrap, true)
+  const rowFilePath = createField('SQLite File Path', sqliteFileRowWrap, true, filePathInp)
+  const filePathLabel = rowFilePath.querySelector('label')
   const rowLibsqlUrl = createField('LibSQL / Turso URL', libsqlUrlInp, true)
   const rowAuthToken = createField('Auth Token', authTokenInp)
   const rowLibsqlDb = createField('Database Label', libsqlDbInp)
@@ -1105,6 +1302,7 @@ export function openStudioConnectionModal(
   const rowRedisDb = createField('Redis DB Index', redisDbSel)
   const rowSsl = createField('Security', sslCheck.wrap)
   const rowChUrl = createField('HTTP(S) Endpoint URL', chUrlInp, true)
+  const chUrlLabel = rowChUrl.querySelector('label')
   const rowOptions = createField('Options (Cluster / Endpoint)', optionsInp, true)
   for (const row of [
     rowName,
@@ -1148,7 +1346,10 @@ export function openStudioConnectionModal(
   sslKeyPassphraseInp.type = 'password'
   sslKeyPassphraseInp.setAttribute('autocomplete', 'new-password')
   const sslRejectCheck = createCheck('Reject Unauthorized Certs')
-  sslRejectCheck.input.checked = editProfile?.sslRejectUnauthorized !== false
+  sslRejectCheck.input.checked =
+    editProfile?.sslRejectUnauthorized !== undefined
+      ? Boolean(editProfile.sslRejectUnauthorized)
+      : editProfile?.sslMode !== 'require'
   const tlsGrid = document.createElement('div')
   tlsGrid.className = 'datanoa-conn-fields'
   tlsGrid.appendChild(createField('SSL Mode', sslModeSel))
@@ -1238,12 +1439,37 @@ export function openStudioConnectionModal(
   }
   sslCheck.input.addEventListener('change', () => {
     sslModeSel.value = sslCheck.input.checked ? 'auto' : 'disable'
+    if (sslCheck.input.checked) {
+      sslRejectCheck.input.checked = true
+    }
     syncStudioSelectTooltip(sslModeSel, 'SSL Mode')
     syncTlsUi()
   })
   sslModeSel.addEventListener('change', () => {
     sslCheck.input.checked = sslModeSel.value !== 'disable'
+    if (sslModeSel.value === 'require') {
+      sslRejectCheck.input.checked = false
+    } else if (sslModeSel.value === 'verify-ca' || sslModeSel.value === 'verify-full') {
+      sslRejectCheck.input.checked = true
+    }
     syncStudioSelectTooltip(sslModeSel, 'SSL Mode')
+    syncTlsUi()
+  })
+  sslRejectCheck.input.addEventListener('change', () => {
+    if (!sslRejectCheck.input.checked) {
+      sslCheck.input.checked = true
+      if (
+        sslModeSel.value === 'auto' ||
+        sslModeSel.value === 'verify-ca' ||
+        sslModeSel.value === 'verify-full'
+      ) {
+        sslModeSel.value = 'require'
+        syncStudioSelectTooltip(sslModeSel, 'SSL Mode')
+      }
+    } else if (sslModeSel.value === 'require') {
+      sslModeSel.value = 'auto'
+      syncStudioSelectTooltip(sslModeSel, 'SSL Mode')
+    }
     syncTlsUi()
   })
   redisDbSel.addEventListener('change', () => {
@@ -1340,6 +1566,7 @@ export function openStudioConnectionModal(
   // ---- Discovery rendering ----
   const discoverySearchInp = createInput('Search .env, Docker Compose & .db files...')
   discoverySearchInp.type = 'search'
+  discoverySearchInp.setAttribute('aria-label', 'Search .env, Docker Compose and SQLite files')
   discoverySearchInp.classList.add('datanoa-discovery-search')
   const discoveryGroupsWrap = document.createElement('div')
   discoveryGroupsWrap.className = 'datanoa-discovery-groups'
@@ -1355,6 +1582,7 @@ export function openStudioConnectionModal(
     hadPassword = false
     hadAuthToken = false
     lastParsedUri = ''
+    lastOracleParsedUrl = ''
     lastParsedPlaceholder = false
     placeholderPending = false
     uriInp.value = ''
@@ -1387,13 +1615,27 @@ export function openStudioConnectionModal(
       showNotice('error', `Unsupported driver "${String(item.driver)}" in Docker Compose.`)
       return
     }
+    const seq = ++dockerApplySeq
     resetFormAuthAndTunnels()
+    clearActiveAutoUri()
+    if (item.url) {
+      const maskedUrl = maskUriSecret(item.url)
+      uriInp.value = maskedUrl
+      activeAutoCandidateId = item.candidateId || null
+      activeAutoRawUri = item.candidateId ? null : item.url
+      activeAutoDisplayUri = maskedUrl
+    } else {
+      uriInp.value = ''
+    }
     portInp.value = ''
+    chUrlInp.value = ''
     applyDriver(item.driver, true)
     nameInp.value = item.name || `${item.project} · ${item.service}`
     lastAutoName = nameInp.value
     if (item.driver === 'libsql') {
-      libsqlUrlInp.value = item.url || `http://${item.host || '127.0.0.1'}:${item.port || 8080}`
+      libsqlUrlInp.value = item.url
+        ? sanitizeLibsqlFormUrlAndName(item.url).cleanUrl || scrubStudioNetworkFormUrl(item.url)
+        : `http://${item.host || '127.0.0.1'}:${item.port || 8080}`
       libsqlDbInp.value = item.database || 'main'
     } else {
       hostInp.value = item.host || '127.0.0.1'
@@ -1409,7 +1651,11 @@ export function openStudioConnectionModal(
         databaseInp.value = item.database || getStudioEngineMeta(item.driver).defaultDb
       }
       if (item.driver === 'clickhouse') {
-        chUrlInp.value = item.url || `http://${item.host || '127.0.0.1'}:${item.port || 8123}`
+        chUrlInp.value = item.url
+          ? scrubStudioNetworkFormUrl(item.url)
+          : `http://${item.host || '127.0.0.1'}:${item.port || 8123}`
+      } else if (item.driver === 'mongodb') {
+        chUrlInp.value = item.url ? scrubStudioNetworkFormUrl(item.url) : ''
       }
       if (item.password !== undefined) {
         passwordInp.value = item.password
@@ -1426,6 +1672,43 @@ export function openStudioConnectionModal(
         'success',
         `Imported ${getStudioEngineMeta(item.driver).label} service "${item.name}" from Docker Compose.`
       )
+    }
+
+    if (item.candidateId) {
+      const candidateId = item.candidateId
+      void ctx
+        .requestPlugin<{
+          ok: boolean
+          parsed?: ParseUriResponse
+          password?: string
+          authToken?: string
+          url?: string
+        }>('workspace.resolveDetectedCandidate', { candidateId })
+        .then((resolved) => {
+          if (seq !== dockerApplySeq || !isModalOpen() || !resolved?.ok) return
+          if (resolved.password !== undefined && item.driver !== 'libsql') {
+            passwordInp.value = resolved.password
+          }
+          if (resolved.authToken !== undefined && item.driver === 'libsql') {
+            authTokenInp.value = resolved.authToken
+          }
+          if (resolved.url) {
+            if (item.driver === 'libsql') {
+              libsqlUrlInp.value =
+                sanitizeLibsqlFormUrlAndName(resolved.url).cleanUrl ||
+                scrubStudioNetworkFormUrl(resolved.url)
+            } else if (item.driver === 'clickhouse' || item.driver === 'mongodb') {
+              chUrlInp.value = scrubStudioNetworkFormUrl(resolved.url)
+            }
+          }
+          if (item.url && activeAutoCandidateId === candidateId && activeAutoDisplayUri) {
+            lastParsedCandidateId = candidateId
+            lastParsedDisplayUri = activeAutoDisplayUri
+          }
+        })
+        .catch(() => {
+          // Best-effort secret resolution; Save/Parse URI still falls back to connection.parseUri({ candidateId })
+        })
     }
   }
 
@@ -1572,12 +1855,22 @@ export function openStudioConnectionModal(
             chip.appendChild(badge)
             chip.addEventListener('click', () => {
               if (isBusy) return
-              uriInp.value = item.uri
+              dockerApplySeq++
+              uriInp.value = masked
+              activeAutoCandidateId = item.candidateId || null
+              activeAutoRawUri = item.candidateId ? null : item.uri
+              activeAutoDisplayUri = masked
               if (!nameInp.value.trim()) {
                 nameInp.value = item.name || item.envKey
                 lastAutoName = nameInp.value
               }
-              void parseUri(item.uri, true)
+              void parseUri(
+                {
+                  ...(item.candidateId ? { candidateId: item.candidateId } : { uri: item.uri }),
+                  displayUri: masked,
+                },
+                true
+              )
             })
             list.appendChild(chip)
           }
@@ -1644,6 +1937,17 @@ export function openStudioConnectionModal(
               wsBadge.className = 'datanoa-badge datanoa-badge-info'
               wsBadge.textContent = 'Workspace'
               badges.appendChild(wsBadge)
+            } else {
+              const otherBadge = document.createElement('span')
+              otherBadge.className = 'datanoa-badge datanoa-badge-neutral'
+              const isRemoteContext = discoveredDockerScopeLabel === 'Docker Context'
+              otherBadge.textContent = isRemoteContext
+                ? 'Other Docker Context'
+                : 'Other Local Docker'
+              otherBadge.title = isRemoteContext
+                ? 'Running in the active Docker context outside the scanned workspace folder'
+                : 'Running in local Docker outside the active workspace folder'
+              badges.appendChild(otherBadge)
             }
             const statusBadge = document.createElement('span')
             statusBadge.className = `datanoa-badge ${
@@ -1768,12 +2072,23 @@ export function openStudioConnectionModal(
         tile.blur?.()
       }
     })
-    const isSqlite = next === 'sqlite'
+    const nextId: string = next
+    const isDuckdb = nextId === 'duckdb'
+    const isFileDb = isStudioFileDbDriver(nextId)
     const isLibsql = next === 'libsql'
     const isD1 = next === 'd1'
-    const isServer = !isSqlite && !isLibsql && !isD1
-    showEl(quickBrowseDbBtn, isSqlite)
-    showEl(rowFilePath, isSqlite)
+    const isServer = !isFileDb && !isLibsql && !isD1
+    const isMongo = next === 'mongodb'
+    const hasUrlField = next === 'clickhouse' || isMongo
+    const hasOptionsField = isStudioOptionsDriver(nextId)
+    showEl(quickBrowseDbBtn, isFileDb)
+    showEl(rowFilePath, isFileDb)
+    if (filePathLabel) {
+      filePathLabel.textContent = isDuckdb ? 'DuckDB File Path' : 'SQLite File Path'
+    }
+    filePathInp.placeholder = isDuckdb
+      ? '/path/to/analytics.duckdb or :memory:'
+      : '/path/to/database.db'
     showEl(rowLibsqlUrl, isLibsql)
     showEl(rowAuthToken, isLibsql || isD1)
     rowAuthToken.classList.toggle('is-full', isD1)
@@ -1792,8 +2107,22 @@ export function openStudioConnectionModal(
     showEl(rowSsl, isServer)
     showEl(tlsSection.root, isServer)
     showEl(sshSection.root, isServer)
-    showEl(rowChUrl, next === 'clickhouse')
-    showEl(rowOptions, next === 'postgres' || next === 'cockroachdb')
+    showEl(rowChUrl, hasUrlField)
+    if (chUrlLabel) {
+      chUrlLabel.textContent = isMongo ? 'Connection URL (Optional / +srv)' : 'HTTP(S) Endpoint URL'
+    }
+    chUrlInp.placeholder = isMongo
+      ? 'mongodb://localhost:27017 or mongodb+srv://...'
+      : 'http://localhost:8123'
+    showEl(rowOptions, hasOptionsField)
+    optionsInp.placeholder =
+      nextId === 'snowflake'
+        ? 'e.g. account=...,warehouse=...,role=...'
+        : nextId === 'bigquery'
+          ? 'e.g. projectId=...,location=US'
+          : nextId === 'cassandra'
+            ? 'e.g. localDataCenter=datacenter1,keyspace=...'
+            : 'e.g. --cluster=my-cluster or endpoint=ep-xyz'
     databaseInp.placeholder = meta.defaultDb
     userInp.placeholder = meta.defaultUser || 'Optional'
     if (applyDefaults) {
@@ -1813,7 +2142,13 @@ export function openStudioConnectionModal(
 
   const clearModalFields = (): void => {
     if (isBusy) return
+    dockerApplySeq++
     resetFormAuthAndTunnels()
+    uriInp.value = ''
+    clearActiveAutoUri()
+    lastParsedUri = ''
+    lastParsedDisplayUri = ''
+    lastParsedCandidateId = ''
     nameInp.value = ''
     lastAutoName = ''
     folderGroupInp.value = ''
@@ -1856,14 +2191,16 @@ export function openStudioConnectionModal(
       return profile
     }
 
-    if (driver === 'sqlite') {
+    if (isStudioFileDbDriver(driver)) {
+      const driverId: string = driver
       const filePath = filePathInp.value.trim()
-      const baseName = filePath.split(/[\\/]/).filter(Boolean).pop() || 'database.db'
+      const defaultFile = driverId === 'duckdb' ? 'analytics.duckdb' : 'database.db'
+      const baseName = filePath.split(/[\\/]/).filter(Boolean).pop() || defaultFile
       return {
         profile: attachFolderScope({
           id,
           name: name || baseName,
-          driver: 'sqlite',
+          driver,
           database: baseName,
           filePath,
           readOnly,
@@ -1883,7 +2220,7 @@ export function openStudioConnectionModal(
           database: d1DatabaseInp.value.trim() || 'main',
           d1AccountId: d1AccountInp.value.trim(),
           d1DatabaseId: d1DatabaseInp.value.trim(),
-          url: d1EndpointInp.value.trim() || undefined,
+          url: scrubStudioNetworkFormUrl(d1EndpointInp.value) || undefined,
           ssl: true,
           readOnly,
           colorTag,
@@ -1895,13 +2232,15 @@ export function openStudioConnectionModal(
     }
 
     if (driver === 'libsql') {
-      const url = libsqlUrlInp.value.trim()
+      const rawUrl = libsqlUrlInp.value.trim()
+      const { cleanUrl, defaultName } = sanitizeLibsqlFormUrlAndName(rawUrl)
+      const url = cleanUrl || rawUrl
       const authToken = authTokenInp.value
       const keepStoredToken = sameDriverAsStored && hadAuthToken
       const submission: ConnectionSubmission = {
         profile: attachFolderScope({
           id,
-          name: name || url || 'LibSQL',
+          name: name || defaultName,
           driver: 'libsql',
           database: libsqlDbInp.value.trim() || 'turso',
           url,
@@ -1947,12 +2286,36 @@ export function openStudioConnectionModal(
       const rdb = Number.parseInt(redisDbSel.value || '0', 10)
       profile.redisDb = Number.isFinite(rdb) && rdb >= 0 && rdb <= 15 ? rdb : 0
     }
-    if (driver === 'postgres' || driver === 'cockroachdb') {
+    if (isStudioOptionsDriver(driver)) {
       const pgOptions = optionsInp.value.trim()
       if (pgOptions) profile.options = pgOptions
     }
+    if (driver === 'mongodb') {
+      const mongoUrl = scrubStudioNetworkFormUrl(chUrlInp.value)
+      if (mongoUrl) {
+        profile.url = mongoUrl
+        try {
+          const parsedMongo = new URL(mongoUrl)
+          if (parsedMongo.hostname) profile.host = parsedMongo.hostname
+          if (parsedMongo.port) {
+            const mongoPort = Number.parseInt(parsedMongo.port, 10)
+            if (Number.isFinite(mongoPort) && mongoPort >= 1 && mongoPort <= 65535) {
+              profile.port = mongoPort
+            }
+          }
+          const mongoTls = parsedMongo.searchParams.get('tls') || parsedMongo.searchParams.get('ssl')
+          if (mongoTls === 'true') profile.ssl = true
+          else if (mongoTls === 'false') profile.ssl = false
+        } catch {
+          // Keep the scrubbed URL string as entered when URL parser fails
+        }
+      }
+    }
+    if (driver === 'oracle' && lastOracleParsedUrl) {
+      profile.url = scrubStudioNetworkFormUrl(lastOracleParsedUrl)
+    }
     if (driver === 'clickhouse') {
-      const chUrl = chUrlInp.value.trim()
+      const chUrl = scrubStudioNetworkFormUrl(chUrlInp.value)
       if (chUrl) {
         profile.url = chUrl
         try {
@@ -1989,6 +2352,13 @@ export function openStudioConnectionModal(
     profile.sslKeyPath = sslKeyPath
     profile.hasSslKeyPassphrase = Boolean(sslKeyPassphrase) || keepStoredSslPassphrase
     profile.sslRejectUnauthorized = sslRejectCheck.input.checked
+    if (
+      profile.ssl &&
+      profile.sslRejectUnauthorized === false &&
+      (profile.sslMode === undefined || profile.sslMode === 'auto')
+    ) {
+      profile.sslMode = 'require'
+    }
 
     const sshEnabled = sshCheck.input.checked
     profile.sshEnabled = sshEnabled
@@ -2023,14 +2393,31 @@ export function openStudioConnectionModal(
     return submission
   }
 
+  interface ResolvedUriParseTarget {
+    uri?: string
+    candidateId?: string
+    displayUri: string
+  }
+
   // ---- URI parsing ----
-  const parseUri = async (rawUri: string, clearMissingSecret = false): Promise<boolean> => {
-    const uri = rawUri.trim()
-    if (!uri) return false
+  const parseUri = async (
+    targetInput: string | ResolvedUriParseTarget,
+    clearMissingSecret = false
+  ): Promise<boolean> => {
+    const target: ResolvedUriParseTarget =
+      typeof targetInput === 'string'
+        ? { uri: targetInput.trim(), displayUri: targetInput.trim() }
+        : {
+            ...(targetInput.uri ? { uri: targetInput.uri.trim() } : {}),
+            ...(targetInput.candidateId ? { candidateId: targetInput.candidateId.trim() } : {}),
+            displayUri: targetInput.displayUri.trim(),
+          }
+    if (!target.candidateId && !target.uri) return false
     const seq = ++parseSeq
     setButtonLoading(parseBtn, true, 'Parsing...')
     try {
-      const res = await ctx.requestPlugin<ParseUriResponse>('connection.parseUri', { uri })
+      const payload = target.candidateId ? { candidateId: target.candidateId } : { uri: target.uri }
+      const res = await ctx.requestPlugin<ParseUriResponse>('connection.parseUri', payload)
       if (seq !== parseSeq || !isModalOpen()) return false
       if (!res.ok || !res.profile) {
         showNotice('error', res.error || 'Could not parse connection URI.')
@@ -2086,18 +2473,24 @@ export function openStudioConnectionModal(
       syncStudioSelectTooltip(redisDbSel, 'Redis Database Index')
       passwordInp.value = ''
       applyDriver(nextDriver, true)
+      lastOracleParsedUrl =
+        nextDriver === 'oracle' && typeof p.url === 'string' && p.url.trim()
+          ? scrubStudioNetworkFormUrl(p.url)
+          : ''
       if (p.name) nameInp.value = p.name
       if (p.readOnly !== undefined) roCheck.input.checked = Boolean(p.readOnly)
-      if (nextDriver === 'sqlite') {
+      if (isStudioFileDbDriver(nextDriver)) {
         filePathInp.value = p.filePath || ''
       } else if (nextDriver === 'libsql') {
-        libsqlUrlInp.value = p.url || ''
+        libsqlUrlInp.value = p.url
+          ? sanitizeLibsqlFormUrlAndName(p.url).cleanUrl || scrubStudioNetworkFormUrl(p.url)
+          : ''
         libsqlDbInp.value = p.database || ''
         authTokenInp.value = nextAuthToken
       } else if (nextDriver === 'd1') {
         d1AccountInp.value = p.d1AccountId || ''
         d1DatabaseInp.value = p.d1DatabaseId || ''
-        d1EndpointInp.value = p.url || ''
+        d1EndpointInp.value = p.url ? scrubStudioNetworkFormUrl(p.url) : ''
         authTokenInp.value = nextAuthToken
       } else {
         if (p.host) hostInp.value = p.host
@@ -2105,20 +2498,42 @@ export function openStudioConnectionModal(
         if (p.user !== undefined) userInp.value = p.user
         if (p.ssl !== undefined) {
           sslCheck.input.checked = Boolean(p.ssl)
-          if (p.ssl && sslModeSel.value === 'disable') {
-            sslModeSel.value = 'auto'
-            syncStudioSelectTooltip(sslModeSel, 'TLS Verification Mode')
-          }
         }
+        if (
+          p.sslMode === 'auto' ||
+          p.sslMode === 'disable' ||
+          p.sslMode === 'require' ||
+          p.sslMode === 'verify-ca' ||
+          p.sslMode === 'verify-full'
+        ) {
+          sslModeSel.value = p.sslMode
+          syncStudioSelectTooltip(sslModeSel, 'TLS Verification Mode')
+        } else if (p.ssl === false) {
+          sslModeSel.value = 'disable'
+          syncStudioSelectTooltip(sslModeSel, 'TLS Verification Mode')
+        } else if (p.ssl && sslModeSel.value === 'disable') {
+          sslModeSel.value = 'auto'
+          syncStudioSelectTooltip(sslModeSel, 'TLS Verification Mode')
+        }
+        if (p.sslRejectUnauthorized !== undefined) {
+          sslRejectCheck.input.checked = Boolean(p.sslRejectUnauthorized)
+        } else if (p.sslMode === 'require') {
+          sslRejectCheck.input.checked = false
+        } else {
+          sslRejectCheck.input.checked = true
+        }
+        reconcileSslCheckWithMode()
         if (nextDriver === 'redis') {
           redisDbSel.value = String(p.redisDb ?? 0)
           syncStudioSelectTooltip(redisDbSel, 'Redis Database Index')
         } else if (p.database !== undefined) {
           databaseInp.value = p.database
         }
-        if (nextDriver === 'clickhouse' && p.url) chUrlInp.value = p.url
+        if ((nextDriver === 'clickhouse' || nextDriver === 'mongodb') && p.url) {
+          chUrlInp.value = scrubStudioNetworkFormUrl(p.url)
+        }
         if (
-          (nextDriver === 'postgres' || nextDriver === 'cockroachdb') &&
+          isStudioOptionsDriver(nextDriver) &&
           typeof p.options === 'string' &&
           p.options.trim()
         ) {
@@ -2129,7 +2544,9 @@ export function openStudioConnectionModal(
       authTokenInp.placeholder =
         hadAuthToken && isEdit ? 'Stored token preserved (type to replace)' : 'Optional Bearer token'
       syncAuthTokenPlaceholder()
-      lastParsedUri = uri
+      lastParsedUri = target.uri || ''
+      lastParsedCandidateId = target.candidateId || ''
+      lastParsedDisplayUri = target.displayUri || (target.uri ? maskUriSecret(target.uri) : '')
       lastParsedPlaceholder = Boolean(res.placeholderPassword)
       placeholderPending = lastParsedPlaceholder && !passwordInp.value
       const engineLabelText = getStudioEngineMeta(nextDriver).label
@@ -2160,14 +2577,38 @@ export function openStudioConnectionModal(
   }
 
   const ensureUriParsed = async (): Promise<boolean> => {
-    const raw = uriInp.value.trim()
-    if (!raw || raw === lastParsedUri) return true
-    return await parseUri(raw, false)
+    const target = resolveUriInputForParse()
+    if (!target.candidateId && !target.uri) {
+      return true
+    }
+    if (
+      target.candidateId &&
+      lastParsedCandidateId &&
+      target.candidateId === lastParsedCandidateId &&
+      target.displayUri === lastParsedDisplayUri
+    ) {
+      return true
+    }
+    if (
+      target.uri &&
+      (target.uri === lastParsedUri ||
+        (lastParsedUri && target.displayUri === maskUriSecret(lastParsedUri)) ||
+        (lastParsedDisplayUri && target.displayUri === lastParsedDisplayUri))
+    ) {
+      return true
+    }
+    return await parseUri(target, false)
   }
 
   const validateRequiredFields = (): boolean => {
-    if (driver === 'sqlite' && !filePathInp.value.trim()) {
-      showNotice('error', 'Please enter a SQLite database file path.')
+    const driverId: string = driver
+    if (isStudioFileDbDriver(driverId) && !filePathInp.value.trim()) {
+      showNotice(
+        'error',
+        driverId === 'duckdb'
+          ? 'Please enter a DuckDB database file path (or :memory:).'
+          : 'Please enter a SQLite database file path.'
+      )
       return false
     }
     if (driver === 'libsql' && !libsqlUrlInp.value.trim()) {
@@ -2188,7 +2629,12 @@ export function openStudioConnectionModal(
         return false
       }
     }
-    if (driver !== 'sqlite' && driver !== 'libsql' && driver !== 'd1' && sshCheck.input.checked) {
+    if (
+      !isStudioFileDbDriver(driver) &&
+      driver !== 'libsql' &&
+      driver !== 'd1' &&
+      sshCheck.input.checked
+    ) {
       const sshHost = sshHostInp.value.trim()
       const sshUser = sshUserInp.value.trim()
       const sshKeyPath = sshKeyPathInp.value.trim()
@@ -2235,7 +2681,9 @@ export function openStudioConnectionModal(
   }
 
   const ensurePasswordBeforeSubmit = (): boolean => {
-    if (driver === 'sqlite' || driver === 'libsql' || driver === 'd1') return true
+    if (isStudioFileDbDriver(driver) || driver === 'libsql' || driver === 'd1') {
+      return true
+    }
     const typed = passwordInp.value
     if (placeholderPending && !typed) {
       showNotice(
@@ -2297,6 +2745,33 @@ export function openStudioConnectionModal(
           discoveredFiles.push(f)
         }
       }
+      const wsDirs = Array.isArray(wsRes?.scannedDirs)
+        ? wsRes.scannedDirs.map((d) => String(d || '').trim()).filter(Boolean)
+        : []
+      const folderScoped = wsRes?.folderScoped ?? Boolean(folder)
+      discoveredDockerScopeLabel =
+        wsRes?.dockerScopeLabel === 'Docker Context' || wsRes?.dockerIsLocal === false
+          ? 'Docker Context'
+          : 'Local Docker'
+      if (wsDirs.length > 0) {
+        discoveryScopeNote.title = wsDirs.join(', ')
+        if (folderScoped) {
+          const shortName = extractScannedFolderName(wsDirs[0])
+          discoveryScopeNote.textContent = `Scanned folder: ${shortName} (Compose files and matching containers inside this folder only).`
+        } else {
+          const folderSummary =
+            wsDirs.length === 1
+              ? '1 local workspace folder'
+              : `${wsDirs.length} local workspace folders`
+          if (discoveredDockerScopeLabel === 'Docker Context') {
+            discoveryScopeNote.textContent = `Scanned ${folderSummary} · Plus active Docker Context containers (non-workspace labeled "Other Docker Context").`
+          } else {
+            discoveryScopeNote.textContent = `Scanned ${folderSummary} · Plus local Docker containers (non-workspace labeled "Other Local Docker").`
+          }
+        }
+      } else {
+        discoveryScopeNote.title = ''
+      }
       discoveryCollapsed.env = null
       discoveryCollapsed.docker = null
       discoveryCollapsed.sqlite = null
@@ -2349,7 +2824,7 @@ export function openStudioConnectionModal(
       showNotice(
         res.ok ? 'success' : 'error',
         res.message ||
-          (res.ok ? 'Connection verified successfully!' : 'Connection test failed.')
+          (res.ok ? 'Connection verified' : 'Connection test failed.')
       )
     } catch (err: unknown) {
       showNotice('error', `Error: ${err instanceof Error ? err.message : String(err)}`)
@@ -2454,18 +2929,42 @@ export function openStudioConnectionModal(
     await ctx.onConnectionDeleted(editId)
   }
 
+  const resolveUriInputForParse = (): ResolvedUriParseTarget => {
+    const displayUri = uriInp.value.trim()
+    if (activeAutoDisplayUri !== null && displayUri === activeAutoDisplayUri) {
+      if (activeAutoCandidateId) {
+        return { candidateId: activeAutoCandidateId, displayUri }
+      }
+      if (activeAutoRawUri) {
+        return { uri: activeAutoRawUri, displayUri }
+      }
+    } else if (
+      activeAutoDisplayUri !== null ||
+      activeAutoCandidateId !== null ||
+      activeAutoRawUri !== null
+    ) {
+      clearActiveAutoUri()
+    }
+    return { uri: displayUri, displayUri }
+  }
+
+  uriInp.addEventListener('input', () => {
+    clearActiveAutoUri()
+  })
   parseBtn.addEventListener('click', () => {
     if (isBusy) return
-    if (!uriInp.value.trim()) {
+    const target = resolveUriInputForParse()
+    if (!target.candidateId && !target.uri) {
       showNotice('error', 'Paste a connection URI first.')
       return
     }
-    void parseUri(uriInp.value, false)
+    void parseUri(target, false)
   })
   uriInp.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault()
-      if (!isBusy && uriInp.value.trim()) void parseUri(uriInp.value, false)
+      const target = resolveUriInputForParse()
+      if (!isBusy && (target.candidateId || target.uri)) void parseUri(target, false)
     }
   })
   detectBtn.addEventListener('click', () => {
@@ -2528,28 +3027,43 @@ export function openStudioConnectionModal(
   if (editProfile) {
     nameInp.value = editProfile.name || ''
     const meta = getStudioEngineMeta(driver)
-    if (driver === 'sqlite') {
+    if (isStudioFileDbDriver(driver)) {
       filePathInp.value = editProfile.filePath || editProfile.database || ''
     } else if (driver === 'libsql') {
-      libsqlUrlInp.value = editProfile.url || ''
+      libsqlUrlInp.value = editProfile.url
+        ? sanitizeLibsqlFormUrlAndName(editProfile.url).cleanUrl ||
+          scrubStudioNetworkFormUrl(editProfile.url)
+        : ''
       libsqlDbInp.value = editProfile.database || ''
       if (hadAuthToken) authTokenInp.placeholder = 'Stored token preserved (type to replace)'
     } else if (driver === 'd1') {
       d1AccountInp.value = editProfile.d1AccountId || ''
       d1DatabaseInp.value = editProfile.d1DatabaseId || ''
-      d1EndpointInp.value = editProfile.url || ''
+      d1EndpointInp.value = editProfile.url ? scrubStudioNetworkFormUrl(editProfile.url) : ''
       if (hadAuthToken) authTokenInp.placeholder = 'Stored token preserved (type to replace)'
     } else {
-      hostInp.value = editProfile.host || 'localhost'
+      const editHost = editProfile.host || 'localhost'
+      hostInp.value = editHost
       portInp.value = String(editProfile.port || meta.defaultPort)
       userInp.value = editProfile.user || ''
-      sslCheck.input.checked = Boolean(editProfile.ssl)
+      const isCloudAutoSsl =
+        editProfile.ssl === undefined &&
+        editProfile.sslMode !== 'disable' &&
+        (driver === 'cockroachdb' || isCloudDatabaseHost(editHost))
+      sslCheck.input.checked =
+        editProfile.sslMode === 'disable'
+          ? false
+          : editProfile.ssl !== undefined
+            ? Boolean(editProfile.ssl)
+            : isCloudAutoSsl
       if (driver === 'redis') {
         redisDbSel.value = String(editProfile.redisDb ?? 0)
       } else {
         databaseInp.value = editProfile.database || ''
       }
-      if (driver === 'clickhouse') chUrlInp.value = editProfile.url || ''
+      if (driver === 'clickhouse' || driver === 'mongodb') {
+        chUrlInp.value = editProfile.url ? scrubStudioNetworkFormUrl(editProfile.url) : ''
+      }
       if (typeof editProfile.options === 'string') optionsInp.value = editProfile.options
       if (hadPassword) passwordInp.placeholder = 'Stored password preserved (type to replace)'
       sslModeSel.value = editProfile.sslMode || 'auto'
@@ -2559,7 +3073,10 @@ export function openStudioConnectionModal(
       if (editProfile.hasSslKeyPassphrase) {
         sslKeyPassphraseInp.placeholder = '(stored securely — leave blank to keep)'
       }
-      if (editProfile.sslRejectUnauthorized === false) sslRejectCheck.input.checked = false
+      sslRejectCheck.input.checked =
+        editProfile.sslRejectUnauthorized !== undefined
+          ? Boolean(editProfile.sslRejectUnauthorized)
+          : editProfile.sslMode !== 'require'
       sshCheck.input.checked = sshEnabledInitially
       sshHostInp.value = editProfile.sshHost || ''
       sshPortInp.value = String(editProfile.sshPort || 22)

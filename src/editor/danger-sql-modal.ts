@@ -28,8 +28,9 @@ function getFindingKindBadgeText(kind: DangerousSqlFinding['kind']): string {
 }
 
 export function openStudioDangerSqlModal(ctx: StudioDangerSqlModalContext): void {
-  const isProd = ctx.colorTag === 'prod'
-  const isStaging = ctx.colorTag === 'staging'
+  const envTag = String(ctx.colorTag || '').trim().toLowerCase()
+  const isProd = envTag === 'prod' || envTag === 'production'
+  const isStaging = envTag === 'staging'
 
   const modal = document.createElement('div')
   modal.className = 'datanoa-create-table-modal datanoa-danger-modal'
@@ -44,7 +45,7 @@ export function openStudioDangerSqlModal(ctx: StudioDangerSqlModalContext): void
 
   const badge = document.createElement('span')
   badge.className = 'datanoa-badge datanoa-badge-danger'
-  badge.textContent = `${ctx.findings.length} ${ctx.findings.length === 1 ? 'WARNING' : 'WARNINGS'}`
+  badge.textContent = `${ctx.findings.length} ${ctx.findings.length === 1 ? 'warning' : 'warnings'}`
 
   head.appendChild(titleSpan)
   head.appendChild(badge)
@@ -122,35 +123,37 @@ export function openStudioDangerSqlModal(ctx: StudioDangerSqlModalContext): void
   previewPre.textContent = ctx.sql.trim()
   body.appendChild(previewPre)
 
-  // Production Confirmation Gate (Strictly on prod connections)
-  let prodCheckbox: HTMLInputElement | null = null
-  let prodTextInput: HTMLInputElement | null = null
+  // Confirmation Gate (Checkbox for ALL environments; CONFIRM text required on prod)
+  const gateBox = document.createElement('div')
+  gateBox.className = isProd ? 'datanoa-modal-box error' : 'datanoa-modal-box warn'
+  gateBox.style.padding = '10px 12px'
+  gateBox.style.marginBottom = '12px'
 
+  const checkLabel = document.createElement('label')
+  checkLabel.style.display = 'flex'
+  checkLabel.style.alignItems = 'center'
+  checkLabel.style.gap = '8px'
+  checkLabel.style.fontSize = '12px'
+  checkLabel.style.cursor = 'pointer'
   if (isProd) {
-    const gateBox = document.createElement('div')
-    gateBox.className = 'datanoa-modal-box error'
-    gateBox.style.padding = '10px 12px'
-    gateBox.style.marginBottom = '12px'
-
-    const checkLabel = document.createElement('label')
-    checkLabel.style.display = 'flex'
-    checkLabel.style.alignItems = 'center'
-    checkLabel.style.gap = '8px'
-    checkLabel.style.fontSize = '12px'
-    checkLabel.style.cursor = 'pointer'
     checkLabel.style.marginBottom = '8px'
+  }
 
-    prodCheckbox = document.createElement('input')
-    prodCheckbox.type = 'checkbox'
-    prodCheckbox.className = 'datanoa-danger-confirm-check'
+  const confirmCheckbox = document.createElement('input')
+  confirmCheckbox.type = 'checkbox'
+  confirmCheckbox.className = 'datanoa-danger-confirm-check'
 
-    const checkText = document.createElement('span')
-    checkText.textContent = 'I understand this query modifies live production data'
+  const checkText = document.createElement('span')
+  checkText.textContent = isProd
+    ? 'I understand this query modifies live production data'
+    : 'I understand this query may permanently modify or delete data'
 
-    checkLabel.appendChild(prodCheckbox)
-    checkLabel.appendChild(checkText)
-    gateBox.appendChild(checkLabel)
+  checkLabel.appendChild(confirmCheckbox)
+  checkLabel.appendChild(checkText)
+  gateBox.appendChild(checkLabel)
 
+  let prodTextInput: HTMLInputElement | null = null
+  if (isProd) {
     prodTextInput = document.createElement('input')
     prodTextInput.type = 'text'
     prodTextInput.id = 'datanoa-danger-confirm-input'
@@ -171,10 +174,9 @@ export function openStudioDangerSqlModal(ctx: StudioDangerSqlModalContext): void
     inputHint.appendChild(document.createElement('span')).textContent = ' to unlock execution:'
     gateBox.appendChild(inputHint)
     gateBox.appendChild(prodTextInput)
-
-    body.appendChild(gateBox)
   }
 
+  body.appendChild(gateBox)
   modal.appendChild(body)
 
   // Modal Actions
@@ -190,22 +192,29 @@ export function openStudioDangerSqlModal(ctx: StudioDangerSqlModalContext): void
   executeBtn.type = 'button'
   executeBtn.className = 'datanoa-btn datanoa-btn-danger-solid datanoa-danger-execute-btn'
   executeBtn.textContent = 'Execute Anyway'
-  executeBtn.disabled = isProd // Disabled by default on prod
+  executeBtn.disabled = true
 
   actions.appendChild(cancelBtn)
   actions.appendChild(executeBtn)
   modal.appendChild(actions)
 
-  // Prod Gate Listener
-  if (isProd && prodCheckbox && prodTextInput) {
-    const updateGate = (): void => {
-      const isChecked = prodCheckbox?.checked ?? false
-      const isTextMatch = (prodTextInput?.value ?? '').trim() === 'CONFIRM'
-      executeBtn.disabled = !(isChecked && isTextMatch)
-    }
+  const updateGate = (): void => {
+    const isChecked = confirmCheckbox.checked
+    executeBtn.disabled = isProd
+      ? !(isChecked && (prodTextInput?.value ?? '').trim() === 'CONFIRM')
+      : !isChecked
+  }
 
-    prodCheckbox.addEventListener('change', updateGate)
+  confirmCheckbox.addEventListener('change', updateGate)
+  if (prodTextInput) {
     prodTextInput.addEventListener('input', updateGate)
+    prodTextInput.addEventListener('keydown', (e: KeyboardEvent) => {
+      if (e.key === 'Enter' && !executeBtn.disabled) {
+        e.preventDefault()
+        ctx.closeModal()
+        ctx.onConfirm()
+      }
+    })
   }
 
   cancelBtn.addEventListener('click', () => {

@@ -9,6 +9,12 @@ import {
   type SchemaObjectKind,
   type TableBrowseResult,
 } from '../protocol.js'
+import {
+  containsSensitiveSqlText,
+  sanitizeSqlResultForStorage,
+  scrubConnectionNameForStorage,
+  scrubSensitiveText,
+} from '../shared-sql-safety.js'
 import type { PersistedConsoleTabsState } from './console-tabs.js'
 
 export interface DocumentSessionLike {
@@ -157,29 +163,36 @@ export function readLocalStudioViewState(): StudioPersistedViewState | null {
 }
 
 function containsSensitiveSqlLiteral(sql: string): boolean {
-  return (
-    /\b(?:identified\s+by|set\s+password|password\s*=|secret\s*=|token\s*=|auth\s+['"]|alter\s+(?:user|role)\b[^;]*\bpassword\b|create\s+(?:user|role)\b[^;]*\b(?:password|identified\s+by)\b)/i.test(
-      sql
-    ) ||
-    /:\/\/[^:/\s?#@]*:[^\s/]+@/i.test(sql) ||
-    /[?&][^=&\s#]*(?:token|pass|pwd|secret|key|auth)[^=&\s#]*=/i.test(sql)
-  )
+  return containsSensitiveSqlText(sql)
 }
 
-function scrubSensitiveStringForLocalStorage(raw: unknown): string | undefined {
+export function scrubSensitiveStringForLocalStorage(raw: unknown): string | undefined {
   if (typeof raw !== 'string') return undefined
   const trimmed = raw.trim()
   if (!trimmed) return undefined
-  return trimmed
-    .replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^:/\s?#@]*):([^\s/]*)@/g, '$1$2@')
-    .replace(/([?&])([^=&\s#]*(?:token|pass|pwd|secret|key|auth)[^=&\s#]*)=([^&\s#]*)/gi, '$1$2=[REDACTED]')
-    .replace(/\b(password|passwd|pwd|secret|token|auth_token)\s*=\s*([^\s;&]+)/gi, '$1=[REDACTED]')
+  return scrubSensitiveText(trimmed, {
+    stripOpaqueFragment: false,
+    stripAllFragments: false,
+  })
+}
+
+function scrubWarmConnectionFieldForLocalStorage(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const trimmed = raw.trim()
+  if (!trimmed) return undefined
+  return scrubSensitiveText(trimmed, {
+    stripOpaqueFragment: true,
+    stripAllFragments: false,
+  })
 }
 
 function sanitizeStudioSnapshotForLocalStorage(
   snapshot: StudioPersistedViewState
 ): StudioPersistedViewState {
   const safe: StudioPersistedViewState = { ...snapshot }
+  if (typeof safe.activeWhereClause === 'string' && containsSensitiveSqlLiteral(safe.activeWhereClause)) {
+    safe.activeWhereClause = ''
+  }
   if (typeof safe.sqlDraft === 'string' && containsSensitiveSqlLiteral(safe.sqlDraft)) {
     delete safe.sqlDraft
   }
@@ -225,11 +238,14 @@ function sanitizeWarmConnections(conns: ConnectionProfile[] | undefined): Connec
     delete copy.sshPassword
     delete copy.sshPassphrase
     delete copy.sslKeyPassphrase
+    if (typeof copy.name === 'string') {
+      copy.name = scrubConnectionNameForStorage(copy.name)
+    }
     if (typeof copy.url === 'string') {
-      copy.url = scrubSensitiveStringForLocalStorage(copy.url)
+      copy.url = scrubWarmConnectionFieldForLocalStorage(copy.url)
     }
     if (typeof copy.options === 'string') {
-      copy.options = scrubSensitiveStringForLocalStorage(copy.options)
+      copy.options = scrubWarmConnectionFieldForLocalStorage(copy.options)
     }
     return copy as unknown as ConnectionProfile
   })
@@ -259,6 +275,9 @@ export function writeLocalStudioWarmCache(snapshot: StudioWarmCacheSnapshot): vo
         typeof snapshot.whereClause === 'string' && containsSensitiveSqlLiteral(snapshot.whereClause)
           ? ''
           : snapshot.whereClause,
+      lastSqlResult: snapshot.lastSqlResult
+        ? sanitizeSqlResultForStorage(snapshot.lastSqlResult)
+        : snapshot.lastSqlResult,
     }
     const clean = sanitizeJsonPayload(candidate) as StudioWarmCacheSnapshot
     let serialized = JSON.stringify(clean)

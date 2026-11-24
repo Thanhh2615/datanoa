@@ -16,6 +16,42 @@ import {
   getFolderSvgMarkup,
 } from './panel-utils.js'
 
+export function getExplorerObjectGroupLabel(driver) {
+  if (driver === 'redis') return 'Keyspaces'
+  if (driver === 'mongodb') return 'Collections'
+  return 'Tables'
+}
+
+export function buildCountQueryForObject(conn, obj) {
+  const driver = conn?.driver || 'sqlite'
+  if (driver === 'mongodb') {
+    return `db.getCollection(${JSON.stringify(obj.name)}).countDocuments({});`
+  }
+  const qTable = quoteTableRef(obj.name, obj.schema, driver)
+  return `SELECT COUNT(*) AS row_count FROM ${qTable};`
+}
+
+function buildSelectPreviewQuery(conn, obj) {
+  const driver = conn?.driver || 'sqlite'
+  if (driver === 'mongodb') {
+    return `db.getCollection(${JSON.stringify(obj.name)}).find({}).limit(100);`
+  }
+  const qTable = quoteTableRef(obj.name, obj.schema, driver)
+  if (driver === 'mssql') {
+    return `SELECT TOP 100 * FROM ${qTable};`
+  }
+  if (driver === 'oracle') {
+    return `SELECT * FROM ${qTable} FETCH FIRST 100 ROWS ONLY;`
+  }
+  return `SELECT * FROM ${qTable} LIMIT 100;`
+}
+
+function buildMongoSampleFieldValue(type) {
+  if (/INT|NUMBER|DECIMAL|NUMERIC|DOUBLE|FLOAT|LONG/i.test(String(type || ''))) return 0
+  if (/BOOL/i.test(String(type || ''))) return false
+  return ''
+}
+
 export function generateSqlForTable(kind, conn, obj, details) {
   const driver = conn?.driver || 'sqlite'
   if (driver === 'redis') {
@@ -28,10 +64,34 @@ export function generateSqlForTable(kind, conn, obj, details) {
     if (kind === 'update') return 'SET key_name "updated_value" KEEPTTL'
     return 'INFO keyspace'
   }
+  if (driver === 'mongodb') {
+    const colCall = `db.getCollection(${JSON.stringify(obj.name)})`
+    if (kind === 'select') {
+      return `${colCall}.find({}).limit(100);`
+    }
+    const cols = (details?.columns || []).filter((c) => c.name !== '_id' && !c.isAutoIncrement)
+    const sampleDoc = {}
+    for (const c of cols.length > 0 ? cols : [{ name: 'name', type: 'String' }]) {
+      sampleDoc[c.name] = buildMongoSampleFieldValue(c.type)
+    }
+    if (kind === 'insert') {
+      return `${colCall}.insertOne(${JSON.stringify(sampleDoc, null, 2)});`
+    }
+    if (kind === 'update') {
+      return `${colCall}.updateOne({ _id: "" }, { $set: ${JSON.stringify(sampleDoc, null, 2)} });`
+    }
+    return `${colCall}.find({}).limit(100);`
+  }
   const qTable = quoteTableRef(obj.name, obj.schema, driver)
   const cols = details?.columns || []
   if (kind === 'select') {
     const colList = cols.length > 0 ? cols.map((c) => quoteIdent(c.name, driver)).join(', ') : '*'
+    if (driver === 'mssql') {
+      return `SELECT TOP 100 ${colList}\nFROM ${qTable};`
+    }
+    if (driver === 'oracle') {
+      return `SELECT ${colList}\nFROM ${qTable}\nFETCH FIRST 100 ROWS ONLY;`
+    }
     return `SELECT ${colList}\nFROM ${qTable}\nLIMIT 100;`
   }
   if (kind === 'insert') {
@@ -53,7 +113,7 @@ export function generateSqlForTable(kind, conn, obj, details) {
       .join(' AND ')
     return `UPDATE ${qTable}\nSET ${setPart || 'col = :val'}\nWHERE ${wherePart || '1 = 0'};`
   }
-  return `SELECT * FROM ${qTable} LIMIT 100;`
+  return buildSelectPreviewQuery(conn, obj)
 }
 
 export function closeContextMenu() {
@@ -117,22 +177,23 @@ export function createPanelExplorerController(ctx) {
     if (!conn || !obj || conn.driver === 'redis') return
     const reqSeq = ++countRowsSeq
     const targetConnId = conn.id
-    const qTable = quoteTableRef(obj.name, obj.schema, conn.driver)
-    showBanner(`Counting rows in ${obj.name}...`, 'neutral')
+    const isMongo = conn.driver === 'mongodb'
+    const sql = buildCountQueryForObject(conn, obj)
+    showBanner(`Counting ${isMongo ? 'documents' : 'rows'} in ${obj.name}...`, 'neutral')
     try {
       const res = await rpc(
         'query.run',
         {
           connectionId: targetConnId,
           queryId: `panel_count_${Date.now()}`,
-          sql: `SELECT COUNT(*) AS row_count FROM ${qTable};`,
+          sql,
           maxRows: 1,
         },
         { timeoutMs: QUERY_TIMEOUT_MS }
       )
       if (reqSeq !== countRowsSeq || !getConnById(targetConnId)) return
       const cnt = res?.rows?.[0]?.[0]
-      showBanner(`${obj.name}: ${cnt ?? 0} row(s)`, 'success')
+      showBanner(`${obj.name}: ${cnt ?? 0} ${isMongo ? 'document(s)' : 'row(s)'}`, 'success')
     } catch (err) {
       if (reqSeq !== countRowsSeq || !getConnById(targetConnId)) return
       showBanner(`Count failed for ${obj.name}: ${err?.message || err}`, 'danger')
@@ -371,8 +432,8 @@ export function createPanelExplorerController(ctx) {
               const moreBtn = document.createElement('button')
               moreBtn.type = 'button'
               moreBtn.className = 'mini-btn'
-              moreBtn.title = 'Table Actions'
-              moreBtn.setAttribute('aria-label', 'Table Actions')
+              moreBtn.title = conn.driver === 'mongodb' ? 'Collection Actions' : 'Table Actions'
+              moreBtn.setAttribute('aria-label', moreBtn.title)
               moreBtn.textContent = '⋮'
               moreBtn.addEventListener('click', (e) => {
                 e.stopPropagation()
@@ -499,13 +560,18 @@ export function createPanelExplorerController(ctx) {
             childrenBox.appendChild(listEl)
           }
 
-          renderObjGroup(conn.driver === 'redis' ? 'Keyspaces' : 'Tables', tables, false)
+          renderObjGroup(getExplorerObjectGroupLabel(conn.driver), tables, false)
           renderObjGroup('Views', views, true)
 
           if (tables.length === 0 && views.length === 0) {
             const none = document.createElement('div')
             none.className = 'col-leaf'
-            none.textContent = objects.length === 0 ? 'No tables found' : 'No matching objects'
+            none.textContent =
+              objects.length === 0
+                ? conn.driver === 'mongodb'
+                  ? 'No collections found'
+                  : 'No tables found'
+                : 'No matching objects'
             childrenBox.appendChild(none)
           }
         }
@@ -841,10 +907,12 @@ export function createPanelExplorerController(ctx) {
     }
 
     const { conn, obj } = target
+    const isMongo = conn?.driver === 'mongodb'
+    const isRedis = conn?.driver === 'redis'
     if (target.type === 'object' && obj) {
       addHeader(`${conn.name} · ${obj.name}`)
       addItem('Open Data', () => selectTableAndOpen(conn.id, obj.name, obj.schema, true))
-      if (obj.kind === 'table' && conn.driver !== 'redis') {
+      if (obj.kind === 'table' && !isRedis && !isMongo) {
         addItem('Edit Table Structure', async () => {
           await selectTableAndOpen(conn.id, obj.name, obj.schema, false)
           switchTab('structure')
@@ -862,16 +930,17 @@ export function createPanelExplorerController(ctx) {
         switchTab('sql')
       })
       addSep()
-      addItem('Copy Table Name', () => copyText(obj.name, `Copied "${obj.name}"`))
-      if (conn.driver !== 'redis') {
-        addItem('Copy SELECT *', () => {
-          const qTable = quoteTableRef(obj.name, obj.schema, conn.driver)
-          void copyText(`SELECT * FROM ${qTable} LIMIT 100;`, `Copied SELECT for ${obj.name}`)
+      addItem(isMongo ? 'Copy Collection Name' : 'Copy Table Name', () =>
+        copyText(obj.name, `Copied "${obj.name}"`)
+      )
+      if (!isRedis) {
+        addItem(isMongo ? 'Copy Find Query' : 'Copy SELECT *', () => {
+          void copyText(buildSelectPreviewQuery(conn, obj), `Copied query for ${obj.name}`)
         })
-        addItem('Count Rows', () => countRowsForTable(conn, obj))
+        addItem(isMongo ? 'Count Docs' : 'Count Rows', () => countRowsForTable(conn, obj))
       }
       addSep()
-      addItem('Generate SELECT', async () => {
+      addItem(isMongo ? 'Generate Find' : 'Generate SELECT', async () => {
         await selectTableAndOpen(conn.id, obj.name, obj.schema, false)
         let details = state.tableDetails[makeTableKey(conn.id, obj.name, obj.schema)]
         if (!details) {
@@ -884,7 +953,7 @@ export function createPanelExplorerController(ctx) {
         setSqlText(generateSqlForTable('select', conn, obj, details))
         switchTab('sql')
       })
-      addItem('Generate INSERT', async () => {
+      addItem(isMongo ? 'Generate Insert' : 'Generate INSERT', async () => {
         await selectTableAndOpen(conn.id, obj.name, obj.schema, false)
         let details = state.tableDetails[makeTableKey(conn.id, obj.name, obj.schema)]
         if (!details) {
@@ -897,7 +966,7 @@ export function createPanelExplorerController(ctx) {
         setSqlText(generateSqlForTable('insert', conn, obj, details))
         switchTab('sql')
       })
-      addItem('Generate UPDATE', async () => {
+      addItem(isMongo ? 'Generate Update' : 'Generate UPDATE', async () => {
         await selectTableAndOpen(conn.id, obj.name, obj.schema, false)
         let details = state.tableDetails[makeTableKey(conn.id, obj.name, obj.schema)]
         if (!details) {
@@ -910,8 +979,12 @@ export function createPanelExplorerController(ctx) {
         setSqlText(generateSqlForTable('update', conn, obj, details))
         switchTab('sql')
       })
-      addItem('Generate CREATE DDL', async () => {
+      addItem(isMongo ? 'Inspect Schema & Indexes' : 'Generate CREATE DDL', async () => {
         await selectTableAndOpen(conn.id, obj.name, obj.schema, false)
+        if (isMongo) {
+          switchTab('structure')
+          return
+        }
         try {
           const ddlRes = await rpc(
             'schema.generateDdl',
@@ -930,18 +1003,18 @@ export function createPanelExplorerController(ctx) {
           showBanner(err?.message || 'Failed to generate DDL', 'danger')
         }
       })
-      if (conn.driver !== 'redis') {
+      if (!isRedis) {
         addSep()
         if (obj.kind === 'table') {
           addItem(
-            'Truncate Table...',
+            isMongo ? 'Truncate Collection...' : 'Truncate Table...',
             () => openDangerTableModal('truncate', conn, obj),
             true,
             Boolean(conn.readOnly)
           )
         }
         addItem(
-          obj.kind === 'view' ? 'Drop View...' : 'Drop Table...',
+          isMongo ? 'Drop Collection...' : obj.kind === 'view' ? 'Drop View...' : 'Drop Table...',
           () => openDangerTableModal('drop', conn, obj),
           true,
           Boolean(conn.readOnly)
@@ -951,8 +1024,8 @@ export function createPanelExplorerController(ctx) {
     } else {
       addHeader(conn.name)
       addItem('Open in Full Studio ↗', () => openFullStudio({ connectionId: conn.id }))
-      if (conn.driver !== 'redis' && !conn.readOnly) {
-        addItem('+ New Table...', () => {
+      if (!isRedis && !conn.readOnly) {
+        addItem(isMongo ? '+ New Collection...' : '+ New Table...', () => {
           if (state.activeConnectionId !== conn.id) activateConnection(conn.id)
           openCreateTableModal()
         })

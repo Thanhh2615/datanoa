@@ -14,6 +14,7 @@ body:
       options:
         - Data Grid & Inline Editing
         - SQL Console & Autocomplete
+        - AI SQL Assistant (Completion / Fix / EXPLAIN)
         - Visual Table Structure Designer (Schema Inspector)
         - Connection Manager & Auto-Discovery
         - Database Engine / Driver Support

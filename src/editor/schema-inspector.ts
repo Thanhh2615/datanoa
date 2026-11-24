@@ -52,6 +52,7 @@ export interface SchemaInspectorOptions {
   dialect?: DatabaseDriverType
   readOnly?: boolean
   referenceTables?: string[]
+  isManualTxActive?: () => boolean
   onInsertDdl?: (ddl: string) => void
   onCopyDdl?: (ddl: string) => void
   onOpenDdlInConsole?: (ddl: string) => void
@@ -61,6 +62,54 @@ export interface SchemaInspectorOptions {
   ) => void | Promise<void>
   onDropTable?: () => void
   onTruncateTable?: () => void
+}
+
+const SQLITE_REBUILD_ACTIVE_TX_ERROR =
+  'Cannot rebuild SQLite/LibSQL/D1 table while a manual transaction is active (SQLite ignores PRAGMA foreign_keys = OFF inside a transaction). Commit or rollback the transaction first.'
+
+const MSSQL_COLUMN_TYPES: readonly string[] = [
+  'INT',
+  'BIGINT',
+  'SMALLINT',
+  'TINYINT',
+  'BIT',
+  'DECIMAL(10,2)',
+  'NUMERIC(10,2)',
+  'MONEY',
+  'FLOAT',
+  'NVARCHAR(255)',
+  'NVARCHAR(MAX)',
+  'VARCHAR(255)',
+  'CHAR(1)',
+  'DATE',
+  'DATETIME2',
+  'DATETIMEOFFSET',
+  'UNIQUEIDENTIFIER',
+  'VARBINARY(MAX)',
+  'XML',
+]
+
+const ORACLE_COLUMN_TYPES: readonly string[] = [
+  'NUMBER(10)',
+  'NUMBER(19)',
+  'NUMBER(10,2)',
+  'VARCHAR2(255)',
+  'NVARCHAR2(255)',
+  'CHAR(1)',
+  'CLOB',
+  'NCLOB',
+  'BLOB',
+  'DATE',
+  'TIMESTAMP',
+  'TIMESTAMP WITH TIME ZONE',
+  'RAW(16)',
+  'FLOAT',
+]
+
+function getSuggestedColumnTypesForDialect(dialect: DatabaseDriverType): readonly string[] {
+  if (dialect === 'mssql') return MSSQL_COLUMN_TYPES
+  if (dialect === 'oracle') return ORACLE_COLUMN_TYPES
+  return COMMON_COLUMN_TYPES
 }
 
 export class SchemaInspectorView {
@@ -94,6 +143,7 @@ export class SchemaInspectorView {
   private onInsertDdl?: (ddl: string) => void
   private onCopyDdl?: (ddl: string) => void
   private onOpenDdlInConsole?: (ddl: string) => void
+  private isManualTxActive?: () => boolean
   private onApplyMigration?: (
     statements: string[],
     draft: TableStructureDraft
@@ -122,12 +172,129 @@ export class SchemaInspectorView {
     if (options.dialect) this.currentDialect = options.dialect
     this.readOnly = Boolean(options.readOnly)
     if (options.referenceTables) this.referenceTables = [...options.referenceTables]
+    this.isManualTxActive = options.isManualTxActive
     this.onInsertDdl = options.onInsertDdl
     this.onCopyDdl = options.onCopyDdl
     this.onOpenDdlInConsole = options.onOpenDdlInConsole
     this.onApplyMigration = options.onApplyMigration
     this.onDropTable = options.onDropTable
     this.onTruncateTable = options.onTruncateTable
+  }
+
+  private buildDraftWithOriginAndTriggers(details: TableDetails): TableStructureDraft {
+    const normalized = normalizeTableDetailsForDraft(details)
+    normalized.columns = normalized.columns.map((col, i) => {
+      const origCol = details.columns?.[i]
+      if (!origCol) return col
+      return {
+        ...col,
+        ...(origCol.collate ? { collate: origCol.collate } : {}),
+        ...(origCol.generatedExpression !== undefined
+          ? { generatedExpression: origCol.generatedExpression }
+          : {}),
+        ...(origCol.generatedStorage !== undefined
+          ? { generatedStorage: origCol.generatedStorage }
+          : {}),
+      }
+    })
+    normalized.indexes = normalized.indexes.map((idx, i) => {
+      const orig = details.indexes?.[i]
+      if (!orig) return idx
+      return {
+        ...idx,
+        ...(orig.origin ? { origin: orig.origin } : {}),
+        ...(Array.isArray(orig.columnSpecs)
+          ? { columnSpecs: orig.columnSpecs.map((s) => ({ ...s })) }
+          : {}),
+        ...(orig.onConflict ? { onConflict: orig.onConflict } : {}),
+        ...(orig.whereClause !== undefined ? { whereClause: orig.whereClause } : {}),
+        ...(orig.partial !== undefined ? { partial: Boolean(orig.partial) } : {}),
+        ...(orig.isExpression !== undefined ? { isExpression: Boolean(orig.isExpression) } : {}),
+      }
+    })
+    if (Array.isArray(details.triggers)) {
+      normalized.triggers = details.triggers.map((t) => ({ name: t.name, sql: t.sql }))
+    }
+    if (Array.isArray(details.inboundForeignKeys)) {
+      normalized.inboundForeignKeys = details.inboundForeignKeys.map((fk) => ({ ...fk }))
+    }
+    if (Array.isArray(details.checkConstraints)) {
+      normalized.checkConstraints = [...details.checkConstraints]
+    }
+    if (details.strict !== undefined) {
+      normalized.strict = Boolean(details.strict)
+    }
+    if (details.withoutRowid !== undefined) {
+      normalized.withoutRowid = Boolean(details.withoutRowid)
+    }
+    const draft = createInitialTableDraft(normalized)
+    draft.columns.forEach((col, i) => {
+      const origCol = details.columns?.[i]
+      if (origCol?.collate && !col.collate) {
+        col.collate = origCol.collate
+      }
+      if (origCol?.generatedExpression !== undefined && col.generatedExpression === undefined) {
+        col.generatedExpression = origCol.generatedExpression
+      }
+      if (origCol?.generatedStorage !== undefined && col.generatedStorage === undefined) {
+        col.generatedStorage = origCol.generatedStorage
+      }
+    })
+    draft.indexes.forEach((idx, i) => {
+      const orig = details.indexes?.[i]
+      if (!orig) return
+      if (orig.origin && !idx.origin) {
+        idx.origin = orig.origin
+      }
+      if (Array.isArray(orig.columnSpecs) && !idx.columnSpecs) {
+        idx.columnSpecs = orig.columnSpecs.map((s) => ({ ...s }))
+      }
+      if (orig.onConflict && !idx.onConflict) {
+        idx.onConflict = orig.onConflict
+      }
+      if (orig.whereClause !== undefined && idx.whereClause === undefined) {
+        idx.whereClause = orig.whereClause
+      }
+      if (orig.partial !== undefined && idx.partial === undefined) {
+        idx.partial = Boolean(orig.partial)
+      }
+      if (orig.isExpression !== undefined && idx.isExpression === undefined) {
+        idx.isExpression = Boolean(orig.isExpression)
+      }
+    })
+    if (Array.isArray(details.triggers) && !draft.triggers) {
+      draft.triggers = details.triggers.map((t) => ({ name: t.name, sql: t.sql }))
+    }
+    if (Array.isArray(details.inboundForeignKeys) && !draft.inboundForeignKeys) {
+      draft.inboundForeignKeys = details.inboundForeignKeys.map((fk) => ({ ...fk }))
+    }
+    if (Array.isArray(details.checkConstraints) && !draft.checkConstraints) {
+      draft.checkConstraints = [...details.checkConstraints]
+    }
+    if (details.strict !== undefined && draft.strict === undefined) {
+      draft.strict = Boolean(details.strict)
+    }
+    if (details.withoutRowid !== undefined && draft.withoutRowid === undefined) {
+      draft.withoutRowid = Boolean(details.withoutRowid)
+    }
+    return draft
+  }
+
+  private computeValidatedPlan(draft: TableStructureDraft): TableMigrationPlan {
+    const plan = validateTableStructureDraft(draft, this.currentDialect, this.referenceTables)
+    if (
+      (this.currentDialect === 'sqlite' ||
+        this.currentDialect === 'libsql' ||
+        this.currentDialect === 'd1') &&
+      plan.isRebuild &&
+      this.isManualTxActive?.()
+    ) {
+      if (!plan.errors.includes(SQLITE_REBUILD_ACTIVE_TX_ERROR)) {
+        plan.errors.push(SQLITE_REBUILD_ACTIVE_TX_ERROR)
+      }
+      plan.valid = false
+    }
+    return plan
   }
 
   private stopMigrationTimer(): void {
@@ -381,12 +548,19 @@ export class SchemaInspectorView {
   }
 
   public setDialect(dialect: DatabaseDriverType): void {
+    const prevDialect = this.currentDialect
     this.currentDialect = dialect
+    if (this.currentDetails && (prevDialect === 'mongodb' || dialect === 'mongodb')) {
+      this.render()
+      return
+    }
     this.refreshStageControls()
   }
 
   public setReadOnly(readOnly: boolean): void {
-    this.readOnly = Boolean(readOnly)
+    const next = Boolean(readOnly)
+    if (this.readOnly === next) return
+    this.readOnly = next
     if (this.currentDetails) {
       this.render()
     }
@@ -449,7 +623,7 @@ export class SchemaInspectorView {
     this.readOnlyObject = null
     this.readOnlyObjectDdl = ''
     this.currentDetails = details
-    this.draft = createInitialTableDraft(normalizeTableDetailsForDraft(details))
+    this.draft = this.buildDraftWithOriginAndTriggers(details)
     this.initDraftColumnRefs(this.draft)
     this.showMigrationPreview = false
     this.closeConfirmModal(true)
@@ -523,6 +697,19 @@ export class SchemaInspectorView {
 
   private async executeValidatedMigration(plan: TableMigrationPlan): Promise<void> {
     if (this.isMigrating || !this.draft || !plan.valid || plan.statements.length === 0) return
+    if (
+      (this.currentDialect === 'sqlite' ||
+        this.currentDialect === 'libsql' ||
+        this.currentDialect === 'd1') &&
+      plan.isRebuild &&
+      this.isManualTxActive?.()
+    ) {
+      if (this.confirmModalRefs) {
+        this.confirmModalRefs.errorBox.textContent = SQLITE_REBUILD_ACTIVE_TX_ERROR
+        this.confirmModalRefs.errorBox.style.display = 'block'
+      }
+      return
+    }
 
     this.isMigrating = true
     if (this.confirmModalRefs) {
@@ -575,17 +762,15 @@ export class SchemaInspectorView {
     }
   }
 
+  private static migrationConfirmTitleSeq = 0
+
   private openMigrationConfirmModal(): void {
     if (!this.draft || this.isMigrating) return
     const count = countTableStructureChanges(this.draft)
     if (count === 0) return
 
     this.closeConfirmModal()
-    const plan = validateTableStructureDraft(
-      this.draft,
-      this.currentDialect,
-      this.referenceTables
-    )
+    const plan = this.computeValidatedPlan(this.draft)
 
     const backdrop = document.createElement('div')
     backdrop.className = 'datanoa-modal-backdrop'
@@ -598,9 +783,11 @@ export class SchemaInspectorView {
     const head = document.createElement('div')
     head.className = 'datanoa-modal-head'
     const headTitle = document.createElement('span')
+    headTitle.id = `datanoa-struct-confirm-title-${++SchemaInspectorView.migrationConfirmTitleSeq}`
     headTitle.textContent = plan.valid
       ? `Confirm Schema Migration — ${this.draft.originalTableName}`
       : `Invalid Schema Changes — ${this.draft.originalTableName}`
+    backdrop.setAttribute('aria-labelledby', headTitle.id)
     const dialectBadge = document.createElement('span')
     dialectBadge.className = 'datanoa-badge datanoa-badge-pk'
     dialectBadge.textContent = `${this.currentDialect.toUpperCase()} · ${count} change(s)`
@@ -699,7 +886,7 @@ export class SchemaInspectorView {
     copyBtn.addEventListener?.('click', () => {
       if (this.isMigrating) return
       this.copyTextToClipboard(plan.statements.join('\n\n'))
-      copyBtn.textContent = 'Copied!'
+      copyBtn.textContent = 'Copied'
       setTimeout(() => {
         if (!this.isMigrating) {
           copyBtn.textContent = 'Copy SQL'
@@ -777,7 +964,7 @@ export class SchemaInspectorView {
   public revertStagedChanges(): void {
     if (!this.currentDetails || this.isMigrating) return
     this.closeConfirmModal()
-    this.draft = createInitialTableDraft(normalizeTableDetailsForDraft(this.currentDetails))
+    this.draft = this.buildDraftWithOriginAndTriggers(this.currentDetails)
     this.initDraftColumnRefs(this.draft)
     this.showMigrationPreview = false
     this.render()
@@ -943,11 +1130,7 @@ export class SchemaInspectorView {
   private refreshStageControls(): void {
     if (!this.draft) return
     const count = countTableStructureChanges(this.draft)
-    const plan = validateTableStructureDraft(
-      this.draft,
-      this.currentDialect,
-      this.referenceTables
-    )
+    const plan = this.computeValidatedPlan(this.draft)
     const {
       titleInput,
       applyBtn,
@@ -1121,7 +1304,7 @@ export class SchemaInspectorView {
       this.currentDetails
 
     if (!this.draft) {
-      this.draft = createInitialTableDraft(normalizeTableDetailsForDraft(this.currentDetails))
+      this.draft = this.buildDraftWithOriginAndTriggers(this.currentDetails)
       this.initDraftColumnRefs(this.draft)
     }
 
@@ -1129,6 +1312,7 @@ export class SchemaInspectorView {
       !this.readOnly &&
       kind === 'table' &&
       this.currentDialect !== 'redis' &&
+      this.currentDialect !== 'mongodb' &&
       Boolean(this.onApplyMigration) &&
       typeof this.container.addEventListener === 'function'
 
@@ -1349,7 +1533,12 @@ export class SchemaInspectorView {
         const dropBtn = document.createElement('button')
         dropBtn.type = 'button'
         dropBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-btn-danger datanoa-struct-drop-btn'
-        dropBtn.textContent = kind === 'view' ? 'Drop View' : 'Drop'
+        dropBtn.textContent =
+          this.currentDialect === 'mongodb'
+            ? 'Drop Collection'
+            : kind === 'view'
+              ? 'Drop View'
+              : 'Drop'
         dropBtn.addEventListener?.('click', () => {
           if (this.isMigrating) return
           this.onDropTable?.()
@@ -1398,7 +1587,7 @@ export class SchemaInspectorView {
       copyMigrationBtn.addEventListener?.('click', () => {
         const sql = this.stageUiRefs.previewPre?.textContent || ''
         this.copyTextToClipboard(sql)
-        copyMigrationBtn.textContent = 'Copied!'
+        copyMigrationBtn.textContent = 'Copied'
         setTimeout(() => {
           copyMigrationBtn.textContent = 'Copy SQL'
         }, 1200)
@@ -1478,7 +1667,7 @@ export class SchemaInspectorView {
       if (typeof copyBtn.addEventListener === 'function') {
         copyBtn.addEventListener('click', () => {
           this.copyTextToClipboard(ddlText)
-          copyBtn.textContent = 'Copied!'
+          copyBtn.textContent = 'Copied'
           setTimeout(() => {
             copyBtn.textContent = 'Copy DDL'
           }, 1400)
@@ -1521,6 +1710,15 @@ export class SchemaInspectorView {
         scrollBody.scrollTop = prevScrollTop
       }
       return
+    }
+
+    if (this.currentDialect === 'mongodb' && !this.readOnly) {
+      const mongoNotice = document.createElement('div')
+      mongoNotice.className = 'datanoa-modal-box'
+      mongoNotice.style.marginBottom = '10px'
+      mongoNotice.textContent =
+        'MongoDB collections are schemaless — SQL ALTER structure editing is disabled; inferred fields, indexes, and collection actions remain available.'
+      scrollBody.appendChild(mongoNotice)
     }
 
     scrollBody.appendChild(buildDdlCard())
@@ -1748,7 +1946,7 @@ export class SchemaInspectorView {
       const typeTd = document.createElement('td')
       const { wrap: typeWrap } = this.createComboCellInput({
         value: col.dataType,
-        items: COMMON_COLUMN_TYPES,
+        items: getSuggestedColumnTypesForDialect(this.currentDialect),
         placeholder: 'TEXT, INTEGER...',
         className: 'datanoa-struct-cell-input datanoa-col-type-input',
         disabled: isDeleted,
@@ -2272,7 +2470,14 @@ export class SchemaInspectorView {
           const btn = document.createElement('button')
           btn.type = 'button'
           btn.className = 'datanoa-btn datanoa-btn-sm datanoa-idx-drop-btn'
-          if (idx.isPrimary || /^sqlite_autoindex_/i.test(idx.name)) {
+          const isUniqueAutoIndex =
+            idx.origin === 'u' || (!idx.isPrimary && idx.unique && /^sqlite_autoindex_/i.test(idx.name))
+          const isPkLocked = Boolean(
+            idx.isPrimary ||
+              idx.origin === 'pk' ||
+              (/^sqlite_autoindex_/i.test(idx.name) && !isUniqueAutoIndex)
+          )
+          if (isPkLocked) {
             btn.textContent = 'Locked'
             btn.disabled = true
             btn.title = 'Primary/auto index is managed via column PK checkboxes'
@@ -2359,7 +2564,7 @@ export class SchemaInspectorView {
     copyBtn.textContent = 'Copy DDL'
     copyBtn.addEventListener?.('click', () => {
       this.copyTextToClipboard(ddlText)
-      copyBtn.textContent = 'Copied!'
+      copyBtn.textContent = 'Copied'
       setTimeout(() => {
         copyBtn.textContent = 'Copy DDL'
       }, 1400)

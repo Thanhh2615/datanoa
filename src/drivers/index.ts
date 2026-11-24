@@ -6,6 +6,9 @@ import { RedisDriver } from './redis/driver'
 import { ClickHouseDriver } from './clickhouse/driver'
 import { LibsqlDriver } from './libsql/driver'
 import { D1Driver } from './d1/driver'
+import { MssqlDriver } from './mssql/driver'
+import { OracleDriver } from './oracle/driver'
+import { MongoDriver } from './mongodb/driver'
 
 export * from './common/driver'
 export * from './common/update-builder'
@@ -17,6 +20,9 @@ export { RedisDriver, RedisSession, tokenizeRedisCommandScript } from './redis/d
 export { ClickHouseDriver, ClickHouseSession } from './clickhouse/driver'
 export { LibsqlDriver, LibsqlSession } from './libsql/driver'
 export { D1Driver, D1Session } from './d1/driver'
+export { MssqlDriver, MssqlSession } from './mssql/driver'
+export { OracleDriver, OracleSession } from './oracle/driver'
+export { MongoDriver, MongoSession } from './mongodb/driver'
 
 const registry = new Map<DriverType, IDatabaseDriver>()
 
@@ -50,6 +56,15 @@ export function getDriver(type: DriverType): IDatabaseDriver {
         break
       case 'd1':
         driver = new D1Driver()
+        break
+      case 'mssql':
+        driver = new MssqlDriver()
+        break
+      case 'oracle':
+        driver = new OracleDriver()
+        break
+      case 'mongodb':
+        driver = new MongoDriver()
         break
       default: {
         const exhaustive: never = type

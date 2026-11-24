@@ -311,7 +311,10 @@ export class SqliteSession implements IDatabaseSession {
       dialect: 'sqlite',
       schemaName: targetSchema,
       objects,
-      getObjectDdl: (object) => this.getObjectDdl(object.name, object.kind, targetSchema),
+      getObjectDdl: (object) =>
+        object.kind === 'table' || object.kind === 'view'
+          ? this.fetchTableOrViewDdl(object.name, targetSchema, false)
+          : this.getObjectDdl(object.name, object.kind, targetSchema),
     })
   }
 
@@ -385,10 +388,14 @@ export class SqliteSession implements IDatabaseSession {
       originalColumnType,
     })
 
-    const runRes = await this.sendToWorker<{ changes: number }>('run', {
+    const runRes = await this.sendToWorker<{ changes: number; txState?: TransactionState }>('run', {
       sql,
       params: updateParams,
     })
+
+    if (runRes.txState) {
+      this.txState = runRes.txState
+    }
 
     if (runRes.changes === 0) {
       throw new DatabaseDriverError(
@@ -509,6 +516,14 @@ export class SqliteSession implements IDatabaseSession {
   }
 
   async getDdl(table: string, schema?: string): Promise<string> {
+    return this.fetchTableOrViewDdl(table, schema, true)
+  }
+
+  private async fetchTableOrViewDdl(
+    table: string,
+    schema: string | undefined,
+    includeTriggers: boolean
+  ): Promise<string> {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'sqlite')
     }
@@ -517,14 +532,15 @@ export class SqliteSession implements IDatabaseSession {
       targetSchema && targetSchema.toLowerCase() !== 'main'
         ? `${quoteIdentForDialect(targetSchema, 'sqlite')}.sqlite_master`
         : 'sqlite_master'
+    const attachedTypes = includeTriggers ? "'index', 'trigger'" : "'index'"
 
     const rows = await this.sendToWorker<Array<{ type: string; sql: string | null }>>('all', {
       sql: `
         SELECT type, sql
         FROM ${masterTable}
-        WHERE ((type IN ('table', 'view') AND name = ?) OR (type = 'index' AND tbl_name = ?))
+        WHERE ((type IN ('table', 'view') AND name = ?) OR (type IN (${attachedTypes}) AND tbl_name = ?))
           AND sql IS NOT NULL
-        ORDER BY CASE WHEN type IN ('table', 'view') THEN 0 ELSE 1 END, name ASC;
+        ORDER BY CASE WHEN type IN ('table', 'view') THEN 0 WHEN type = 'index' THEN 1 ELSE 2 END, name ASC;
       `,
       params: [table, table],
     })

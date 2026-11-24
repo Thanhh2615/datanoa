@@ -2,6 +2,7 @@
 // Side Panel Data Grid: toolbar, staging bar, virtualized row window, inline editor,
 // column resize/auto-fit/pin/hide, find highlights, export, and value inspector.
 
+import { formatJsonPreservingNumbers } from '../shared-grid-paste.js'
 import {
   formatExportData,
   formatSelectionAsOutput,
@@ -21,6 +22,12 @@ import {
   syncSelectTooltip,
   syncVirtualTableWindow,
 } from './panel-utils.js'
+
+export function shouldDisableEditStructureButton({ busy, isView, activeTable, driver }) {
+  return Boolean(
+    busy || isView || !activeTable || driver === 'redis' || driver === 'mongodb'
+  )
+}
 
 export function createPanelDataGridController(ctx) {
   const {
@@ -225,10 +232,17 @@ export function createPanelDataGridController(ctx) {
 
     const editStructBtn = $('editTableStructureBtn')
     if (editStructBtn) {
-      editStructBtn.disabled = busy || isView || !state.activeTable || conn?.driver === 'redis'
+      editStructBtn.disabled = shouldDisableEditStructureButton({
+        busy,
+        isView,
+        activeTable: state.activeTable,
+        driver: conn?.driver,
+      })
       editStructBtn.title = isView
         ? 'Views are read-only — inspect DDL in Structure tab'
-        : 'Edit Table Structure (ALTER TABLE)'
+        : conn?.driver === 'mongodb'
+          ? 'MongoDB collections are schemaless — inspect inferred fields in Structure tab'
+          : 'Edit Table Structure (ALTER TABLE)'
     }
 
     $('addRowBtn').disabled = busy || isConnRo || isView || !pd
@@ -907,7 +921,10 @@ export function createPanelDataGridController(ctx) {
           pd.primaryKey?.length > 0 ? pd.primaryKey : [pd.columns[0]?.name].filter(Boolean)
         const pks = {}
         for (const pk of pkCols) pks[pk] = entry.data[pk]
-        state.stagedDeletes.set(rk, pks)
+        state.stagedDeletes.set(rk, {
+          primaryKeys: pks,
+          originalRow: { ...entry.data },
+        })
         state.stagedUpdates.delete(rk)
       }
     }
@@ -2046,7 +2063,23 @@ export function createPanelDataGridController(ctx) {
         originalRow: item.originalRow,
       })
     }
-    const deletes = Array.from(state.stagedDeletes.values())
+    const deletes = []
+    const deleteRows = []
+    for (const item of state.stagedDeletes.values()) {
+      const hasWrappedShape =
+        item &&
+        typeof item === 'object' &&
+        'primaryKeys' in item &&
+        item.primaryKeys &&
+        typeof item.primaryKeys === 'object'
+      const pks = hasWrappedShape ? item.primaryKeys : item
+      deletes.push(pks)
+      deleteRows.push(
+        hasWrappedShape && item.originalRow && typeof item.originalRow === 'object'
+          ? { ...item.originalRow }
+          : { ...pks }
+      )
+    }
     const inserts = state.stagedInserts.map((r) => {
       const clean = {}
       for (const [k, v] of Object.entries(r.values)) {
@@ -2062,7 +2095,7 @@ export function createPanelDataGridController(ctx) {
       ...(state.activeSchema ? { schema: state.activeSchema } : {}),
       ...(inserts.length > 0 ? { inserts } : {}),
       ...(updates.length > 0 ? { updates } : {}),
-      ...(deletes.length > 0 ? { deletes } : {}),
+      ...(deletes.length > 0 ? { deletes, deleteRows } : {}),
     }
   }
 
@@ -2125,6 +2158,16 @@ export function createPanelDataGridController(ctx) {
     const col = pd.columns.find((c) => c.name === state.selectedCol)
     const val = getEffectiveCellValue(entry.rowKey, entry.data, state.selectedCol)
     drawer.hidden = false
+    drawer.classList.toggle('is-collapsed', Boolean(state.inspectorCollapsed))
+    if (state.inspectorCollapsed) {
+      drawer.style.height = ''
+    } else {
+      const savedPx = Number(window.localStorage?.getItem('datanoa.panelValueInspectorPx'))
+      const targetPx = Number.isFinite(savedPx) && savedPx >= 148 ? Math.round(savedPx) : 220
+      const boxH = drawer.parentElement?.getBoundingClientRect?.().height
+      const maxAllowed = boxH && Number.isFinite(boxH) && boxH > 0 ? Math.max(148, Math.floor(boxH * 0.76)) : 560
+      drawer.style.height = `${Math.max(148, Math.min(maxAllowed, targetPx))}px`
+    }
     $('valueInspectorTitle').textContent =
       `${state.activeTable}.${state.selectedCol} (${col?.type || 'TEXT'})`
     $('valueInspectorBody').hidden = state.inspectorCollapsed
@@ -2160,7 +2203,7 @@ export function createPanelDataGridController(ctx) {
           (trimmed.startsWith('[') && trimmed.endsWith(']'))
         ) {
           try {
-            displayStr = JSON.stringify(JSON.parse(trimmed), null, 2)
+            displayStr = formatJsonPreservingNumbers(trimmed, 2)
           } catch {
             displayStr = s
           }

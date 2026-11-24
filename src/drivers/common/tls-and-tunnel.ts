@@ -43,6 +43,35 @@ const SSH_KILL_GRACE_MS = 1200
 const INVALID_TOKEN_CHARS = /[\s\u0000-\u001f\u007f]/
 const INVALID_CONTROL_CHARS = /[\u0000-\u001f\u007f]/
 
+export const ACTIONABLE_TLS_CERT_ERROR_HINT =
+  'Add a trusted CA certificate in Studio (TLS/mTLS), or edit this connection and uncheck "Verify TLS certificate" (or use ?sslmode=require) if you trust this server.'
+
+const ACTIONABLE_TLS_CERT_ERROR_RE =
+  /(?:self[\s-]signed certificate(?:\s+in\s+certificate\s+chain)?|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_VERIFY_LEAF_SIGNATURE|UNABLE_TO_GET_ISSUER_CERT_LOCALLY|ERR_TLS_CERT_ALTNAME_INVALID|unable to verify the first certificate|Hostname\/IP does not match certificate'?s altnames)/i
+
+const ACTIONABLE_TLS_CERT_ERROR_CODES: ReadonlySet<string> = new Set([
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'ERR_TLS_CERT_ALTNAME_INVALID',
+])
+
+/**
+ * Appends a concise, actionable remediation hint to Node.js TLS certificate verification errors
+ * without weakening fail-closed defaults or duplicating the hint if already present.
+ */
+export function appendActionableTlsErrorHint(message: string, errorCode?: string): string {
+  if (typeof message !== 'string' || message.trim().length === 0) return message
+  if (message.includes(ACTIONABLE_TLS_CERT_ERROR_HINT)) return message
+  const normalizedCode = typeof errorCode === 'string' ? errorCode.trim().toUpperCase() : ''
+  const isTlsCertError =
+    ACTIONABLE_TLS_CERT_ERROR_RE.test(message) ||
+    (normalizedCode.length > 0 && ACTIONABLE_TLS_CERT_ERROR_CODES.has(normalizedCode))
+  if (!isTlsCertError) return message
+  return `${message.trimEnd()} — ${ACTIONABLE_TLS_CERT_ERROR_HINT}`
+}
+
 function trimOptionalPath(value: string | undefined): string | undefined {
   if (typeof value !== 'string') return undefined
   const trimmed = value.trim()
@@ -81,8 +110,10 @@ export async function resolveEffectiveTlsOptions(
   const explicitMode =
     profile.sslMode !== undefined && profile.sslMode !== 'auto' ? profile.sslMode : undefined
   const hasCustomCerts = Boolean(caPath || certPath || keyPath)
+  const hasExplicitRejectUnauthorized =
+    profile.sslRejectUnauthorized !== undefined && profile.ssl !== false
 
-  if (!hasCustomCerts && !explicitMode) return undefined
+  if (!hasCustomCerts && !explicitMode && !hasExplicitRejectUnauthorized) return undefined
 
   const options: tls.ConnectionOptions = {}
   if (caPath) options.ca = await readPemFile(caPath, 'SSL CA certificate')
@@ -123,7 +154,11 @@ export async function resolveEffectiveTlsOptions(
       }
       break
     default:
-      options.rejectUnauthorized = profile.sslRejectUnauthorized ?? true
+      options.rejectUnauthorized = Boolean(profile.sslRejectUnauthorized ?? true)
+      if (options.rejectUnauthorized !== false && trimmedServername.length > 0) {
+        options.checkServerIdentity = (_hostname: string, cert: tls.PeerCertificate) =>
+          tls.checkServerIdentity(trimmedServername, cert)
+      }
       break
   }
 
@@ -132,6 +167,28 @@ export async function resolveEffectiveTlsOptions(
 
 /** Backwards-compatible alias used by drivers that only need the TLS options */
 export const buildTlsConnectionOptions = resolveEffectiveTlsOptions
+
+/**
+ * Builds fail-closed default TLS connection options (`rejectUnauthorized: true`),
+ * binding DNS-only SNI and `checkServerIdentity` to `originalServername` when provided
+ * (for example when tunnelling via SSH over 127.0.0.1).
+ */
+export function buildDefaultTlsOptions(originalServername?: string): tls.ConnectionOptions {
+  const opts: tls.ConnectionOptions = { rejectUnauthorized: true }
+  const raw = typeof originalServername === 'string' ? originalServername.trim() : ''
+  const clean =
+    raw.startsWith('[') && raw.endsWith(']') && net.isIP(raw.slice(1, -1)) === 6
+      ? raw.slice(1, -1)
+      : raw
+  if (clean.length > 0) {
+    if (net.isIP(clean) === 0) {
+      opts.servername = clean
+    }
+    opts.checkServerIdentity = (_hostname: string, cert: tls.PeerCertificate) =>
+      tls.checkServerIdentity(clean, cert)
+  }
+  return opts
+}
 
 function requireSafeToken(value: unknown, label: string, forbidden: readonly string[] = []): string {
   if (typeof value !== 'string') {

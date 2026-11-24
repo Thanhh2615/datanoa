@@ -1,5 +1,12 @@
-import type { ConnectionProfile, DatabaseDriverType } from '../../protocol'
+import type { ConnectionProfile, DatabaseDriverType, SslMode } from '../../protocol'
+import {
+  findCredentialAuthorityAtIndex,
+  isCloudDatabaseHost,
+  isSensitiveUriParamKey,
+} from '../../shared-sql-safety.js'
 import { BUILTIN_ENGINE_CATALOG } from './engine-catalog'
+
+export { isCloudDatabaseHost }
 
 export type EngineKind = 'file' | 'sql' | 'kv' | 'http'
 
@@ -60,7 +67,15 @@ function decodeUriPart(raw: string): string {
   try {
     return decodeURIComponent(raw)
   } catch {
-    return raw
+    return raw.replace(/(?:%[0-9A-Fa-f]{2})+/g, (seq) => {
+      try {
+        return decodeURIComponent(seq)
+      } catch {
+        return seq.replace(/%[0-7][0-9A-Fa-f]/g, (byte) =>
+          String.fromCharCode(parseInt(byte.slice(1), 16))
+        )
+      }
+    })
   }
 }
 
@@ -73,8 +88,19 @@ function parsePort(portStr: string, fallbackPort: number): number | null {
   return parsed
 }
 
-function resolveTlsFlag(params: URLSearchParams, defaultSsl: boolean): boolean {
-  const sslMode = (params.get('sslmode') ?? params.get('ssl-mode'))?.trim().toLowerCase()
+export interface ResolvedTlsSettings {
+  ssl: boolean
+  sslMode?: SslMode
+  sslRejectUnauthorized?: boolean
+  error?: string
+}
+
+export function resolveTlsSettings(
+  params: URLSearchParams,
+  defaultSsl: boolean
+): ResolvedTlsSettings {
+  const rawSslMode = (params.get('sslmode') || params.get('ssl-mode') || '').trim()
+  const sslMode = rawSslMode.toLowerCase()
   if (
     sslMode === 'disable' ||
     sslMode === 'disabled' ||
@@ -83,23 +109,51 @@ function resolveTlsFlag(params: URLSearchParams, defaultSsl: boolean): boolean {
     sslMode === 'off' ||
     sslMode === 'no'
   ) {
-    return false
+    return { ssl: false, sslMode: 'disable' }
   }
-  if (
-    sslMode === 'require' ||
-    sslMode === 'required' ||
-    sslMode === 'verify-full' ||
-    sslMode === 'verify-ca' ||
-    sslMode === 'verify_ca' ||
-    sslMode === 'verify_identity'
-  ) {
-    return true
+  if (sslMode === 'verify-full' || sslMode === 'verify_identity') {
+    return { ssl: true, sslMode: 'verify-full', sslRejectUnauthorized: true }
+  }
+  if (sslMode === 'verify-ca' || sslMode === 'verify_ca') {
+    return { ssl: true, sslMode: 'verify-ca', sslRejectUnauthorized: true }
+  }
+  if (sslMode === 'require' || sslMode === 'required') {
+    return { ssl: true, sslMode: 'require', sslRejectUnauthorized: false }
+  }
+  if (sslMode === 'prefer' || sslMode === 'allow') {
+    return { ssl: true }
+  }
+  if (sslMode.length > 0) {
+    return {
+      ssl: true,
+      sslMode: 'verify-full',
+      sslRejectUnauthorized: true,
+      error: `Unsupported sslmode: ${rawSslMode}`,
+    }
   }
 
   for (const key of ['tls', 'ssl', 'secure']) {
     const raw = params.get(key)
     if (raw === null) continue
-    const normalized = raw.trim().toLowerCase()
+    const trimmedRaw = raw.trim()
+    if (trimmedRaw.startsWith('{')) {
+      try {
+        const parsedJson = JSON.parse(trimmedRaw) as unknown
+        if (parsedJson && typeof parsedJson === 'object' && !Array.isArray(parsedJson)) {
+          const rec = parsedJson as Record<string, unknown>
+          if (rec.rejectUnauthorized === true) {
+            return { ssl: true, sslMode: 'verify-full', sslRejectUnauthorized: true }
+          }
+          if (rec.rejectUnauthorized === false) {
+            return { ssl: true, sslMode: 'require', sslRejectUnauthorized: false }
+          }
+        }
+        return { ssl: true }
+      } catch {
+        return { ssl: true }
+      }
+    }
+    const normalized = trimmedRaw.toLowerCase()
     if (
       normalized === 'false' ||
       normalized === '0' ||
@@ -108,51 +162,12 @@ function resolveTlsFlag(params: URLSearchParams, defaultSsl: boolean): boolean {
       normalized === 'off' ||
       normalized === 'no'
     ) {
-      return false
+      return { ssl: false }
     }
-    if (normalized.length > 0) return true
+    if (normalized.length > 0) return { ssl: true }
   }
 
-  return defaultSsl
-}
-
-const CLOUD_DB_HOST_SUFFIXES: readonly string[] = [
-  '.supabase.co',
-  '.supabase.com',
-  '.neon.tech',
-  '.cockroachlabs.cloud',
-  '.rds.amazonaws.com',
-  '.aivencloud.com',
-  '.render.com',
-  '.railway.app',
-  '.rlwy.net',
-  '.database.azure.com',
-  '.ondigitalocean.com',
-  '.tidbcloud.com',
-  '.psdb.cloud',
-  '.planetscale.com',
-  '.upstash.io',
-  '.turso.io',
-  '.clickhouse.cloud',
-  '.clever-cloud.com',
-  '.elephantsql.com',
-  '.timescale.com',
-  '.xata.sh',
-  '.tembo.io',
-]
-
-export function isCloudDatabaseHost(hostname: string): boolean {
-  const lower = (hostname || '').trim().toLowerCase()
-  if (
-    !lower ||
-    lower === 'localhost' ||
-    lower === '127.0.0.1' ||
-    lower === '::1' ||
-    lower === '[::1]'
-  ) {
-    return false
-  }
-  return CLOUD_DB_HOST_SUFFIXES.some((suffix) => lower.endsWith(suffix))
+  return { ssl: defaultSsl }
 }
 
 export function isSupabaseHost(hostname: string): boolean {
@@ -169,6 +184,7 @@ const PLACEHOLDER_PASSWORD_RE =
 interface StandardUrlResult {
   url: URL
   placeholderPassword: boolean
+  authoritySeedList?: string
 }
 
 function safeParseUrl(candidate: string): URL | null {
@@ -179,20 +195,71 @@ function safeParseUrl(candidate: string): URL | null {
   }
 }
 
+function isValidAuthoritySeedItem(rawHostPort: string): boolean {
+  const m =
+    /^(\[[0-9a-fA-F:%.]+\]|[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?)(?::(\d{1,5}))?$/.exec(
+      rawHostPort
+    )
+  if (!m) return false
+  if (/^\d+$/.test(m[1])) return false
+  if (m[2]) {
+    const port = Number(m[2])
+    if (port < 1 || port > 65535) return false
+  }
+  return true
+}
+
+export function splitCommaSeedAuthority(hostAndRest: string): {
+  primaryHostAndRest: string
+  authoritySeedList?: string
+} {
+  const delimIdx = hostAndRest.search(/[/?#]/)
+  const rawAuthority = delimIdx >= 0 ? hostAndRest.slice(0, delimIdx) : hostAndRest
+  if (!rawAuthority.includes(',')) {
+    return { primaryHostAndRest: hostAndRest }
+  }
+  const items = rawAuthority.split(',')
+  if (items.length < 2 || !items.every(isValidAuthoritySeedItem)) {
+    return { primaryHostAndRest: hostAndRest }
+  }
+  const suffix = delimIdx >= 0 ? hostAndRest.slice(delimIdx) : ''
+  return {
+    primaryHostAndRest: `${items[0]}${suffix}`,
+    authoritySeedList: rawAuthority,
+  }
+}
+
+function replaceAuthorityHostPreservingPath(
+  scrubbedUrlString: string,
+  authoritySeedList?: string
+): string {
+  if (!authoritySeedList) return scrubbedUrlString
+  const schemeEnd = scrubbedUrlString.indexOf('://')
+  const afterScheme = scrubbedUrlString.slice(schemeEnd + 3)
+  const delimIdx = afterScheme.search(/[/?#]/)
+  const suffix = delimIdx >= 0 ? afterScheme.slice(delimIdx) : ''
+  return `${scrubbedUrlString.slice(0, schemeEnd + 3)}${authoritySeedList}${suffix}`
+}
+
 function buildPasswordNormalizedUrl(
   prefix: string,
   rawPass: string,
   hostAndRest: string
 ): StandardUrlResult | null {
+  const { primaryHostAndRest, authoritySeedList } = splitCommaSeedAuthority(hostAndRest)
   const trimmedPass = rawPass.trim()
   if (!trimmedPass || PLACEHOLDER_PASSWORD_RE.test(trimmedPass)) {
-    const parsed = safeParseUrl(`${prefix}@${hostAndRest}`)
-    return parsed ? { url: parsed, placeholderPassword: true } : null
+    const parsed = safeParseUrl(`${prefix}@${primaryHostAndRest}`)
+    return parsed
+      ? { url: parsed, placeholderPassword: true, ...(authoritySeedList ? { authoritySeedList } : {}) }
+      : null
   }
   const parsed = safeParseUrl(
-    `${prefix}:${encodeURIComponent(decodeUriPart(rawPass))}@${hostAndRest}`
+    `${prefix}:${encodeURIComponent(decodeUriPart(rawPass))}@${primaryHostAndRest}`
   )
-  return parsed ? { url: parsed, placeholderPassword: false } : null
+  return parsed
+    ? { url: parsed, placeholderPassword: false, ...(authoritySeedList ? { authoritySeedList } : {}) }
+    : null
 }
 
 function normalizeRawUriInput(rawUri: string): string {
@@ -216,11 +283,66 @@ function normalizeRawUriInput(rawUri: string): string {
   return value
 }
 
+function recoverAuthorityUrl(rawUri: string): StandardUrlResult | null {
+  const schemeEnd = rawUri.indexOf('://')
+  if (schemeEnd <= 0) return null
+
+  const schemePrefix = rawUri.slice(0, schemeEnd + 3)
+  const body = rawUri.slice(schemeEnd + 3)
+  const delimIdx = body.search(/[:/?#@[\]]/)
+  if (delimIdx < 0 || body[delimIdx] !== ':') return null
+
+  const atIdx = findCredentialAuthorityAtIndex(schemePrefix, body, delimIdx)
+  if (atIdx <= delimIdx) return null
+
+  return buildPasswordNormalizedUrl(
+    `${schemePrefix}${body.slice(0, delimIdx)}`,
+    body.slice(delimIdx + 1, atIdx),
+    body.slice(atIdx + 1)
+  )
+}
+
+function recoverCommaSeedAuthorityUrl(rawUri: string): StandardUrlResult | null {
+  const m =
+    /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)(?:([^:/?#\s@[\]]*)@)?([^/?#\s@]+(?:,[^/?#\s@]+)+)(.*)$/.exec(
+      rawUri
+    )
+  if (!m) return null
+  const { primaryHostAndRest, authoritySeedList } = splitCommaSeedAuthority(`${m[3]}${m[4]}`)
+  if (!authoritySeedList) return null
+  const prefix = m[2] !== undefined ? `${m[1]}${m[2]}@` : m[1]
+  const parsed = safeParseUrl(`${prefix}${primaryHostAndRest}`)
+  return parsed ? { url: parsed, placeholderPassword: false, authoritySeedList } : null
+}
+
+function shouldAttemptAuthorityRecovery(direct: URL, rawUri: string): boolean {
+  if (
+    (direct.protocol === 'mongodb:' || direct.protocol === 'mongodb+srv:') &&
+    direct.hostname.includes(',')
+  ) {
+    return true
+  }
+  if (direct.hostname.startsWith('[')) {
+    return false
+  }
+  const hashLooksLikePasswordTail =
+    direct.hash.includes('@') && !/^#[^#@=]*=/.test(direct.hash)
+  if (direct.password.length > 0) {
+    return hashLooksLikePasswordTail
+  }
+  if (direct.username.length > 0) {
+    return false
+  }
+  const hasColonBeforeDelim = /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^:/?#\s@[\]]*:/.test(rawUri)
+  return hasColonBeforeDelim && (direct.pathname + direct.search + direct.hash).includes('@')
+}
+
 function parseStandardUrl(rawUri: string): StandardUrlResult | null {
   // Always normalize bracketed userinfo passwords BEFORE calling new URL(), because inputs
   // without '#' (e.g. postgres://user:[MyPass]@host) parse cleanly in WHATWG URL and would
   // otherwise keep literal '[' and ']' inside url.password.
-  const bracketMatch = /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^:/?#\s@]*):\[([^\]]*)\]@(.+)$/.exec(rawUri)
+  const bracketMatch =
+    /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^:/?#\s@[\]]*):\[([^\]]*)\]@(.+)$/.exec(rawUri)
   if (bracketMatch) {
     const normalized = buildPasswordNormalizedUrl(
       bracketMatch[1],
@@ -231,26 +353,19 @@ function parseStandardUrl(rawUri: string): StandardUrlResult | null {
   }
 
   const direct = safeParseUrl(rawUri)
-  const suspiciousAuthorityMisparse =
-    direct !== null &&
-    ((direct.hash.length > 0 && direct.hash.includes('@')) ||
-      (direct.search.length > 0 && direct.search.includes('@') && !direct.password))
-  if (direct && !suspiciousAuthorityMisparse) {
+  if (direct && !shouldAttemptAuthorityRecovery(direct, rawUri)) {
     return { url: direct, placeholderPassword: false }
   }
 
-  // Recover URIs whose unencoded '#' or '?' in password truncated the authority or confused new URL()
-  const authorityMatch =
-    /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^:/?#\s@]*):(.*)@((?:\[[0-9a-fA-F:%.]+\]|[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?)(?::\d{1,5})?(?:\/[^?#@]*)?(?:\?[^@]*)?(?:#[^@]*)?)$/.exec(
-      rawUri
-    )
-  if (authorityMatch) {
-    const normalized = buildPasswordNormalizedUrl(
-      authorityMatch[1],
-      authorityMatch[2],
-      authorityMatch[3]
-    )
-    if (normalized) return normalized
+  // Recover URIs whose unencoded '/', '#' or '?' in password truncated the authority or confused new URL()
+  const recovered = recoverAuthorityUrl(rawUri)
+  if (recovered) {
+    return recovered
+  }
+
+  const commaRecovered = recoverCommaSeedAuthorityUrl(rawUri)
+  if (commaRecovered) {
+    return commaRecovered
   }
 
   return direct ? { url: direct, placeholderPassword: false } : null
@@ -302,17 +417,19 @@ const SQL_URI_SPECS: Readonly<Record<string, SqlUriSpec>> = {
   cockroach: { driver: 'cockroachdb', defaultPort: 26257, defaultDatabase: 'defaultdb', defaultSsl: true },
   mysql: { driver: 'mysql', defaultPort: 3306, defaultDatabase: '', defaultSsl: false },
   mariadb: { driver: 'mariadb', defaultPort: 3306, defaultDatabase: '', defaultSsl: false },
-  mssql: { driver: 'mssql' as DatabaseDriverType, defaultPort: 1433, defaultDatabase: 'master', defaultSsl: false },
-  sqlserver: { driver: 'mssql' as DatabaseDriverType, defaultPort: 1433, defaultDatabase: 'master', defaultSsl: false },
-  oracle: { driver: 'oracle' as DatabaseDriverType, defaultPort: 1521, defaultDatabase: 'FREEPDB1', defaultSsl: false },
-  mongodb: { driver: 'mongodb' as DatabaseDriverType, defaultPort: 27017, defaultDatabase: 'admin', defaultSsl: false },
-  'mongodb+srv': { driver: 'mongodb' as DatabaseDriverType, defaultPort: 27017, defaultDatabase: 'admin', defaultSsl: true },
+  mssql: { driver: 'mssql', defaultPort: 1433, defaultDatabase: 'master', defaultSsl: false },
+  sqlserver: { driver: 'mssql', defaultPort: 1433, defaultDatabase: 'master', defaultSsl: false },
+  oracle: { driver: 'oracle', defaultPort: 1521, defaultDatabase: 'FREEPDB1', defaultSsl: false },
+  oracledb: { driver: 'oracle', defaultPort: 1521, defaultDatabase: 'FREEPDB1', defaultSsl: false },
+  mongodb: { driver: 'mongodb', defaultPort: 27017, defaultDatabase: 'admin', defaultSsl: false },
+  'mongodb+srv': { driver: 'mongodb', defaultPort: 27017, defaultDatabase: 'admin', defaultSsl: true },
 }
 
 function parseSqlNetworkUri(
   url: URL,
   spec: SqlUriSpec,
-  placeholderFromUrl = false
+  placeholderFromUrl = false,
+  authoritySeedList?: string
 ): ParsedConnectionUri {
   if (!url.hostname) {
     return { ok: false, error: `Missing host in ${spec.driver} connection URI.` }
@@ -324,14 +441,49 @@ function parseSqlNetworkUri(
   }
 
   const rawDb = decodeUriPart(url.pathname.replace(/^\/+/, ''))
-  const database = rawDb || spec.defaultDatabase
+  const hasOracleQueryTarget =
+    spec.driver === 'oracle' &&
+    ['sid', 'serviceName', 'service'].some((key) =>
+      Boolean((url.searchParams.get(key) || '').trim())
+    )
+  const database = rawDb || (hasOracleQueryTarget ? '' : spec.defaultDatabase)
   const user = url.username ? decodeUriPart(url.username) : undefined
   const rawPassword = url.password ? decodeUriPart(url.password) : undefined
   const { password, placeholderPassword } = resolveUriPassword(rawPassword, placeholderFromUrl)
   const defaultSsl = spec.defaultSsl || isCloudDatabaseHost(url.hostname)
-  const ssl = resolveTlsFlag(url.searchParams, defaultSsl)
+  let tls = resolveTlsSettings(url.searchParams, defaultSsl)
+  if (tls.error) {
+    return { ok: false, error: tls.error }
+  }
+  if (
+    spec.driver === 'mssql' &&
+    tls.sslMode === undefined &&
+    !url.searchParams.has('ssl') &&
+    !url.searchParams.has('tls')
+  ) {
+    const encRaw = (url.searchParams.get('encrypt') || '').trim().toLowerCase()
+    const trustRaw = (url.searchParams.get('trustServerCertificate') || '').trim().toLowerCase()
+    if (encRaw === 'false' || encRaw === '0' || encRaw === 'no') {
+      tls = { ssl: false, sslMode: 'disable' }
+    } else if (encRaw === 'true' || encRaw === '1' || encRaw === 'yes') {
+      if (trustRaw === 'true' || trustRaw === '1' || trustRaw === 'yes') {
+        tls = { ssl: true, sslMode: 'require', sslRejectUnauthorized: false }
+      } else if (trustRaw === 'false' || trustRaw === '0' || trustRaw === 'no') {
+        tls = { ssl: true, sslMode: 'verify-full', sslRejectUnauthorized: true }
+      } else {
+        tls = { ssl: true }
+      }
+    }
+  }
   const rawOptions = url.searchParams.get('options')
   const options = rawOptions && rawOptions.trim().length > 0 ? rawOptions.trim() : undefined
+  const hasOracleUrlParams =
+    spec.driver === 'oracle' &&
+    ['schema', 'sid', 'serviceName', 'service'].some((key) => url.searchParams.has(key))
+  const networkUrl =
+    spec.driver === 'mongodb' || hasOracleUrlParams
+      ? scrubParsedStandardUrl(url, authoritySeedList)
+      : undefined
 
   return buildSuccessResult(
     {
@@ -340,7 +492,12 @@ function parseSqlNetworkUri(
       host: url.hostname,
       port,
       database,
-      ssl,
+      ssl: tls.ssl,
+      ...(tls.sslMode !== undefined ? { sslMode: tls.sslMode } : {}),
+      ...(tls.sslRejectUnauthorized !== undefined
+        ? { sslRejectUnauthorized: tls.sslRejectUnauthorized }
+        : {}),
+      ...(networkUrl ? { url: networkUrl } : {}),
       ...(options ? { options } : {}),
     },
     { user, password, placeholderPassword }
@@ -376,7 +533,11 @@ function parseRedisUri(
   }
 
   const defaultSsl = scheme === 'rediss' || isCloudDatabaseHost(url.hostname)
-  const ssl = resolveTlsFlag(url.searchParams, defaultSsl)
+  const tls = resolveTlsSettings(url.searchParams, defaultSsl)
+  if (tls.error) {
+    return { ok: false, error: tls.error }
+  }
+  const { ssl } = tls
   const user = url.username ? decodeUriPart(url.username) : undefined
   const queryPassword = url.searchParams.get('password') || undefined
   const rawPassword = url.password ? decodeUriPart(url.password) : queryPassword
@@ -391,6 +552,10 @@ function parseRedisUri(
       database: String(redisDb),
       redisDb,
       ssl,
+      ...(tls.sslMode !== undefined ? { sslMode: tls.sslMode } : {}),
+      ...(tls.sslRejectUnauthorized !== undefined
+        ? { sslRejectUnauthorized: tls.sslRejectUnauthorized }
+        : {}),
     },
     { user, password, placeholderPassword }
   )
@@ -398,7 +563,7 @@ function parseRedisUri(
 
 function parseClickHouseUri(
   url: URL,
-  scheme: string,
+  scheme: 'clickhouse' | 'clickhouses' | 'http' | 'https',
   placeholderFromUrl = false
 ): ParsedConnectionUri {
   if (!url.hostname) {
@@ -409,14 +574,18 @@ function parseClickHouseUri(
     scheme === 'https' ||
     scheme === 'clickhouses' ||
     (scheme !== 'http' && isCloudDatabaseHost(url.hostname))
-  const ssl = resolveTlsFlag(url.searchParams, defaultSsl)
-  const defaultPortMap: Readonly<Record<string, number>> = {
+  const chTls = resolveTlsSettings(url.searchParams, defaultSsl)
+  if (chTls.error) {
+    return { ok: false, error: chTls.error }
+  }
+  const { ssl } = chTls
+  const defaultPortMap: Readonly<Record<'clickhouse' | 'clickhouses' | 'http' | 'https', number>> = {
     clickhouse: 8123,
     clickhouses: 8443,
     http: 80,
     https: 443,
   }
-  const port = parsePort(url.port, defaultPortMap[scheme] ?? 8123)
+  const port = parsePort(url.port, defaultPortMap[scheme])
   if (port === null) {
     return { ok: false, error: 'Invalid port in ClickHouse connection URI.' }
   }
@@ -439,6 +608,10 @@ function parseClickHouseUri(
       port,
       database,
       ssl,
+      ...(chTls.sslMode !== undefined ? { sslMode: chTls.sslMode } : {}),
+      ...(chTls.sslRejectUnauthorized !== undefined
+        ? { sslRejectUnauthorized: chTls.sslRejectUnauthorized }
+        : {}),
     },
     { user, password, placeholderPassword }
   )
@@ -450,7 +623,11 @@ function parseLibsqlUri(url: URL): ParsedConnectionUri {
   }
 
   const defaultSsl = url.protocol !== 'http:'
-  const ssl = resolveTlsFlag(url.searchParams, defaultSsl)
+  const libTls = resolveTlsSettings(url.searchParams, defaultSsl)
+  if (libTls.error) {
+    return { ok: false, error: libTls.error }
+  }
+  const { ssl } = libTls
   const port = parsePort(url.port, ssl ? 443 : 80)
   if (port === null) {
     return { ok: false, error: 'Invalid port in LibSQL connection URI.' }
@@ -465,6 +642,12 @@ function parseLibsqlUri(url: URL): ParsedConnectionUri {
     url.searchParams.get('auth_token') ??
     url.searchParams.get('jwt')
   const authToken = authTokenRaw && authTokenRaw.length > 0 ? authTokenRaw : undefined
+  const validated = validateLibsqlEndpointUrl(normalizedUrl, {
+    hasAuthToken: Boolean(authToken),
+  })
+  if (!validated.ok) {
+    return { ok: false, error: validated.error }
+  }
 
   return buildSuccessResult(
     {
@@ -481,8 +664,8 @@ function parseLibsqlUri(url: URL): ParsedConnectionUri {
 }
 
 const D1_ENDPOINT_CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/
-const SENSITIVE_URL_QUERY_PARAM_RE =
-  /^(?:token|auth_?token|api_?key|key|secret|password|pwd|access_?token|bearer)$/i
+export const SENSITIVE_URL_QUERY_PARAM_RE =
+  /^(?:(?:.*[-_])?(?:token|pass(?:word|wd|phrase)?|pwd|secret|api[-_]?key|apikey|key|jwt|bearer|credentials?|auth[-_]?token|authtoken|authorization|sig(?:nature)?)|(?:auth|access|refresh|id|api|client|session|private|secret|signing|encryption)[_-]?(?:token|key|secret|pass(?:word|wd|phrase)?|pwd)|.*(?:pass(?:word|wd|phrase)|secret|token|apikey|privatekey))$/i
 
 function isD1LoopbackHostname(hostname: string): boolean {
   const host = hostname.trim().toLowerCase()
@@ -533,7 +716,7 @@ export function validateD1EndpointUrl(
     }
   }
   for (const key of parsed.searchParams.keys()) {
-    if (SENSITIVE_URL_QUERY_PARAM_RE.test(key)) {
+    if (isSensitiveUriParamKey(key)) {
       return {
         ok: false,
         error: `Cloudflare D1 endpoint URL must not include credential query parameter "${key}"; store the API token in Secrets.`,
@@ -559,22 +742,112 @@ export function validateD1EndpointUrl(
   return { ok: true, url: trimmed }
 }
 
+export function validateLibsqlEndpointUrl(
+  rawUrl: string,
+  options?: { hasAuthToken?: boolean }
+): { ok: true; url: string } | { ok: false; error: string } {
+  const trimmed = rawUrl.trim()
+  if (!trimmed) {
+    return { ok: false, error: 'LibSQL endpoint URL cannot be empty.' }
+  }
+  if (D1_ENDPOINT_CONTROL_CHARS_RE.test(trimmed)) {
+    return { ok: false, error: 'LibSQL endpoint URL must not contain control characters.' }
+  }
+  let parsed: URL
+  try {
+    parsed = new URL(trimmed)
+  } catch {
+    return { ok: false, error: 'LibSQL endpoint URL is not a valid absolute URL.' }
+  }
+  if (
+    parsed.protocol !== 'https:' &&
+    parsed.protocol !== 'http:' &&
+    parsed.protocol !== 'libsql:'
+  ) {
+    return {
+      ok: false,
+      error: `Unsupported LibSQL endpoint scheme "${parsed.protocol}" — only https, libsql, or loopback http is allowed.`,
+    }
+  }
+  if (!parsed.hostname) {
+    return { ok: false, error: 'LibSQL endpoint URL must include a valid host.' }
+  }
+  if (parsed.username || parsed.password) {
+    return {
+      ok: false,
+      error:
+        'LibSQL endpoint URL must not contain embedded credentials; store the auth token in Secrets.',
+    }
+  }
+  for (const key of parsed.searchParams.keys()) {
+    if (isSensitiveUriParamKey(key)) {
+      return {
+        ok: false,
+        error: `LibSQL endpoint URL must not include credential query parameter "${key}"; store the auth token in Secrets.`,
+      }
+    }
+  }
+  if (parsed.protocol === 'http:') {
+    if (!isD1LoopbackHostname(parsed.hostname)) {
+      return {
+        ok: false,
+        error:
+          'LibSQL endpoint URL must use HTTPS (or libsql://); plain HTTP is only allowed for localhost, 127.0.0.0/8, or [::1].',
+      }
+    }
+    if (options?.hasAuthToken) {
+      return {
+        ok: false,
+        error:
+          'LibSQL endpoint URL cannot send an auth token over plain HTTP; use HTTPS or remove the token for localhost/loopback emulators.',
+      }
+    }
+  }
+  return { ok: true, url: trimmed }
+}
+
+function scrubQueryOrHashPairs(segment: string): string {
+  return segment
+    .split('&')
+    .filter((pair) => {
+      const eqIdx = pair.indexOf('=')
+      if (eqIdx <= 0) return true
+      const rawKey = pair.slice(0, eqIdx).trim()
+      return !isSensitiveUriParamKey(rawKey)
+    })
+    .join('&')
+}
+
+function scrubParsedStandardUrl(parsed: URL, authoritySeedList?: string): string {
+  const clone = new URL(parsed.toString())
+  clone.username = ''
+  clone.password = ''
+  if (clone.search.length > 1) {
+    const cleanedSearch = scrubQueryOrHashPairs(clone.search.slice(1))
+    clone.search = cleanedSearch ? `?${cleanedSearch}` : ''
+  }
+  if (clone.hash.length > 1) {
+    const rawFrag = clone.hash.slice(1)
+    const qIdx = rawFrag.indexOf('?')
+    let cleanedFrag: string
+    if (qIdx >= 0) {
+      const prefix = scrubQueryOrHashPairs(rawFrag.slice(0, qIdx))
+      const tail = scrubQueryOrHashPairs(rawFrag.slice(qIdx + 1))
+      cleanedFrag = tail ? `${prefix}?${tail}` : prefix
+    } else {
+      cleanedFrag = scrubQueryOrHashPairs(rawFrag)
+    }
+    clone.hash = cleanedFrag ? `#${cleanedFrag}` : ''
+  }
+  return replaceAuthorityHostPreservingPath(clone.toString(), authoritySeedList)
+}
+
 export function scrubUrlCredentials(rawUrl: string): string | undefined {
   const trimmed = rawUrl.trim()
   if (!trimmed) return undefined
-  try {
-    const parsed = new URL(trimmed)
-    parsed.username = ''
-    parsed.password = ''
-    for (const key of Array.from(parsed.searchParams.keys())) {
-      if (SENSITIVE_URL_QUERY_PARAM_RE.test(key)) {
-        parsed.searchParams.delete(key)
-      }
-    }
-    return parsed.toString()
-  } catch {
-    return undefined
-  }
+  const recovered = parseStandardUrl(trimmed)
+  if (!recovered) return undefined
+  return scrubParsedStandardUrl(recovered.url, recovered.authoritySeedList)
 }
 
 function parseD1Uri(url: URL): ParsedConnectionUri {
@@ -681,11 +954,11 @@ export function parseConnectionUri(rawUri: string): ParsedConnectionUri {
   if (!parsedUrl) {
     return { ok: false, error: `Malformed ${scheme} connection URI.` }
   }
-  const { url, placeholderPassword } = parsedUrl
+  const { url, placeholderPassword, authoritySeedList } = parsedUrl
 
   const sqlSpec = SQL_URI_SPECS[scheme]
   if (sqlSpec) {
-    return parseSqlNetworkUri(url, sqlSpec, placeholderPassword)
+    return parseSqlNetworkUri(url, sqlSpec, placeholderPassword, authoritySeedList)
   }
 
   if (scheme === 'redis' || scheme === 'rediss') {
@@ -701,7 +974,7 @@ export function parseConnectionUri(rawUri: string): ParsedConnectionUri {
   }
 
   if (scheme === 'http' || scheme === 'https') {
-    const lowerHost = (url.hostname || '').toLowerCase()
+    const lowerHost = url.hostname.toLowerCase()
     const hasLibsqlToken =
       url.searchParams.has('authToken') ||
       url.searchParams.has('auth_token') ||

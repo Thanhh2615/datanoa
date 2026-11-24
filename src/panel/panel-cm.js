@@ -32,15 +32,266 @@ import {
   codeFolding,
   foldKeymap,
   bracketMatching,
+  placeholder,
 } from '../../vendor/codemirror.js'
+import { clearGhostEffect, createCmInlineAiExtension } from '../shared-cm-inline-ai.js'
+import {
+  clearDbSqlErrorEffect,
+  createCmSqlLintExtension,
+  setDbSqlErrorEffect,
+  triggerSqlLintEffect,
+} from '../shared-cm-sql-lint.js'
 import { findStatementAtOffset } from './panel-core.js'
+import { resolveSqlExecutionSpan, resolveSqlReplacementSpan } from '../shared-sql-core.js'
 import { computePanelSqlCompletions } from './panel-sql-tabs.js'
+import { bindCtrlWheelHorizontalScroll } from '../shared-wheel-scroll.js'
+
+export function extractPanelCaretStatementSql(state, activeDriver) {
+  const sel = state?.selection?.main
+  if (sel && !sel.empty) {
+    return state.sliceDoc(sel.from, sel.to).trim()
+  }
+  const full = state.doc.toString()
+  if (activeDriver === 'redis') return full.trim()
+  const head = sel?.head ?? sel?.from ?? 0
+  return findStatementAtOffset(full, head, activeDriver).trim()
+}
+
+export function extractPanelExecutionRange(state, mode = 'caret', activeDriver = 'sqlite') {
+  return resolveSqlExecutionSpan(state.doc.toString(), state?.selection?.main, mode, activeDriver)
+}
+
+export function replacePanelSqlRange(view, target, nextSql, activeDriver = 'sqlite') {
+  if (!view) return false
+  const edit = resolveSqlReplacementSpan(view.state.doc.toString(), target, nextSql, activeDriver)
+  if (!edit) return false
+
+  view.dispatch({
+    changes: { from: edit.from, to: edit.to, insert: edit.insert },
+    selection: { anchor: edit.from + edit.insert.length },
+    effects: clearGhostEffect.of(undefined),
+  })
+  view.focus()
+  return true
+}
 
 const REDIS_MONOCHROME_LANG = StreamLanguage.define({
   name: 'redis',
   token(stream) {
     stream.skipToEnd()
     return null
+  },
+})
+
+function advancePanelBlockComment(stream, state) {
+  if (!state.inBlockComment) return false
+  if (stream.match(/^.*?\*\//)) {
+    state.inBlockComment = false
+  } else {
+    stream.skipToEnd()
+  }
+  return true
+}
+
+function readPanelSqlDelimited(stream, closeChar) {
+  while (!stream.eol()) {
+    const ch = stream.next()
+    if (ch === closeChar && stream.next() !== closeChar) break
+  }
+}
+
+function readPanelEscapedString(stream, quoteChar) {
+  while (!stream.eol()) {
+    const ch = stream.next()
+    if (ch === '\\') {
+      stream.next()
+      continue
+    }
+    if (ch === quoteChar) break
+  }
+}
+
+const PANEL_MSSQL_KEYWORDS = new Set([
+  'SELECT', 'FROM', 'WHERE', 'INSERT', 'INTO', 'VALUES', 'UPDATE', 'SET', 'DELETE',
+  'MERGE', 'USING', 'MATCHED', 'OUTPUT', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL',
+  'OUTER', 'CROSS', 'APPLY', 'ON', 'AS', 'AND', 'OR', 'NOT', 'IN', 'IS', 'NULL', 'LIKE',
+  'BETWEEN', 'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'GROUP', 'BY', 'HAVING',
+  'ORDER', 'ASC', 'DESC', 'OFFSET', 'FETCH', 'NEXT', 'ROWS', 'ONLY', 'TOP', 'PERCENT',
+  'WITH', 'TIES', 'DISTINCT', 'UNION', 'ALL', 'OVER', 'PARTITION', 'CREATE', 'ALTER',
+  'DROP', 'TRUNCATE', 'TABLE', 'VIEW', 'INDEX', 'PRIMARY', 'KEY', 'FOREIGN',
+  'REFERENCES', 'DECLARE', 'BEGIN', 'TRY', 'CATCH', 'TRAN', 'TRANSACTION', 'COMMIT',
+  'ROLLBACK', 'EXEC', 'EXECUTE', 'GO', 'NOLOCK',
+])
+
+const PANEL_MSSQL_TYPES = new Set([
+  'INT', 'BIGINT', 'SMALLINT', 'TINYINT', 'BIT', 'DECIMAL', 'NUMERIC', 'MONEY', 'FLOAT',
+  'REAL', 'CHAR', 'VARCHAR', 'NVARCHAR', 'NCHAR', 'TEXT', 'DATE', 'DATETIME',
+  'DATETIME2', 'DATETIMEOFFSET', 'TIME', 'UNIQUEIDENTIFIER', 'VARBINARY', 'XML', 'MAX',
+  'GETDATE', 'GETUTCDATE', 'SYSDATETIME', 'NEWID', 'ISNULL', 'COALESCE', 'TRY_CAST',
+  'TRY_CONVERT', 'CAST', 'CONVERT', 'DATEADD', 'DATEDIFF', 'STRING_AGG', 'COUNT',
+  'SUM', 'AVG', 'MIN', 'MAX',
+])
+
+const PANEL_ORACLE_KEYWORDS = new Set([
+  'SELECT', 'FROM', 'WHERE', 'INSERT', 'INTO', 'VALUES', 'UPDATE', 'SET', 'DELETE',
+  'MERGE', 'USING', 'RETURNING', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER',
+  'CROSS', 'ON', 'AS', 'AND', 'OR', 'NOT', 'IN', 'IS', 'NULL', 'LIKE', 'BETWEEN',
+  'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'ELSIF', 'END', 'GROUP', 'BY', 'HAVING',
+  'ORDER', 'ASC', 'DESC', 'OFFSET', 'FETCH', 'FIRST', 'NEXT', 'ROWS', 'ONLY',
+  'DISTINCT', 'UNION', 'ALL', 'INTERSECT', 'MINUS', 'CONNECT', 'PRIOR', 'START',
+  'WITH', 'OVER', 'PARTITION', 'CREATE', 'REPLACE', 'ALTER', 'DROP', 'TRUNCATE',
+  'TABLE', 'VIEW', 'MATERIALIZED', 'INDEX', 'SEQUENCE', 'SYNONYM', 'TRIGGER',
+  'DECLARE', 'BEGIN', 'EXCEPTION', 'LOOP', 'IF', 'COMMIT', 'ROLLBACK', 'EXPLAIN',
+  'PLAN', 'FOR', 'DUAL', 'ROWNUM', 'ROWID', 'LEVEL', 'PRIMARY', 'KEY', 'FOREIGN',
+  'REFERENCES', 'PRAGMA',
+])
+
+const PANEL_ORACLE_TYPES = new Set([
+  'NUMBER', 'BINARY_INTEGER', 'PLS_INTEGER', 'INTEGER', 'INT', 'FLOAT', 'VARCHAR2',
+  'NVARCHAR2', 'VARCHAR', 'CHAR', 'NCHAR', 'CLOB', 'NCLOB', 'BLOB', 'RAW', 'DATE',
+  'TIMESTAMP', 'INTERVAL', 'BOOLEAN', 'SYSDATE', 'SYSTIMESTAMP', 'NVL', 'NVL2',
+  'DECODE', 'COALESCE', 'TO_DATE', 'TO_CHAR', 'TO_NUMBER', 'LISTAGG', 'SUBSTR',
+  'INSTR', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'DBMS_XPLAN', 'DISPLAY',
+])
+
+const PANEL_MONGO_METHODS = new Set([
+  'getCollection', 'find', 'findOne', 'aggregate', 'countDocuments',
+  'estimatedDocumentCount', 'distinct', 'insertOne', 'insertMany', 'updateOne',
+  'updateMany', 'replaceOne', 'deleteOne', 'deleteMany', 'findOneAndUpdate',
+  'findOneAndDelete', 'bulkWrite', 'explain', 'sort', 'limit', 'skip', 'projection',
+  'toArray', 'drop', 'dropDatabase', 'createCollection', 'createIndex', 'dropIndex',
+  'getIndexes', 'stats',
+])
+
+const PANEL_MONGO_TYPES = new Set([
+  'db', 'ObjectId', 'ISODate', 'NumberInt', 'NumberLong', 'NumberDecimal', 'UUID',
+  'Timestamp', 'Binary', 'MinKey', 'MaxKey', 'RegExp',
+])
+
+const MSSQL_TSQL_LANG = StreamLanguage.define({
+  name: 'mssql',
+  startState: () => ({ inBlockComment: false }),
+  token(stream, state) {
+    if (advancePanelBlockComment(stream, state)) return 'comment'
+    if (stream.eatSpace()) return null
+    if (stream.match(/^--.*/)) return 'comment'
+    if (stream.match(/^\/\*/)) {
+      if (!stream.match(/^.*?\*\//)) state.inBlockComment = true
+      return 'comment'
+    }
+    if (stream.match(/^[Nn]?'/)) {
+      readPanelSqlDelimited(stream, "'")
+      return 'string'
+    }
+    if (stream.eat('[')) {
+      readPanelSqlDelimited(stream, ']')
+      return 'variableName'
+    }
+    if (stream.eat('"')) {
+      readPanelSqlDelimited(stream, '"')
+      return 'variableName'
+    }
+    if (stream.match(/^@@?[A-Za-z_][A-Za-z0-9_]*/)) return 'variableName'
+    if (stream.match(/^\d+(?:\.\d+)?/)) return 'number'
+    if (stream.match(/^[A-Za-z_][A-Za-z0-9_$#]*/)) {
+      const upper = stream.current().toUpperCase()
+      if (PANEL_MSSQL_KEYWORDS.has(upper)) return 'keyword'
+      if (PANEL_MSSQL_TYPES.has(upper)) return 'typeName'
+      return 'propertyName'
+    }
+    if (stream.match(/^[+\-*/%=<>!&|^~]+/)) return 'operator'
+    stream.next()
+    return 'punctuation'
+  },
+})
+
+const PANEL_ORACLE_Q_CLOSE = { '[': ']', '(': ')', '{': '}', '<': '>' }
+
+function advancePanelOracleQuote(stream, state) {
+  if (!state.oracleQuoteClose) return false
+  const rest = stream.string.slice(stream.pos)
+  const idx = rest.indexOf(`${state.oracleQuoteClose}'`)
+  if (idx >= 0) {
+    stream.pos += idx + 2
+    state.oracleQuoteClose = null
+  } else {
+    stream.skipToEnd()
+  }
+  return true
+}
+
+const ORACLE_PLSQL_LANG = StreamLanguage.define({
+  name: 'oracle',
+  startState: () => ({ inBlockComment: false, oracleQuoteClose: null }),
+  token(stream, state) {
+    if (advancePanelOracleQuote(stream, state)) return 'string'
+    if (advancePanelBlockComment(stream, state)) return 'comment'
+    if (stream.eatSpace()) return null
+    if (stream.match(/^--.*/)) return 'comment'
+    if (stream.match(/^\/\*/)) {
+      if (!stream.match(/^.*?\*\//)) state.inBlockComment = true
+      return 'comment'
+    }
+    const qMatch = stream.match(/^[Nn]?[Qq]'([^\s])/)
+    if (qMatch) {
+      state.oracleQuoteClose = PANEL_ORACLE_Q_CLOSE[qMatch[1]] ?? qMatch[1]
+      advancePanelOracleQuote(stream, state)
+      return 'string'
+    }
+    if (stream.eat("'")) {
+      readPanelSqlDelimited(stream, "'")
+      return 'string'
+    }
+    if (stream.eat('"')) {
+      readPanelSqlDelimited(stream, '"')
+      return 'variableName'
+    }
+    if (stream.match(/^:[A-Za-z_][A-Za-z0-9_$#]*/)) return 'variableName'
+    if (stream.sol() && stream.match(/^\/\s*$/)) return 'keyword'
+    if (stream.match(/^\d+(?:\.\d+)?/)) return 'number'
+    if (stream.match(/^[A-Za-z_][A-Za-z0-9_$#]*/)) {
+      const upper = stream.current().toUpperCase()
+      if (PANEL_ORACLE_KEYWORDS.has(upper)) return 'keyword'
+      if (PANEL_ORACLE_TYPES.has(upper)) return 'typeName'
+      return 'propertyName'
+    }
+    if (stream.match(/^:=|=>|\|\||<>|!=|<=|>=|[+\-*/=<>]/)) return 'operator'
+    stream.next()
+    return 'punctuation'
+  },
+})
+
+const MONGODB_MQL_LANG = StreamLanguage.define({
+  name: 'mongodb',
+  startState: () => ({ inBlockComment: false }),
+  token(stream, state) {
+    if (advancePanelBlockComment(stream, state)) return 'comment'
+    if (stream.eatSpace()) return null
+    if (stream.match(/^\/\/.*/) || stream.match(/^--.*/)) return 'comment'
+    if (stream.match(/^\/\*/)) {
+      if (!stream.match(/^.*?\*\//)) state.inBlockComment = true
+      return 'comment'
+    }
+    const ch = stream.peek()
+    if (ch === '"' || ch === "'" || ch === '`') {
+      stream.next()
+      readPanelEscapedString(stream, ch)
+      const val = stream.current().slice(1, -1)
+      return /^\$[A-Za-z_][A-Za-z0-9_]*$/.test(val) ? 'keyword' : 'string'
+    }
+    if (stream.match(/^\$[A-Za-z_][A-Za-z0-9_]*/)) return 'keyword'
+    if (stream.match(/^-?\d+(?:\.\d+)?/)) return 'number'
+    if (stream.match(/^[A-Za-z_][A-Za-z0-9_]*/)) {
+      const word = stream.current()
+      if (word === 'true' || word === 'false') return 'bool'
+      if (word === 'null') return 'null'
+      if (PANEL_MONGO_METHODS.has(word)) return 'keyword'
+      if (PANEL_MONGO_TYPES.has(word)) return 'typeName'
+      return 'propertyName'
+    }
+    if (stream.match(/^[+\-*/%=<>!&|?:]+/)) return 'operator'
+    stream.next()
+    return 'punctuation'
   },
 })
 
@@ -85,6 +336,7 @@ function resolveDialect(dialect) {
   switch (dialect) {
     case 'postgres':
     case 'cockroachdb':
+    case 'oracle':
       return PostgreSQL
     case 'mysql':
     case 'clickhouse':
@@ -94,17 +346,31 @@ function resolveDialect(dialect) {
     case 'sqlite':
     case 'libsql':
     case 'd1':
+    case 'mssql':
     case 'redis':
+    case 'mongodb':
     default:
       return SQLite
   }
 }
 
-function buildLanguageExtension(dialect) {
-  if (dialect === 'redis') {
-    return new LanguageSupport(REDIS_MONOCHROME_LANG)
+export function buildPanelLanguageExtension(dialect) {
+  switch (dialect) {
+    case 'redis':
+      return new LanguageSupport(REDIS_MONOCHROME_LANG)
+    case 'mongodb':
+      return new LanguageSupport(MONGODB_MQL_LANG)
+    case 'mssql':
+      return new LanguageSupport(MSSQL_TSQL_LANG)
+    case 'oracle':
+      return new LanguageSupport(ORACLE_PLSQL_LANG)
+    default:
+      return sql({ dialect: resolveDialect(dialect) })
   }
-  return sql({ dialect: resolveDialect(dialect) })
+}
+
+function buildLanguageExtension(dialect) {
+  return buildPanelLanguageExtension(dialect)
 }
 
 function buildEditorTheme(typography, isLightTheme) {
@@ -184,6 +450,16 @@ function buildEditorTheme(typography, isLightTheme) {
       '.cm-panels input, .cm-panels button': {
         fontSize: '12px',
       },
+      '.cm-tooltip': {
+        backgroundColor: 'var(--surface)',
+        border: '1px solid var(--border-strong)',
+        borderRadius: 'var(--radius-control, 4px)',
+        boxShadow: isLightTheme
+          ? '0 6px 18px rgba(15, 23, 42, 0.14)'
+          : '0 8px 20px rgba(0, 0, 0, 0.28)',
+        color: 'var(--t1)',
+        zIndex: '4000',
+      },
       '.cm-tooltip.cm-tooltip-autocomplete': {
         backgroundColor: 'var(--surface)',
         border: '1px solid var(--border-strong)',
@@ -206,9 +482,92 @@ function buildEditorTheme(typography, isLightTheme) {
         fontSize: '11px',
         marginLeft: '8px',
       },
+      '.cm-placeholder': {
+        color: isLightTheme ? '#8a8a8a' : 'var(--t3, #6e6e6e)',
+        pointerEvents: 'none',
+      },
+      '.cm-ai-replace-strike': {
+        textDecoration: 'line-through',
+        textDecorationColor: isLightTheme
+          ? 'rgba(220, 38, 38, 0.78)'
+          : 'rgba(248, 113, 113, 0.78)',
+        textDecorationThickness: '1.4px',
+        opacity: '0.58',
+      },
+      '.cm-sql-diag-error': {
+        textDecorationLine: 'underline',
+        textDecorationStyle: 'wavy',
+        textDecorationColor: isLightTheme
+          ? 'rgba(220, 38, 38, 0.75)'
+          : 'rgba(248, 113, 113, 0.72)',
+        textUnderlineOffset: '3px',
+        textDecorationThickness: '1.25px',
+      },
+      '.cm-sql-diag-warn': {
+        textDecorationLine: 'underline',
+        textDecorationStyle: 'wavy',
+        textDecorationColor: isLightTheme
+          ? 'rgba(217, 119, 6, 0.75)'
+          : 'rgba(251, 191, 36, 0.72)',
+        textUnderlineOffset: '3px',
+        textDecorationThickness: '1.25px',
+      },
+      '.cm-sql-diag-tooltip': {
+        fontSize: '11.5px',
+        padding: '5px 8px',
+        maxWidth: '340px',
+        lineHeight: '1.4',
+        whiteSpace: 'pre-wrap',
+        color: 'var(--t1)',
+      },
     },
     { dark: !isLightTheme }
   )
+}
+
+function resolvePanelCompletionFacetData(dialect) {
+  switch (dialect) {
+    case 'redis':
+      return REDIS_MONOCHROME_LANG.data
+    case 'mongodb':
+      return MONGODB_MQL_LANG.data
+    case 'mssql':
+      return MSSQL_TSQL_LANG.data
+    case 'oracle':
+      return ORACLE_PLSQL_LANG.data
+    default:
+      return resolveDialect(dialect).language.data
+  }
+}
+
+export function buildPanelCompletionExtension(dialect, schema = {}, activeTable = undefined) {
+  const smartSource = (context) => {
+    const docText = context.state.doc.toString()
+    const computed = computePanelSqlCompletions(
+      docText,
+      context.pos,
+      dialect,
+      schema,
+      activeTable,
+      Boolean(context.explicit)
+    )
+    if (!computed) return null
+    return {
+      from: computed.from,
+      options: computed.options,
+      validFor: /^[$A-Za-z0-9_]*$/,
+    }
+  }
+  return [
+    autocompletion({
+      override: [smartSource],
+      activateOnTyping: true,
+      maxRenderedOptions: 40,
+    }),
+    resolvePanelCompletionFacetData(dialect).of({
+      autocomplete: smartSource,
+    }),
+  ]
 }
 
 export function createPanelCodeMirrorEditor(options) {
@@ -230,11 +589,12 @@ export function createPanelCodeMirrorEditor(options) {
   let currentTable = undefined
   let currentTypography = typography
   let currentIsLight = Boolean(isLightTheme)
-  let currentPlaceholder = ''
+  let currentPlaceholder = String(options?.placeholder || '')
 
   const languageCompartment = new Compartment()
   const completionCompartment = new Compartment()
   const themeCompartment = new Compartment()
+  const placeholderCompartment = new Compartment()
 
   function syncEmptyAttr(view) {
     if (!parent) return
@@ -246,28 +606,7 @@ export function createPanelCodeMirrorEditor(options) {
   }
 
   function buildCompletionExtension() {
-    const smartSource = (context) => {
-      const docText = context.state.doc.toString()
-      const computed = computePanelSqlCompletions(
-        docText,
-        context.pos,
-        currentDialect,
-        currentSchema,
-        currentTable,
-        Boolean(context.explicit)
-      )
-      if (!computed) return null
-      return {
-        from: computed.from,
-        options: computed.options,
-        validFor: /^[A-Za-z0-9_]*$/,
-      }
-    }
-    return autocompletion({
-      override: [smartSource],
-      activateOnTyping: true,
-      maxRenderedOptions: 40,
-    })
+    return buildPanelCompletionExtension(currentDialect, currentSchema, currentTable)
   }
 
   const runKeymap = keymap.of([
@@ -310,6 +649,9 @@ export function createPanelCodeMirrorEditor(options) {
       languageCompartment.of(buildLanguageExtension(currentDialect)),
       completionCompartment.of(buildCompletionExtension()),
       themeCompartment.of(buildEditorTheme(currentTypography, currentIsLight)),
+      placeholderCompartment.of(currentPlaceholder ? placeholder(currentPlaceholder) : []),
+      createCmSqlLintExtension({ getDialect: () => currentDialect }),
+      ...(options?.aiInline ? [createCmInlineAiExtension(options.aiInline)] : []),
       runKeymap,
       keymap.of([
         ...completionKeymap,
@@ -332,6 +674,7 @@ export function createPanelCodeMirrorEditor(options) {
     parent,
   })
   syncEmptyAttr(view)
+  const detachWheelScroll = bindCtrlWheelHorizontalScroll(view.scrollDOM)
 
   return {
     view,
@@ -355,13 +698,13 @@ export function createPanelCodeMirrorEditor(options) {
       return this.getSelectedText().length > 0
     },
     getCaretStatementSql(driverOverride) {
-      const selected = this.getSelectedText()
-      if (selected) return selected
-      const full = view.state.doc.toString()
-      const head = view.state.selection.main.head
-      const activeDriver = driverOverride || currentDialect
-      if (activeDriver === 'redis') return full.trim()
-      return findStatementAtOffset(full, head, activeDriver).trim()
+      return extractPanelCaretStatementSql(view.state, driverOverride || currentDialect)
+    },
+    getExecutionRange(mode = 'caret', driverOverride) {
+      return extractPanelExecutionRange(view.state, mode, driverOverride || currentDialect)
+    },
+    replaceSqlRange(target, nextSql) {
+      return replacePanelSqlRange(view, target, nextSql, currentDialect)
     },
     getCursorOffset() {
       return view.state.selection.main.head
@@ -376,8 +719,11 @@ export function createPanelCodeMirrorEditor(options) {
       currentDialect = normalized
       view.dispatch({
         effects: [
+          clearGhostEffect.of(undefined),
+          clearDbSqlErrorEffect.of(undefined),
           languageCompartment.reconfigure(buildLanguageExtension(currentDialect)),
           completionCompartment.reconfigure(buildCompletionExtension()),
+          triggerSqlLintEffect.of(undefined),
         ],
       })
     },
@@ -405,6 +751,11 @@ export function createPanelCodeMirrorEditor(options) {
       if (parent) {
         parent.dataset.placeholder = currentPlaceholder
       }
+      view.dispatch({
+        effects: placeholderCompartment.reconfigure(
+          currentPlaceholder ? placeholder(currentPlaceholder) : []
+        ),
+      })
     },
     openFindReplace() {
       view.focus()
@@ -413,7 +764,27 @@ export function createPanelCodeMirrorEditor(options) {
     focus() {
       view.focus()
     },
+    clearAiGhost() {
+      view.dispatch({ effects: clearGhostEffect.of(undefined) })
+    },
+    setDbSyntaxError(errorMessage, targetRange) {
+      const clean = String(errorMessage || '').trim()
+      if (!clean) {
+        view.dispatch({ effects: clearDbSqlErrorEffect.of(undefined) })
+        return
+      }
+      view.dispatch({
+        effects: setDbSqlErrorEffect.of({
+          errorMessage: clean,
+          targetRange: targetRange ?? null,
+        }),
+      })
+    },
+    clearDbSyntaxError() {
+      view.dispatch({ effects: clearDbSqlErrorEffect.of(undefined) })
+    },
     destroy() {
+      detachWheelScroll()
       view.destroy()
     },
   }

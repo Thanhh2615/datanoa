@@ -60,7 +60,8 @@ function tokenizeSqlStatement(
   const backslashAndHash = usesBackslashAndHash(dialect)
   const nestedComments = supportsNestedBlockComments(dialect)
   const dollarQuotes = supportsDollarQuoting(dialect)
-  const bracketIdents = dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1'
+  const bracketIdents =
+    dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1' || dialect === 'mssql'
   let depth = 0
   let i = 0
 
@@ -311,6 +312,55 @@ function classifyProjectionItem(tokens: SqlToken[]): ProjectionItem {
   return { isStar: false, outputName: alias }
 }
 
+function skipSelectProjectionModifiers(
+  tokens: SqlToken[],
+  startIdx: number,
+  endIdx: number,
+  dialect: DatabaseDriverType
+): number {
+  let cursor = startIdx
+  if (
+    cursor < endIdx &&
+    tokens[cursor].type === 'word' &&
+    tokens[cursor].text.toUpperCase() === 'ALL'
+  ) {
+    cursor++
+  }
+  if (
+    dialect === 'mssql' &&
+    cursor < endIdx &&
+    tokens[cursor].type === 'word' &&
+    tokens[cursor].text.toUpperCase() === 'TOP'
+  ) {
+    cursor++
+    if (cursor < endIdx && tokens[cursor].text === '(') {
+      const targetDepth = tokens[cursor].depth
+      cursor++
+      while (cursor < endIdx && !(tokens[cursor].depth === targetDepth && tokens[cursor].text === ')')) {
+        cursor++
+      }
+      cursor++
+    }
+    if (
+      cursor < endIdx &&
+      tokens[cursor].type === 'word' &&
+      tokens[cursor].text.toUpperCase() === 'PERCENT'
+    ) {
+      cursor++
+    }
+    if (
+      cursor + 1 < endIdx &&
+      tokens[cursor].type === 'word' &&
+      tokens[cursor].text.toUpperCase() === 'WITH' &&
+      tokens[cursor + 1].type === 'word' &&
+      tokens[cursor + 1].text.toUpperCase() === 'TIES'
+    ) {
+      cursor += 2
+    }
+  }
+  return cursor
+}
+
 function parseProjectionItems(
   tokens: SqlToken[],
   startIdx: number,
@@ -382,6 +432,9 @@ export function analyzeEditableSelectQuery(
   if (dialect === 'redis') {
     return { editable: false, reason: 'Redis commands are not editable SQL tables' }
   }
+  if (dialect === 'mongodb') {
+    return { editable: false, reason: 'MongoDB commands are not editable SQL tables' }
+  }
 
   if (!sql || typeof sql !== 'string' || !sql.trim()) {
     return { editable: false, reason: 'SQL query is empty' }
@@ -450,7 +503,11 @@ export function analyzeEditableSelectQuery(
   // 3. Find top-level FROM clause
   let fromIdx = -1
   for (let idx = 0; idx < tokens.length; idx++) {
-    if (tokens[idx].depth === 0 && tokens[idx].text.toUpperCase() === 'FROM') {
+    if (
+      tokens[idx].depth === 0 &&
+      tokens[idx].type === 'word' &&
+      tokens[idx].text.toUpperCase() === 'FROM'
+    ) {
       fromIdx = idx
       break
     }
@@ -461,7 +518,8 @@ export function analyzeEditableSelectQuery(
   }
 
   // 3b. Reject aggregate calls anywhere in the SELECT projection
-  const projectionTokens = tokens.slice(1, fromIdx)
+  const projStartIdx = skipSelectProjectionModifiers(tokens, 1, fromIdx, dialect)
+  const projectionTokens = tokens.slice(projStartIdx, fromIdx)
   for (let idx = 0; idx < projectionTokens.length; idx++) {
     const t = projectionTokens[idx]
     if (
@@ -472,7 +530,7 @@ export function analyzeEditableSelectQuery(
       return { editable: false, reason: 'aggregate_query' }
     }
   }
-  const projectionItems = parseProjectionItems(tokens, 1, fromIdx)
+  const projectionItems = parseProjectionItems(tokens, projStartIdx, fromIdx)
 
   let cursor = fromIdx + 1
   if (cursor >= tokens.length) {

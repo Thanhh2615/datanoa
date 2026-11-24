@@ -18,7 +18,15 @@ import {
 import type { IDatabaseDriver } from './common/driver'
 import { BUILTIN_ENGINE_CATALOG } from './common/engine-catalog'
 
-export const BYOD_DRIVER_IDS = ['mssql', 'oracle', 'mongodb', 'custom'] as const
+export const BYOD_DRIVER_IDS = [
+  'duckdb',
+  'snowflake',
+  'bigquery',
+  'cassandra',
+  'elasticsearch',
+  'neo4j',
+  'custom',
+] as const
 export type ByodDriverType = (typeof BYOD_DRIVER_IDS)[number]
 
 export function isByodDriverId(value: unknown): value is ByodDriverType {
@@ -27,12 +35,17 @@ export function isByodDriverId(value: unknown): value is ByodDriverType {
 
 export function getByodDefaultPort(driverId: string): number {
   switch (driverId) {
-    case 'mssql':
-      return 1433
-    case 'oracle':
-      return 1521
-    case 'mongodb':
-      return 27017
+    case 'duckdb':
+      return 0
+    case 'snowflake':
+    case 'bigquery':
+      return 443
+    case 'cassandra':
+      return 9042
+    case 'elasticsearch':
+      return 9200
+    case 'neo4j':
+      return 7687
     default:
       return 5432
   }
@@ -44,19 +57,34 @@ export const BYOD_DRIVER_SLOTS: readonly {
   description: string
 }[] = [
   {
-    id: 'mssql',
-    name: 'SQL Server (MSSQL — BYOD Local Driver)',
-    description: 'Microsoft SQL Server via a locally installed Node driver adapter.',
+    id: 'duckdb',
+    name: 'DuckDB (BYOD Local Driver)',
+    description: 'In-process analytical SQL database via a locally installed @duckdb/node-api adapter.',
   },
   {
-    id: 'oracle',
-    name: 'Oracle Database (Thin — BYOD Local Driver)',
-    description: 'Oracle Database thin client via a locally installed Node driver adapter.',
+    id: 'snowflake',
+    name: 'Snowflake (BYOD Local Driver)',
+    description: 'Snowflake cloud data warehouse via a locally installed snowflake-sdk adapter.',
   },
   {
-    id: 'mongodb',
-    name: 'MongoDB (BYOD Local Driver)',
-    description: 'MongoDB document store via a locally installed Node driver adapter.',
+    id: 'bigquery',
+    name: 'Google BigQuery (BYOD Local Driver)',
+    description: 'Google Cloud BigQuery via a locally installed @google-cloud/bigquery adapter.',
+  },
+  {
+    id: 'cassandra',
+    name: 'Apache Cassandra (BYOD Local Driver)',
+    description: 'Distributed wide-column store via a locally installed cassandra-driver adapter.',
+  },
+  {
+    id: 'elasticsearch',
+    name: 'Elasticsearch (BYOD Local Driver)',
+    description: 'Search and analytics engine via a locally installed @elastic/elasticsearch adapter.',
+  },
+  {
+    id: 'neo4j',
+    name: 'Neo4j (BYOD Local Driver)',
+    description: 'Graph database (Cypher) via a locally installed neo4j-driver adapter.',
   },
   {
     id: 'custom',
@@ -426,22 +454,6 @@ export class DriverManager {
       ext === '.cjs' ||
       (ext === '.js' && !(await isPackageTypeModule(entryPath)) && !looksLikeEsmSyntax(sourceText))
 
-    if (isCjs) {
-      const cjsRequire = moduleApi.createRequire(entryPath)
-      const resolvedPath = cjsRequire.resolve(entryPath)
-      const evictCache = (): void => {
-        if (cjsRequire.cache && resolvedPath in cjsRequire.cache) {
-          delete cjsRequire.cache[resolvedPath]
-        }
-      }
-      evictCache()
-      const exported: unknown = cjsRequire(resolvedPath)
-      await this.verifyPostLoadSha256(entryPath, expectedSha256, evictCache)
-      return isRecord(exported) ? { default: exported, ...exported } : { default: exported }
-    }
-
-    // ESM: serve verified in-memory bytes via Node registerHooks (zero entry TOCTOU)
-    const pinnedUrl = `${pathToFileURL(entryPath).href}?v=${expectedSha256}`
     const registerHooksFn = (
       moduleApi as unknown as {
         registerHooks?: (hooks: {
@@ -453,6 +465,50 @@ export class DriverManager {
         }) => { deregister: () => void }
       }
     ).registerHooks
+
+    if (isCjs) {
+      const cjsRequire = moduleApi.createRequire(entryPath)
+      const resolvedPath = cjsRequire.resolve(entryPath)
+      const evictCache = (): void => {
+        if (cjsRequire.cache && resolvedPath in cjsRequire.cache) {
+          delete cjsRequire.cache[resolvedPath]
+        }
+      }
+      evictCache()
+
+      if (typeof registerHooksFn === 'function') {
+        const normalizeFileUrl = (rawUrl: string): string => {
+          const stripped = rawUrl.split('?')[0].split('#')[0]
+          return process.platform === 'win32' ? stripped.toLowerCase() : stripped
+        }
+        const targetUrls = new Set<string>([
+          normalizeFileUrl(pathToFileURL(entryPath).href),
+          normalizeFileUrl(pathToFileURL(resolvedPath).href),
+        ])
+        const hook = registerHooksFn({
+          load(url, context, nextLoad) {
+            if (targetUrls.has(normalizeFileUrl(url))) {
+              return { format: 'commonjs', source: bytes, shortCircuit: true }
+            }
+            return nextLoad(url, context)
+          },
+        })
+        try {
+          const exported: unknown = cjsRequire(resolvedPath)
+          await this.verifyPostLoadSha256(entryPath, expectedSha256, evictCache)
+          return isRecord(exported) ? { default: exported, ...exported } : { default: exported }
+        } finally {
+          hook.deregister()
+        }
+      }
+
+      const exported: unknown = cjsRequire(resolvedPath)
+      await this.verifyPostLoadSha256(entryPath, expectedSha256, evictCache)
+      return isRecord(exported) ? { default: exported, ...exported } : { default: exported }
+    }
+
+    // ESM: serve verified in-memory bytes via Node registerHooks (zero entry TOCTOU)
+    const pinnedUrl = `${pathToFileURL(entryPath).href}?v=${expectedSha256}`
 
     if (typeof registerHooksFn === 'function') {
       const hook = registerHooksFn({

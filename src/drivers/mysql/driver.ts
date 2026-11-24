@@ -1,8 +1,4 @@
-import mysql, {
-  mysqlPromise,
-  type ConnectionOptions,
-  type PoolOptions,
-} from '../../../vendor/mysql2.js'
+import type { ConnectionOptions, PoolOptions } from '../../../vendor/mysql2.js'
 import { isCloudDatabaseHost } from '../common/connection-uri'
 import type {
   ApplyChangesParams,
@@ -26,7 +22,7 @@ import { DatabaseDriverError, runDriverConnectionTest } from '../common/driver'
 import * as net from 'node:net'
 import * as tls from 'node:tls'
 import type { DriverTlsOptions } from '../common/tls-and-tunnel'
-import { resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
+import { buildDefaultTlsOptions, resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
 import {
   assembleTableBrowseResult,
   buildBatchStatements,
@@ -48,7 +44,70 @@ import {
   reconstructTableDdl,
   splitSqlStatements,
 } from '../common/sql-tools'
-import { compactSql, stripLeadingSqlComments } from '../common/sql-lexer'
+import {
+  SQL_STANDALONE_ROLLBACK_RE,
+  compactSql,
+  isMysqlImplicitCommitStatement,
+  stripLeadingSqlComments,
+} from '../common/sql-lexer'
+
+type MysqlVendorModule = typeof import('../../../vendor/mysql2.js')
+let mysqlVendorPromise: Promise<MysqlVendorModule> | null = null
+let cachedMysqlTypes: Record<number, string> | null = null
+
+const MYSQL_FALLBACK_TYPE_NAMES: Readonly<Record<number, string>> = {
+  0: 'decimal',
+  1: 'tiny',
+  2: 'short',
+  3: 'long',
+  4: 'float',
+  5: 'double',
+  6: 'null',
+  7: 'timestamp',
+  8: 'longlong',
+  9: 'int24',
+  10: 'date',
+  11: 'time',
+  12: 'datetime',
+  13: 'year',
+  14: 'newdate',
+  15: 'varchar',
+  16: 'bit',
+  17: 'timestamp2',
+  18: 'datetime2',
+  19: 'time2',
+  245: 'json',
+  246: 'newdecimal',
+  247: 'enum',
+  248: 'set',
+  249: 'tiny_blob',
+  250: 'medium_blob',
+  251: 'long_blob',
+  252: 'blob',
+  253: 'var_string',
+  254: 'string',
+  255: 'geometry',
+}
+
+async function loadMysqlVendor(): Promise<MysqlVendorModule> {
+  if (!mysqlVendorPromise) {
+    mysqlVendorPromise = import('../../../vendor/mysql2.js')
+      .then((mod) => {
+        const typesObj =
+          (mod as unknown as { Types?: Record<number, string> }).Types ??
+          (mod.default as unknown as { Types?: Record<number, string> } | undefined)?.Types
+        if (typesObj && typeof typesObj === 'object') {
+          cachedMysqlTypes = typesObj
+        }
+        return mod
+      })
+      .catch((err: unknown) => {
+        mysqlVendorPromise = null
+        throw err
+      })
+  }
+  return mysqlVendorPromise
+}
 
 const MYSQL_SERVER_STATUS_IN_TRANS = 0x0001
 const MYSQL_SERVER_STATUS_AUTOCOMMIT = 0x0002
@@ -66,15 +125,6 @@ function extractServerStatus(res: unknown): number | undefined {
     if (typeof val === 'number' && Number.isFinite(val)) return val
   }
   return undefined
-}
-
-function isMysqlImplicitCommitStatement(normalizedSql: string): boolean {
-  if (/^(?:CREATE|DROP)\s+TEMPORARY\s+TABLE\b/i.test(normalizedSql)) {
-    return false
-  }
-  return /^(?:CREATE|ALTER|DROP|TRUNCATE|RENAME|LOCK\s+TABLES|UNLOCK\s+TABLES|LOAD\s+DATA|ANALYZE|OPTIMIZE|REPAIR|FLUSH|RESET|SET\s+AUTOCOMMIT\s*=\s*(?:1|ON|TRUE))\b/i.test(
-    normalizedSql
-  )
 }
 
 interface MysqlQueryObject {
@@ -222,8 +272,9 @@ function asRecordRows(rows: unknown): Record<string, unknown>[] {
 }
 
 function resolveMysqlColumnTypeName(columnType: number | undefined): string {
-  const typeMap = (mysql as unknown as { Types?: Record<number, string> })?.Types
-  if (typeMap && columnType !== undefined && typeMap[columnType]) {
+  if (columnType === undefined) return 'unknown'
+  const typeMap = cachedMysqlTypes ?? MYSQL_FALLBACK_TYPE_NAMES
+  if (typeMap[columnType]) {
     return String(typeMap[columnType]).toLowerCase()
   }
   return 'unknown'
@@ -419,6 +470,7 @@ export class MysqlSession implements IDatabaseSession {
     if (this.cancelConnOptions) {
       let killConn: MysqlConnectionLike | null = null
       try {
+        const { mysqlPromise } = await loadMysqlVendor()
         killConn = (await mysqlPromise.createConnection({
           ...this.cancelConnOptions,
           connectTimeout: 5000,
@@ -584,7 +636,7 @@ export class MysqlSession implements IDatabaseSession {
     const defaultSchema = this.profile.database || ''
     const targetSchema = params.schema || this.profile.database
 
-    if (!this.autoCommit || this.txConn !== null) {
+    if (!params.bypassTransaction && (!this.autoCommit || this.txConn !== null)) {
       return this.runExclusiveTxOp(async () => {
         if (this.isClosed) {
           throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
@@ -1101,7 +1153,7 @@ export class MysqlSession implements IDatabaseSession {
               this.statementCount++
             }
             const isCommit = /^COMMIT\b/i.test(normalizedStmt)
-            const isRollback = /^ROLLBACK\b(?!\s+TO\b)/i.test(normalizedStmt)
+            const isRollback = SQL_STANDALONE_ROLLBACK_RE.test(normalizedStmt)
             const isAndChain = /\bAND\s+CHAIN\b/i.test(normalizedStmt)
             if (isCommit || isRollback) {
               const stillInTx =
@@ -1347,6 +1399,7 @@ export class MysqlDriver implements IDatabaseDriver {
       extraSecrets?.tlsServername
     )
     let sslConfig: ConnectionOptions['ssl']
+    let defaultUseSsl = false
     if (tlsOverride === false) {
       // Explicit sslMode: 'disable' — never fall back to auto-SSL
       sslConfig = undefined
@@ -1372,9 +1425,14 @@ export class MysqlDriver implements IDatabaseDriver {
       }
       sslConfig = sslOptions
     } else {
-      const useSsl =
+      defaultUseSsl =
         profile.ssl !== undefined ? Boolean(profile.ssl) : isCloudDatabaseHost(effectiveHost)
-      sslConfig = useSsl ? { rejectUnauthorized: false } : undefined
+      sslConfig = defaultUseSsl
+        ? ({
+            ...buildDefaultTlsOptions(extraSecrets?.tlsServername),
+            verifyIdentity: true,
+          } as ConnectionOptions['ssl'])
+        : undefined
     }
     const cancelConnOptions = {
       host: effectiveHost,
@@ -1406,9 +1464,16 @@ export class MysqlDriver implements IDatabaseDriver {
     } as PoolOptions
 
     const verifyIpIdentity =
-      profile.sslMode === 'verify-full' && net.isIP(effectiveHost) !== 0
+      (profile.sslMode === 'verify-full' ||
+        ((profile.sslMode === undefined || profile.sslMode === 'auto') &&
+          ((tlsOverride !== undefined &&
+            tlsOverride !== false &&
+            tlsOverride.rejectUnauthorized !== false) ||
+            (tlsOverride === undefined && defaultUseSsl)))) &&
+      net.isIP(effectiveHost) !== 0
         ? effectiveHost
         : undefined
+    const { mysqlPromise } = await loadMysqlVendor()
     const pool = mysqlPromise.createPool(options) as unknown as MysqlPoolLike
     return new MysqlSession(
       pool,

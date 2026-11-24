@@ -1,6 +1,7 @@
 // src/panel/panel-connection-form.js
 // Side Panel Connection Form, Engine Selector, URI Parser & Workspace Auto-Discovery
 
+import { findCredentialAuthorityAtIndex, isCloudDatabaseHost } from '../shared-sql-safety.js'
 import {
   ENGINES,
   ENGINE_BY_ID,
@@ -32,10 +33,17 @@ function deriveSmartSqliteConnName(filePath) {
   return base
 }
 
+function extractScannedFolderName(rawPath) {
+  const trimmed = String(rawPath || '').trim().replace(/[\\/]+$/, '')
+  if (!trimmed) return String(rawPath || '').trim()
+  const parts = trimmed.split(/[\\/]/).filter(Boolean)
+  return parts[parts.length - 1] || trimmed
+}
+
 export function formatConnSubtitle(conn) {
   if (!conn) return ''
-  if (conn.driver === 'sqlite') return conn.filePath || conn.database
-  if (conn.driver === 'libsql') return conn.url || conn.database
+  if (conn.driver === 'sqlite' || conn.driver === 'duckdb') return conn.filePath || conn.database
+  if (conn.driver === 'libsql') return conn.url ? maskConnectionUriSecret(conn.url) : conn.database
   if (conn.driver === 'd1') {
     const acct = String(conn.d1AccountId || '').trim()
     const dbId = String(conn.d1DatabaseId || conn.database || '').trim()
@@ -53,6 +61,126 @@ export function formatConnSubtitle(conn) {
   return `${conn.user ? `${conn.user}@` : ''}${conn.host || 'localhost'}:${port}/${conn.database}`
 }
 
+const SENSITIVE_PANEL_LIBSQL_PARAM_RE =
+  /^(?:api[-_]?key|apikey|auth[-_]?token|authtoken|access[-_]?token|refresh[-_]?token|id[-_]?token|client[-_]?secret|private[-_]?key|credentials?|authorization|sig(?:nature)?|token|pass(?:word|wd|phrase)?|pwd|secret|key|jwt|bearer)$/i
+
+const FALLBACK_PANEL_SECRET_QUERY_KV_RE =
+  /([?&#])(?:[^=&\s#]*(?:api[-_]?key|apikey|auth[-_]?token|authtoken|access[-_]?token|refresh[-_]?token|id[-_]?token|client[-_]?secret|private[-_]?key|token|jwt|secret|pass(?:word|wd|phrase)?|pwd|bearer|credentials?|authorization|key)|sig(?:nature)?)=[^&\s#]*/gi
+
+function stripEmbeddedPanelSchemeCredentials(raw) {
+  return raw.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^\s'"<>(),;]+)/g, (full, scheme, rest) => {
+    const delimIdx = rest.search(/[:/?#@]/)
+    if (delimIdx < 0 || rest[delimIdx] !== ':') return full
+    const atIdx = findCredentialAuthorityAtIndex(scheme, rest, delimIdx)
+    return atIdx > 0 ? `${scheme}${rest.slice(atIdx + 1)}` : full
+  })
+}
+
+function scrubFallbackPanelUrlText(raw) {
+  return stripEmbeddedPanelSchemeCredentials(String(raw || ''))
+    .replace(FALLBACK_PANEL_SECRET_QUERY_KV_RE, '$1')
+    .replace(/\?&+/g, '?')
+    .replace(/#&+/g, '#')
+    .replace(/[?&]+#/g, '#')
+    .replace(/&{2,}/g, '&')
+    .replace(/[?&#]+(?=$|\s)/g, '')
+}
+
+function scrubParsedPanelUrlSecrets(parsed) {
+  parsed.username = ''
+  parsed.password = ''
+  for (const key of Array.from(parsed.searchParams.keys())) {
+    if (SENSITIVE_PANEL_LIBSQL_PARAM_RE.test(key)) {
+      parsed.searchParams.delete(key)
+    }
+  }
+  if (parsed.hash.length > 1) {
+    const rawFrag = parsed.hash.slice(1)
+    const qIdx = rawFrag.indexOf('?')
+    const cleanPairs = (seg) =>
+      seg
+        .split('&')
+        .filter((pair) => {
+          const eqIdx = pair.indexOf('=')
+          if (eqIdx <= 0) return true
+          const rawKey = pair.slice(0, eqIdx).trim()
+          let decodedKey = rawKey
+          try {
+            decodedKey = decodeURIComponent(rawKey)
+          } catch {
+            // Keep rawKey when percent-decoding fails
+          }
+          return !(
+            SENSITIVE_PANEL_LIBSQL_PARAM_RE.test(rawKey) ||
+            SENSITIVE_PANEL_LIBSQL_PARAM_RE.test(decodedKey)
+          )
+        })
+        .join('&')
+    const cleaned =
+      qIdx >= 0
+        ? (() => {
+            const pfx = cleanPairs(rawFrag.slice(0, qIdx))
+            const tail = cleanPairs(rawFrag.slice(qIdx + 1))
+            return tail ? `${pfx}?${tail}` : pfx
+          })()
+        : cleanPairs(rawFrag)
+    parsed.hash = cleaned ? `#${cleaned}` : ''
+  }
+}
+
+function parsePanelNetworkUrlSafely(rawWithScheme) {
+  try {
+    const direct = new URL(rawWithScheme)
+    if (direct.username === '' && direct.password === '' && direct.port !== '') {
+      const recovered = stripEmbeddedPanelSchemeCredentials(rawWithScheme)
+      if (recovered !== rawWithScheme) {
+        return new URL(recovered)
+      }
+    }
+    return direct
+  } catch {
+    return null
+  }
+}
+
+function sanitizePanelLibsqlUrlAndName(rawUrl) {
+  const trimmed = String(rawUrl || '').trim()
+  if (!trimmed) return { cleanUrl: '', defaultName: 'LibSQL' }
+  const withScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed) ? trimmed : `https://${trimmed}`
+  const parsed = parsePanelNetworkUrlSafely(withScheme)
+  if (!parsed) {
+    return { cleanUrl: scrubFallbackPanelUrlText(trimmed), defaultName: 'LibSQL' }
+  }
+  const hostname = parsed.hostname || 'LibSQL'
+  scrubParsedPanelUrlSecrets(parsed)
+  const cleanPath =
+    parsed.pathname && parsed.pathname !== '/' ? parsed.pathname.replace(/\/+$/, '') : ''
+  const cleanSearch = parsed.searchParams.toString()
+  const cleanUrl = `${parsed.protocol}//${parsed.host}${cleanPath}${cleanSearch ? `?${cleanSearch}` : ''}`
+  return { cleanUrl, defaultName: hostname }
+}
+
+function scrubPanelNetworkFormUrl(rawUrl) {
+  const trimmed = String(rawUrl || '').trim()
+  if (!trimmed) return ''
+  const parsed = parsePanelNetworkUrlSafely(trimmed)
+  if (!parsed) {
+    return scrubFallbackPanelUrlText(trimmed)
+  }
+  scrubParsedPanelUrlSecrets(parsed)
+  return parsed.toString()
+}
+
+function isPanelOptionsDriver(driver) {
+  return (
+    driver === 'postgres' ||
+    driver === 'cockroachdb' ||
+    driver === 'snowflake' ||
+    driver === 'bigquery' ||
+    driver === 'cassandra'
+  )
+}
+
 export function createPanelConnectionFormController(ctx) {
   const {
     state,
@@ -68,9 +196,61 @@ export function createPanelConnectionFormController(ctx) {
   let detectSeq = 0
   let parseUriSeq = 0
   let refreshByodSeq = 0
+  let dockerApplySeq = 0
   let byodActionBusy = false
-  const BYOD_IDS = new Set(['mssql', 'oracle', 'mongodb', 'custom'])
-  const BYOD_NPM_PKGS = { mssql: 'mssql', oracle: 'oracledb', mongodb: 'mongodb', custom: '' }
+  let activeAutoCandidateId = null
+  let activeAutoRawUri = null
+  let activeAutoDisplayUri = null
+  let lastParsedDisplayUri = ''
+  let lastParsedCandidateId = ''
+
+  function clearActiveAutoUri() {
+    activeAutoCandidateId = null
+    activeAutoRawUri = null
+    activeAutoDisplayUri = null
+  }
+
+  function syncSslVerifyUi() {
+    const sslOn = Boolean($('formSsl')?.checked)
+    const verifyRow = $('sslVerifyRow')
+    const verifyEl = $('formSslVerify')
+    if (verifyRow) {
+      verifyRow.hidden = !sslOn
+    }
+    if (verifyEl) {
+      if (state.formSslMode === 'verify-ca' || state.formSslMode === 'verify-full') {
+        verifyEl.checked = true
+        verifyEl.disabled = true
+      } else if (sslOn) {
+        verifyEl.disabled = false
+        verifyEl.checked =
+          state.formSslRejectUnauthorized !== undefined
+            ? state.formSslRejectUnauthorized !== false
+            : state.formSslMode !== 'require'
+      } else {
+        verifyEl.disabled = true
+        verifyEl.checked = true
+      }
+    }
+  }
+  const BYOD_IDS = new Set([
+    'duckdb',
+    'snowflake',
+    'bigquery',
+    'cassandra',
+    'elasticsearch',
+    'neo4j',
+    'custom',
+  ])
+  const BYOD_NPM_PKGS = {
+    duckdb: '@duckdb/node-api',
+    snowflake: 'snowflake-sdk',
+    bigquery: '@google-cloud/bigquery',
+    cassandra: 'cassandra-driver',
+    elasticsearch: '@elastic/elasticsearch',
+    neo4j: 'neo4j-driver',
+    custom: '',
+  }
   const byodDefaultDirs = {}
   let byodHostPlatform = 'win32'
   let byodRegistryMap = new Map()
@@ -239,6 +419,7 @@ export function createPanelConnectionFormController(ctx) {
         enhanceCollapsibleSelectDropdown(wsSel, {
           tooltipPrefix: 'Workspace Scope (Pin Connection)',
           searchPlaceholder: 'Search workspaces by name, branch, or project folder...',
+          searchAriaLabel: 'Search workspaces',
           defaultCollapseNonActiveFolders: true,
           leadingIconType: 'workspace',
         })
@@ -291,40 +472,78 @@ export function createPanelConnectionFormController(ctx) {
 
   function setFormDriver(driver, applyDefaults = true) {
     const prevDriver = state.formDriver
-    const valid = ENGINE_BY_ID[driver] ? driver : 'sqlite'
+    const valid = ENGINE_BY_ID[driver] && !ENGINE_BY_ID[driver].studioOnly ? driver : 'sqlite'
     state.formDriver = valid
     document.querySelectorAll('.engine-tile').forEach((tile) => {
       tile.classList.toggle('active', tile.dataset.driver === valid)
     })
 
     const isSqlite = valid === 'sqlite'
+    const isDuckdb = valid === 'duckdb'
+    const isFileDb = isSqlite || isDuckdb
     const isLibsql = valid === 'libsql'
     const isRedis = valid === 'redis'
     const isClickhouse = valid === 'clickhouse'
-    const isPgFamily = valid === 'postgres' || valid === 'cockroachdb'
+    const isMongo = valid === 'mongodb'
+    const hasUrlRow = isClickhouse || isMongo
+    const hasOptionsRow = isPanelOptionsDriver(valid)
 
-    $('sqliteFields').hidden = !isSqlite
+    $('sqliteFields').hidden = !isFileDb
     $('libsqlFields').hidden = !isLibsql
-    $('serverFields').hidden = isSqlite || isLibsql
-    $('clickhouseUrlRow').hidden = !isClickhouse
-    if ($('pgOptionsRow')) $('pgOptionsRow').hidden = !isPgFamily
+    $('serverFields').hidden = isFileDb || isLibsql
+    $('clickhouseUrlRow').hidden = !hasUrlRow
+    const urlLabel = $('clickhouseUrlRow')?.querySelector?.('.field-label')
+    if (urlLabel) {
+      urlLabel.textContent = isMongo
+        ? 'Connection URL (Optional / +srv)'
+        : 'HTTP(S) Endpoint URL (Optional)'
+    }
+    if ($('formClickhouseUrl')) {
+      $('formClickhouseUrl').placeholder = isMongo
+        ? 'mongodb://localhost:27017 or mongodb+srv://...'
+        : 'http://localhost:8123'
+    }
+    if ($('pgOptionsRow')) $('pgOptionsRow').hidden = !hasOptionsRow
+    if ($('formOptions')) {
+      $('formOptions').placeholder =
+        valid === 'snowflake'
+          ? 'e.g. account=...,warehouse=...,role=...'
+          : valid === 'bigquery'
+            ? 'e.g. projectId=...,location=US'
+            : valid === 'cassandra'
+              ? 'e.g. localDataCenter=datacenter1,keyspace=...'
+              : 'e.g. --cluster=... or endpoint=...'
+    }
+    if ($('formFilePath')) {
+      $('formFilePath').placeholder = isDuckdb
+        ? 'D:\\project\\analytics.duckdb or :memory:'
+        : 'D:\\project\\data.db or folder path'
+    }
     $('sqlDbRow').hidden = isRedis
     $('redisDbRow').hidden = !isRedis
 
-    if (!isPgFamily || (applyDefaults && prevDriver !== valid)) {
+    if (!hasOptionsRow || (applyDefaults && prevDriver !== valid)) {
       state.formOptions = ''
       if ($('formOptions')) $('formOptions').value = ''
     }
 
-    if (applyDefaults && !isSqlite && !isLibsql) {
+    if (applyDefaults && !isFileDb && !isLibsql) {
       const meta = ENGINE_BY_ID[valid]
+      const defaultSsl = Boolean(
+        meta?.defaultSsl ??
+          (valid === 'cockroachdb' || valid === 'snowflake' || valid === 'bigquery')
+      )
       $('formPort').value = String(meta.defaultPort)
       $('formDatabase').placeholder = meta.defaultDb
       $('formUser').value = meta.defaultUser
-      $('formSsl').checked = valid === 'cockroachdb'
+      $('formSsl').checked = defaultSsl
+      state.formSslMode = undefined
+      state.formSslRejectUnauthorized = defaultSsl ? true : undefined
+      state.formSslTouched = false
     }
+    syncSslVerifyUi()
     if ($('quickBrowseDbFileBtn')) {
-      $('quickBrowseDbFileBtn').hidden = !isSqlite
+      $('quickBrowseDbFileBtn').hidden = !isFileDb
     }
     renderDiscoveredItems()
     syncPanelByodBox()
@@ -335,21 +554,48 @@ export function createPanelConnectionFormController(ctx) {
   function initStaticSelectors() {
     const grid = $('engineGrid')
     grid.textContent = ''
-    for (const eng of ENGINES) {
-      const btn = document.createElement('button')
-      btn.type = 'button'
-      btn.className = `engine-tile${eng.id === state.formDriver ? ' active' : ''}`
-      btn.dataset.driver = eng.id
-      btn.title = eng.label
-      const ico = document.createElement('span')
-      setDbLogoElement(ico, eng.id, 15)
-      const lbl = document.createElement('span')
-      lbl.className = 'engine-tile-label'
-      lbl.textContent = eng.label
-      btn.append(ico, lbl)
-      btn.addEventListener('click', () => setFormDriver(eng.id, true))
-      grid.appendChild(btn)
+    grid.classList.add('engine-groups')
+
+    const builtinEngines = ENGINES.filter((eng) => !eng.studioOnly && !BYOD_IDS.has(eng.id))
+    const byodEngines = ENGINES.filter((eng) => !eng.studioOnly && BYOD_IDS.has(eng.id))
+
+    const appendEngineGroup = (groupKey, labelText, engines) => {
+      if (engines.length === 0) return
+      const groupEl = document.createElement('div')
+      groupEl.className = 'engine-group'
+      groupEl.dataset.engineGroup = groupKey
+
+      const labelEl = document.createElement('div')
+      labelEl.className = 'engine-group-label'
+      labelEl.textContent = labelText
+
+      const tilesGrid = document.createElement('div')
+      tilesGrid.className = 'engine-group-grid'
+      tilesGrid.setAttribute('role', 'group')
+      tilesGrid.setAttribute('aria-label', labelText)
+
+      for (const eng of engines) {
+        const btn = document.createElement('button')
+        btn.type = 'button'
+        btn.className = `engine-tile${eng.id === state.formDriver ? ' active' : ''}`
+        btn.dataset.driver = eng.id
+        btn.title = groupKey === 'byod' ? `${eng.label} (Local BYOD Driver)` : eng.label
+        const ico = document.createElement('span')
+        setDbLogoElement(ico, eng.id, 15)
+        const lbl = document.createElement('span')
+        lbl.className = 'engine-tile-label'
+        lbl.textContent = eng.label
+        btn.append(ico, lbl)
+        btn.addEventListener('click', () => setFormDriver(eng.id, true))
+        tilesGrid.appendChild(btn)
+      }
+
+      groupEl.append(labelEl, tilesGrid)
+      grid.appendChild(groupEl)
     }
+
+    appendEngineGroup('builtin', 'Built-in Database Engines', builtinEngines)
+    appendEngineGroup('byod', 'Local Custom Drivers (BYOD)', byodEngines)
 
     const redisSel = $('formRedisDb')
     redisSel.textContent = ''
@@ -366,16 +612,17 @@ export function createPanelConnectionFormController(ctx) {
 
     const pickAndFillLocalSqliteFile = () => {
       if (state.formBusy || !state.formOpen) return
+      const isDuck = state.formDriver === 'duckdb'
       void openPanelFilePickerModal({
-        title: 'Select SQLite database file',
+        title: isDuck ? 'Select DuckDB database file' : 'Select SQLite database file',
         mode: 'file',
         initialDir: $('formFilePath')?.value.trim() || undefined,
-        extensions: ['.db', '.sqlite', '.sqlite3', '.db3'],
+        extensions: isDuck ? ['.duckdb', '.ddb', '.db'] : ['.db', '.sqlite', '.sqlite3', '.db3'],
       })
         .then((res) => {
           if (!state.formOpen) return
           if (res?.ok && res.path) {
-            if (state.formDriver !== 'sqlite') {
+            if (state.formDriver !== 'sqlite' && state.formDriver !== 'duckdb') {
               setFormDriver('sqlite', false)
             }
             $('formFilePath').value = res.path
@@ -617,7 +864,7 @@ export function createPanelConnectionFormController(ctx) {
           byodPendingSha.delete(driverId)
           await refreshPanelByodAndWorkspaces()
           if (state.formDriver === driverId) {
-            showFormNotice(`${driverId} driver verified and ready!`, 'success')
+            showFormNotice(`${driverId} driver verified and ready`, 'success')
           }
         } catch (err) {
           if (state.formDriver === driverId) {
@@ -646,21 +893,51 @@ export function createPanelConnectionFormController(ctx) {
       'formOptions',
       'formRedisDb',
       'formSsl',
+      'formSslVerify',
       'formReadOnly',
     ]
     for (const id of trackedInputIds) {
       const el = $(id)
       if (!el) continue
-      const evName =
-        el instanceof HTMLSelectElement ||
-        (el instanceof HTMLInputElement && el.type === 'checkbox')
-          ? 'change'
-          : 'input'
+      const isSelect =
+        el.tagName === 'SELECT' ||
+        (typeof HTMLSelectElement !== 'undefined' && el instanceof HTMLSelectElement)
+      const isCheckbox = el.type === 'checkbox'
+      const evName = isSelect || isCheckbox ? 'change' : 'input'
       el.addEventListener(evName, () => {
         if (id === 'formWorkspaceScope') {
           state.pendingWorkspaceScope = null
         }
-        if (el instanceof HTMLSelectElement) syncSelectTooltip(el)
+        if (id === 'formSsl') {
+          state.formSslTouched = true
+          if (el.checked) {
+            state.formSslMode = 'auto'
+            state.formSslRejectUnauthorized = true
+          } else {
+            state.formSslMode = 'disable'
+            state.formSslRejectUnauthorized = undefined
+          }
+          syncSslVerifyUi()
+        }
+        if (id === 'formSslVerify') {
+          state.formSslTouched = true
+          state.formSslRejectUnauthorized = Boolean(el.checked)
+          if (!el.checked) {
+            if ($('formSsl')) $('formSsl').checked = true
+            if (
+              state.formSslMode === undefined ||
+              state.formSslMode === 'auto' ||
+              state.formSslMode === 'verify-ca' ||
+              state.formSslMode === 'verify-full'
+            ) {
+              state.formSslMode = 'require'
+            }
+          } else if (state.formSslMode === 'require') {
+            state.formSslMode = 'auto'
+          }
+          syncSslVerifyUi()
+        }
+        if (isSelect) syncSelectTooltip(el)
         savePanelViewState?.()
       })
     }
@@ -670,6 +947,10 @@ export function createPanelConnectionFormController(ctx) {
   }
 
   function resetConnectionForm() {
+    dockerApplySeq++
+    clearActiveAutoUri()
+    lastParsedDisplayUri = ''
+    lastParsedCandidateId = ''
     state.editingId = null
     state.formHadPassword = false
     state.formHadAuthToken = false
@@ -678,6 +959,10 @@ export function createPanelConnectionFormController(ctx) {
     state.sourceSecretConnId = null
     state.lastParsedUri = ''
     state.formOptions = ''
+    state.formSslMode = undefined
+    state.formSslRejectUnauthorized = undefined
+    state.formSslTouched = false
+    state.parsedOracleUrl = ''
     state.lastAutoFilledSqliteName = ''
     state.discoveredSearch = ''
     if ($('discoveredSearchInput')) $('discoveredSearchInput').value = ''
@@ -698,6 +983,7 @@ export function createPanelConnectionFormController(ctx) {
     $('formPassword').value = ''
     $('formPassword').placeholder = 'Optional'
     $('formSsl').checked = false
+    syncSslVerifyUi()
     $('formReadOnly').checked = false
     if ($('formFolder')) $('formFolder').value = ''
     state.pendingWorkspaceScope = ''
@@ -723,7 +1009,7 @@ export function createPanelConnectionFormController(ctx) {
   }
 
   function populateFormFromProfile(profile, mode = 'edit') {
-    if (!profile?.driver || !ENGINE_BY_ID[profile.driver]) {
+    if (!profile?.driver || !ENGINE_BY_ID[profile.driver] || ENGINE_BY_ID[profile.driver].studioOnly) {
       showBanner(
         `"${String(profile?.driver || 'This')}" connections are configured in Fullscreen Studio — click Studio to edit or duplicate.`,
         'warn'
@@ -770,28 +1056,51 @@ export function createPanelConnectionFormController(ctx) {
       wsSel._customDropdownSync?.()
     }
 
-    if (driver === 'sqlite') {
+    state.parsedOracleUrl = driver === 'oracle' && typeof profile.url === 'string' ? profile.url : ''
+    if (driver === 'sqlite' || driver === 'duckdb') {
       $('formFilePath').value = profile.filePath || profile.database || ''
     } else if (driver === 'libsql') {
-      $('formLibsqlUrl').value = profile.url || ''
+      $('formLibsqlUrl').value = profile.url
+        ? sanitizePanelLibsqlUrlAndName(profile.url).cleanUrl ||
+          scrubPanelNetworkFormUrl(profile.url)
+        : ''
       $('formLibsqlDb').value = profile.database || ''
       if (profile.hasAuthToken && (mode === 'edit' || mode === 'duplicate')) {
         $('formAuthToken').placeholder = 'Stored token preserved (type to replace)'
       }
     } else {
-      $('formHost').value = profile.host || 'localhost'
+      const hostValue = profile.host || 'localhost'
+      $('formHost').value = hostValue
       $('formPort').value = String(profile.port || ENGINE_BY_ID[driver].defaultPort)
       $('formUser').value = profile.user || ''
-      $('formSsl').checked = Boolean(profile.ssl)
+      const isCloudAutoSsl =
+        profile.ssl === undefined &&
+        profile.sslMode !== 'disable' &&
+        (driver === 'cockroachdb' || isCloudDatabaseHost(hostValue))
+      const hasExplicitTlsMode =
+        profile.sslMode === 'require' ||
+        profile.sslMode === 'verify-ca' ||
+        profile.sslMode === 'verify-full'
+      const effectiveSsl =
+        profile.sslMode === 'disable'
+          ? false
+          : profile.ssl !== undefined
+            ? Boolean(profile.ssl)
+            : isCloudAutoSsl || hasExplicitTlsMode
+      $('formSsl').checked = effectiveSsl
+      state.formSslMode = profile.sslMode
+      state.formSslRejectUnauthorized = profile.sslRejectUnauthorized
+      state.formSslTouched = false
+      syncSslVerifyUi()
       if (driver === 'redis') {
         $('formRedisDb').value = String(profile.redisDb ?? 0)
       } else {
         $('formDatabase').value = profile.database || ''
       }
-      if (driver === 'clickhouse') {
-        $('formClickhouseUrl').value = profile.url || ''
+      if (driver === 'clickhouse' || driver === 'mongodb') {
+        $('formClickhouseUrl').value = profile.url ? scrubPanelNetworkFormUrl(profile.url) : ''
       }
-      if (driver === 'postgres' || driver === 'cockroachdb') {
+      if (isPanelOptionsDriver(driver)) {
         const opts = typeof profile.options === 'string' ? profile.options : ''
         state.formOptions = opts
         if ($('formOptions')) $('formOptions').value = opts
@@ -812,14 +1121,15 @@ export function createPanelConnectionFormController(ctx) {
     const folder = ($('formFolder') ? $('formFolder').value : '').trim().slice(0, 64)
     const workspaceScope = ($('formWorkspaceScope') ? $('formWorkspaceScope').value : '').trim().slice(0, 260)
 
-    if (driver === 'sqlite') {
+    if (driver === 'sqlite' || driver === 'duckdb') {
       const filePath = $('formFilePath').value.trim()
-      const baseName = filePath.split(/[\\/]/).filter(Boolean).pop() || 'database.db'
+      const defaultFile = driver === 'duckdb' ? 'analytics.duckdb' : 'database.db'
+      const baseName = filePath.split(/[\\/]/).filter(Boolean).pop() || defaultFile
       return {
         profile: {
           id,
           name: name || baseName,
-          driver: 'sqlite',
+          driver,
           database: baseName,
           filePath,
           readOnly,
@@ -831,7 +1141,9 @@ export function createPanelConnectionFormController(ctx) {
     }
 
     if (driver === 'libsql') {
-      const url = $('formLibsqlUrl').value.trim()
+      const rawUrl = $('formLibsqlUrl').value.trim()
+      const { cleanUrl, defaultName } = sanitizePanelLibsqlUrlAndName(rawUrl)
+      const url = cleanUrl || rawUrl
       const authToken = $('formAuthToken').value
       const database = $('formLibsqlDb').value.trim() || 'turso'
       const keepStoredToken =
@@ -839,7 +1151,7 @@ export function createPanelConnectionFormController(ctx) {
       return {
         profile: {
           id,
-          name: name || url || 'LibSQL',
+          name: name || defaultName,
           driver: 'libsql',
           database,
           url,
@@ -892,13 +1204,37 @@ export function createPanelConnectionFormController(ctx) {
       profile.redisDb = Number.isFinite(rdb) && rdb >= 0 && rdb <= 15 ? rdb : 0
     }
 
-    if (driver === 'postgres' || driver === 'cockroachdb') {
+    if (isPanelOptionsDriver(driver)) {
       const pgOptions = ($('formOptions') ? $('formOptions').value : state.formOptions || '').trim()
       if (pgOptions) profile.options = pgOptions
     }
 
+    if (driver === 'mongodb') {
+      const mongoUrl = scrubPanelNetworkFormUrl($('formClickhouseUrl')?.value || '')
+      if (mongoUrl) {
+        profile.url = mongoUrl
+        try {
+          const parsedMongo = new URL(mongoUrl)
+          if (parsedMongo.hostname) profile.host = parsedMongo.hostname
+          if (parsedMongo.port) {
+            const parsedMongoPort = Number.parseInt(parsedMongo.port, 10)
+            if (Number.isFinite(parsedMongoPort) && parsedMongoPort >= 1 && parsedMongoPort <= 65535) {
+              profile.port = parsedMongoPort
+            }
+          }
+          const mongoTls = parsedMongo.searchParams.get('tls') || parsedMongo.searchParams.get('ssl')
+          if (mongoTls === 'true') profile.ssl = true
+          else if (mongoTls === 'false') profile.ssl = false
+        } catch {}
+      }
+    }
+
+    if (driver === 'oracle' && state.parsedOracleUrl) {
+      profile.url = scrubPanelNetworkFormUrl(state.parsedOracleUrl)
+    }
+
     if (driver === 'clickhouse') {
-      const chUrl = $('formClickhouseUrl').value.trim()
+      const chUrl = scrubPanelNetworkFormUrl($('formClickhouseUrl').value)
       const generatedUrl = `${ssl ? 'https' : 'http'}://${host}:${port}`
       if (chUrl) {
         profile.url = chUrl
@@ -921,6 +1257,28 @@ export function createPanelConnectionFormController(ctx) {
       } else {
         profile.url = generatedUrl
       }
+    }
+
+    if (
+      state.formSslMode === 'auto' ||
+      state.formSslMode === 'disable' ||
+      state.formSslMode === 'require' ||
+      state.formSslMode === 'verify-ca' ||
+      state.formSslMode === 'verify-full'
+    ) {
+      profile.sslMode = state.formSslMode
+    }
+    if (typeof state.formSslRejectUnauthorized === 'boolean') {
+      profile.sslRejectUnauthorized = state.formSslRejectUnauthorized
+      if (
+        profile.ssl &&
+        state.formSslRejectUnauthorized === false &&
+        (profile.sslMode === undefined || profile.sslMode === 'auto')
+      ) {
+        profile.sslMode = 'require'
+      }
+    } else if (profile.ssl && profile.sslMode !== 'require' && profile.sslMode !== 'disable') {
+      profile.sslRejectUnauthorized = true
     }
 
     if (state.editingId === id && Array.isArray(state.connections)) {
@@ -946,6 +1304,9 @@ export function createPanelConnectionFormController(ctx) {
             'd1DatabaseId',
           ]
           for (const key of extendedKeys) {
+            if (state.formSslTouched && (key === 'sslMode' || key === 'sslRejectUnauthorized')) {
+              continue
+            }
             if (existing[key] !== undefined && profile[key] === undefined) {
               profile[key] = existing[key]
             }
@@ -961,23 +1322,57 @@ export function createPanelConnectionFormController(ctx) {
     }
   }
 
+  function resolveUriInputForParse(explicitRaw) {
+    const uriEl = $('uriInput')
+    if (explicitRaw && typeof explicitRaw === 'object') {
+      const candidateId =
+        typeof explicitRaw.candidateId === 'string' && explicitRaw.candidateId.trim()
+          ? explicitRaw.candidateId.trim()
+          : undefined
+      const uri =
+        typeof explicitRaw.uri === 'string' && explicitRaw.uri.trim()
+          ? explicitRaw.uri.trim()
+          : undefined
+      const displayUri = String(explicitRaw.displayUri ?? uriEl?.value ?? uri ?? '').trim()
+      return { ...(candidateId ? { candidateId } : {}), ...(uri ? { uri } : {}), displayUri }
+    }
+    const displayUri = String(explicitRaw ?? uriEl?.value ?? '').trim()
+    if (activeAutoDisplayUri !== null && displayUri === activeAutoDisplayUri) {
+      if (activeAutoCandidateId) {
+        return { candidateId: activeAutoCandidateId, displayUri }
+      }
+      if (activeAutoRawUri) {
+        return { uri: activeAutoRawUri, displayUri }
+      }
+    } else if (
+      explicitRaw === undefined &&
+      (activeAutoDisplayUri !== null || activeAutoCandidateId !== null || activeAutoRawUri !== null)
+    ) {
+      clearActiveAutoUri()
+    }
+    return { uri: displayUri, displayUri }
+  }
+
   async function handleParseUri(rawUri, options = {}) {
-    const uri = (rawUri ?? $('uriInput').value).trim()
-    if (!uri) return false
+    const target = resolveUriInputForParse(rawUri)
+    if (!target.candidateId && !target.uri) return false
     const seq = ++parseUriSeq
     const parseBtn = $('parseUriBtn')
     clearFormNotice()
     setButtonLoading(parseBtn, true, 'Parsing...')
     try {
-      const res = await rpc('connection.parseUri', { uri })
+      const payload = target.candidateId ? { candidateId: target.candidateId } : { uri: target.uri }
+      const res = await rpc('connection.parseUri', payload)
       if (seq !== parseUriSeq) return false
       if (!res?.ok || !res.profile) {
         showFormNotice(res?.error || 'Could not parse connection URI.', 'danger')
         return false
       }
-      state.lastParsedUri = uri
+      state.lastParsedUri = target.uri || ''
+      lastParsedCandidateId = target.candidateId || ''
+      lastParsedDisplayUri = target.displayUri || (target.uri ? maskConnectionUriSecret(target.uri) : '')
       const p = res.profile
-      if (!p.driver || !ENGINE_BY_ID[p.driver]) {
+      if (!p.driver || !ENGINE_BY_ID[p.driver] || ENGINE_BY_ID[p.driver].studioOnly) {
         showFormNotice(
           `"${String(p.driver || 'This')}" connections are configured in Fullscreen Studio — click Studio to add or edit.`,
           'warn'
@@ -1038,32 +1433,63 @@ export function createPanelConnectionFormController(ctx) {
       $('formRedisDb').value = '0'
       $('formPassword').value = ''
       setFormDriver(driver, true)
+      state.parsedOracleUrl = driver === 'oracle' && p.url ? scrubPanelNetworkFormUrl(p.url) : ''
       if (p.name) $('formName').value = p.name
       if (p.readOnly !== undefined) $('formReadOnly').checked = Boolean(p.readOnly)
-      if (driver === 'sqlite') {
+      if (driver === 'sqlite' || driver === 'duckdb') {
         $('formFilePath').value = p.filePath || ''
       } else if (driver === 'libsql') {
-        $('formLibsqlUrl').value = p.url || ''
+        $('formLibsqlUrl').value = p.url
+          ? sanitizePanelLibsqlUrlAndName(p.url).cleanUrl || scrubPanelNetworkFormUrl(p.url)
+          : ''
         $('formLibsqlDb').value = p.database || ''
         $('formAuthToken').value = nextAuthToken
       } else {
         if (p.host) $('formHost').value = p.host
         if (p.port) $('formPort').value = String(p.port)
         if (p.user !== undefined) $('formUser').value = p.user
+        state.formSslTouched = true
         if (p.ssl !== undefined) $('formSsl').checked = Boolean(p.ssl)
+        if (
+          p.sslMode === 'auto' ||
+          p.sslMode === 'disable' ||
+          p.sslMode === 'require' ||
+          p.sslMode === 'verify-ca' ||
+          p.sslMode === 'verify-full'
+        ) {
+          state.formSslMode = p.sslMode
+          if (p.sslMode === 'disable') $('formSsl').checked = false
+          else if (
+            p.sslMode === 'require' ||
+            p.sslMode === 'verify-ca' ||
+            p.sslMode === 'verify-full'
+          ) {
+            $('formSsl').checked = true
+          }
+        } else if (p.ssl === false) {
+          state.formSslMode = 'disable'
+        } else if (p.ssl) {
+          state.formSslMode = 'auto'
+        } else {
+          state.formSslMode = undefined
+        }
+        if (p.sslRejectUnauthorized !== undefined) {
+          state.formSslRejectUnauthorized = Boolean(p.sslRejectUnauthorized)
+        } else if ($('formSsl').checked) {
+          state.formSslRejectUnauthorized = true
+        } else {
+          state.formSslRejectUnauthorized = undefined
+        }
+        syncSslVerifyUi()
         if (driver === 'redis') {
           $('formRedisDb').value = String(p.redisDb ?? 0)
         } else if (p.database !== undefined) {
           $('formDatabase').value = p.database
         }
-        if (driver === 'clickhouse' && p.url) {
-          $('formClickhouseUrl').value = p.url
+        if ((driver === 'clickhouse' || driver === 'mongodb') && p.url) {
+          $('formClickhouseUrl').value = scrubPanelNetworkFormUrl(p.url)
         }
-        if (
-          (driver === 'postgres' || driver === 'cockroachdb') &&
-          typeof p.options === 'string' &&
-          p.options.trim()
-        ) {
+        if (isPanelOptionsDriver(driver) && typeof p.options === 'string' && p.options.trim()) {
           state.formOptions = p.options.trim()
           if ($('formOptions')) $('formOptions').value = state.formOptions
         }
@@ -1087,6 +1513,7 @@ export function createPanelConnectionFormController(ctx) {
             : 'Optional'
         showFormNotice(`Parsed ${ENGINE_BY_ID[driver].label} URI`, 'success')
       }
+      savePanelViewState?.()
       return true
     } catch (err) {
       if (seq !== parseUriSeq) return false
@@ -1118,6 +1545,35 @@ export function createPanelConnectionFormController(ctx) {
       state.discoveredDocker = Array.isArray(wsRes?.dockerComposeConnections)
         ? wsRes.dockerComposeConnections
         : []
+      const scannedDirs = Array.isArray(wsRes?.scannedDirs)
+        ? wsRes.scannedDirs.map((d) => String(d || '').trim()).filter(Boolean)
+        : []
+      state.discoveredScannedDirs = scannedDirs
+      state.discoveredFolderScoped = wsRes?.folderScoped ?? Boolean(folderPath && folderPath.trim())
+      state.discoveredDockerScopeLabel =
+        wsRes?.dockerScopeLabel === 'Docker Context' || wsRes?.dockerIsLocal === false
+          ? 'Docker Context'
+          : 'Local Docker'
+      const scopeHintEl = $('discoveredScopeHint')
+      if (scopeHintEl && scannedDirs.length > 0) {
+        scopeHintEl.title = scannedDirs.join(', ')
+        if (state.discoveredFolderScoped) {
+          const shortName = extractScannedFolderName(scannedDirs[0])
+          scopeHintEl.textContent = `Scanned folder: ${shortName} (Compose files and matching containers inside this folder only).`
+        } else {
+          const folderSummary =
+            scannedDirs.length === 1
+              ? '1 local workspace folder'
+              : `${scannedDirs.length} local workspace folders`
+          if (state.discoveredDockerScopeLabel === 'Docker Context') {
+            scopeHintEl.textContent = `Scanned ${folderSummary} · Plus active Docker Context containers (non-workspace labeled "Other Docker Context").`
+          } else {
+            scopeHintEl.textContent = `Scanned ${folderSummary} · Plus local Docker containers (non-workspace labeled "Other Local Docker").`
+          }
+        }
+      } else if (scopeHintEl) {
+        scopeHintEl.title = ''
+      }
       const wsFiles = Array.isArray(wsRes?.sqliteFiles) ? wsRes.sqliteFiles : []
       const extraFiles = Array.isArray(folderRes?.files) ? folderRes.files : []
       const seenPaths = new Set()
@@ -1160,20 +1616,32 @@ export function createPanelConnectionFormController(ctx) {
   }
 
   function applyDiscoveredDockerCompose(item) {
-    if (!item?.driver || !ENGINE_BY_ID[item.driver]) {
+    if (!item?.driver || !ENGINE_BY_ID[item.driver] || ENGINE_BY_ID[item.driver].studioOnly) {
       showFormNotice(
         `"${String(item?.driver || 'This')}" connections must be configured in Fullscreen Studio.`,
         'warn'
       )
       return
     }
+    const seq = ++dockerApplySeq
+    clearActiveAutoUri()
+    lastParsedDisplayUri = ''
+    lastParsedCandidateId = ''
     state.sourceSecretConnId = null
     state.formHadPassword = false
     state.formHadAuthToken = false
     state.placeholderPasswordPending = false
     state.lastParsedPlaceholderUri = false
     state.lastParsedUri = ''
-    $('uriInput').value = ''
+    if (item.url) {
+      const maskedUrl = maskConnectionUriSecret(item.url)
+      $('uriInput').value = maskedUrl
+      activeAutoCandidateId = item.candidateId || null
+      activeAutoRawUri = item.candidateId ? null : item.url
+      activeAutoDisplayUri = maskedUrl
+    } else {
+      $('uriInput').value = ''
+    }
     $('formPassword').value = ''
     $('formPassword').placeholder = item.passwordFromFile
       ? `Required (${item.passwordFromFile})`
@@ -1181,16 +1649,23 @@ export function createPanelConnectionFormController(ctx) {
     $('formAuthToken').value = ''
     $('formAuthToken').placeholder = 'Optional Bearer token'
 
+    if ($('formClickhouseUrl')) $('formClickhouseUrl').value = ''
     setFormDriver(item.driver, true)
     $('formName').value = item.name || `${item.project} · ${item.service}`
     if (item.driver === 'libsql') {
-      $('formLibsqlUrl').value = item.url || `http://${item.host || '127.0.0.1'}:${item.port || 8080}`
+      $('formLibsqlUrl').value = item.url
+        ? sanitizePanelLibsqlUrlAndName(item.url).cleanUrl || scrubPanelNetworkFormUrl(item.url)
+        : `http://${item.host || '127.0.0.1'}:${item.port || 8080}`
       $('formLibsqlDb').value = item.database || 'main'
     } else {
       $('formHost').value = item.host || '127.0.0.1'
       $('formPort').value = String(item.port || ENGINE_BY_ID[item.driver].defaultPort)
       $('formUser').value = item.user || ''
       $('formSsl').checked = Boolean(item.ssl)
+      state.formSslTouched = true
+      state.formSslMode = item.ssl ? 'auto' : undefined
+      state.formSslRejectUnauthorized = item.ssl ? true : undefined
+      syncSslVerifyUi()
       if (item.driver === 'redis') {
         $('formRedisDb').value = String(item.redisDb ?? 0)
         syncSelectTooltip($('formRedisDb'))
@@ -1198,7 +1673,11 @@ export function createPanelConnectionFormController(ctx) {
         $('formDatabase').value = item.database || ENGINE_BY_ID[item.driver].defaultDb || ''
       }
       if (item.driver === 'clickhouse') {
-        $('formClickhouseUrl').value = item.url || `http://${item.host || '127.0.0.1'}:${item.port || 8123}`
+        $('formClickhouseUrl').value = item.url
+          ? scrubPanelNetworkFormUrl(item.url)
+          : `http://${item.host || '127.0.0.1'}:${item.port || 8123}`
+      } else if (item.driver === 'mongodb') {
+        $('formClickhouseUrl').value = item.url ? scrubPanelNetworkFormUrl(item.url) : ''
       }
       if (item.password !== undefined) {
         $('formPassword').value = item.password
@@ -1215,6 +1694,36 @@ export function createPanelConnectionFormController(ctx) {
       )
     }
     savePanelViewState?.()
+
+    if (item.candidateId) {
+      const candidateId = item.candidateId
+      void rpc('workspace.resolveDetectedCandidate', { candidateId })
+        .then((resolved) => {
+          if (seq !== dockerApplySeq || !resolved?.ok) return
+          if (resolved.password !== undefined && item.driver !== 'libsql') {
+            $('formPassword').value = resolved.password
+          }
+          if (resolved.authToken !== undefined && item.driver === 'libsql') {
+            $('formAuthToken').value = resolved.authToken
+          }
+          if (resolved.url) {
+            if (item.driver === 'libsql') {
+              $('formLibsqlUrl').value =
+                sanitizePanelLibsqlUrlAndName(resolved.url).cleanUrl ||
+                scrubPanelNetworkFormUrl(resolved.url)
+            } else if (item.driver === 'clickhouse' || item.driver === 'mongodb') {
+              $('formClickhouseUrl').value = scrubPanelNetworkFormUrl(resolved.url)
+            }
+          }
+          if (item.url && activeAutoCandidateId === candidateId && activeAutoDisplayUri) {
+            lastParsedCandidateId = candidateId
+            lastParsedDisplayUri = activeAutoDisplayUri
+          }
+        })
+        .catch(() => {
+          // Best-effort secret resolution; Save/Parse URI falls back to connection.parseUri({ candidateId })
+        })
+    }
   }
 
   function applyGroupCollapseState(groupKey, groupEl, toggleBtn, bodyEl, countEl, totalCount, filteredCount, hasQuery) {
@@ -1339,9 +1848,20 @@ export function createPanelConnectionFormController(ctx) {
         chip.append(top, sub)
 
         chip.addEventListener('click', () => {
-          $('uriInput').value = item.uri
+          dockerApplySeq++
+          const uriEl = $('uriInput')
+          uriEl.value = maskedUri
+          activeAutoCandidateId = item.candidateId || null
+          activeAutoRawUri = item.candidateId ? null : item.uri
+          activeAutoDisplayUri = maskedUri
           if (!$('formName').value.trim()) $('formName').value = item.name || item.envKey
-          void handleParseUri(item.uri, { clearMissingSecret: true })
+          void handleParseUri(
+            {
+              ...(item.candidateId ? { candidateId: item.candidateId } : { uri: item.uri }),
+              displayUri: maskedUri,
+            },
+            { clearMissingSecret: true }
+          )
         })
         envList.appendChild(chip)
       }
@@ -1407,6 +1927,17 @@ export function createPanelConnectionFormController(ctx) {
           wsBadge.className = 'badge badge-info'
           wsBadge.textContent = 'Workspace'
           badges.appendChild(wsBadge)
+        } else {
+          const otherBadge = document.createElement('span')
+          otherBadge.className = 'badge badge-neutral'
+          const isRemoteContext = state.discoveredDockerScopeLabel === 'Docker Context'
+          otherBadge.textContent = isRemoteContext
+            ? 'Other Docker Context'
+            : 'Other Local Docker'
+          otherBadge.title = isRemoteContext
+            ? 'Running in the active Docker context outside the scanned workspace folder'
+            : 'Running in local Docker outside the active workspace folder'
+          badges.appendChild(otherBadge)
         }
         const statusBadge = document.createElement('span')
         statusBadge.className =
@@ -1514,15 +2045,39 @@ export function createPanelConnectionFormController(ctx) {
   }
 
   async function ensureUriParsedBeforeAction() {
-    const pendingUri = $('uriInput').value.trim()
-    if (pendingUri && pendingUri !== state.lastParsedUri) {
-      return await handleParseUri(pendingUri)
+    const target = resolveUriInputForParse()
+    if (!target.candidateId && !target.uri) {
+      return true
     }
-    return true
+    if (
+      target.candidateId &&
+      lastParsedCandidateId &&
+      target.candidateId === lastParsedCandidateId &&
+      target.displayUri === lastParsedDisplayUri
+    ) {
+      return true
+    }
+    if (
+      target.uri &&
+      (target.uri === state.lastParsedUri ||
+        (state.lastParsedUri &&
+          (target.uri === maskConnectionUriSecret(state.lastParsedUri) ||
+            target.displayUri === maskConnectionUriSecret(state.lastParsedUri))) ||
+        (lastParsedDisplayUri && target.displayUri === lastParsedDisplayUri))
+    ) {
+      return true
+    }
+    return await handleParseUri(target)
   }
 
   function ensureRequiredPasswordBeforeSubmit(targetId) {
-    if (state.formDriver === 'sqlite' || state.formDriver === 'libsql') return true
+    if (
+      state.formDriver === 'sqlite' ||
+      state.formDriver === 'duckdb' ||
+      state.formDriver === 'libsql'
+    ) {
+      return true
+    }
     const typedPassword = $('formPassword').value
     if (state.placeholderPasswordPending && !typedPassword) {
       showFormNotice(
@@ -1558,6 +2113,8 @@ export function createPanelConnectionFormController(ctx) {
     initStaticSelectors,
     setFormColorTag,
     setFormDriver,
+    syncSslVerifyUi,
+    clearActiveAutoUri,
     resetConnectionForm,
     clearFormFields,
     populateFormFromProfile,

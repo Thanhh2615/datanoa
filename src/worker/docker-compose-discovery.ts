@@ -31,6 +31,92 @@ export interface ComposeDetectOptions {
   liveContainersOverride?: DockerInspectContainer[]
 }
 
+export interface DockerTargetLocality {
+  isLocal: boolean
+  contextLabel: 'Local Docker' | 'Docker Context'
+}
+
+const KNOWN_LOCAL_DOCKER_CONTEXTS: ReadonlySet<string> = new Set([
+  'default',
+  'desktop-linux',
+  'desktop-windows',
+  'rancher-desktop',
+  'orbstack',
+  'colima',
+  'lima-default',
+  'podman-machine-default',
+])
+
+function isLocalDockerHostEndpoint(rawHost: string): boolean {
+  const trimmed = rawHost.trim().toLowerCase()
+  if (!trimmed) return true
+  if (trimmed.startsWith('unix://') || trimmed.startsWith('npipe://') || trimmed.startsWith('fd://')) {
+    return true
+  }
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol === 'tcp:' || parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      const h = parsed.hostname.replace(/^\[|\]$/g, '')
+      return h === 'localhost' || h === '::1' || /^127(?:\.\d{1,3}){3}$/.test(h)
+    }
+  } catch {
+    // Non-URL Docker host (e.g. remote ssh/host) treated as non-local
+  }
+  return false
+}
+
+export function detectDockerTargetLocality(
+  env: NodeJS.ProcessEnv = process.env,
+  dockerConfigPath?: string
+): DockerTargetLocality {
+  const dockerHost = (env.DOCKER_HOST || '').trim()
+  if (dockerHost.length > 0) {
+    const isLocal = isLocalDockerHostEndpoint(dockerHost)
+    return {
+      isLocal,
+      contextLabel: isLocal ? 'Local Docker' : 'Docker Context',
+    }
+  }
+
+  const dockerContext = (env.DOCKER_CONTEXT || '').trim()
+  if (dockerContext.length > 0) {
+    const isLocal = KNOWN_LOCAL_DOCKER_CONTEXTS.has(dockerContext.toLowerCase())
+    return {
+      isLocal,
+      contextLabel: isLocal ? 'Local Docker' : 'Docker Context',
+    }
+  }
+
+  const configPath =
+    dockerConfigPath ??
+    path.join(
+      (env.DOCKER_CONFIG || '').trim() ||
+        path.join(env.HOME || env.USERPROFILE || os.homedir(), '.docker'),
+      'config.json'
+    )
+  try {
+    if (fs.existsSync(configPath)) {
+      const raw = fs.readFileSync(configPath, 'utf8')
+      const parsed = JSON.parse(raw) as { currentContext?: unknown }
+      const currentContext =
+        typeof parsed?.currentContext === 'string' ? parsed.currentContext.trim() : ''
+      if (currentContext.length > 0 && !KNOWN_LOCAL_DOCKER_CONTEXTS.has(currentContext.toLowerCase())) {
+        return {
+          isLocal: false,
+          contextLabel: 'Docker Context',
+        }
+      }
+    }
+  } catch {
+    // Unreadable ~/.docker/config.json defaults to Local Docker
+  }
+
+  return {
+    isLocal: true,
+    contextLabel: 'Local Docker',
+  }
+}
+
 const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project'
 const COMPOSE_SERVICE_LABEL = 'com.docker.compose.service'
 const COMPOSE_WORKDIR_LABEL = 'com.docker.compose.project.working_dir'

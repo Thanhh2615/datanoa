@@ -3,6 +3,8 @@
 
 import { DATANOA_LOGO_DATA_URI } from '../assets/logo.js'
 import { createDbLogoSvg, createSvgElement } from './db-icons.js'
+import { renderAiStatusButtonContent } from '../shared-ai-ui.js'
+import { bindCtrlWheelHorizontalScroll } from '../shared-wheel-scroll.js'
 
 export interface StudioDomRefs {
   rootEl: HTMLDivElement
@@ -25,6 +27,7 @@ export interface StudioDomRefs {
   historyBtn: HTMLButtonElement
   savedQueriesBtn: HTMLButtonElement
   findSqlBtn: HTMLButtonElement
+  aiBtn: HTMLButtonElement
   refreshBtn: HTMLButtonElement
   sqlToolbarEl: HTMLDivElement
   tabButtons: Record<'split' | 'grid' | 'sql' | 'inspector', HTMLButtonElement>
@@ -89,15 +92,17 @@ export interface StudioDomRefs {
   queryBannerDetailEl: HTMLDivElement
   queryBannerRetryBtn: HTMLButtonElement
   queryBannerBackBtn: HTMLButtonElement
+  queryBannerFixAiBtn: HTMLButtonElement
   queryBannerCopyBtn: HTMLButtonElement
   queryBannerReportBtn: HTMLButtonElement
   queryBannerCloseBtn: HTMLButtonElement
+  aiFixEl: HTMLDivElement
   gridAreaEl: HTMLDivElement
+  explainAiEl: HTMLDivElement
   resultSetsBarEl: HTMLDivElement
   inspectorAreaEl: HTMLDivElement
   statusStateEl: HTMLSpanElement
   statusSelectionEl: HTMLButtonElement
-  shortcutHintEl: HTMLSpanElement
   statusMetricsEl: HTMLSpanElement
   shortcutsBtn: HTMLButtonElement
   feedbackBtn: HTMLButtonElement
@@ -256,7 +261,7 @@ export function createStudioDomTree(
 
   const findSqlBtn = document.createElement('button')
   findSqlBtn.type = 'button'
-  findSqlBtn.className = 'datanoa-btn datanoa-btn-sm'
+  findSqlBtn.className = 'datanoa-btn'
   findSqlBtn.textContent = 'Find'
   findSqlBtn.title = 'Find & Replace in SQL Console (Ctrl+F / Ctrl+H)'
   sqlToolbarEl.appendChild(findSqlBtn)
@@ -432,6 +437,7 @@ export function createStudioDomTree(
 
   const consoleTabsBarEl = document.createElement('div')
   consoleTabsBarEl.className = 'datanoa-console-tabs'
+  bindCtrlWheelHorizontalScroll(consoleTabsBarEl)
 
   const splitResizerEl = document.createElement('div')
   splitResizerEl.className = 'datanoa-split-resizer'
@@ -771,6 +777,13 @@ export function createStudioDomTree(
   queryBannerBackBtn.textContent = 'Back to Table'
   queryBannerBackBtn.style.display = 'none'
 
+  const queryBannerFixAiBtn = document.createElement('button')
+  queryBannerFixAiBtn.type = 'button'
+  queryBannerFixAiBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-btn-primary datanoa-fix-ai-btn'
+  queryBannerFixAiBtn.textContent = 'Fix with AI'
+  queryBannerFixAiBtn.title = 'Ask AI SQL Assistant to explain and suggest a fix for this SQL error'
+  queryBannerFixAiBtn.style.display = 'none'
+
   const queryBannerCopyBtn = document.createElement('button')
   queryBannerCopyBtn.type = 'button'
   queryBannerCopyBtn.className = 'datanoa-btn datanoa-btn-sm'
@@ -791,11 +804,16 @@ export function createStudioDomTree(
 
   bannerActions.appendChild(queryBannerRetryBtn)
   bannerActions.appendChild(queryBannerBackBtn)
+  bannerActions.appendChild(queryBannerFixAiBtn)
   bannerActions.appendChild(queryBannerCopyBtn)
   bannerActions.appendChild(queryBannerReportBtn)
   bannerActions.appendChild(queryBannerCloseBtn)
   queryBannerEl.appendChild(bannerBody)
   queryBannerEl.appendChild(bannerActions)
+
+  const aiFixEl = document.createElement('div')
+  aiFixEl.className = 'datanoa-ai-fix-panel'
+  aiFixEl.hidden = true
 
   const gridAreaEl = document.createElement('div')
   gridAreaEl.className = 'datanoa-grid-area'
@@ -803,6 +821,7 @@ export function createStudioDomTree(
   const resultSetsBarEl = document.createElement('div')
   resultSetsBarEl.className = 'datanoa-result-sets-bar'
   resultSetsBarEl.style.display = 'none'
+  bindCtrlWheelHorizontalScroll(resultSetsBarEl)
 
   const inspectorAreaEl = document.createElement('div')
   inspectorAreaEl.className = 'datanoa-inspector-view'
@@ -818,8 +837,13 @@ export function createStudioDomTree(
   mainViewEl.appendChild(gridToolbarEl)
   mainViewEl.appendChild(dmlPreviewEl)
   mainViewEl.appendChild(queryBannerEl)
+  mainViewEl.appendChild(aiFixEl)
   mainViewEl.appendChild(resultSetsBarEl)
   mainViewEl.appendChild(gridAreaEl)
+  const explainAiEl = document.createElement('div')
+  explainAiEl.className = 'datanoa-ai-explain-panel'
+  explainAiEl.hidden = true
+  mainViewEl.appendChild(explainAiEl)
   mainViewEl.appendChild(valueInspectorEl)
   mainViewEl.appendChild(inspectorAreaEl)
 
@@ -840,14 +864,17 @@ export function createStudioDomTree(
   statusSelectionEl.style.display = 'none'
   statusSelectionEl.title = 'Click to copy selection statistics to clipboard'
 
-  const shortcutHintEl = document.createElement('span')
-  shortcutHintEl.className = 'datanoa-shortcut-hint'
-  shortcutHintEl.textContent =
-    'Ctrl + Scroll ↔ Pan · Ctrl+K Switcher · Ctrl+F Find · Shift+Alt+F Format · Ctrl+S Submit'
-
   const statusMetricsEl = document.createElement('span')
   statusMetricsEl.className = 'datanoa-status-metrics'
   statusMetricsEl.textContent = '0 rows'
+
+  const statusActionsEl = document.createElement('div')
+  statusActionsEl.className = 'datanoa-status-actions'
+
+  const aiBtn = document.createElement('button')
+  aiBtn.type = 'button'
+  aiBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-ai-toolbar-btn datanoa-status-ai-btn tone-neutral'
+  renderAiStatusButtonContent(aiBtn, null)
 
   const shortcutsBtn = document.createElement('button')
   shortcutsBtn.type = 'button'
@@ -863,12 +890,14 @@ export function createStudioDomTree(
   feedbackBtn.title = 'Report a Bug or Request a Feature on GitHub'
   feedbackBtn.setAttribute('aria-label', 'Report a Bug or Request a Feature on GitHub')
 
+  statusActionsEl.appendChild(aiBtn)
+  statusActionsEl.appendChild(shortcutsBtn)
+  statusActionsEl.appendChild(feedbackBtn)
+
   statusBar.appendChild(statusStateEl)
   statusBar.appendChild(statusSelectionEl)
-  statusBar.appendChild(shortcutHintEl)
   statusBar.appendChild(statusMetricsEl)
-  statusBar.appendChild(shortcutsBtn)
-  statusBar.appendChild(feedbackBtn)
+  statusBar.appendChild(statusActionsEl)
 
   rootEl.appendChild(toolbar)
   rootEl.appendChild(cautionStripEl)
@@ -896,6 +925,7 @@ export function createStudioDomTree(
     historyBtn,
     savedQueriesBtn,
     findSqlBtn,
+    aiBtn,
     refreshBtn,
     sqlToolbarEl,
     tabButtons,
@@ -960,15 +990,17 @@ export function createStudioDomTree(
     queryBannerDetailEl,
     queryBannerRetryBtn,
     queryBannerBackBtn,
+    queryBannerFixAiBtn,
     queryBannerCopyBtn,
     queryBannerReportBtn,
     queryBannerCloseBtn,
+    aiFixEl,
     gridAreaEl,
+    explainAiEl,
     resultSetsBarEl,
     inspectorAreaEl,
     statusStateEl,
     statusSelectionEl,
-    shortcutHintEl,
     statusMetricsEl,
     shortcutsBtn,
     feedbackBtn,

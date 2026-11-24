@@ -36,6 +36,8 @@ import {
   quoteQualifiedTable,
 } from '../common/update-builder'
 import { TableDetailsCache, collectAndAssembleSchemaDdl } from '../common/schema'
+import { scrubUrlCredentials } from '../common/connection-uri'
+import { scrubDriverErrorText } from '../common/sql-credentials'
 import { stripCommentsAndLiterals, isMutatingStatement } from '../common/sql-lexer'
 import { compactSql, quoteIdentForDialect, reconstructTableDdl, splitSqlStatements } from '../common/sql-tools'
 
@@ -55,16 +57,34 @@ const CLICKHOUSE_ROW_RETURNING_REGEX =
   /^\s*\(*\s*(?:SELECT|SHOW|DESCRIBE|DESC|EXPLAIN|EXISTS|WITH)\b/i
 const CLICKHOUSE_FORMAT_SUFFIX_REGEX = /\bFORMAT\s+([A-Za-z0-9_]+)\s*;?\s*$/i
 
+function formatClickHouseErrorMessage(err: unknown, fallback: string): string {
+  const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : ''
+  return scrubDriverErrorText(raw).trim() || fallback
+}
+
 function finishClickHouseHttp(
   text: string,
   ok: boolean,
   status: number,
   summaryHeader: string | null,
-  expectJsonCompact: boolean
-): { json?: ClickHouseJsonCompactResponse; summaryAffectedRows?: number; rawText: string } {
+  expectJsonCompact: boolean,
+  allowPlainTextExplain = false
+): {
+  json?: ClickHouseJsonCompactResponse
+  summaryAffectedRows?: number
+  rawText: string
+  isPlainTextExplain?: boolean
+} {
+  if (status >= 300 && status < 400) {
+    throw new DatabaseDriverError(
+      `ClickHouse HTTP redirect (HTTP ${status}) was blocked to protect credentials. Configure the final endpoint URL directly.`,
+      'CLICKHOUSE_REDIRECT_BLOCKED',
+      'clickhouse'
+    )
+  }
   if (!ok) {
     throw new DatabaseDriverError(
-      text.trim() || `ClickHouse HTTP error ${status}`,
+      scrubDriverErrorText(text).trim() || `ClickHouse HTTP error ${status}`,
       'CLICKHOUSE_ERROR',
       'clickhouse'
     )
@@ -91,8 +111,11 @@ function finishClickHouseHttp(
       const parsed = JSON.parse(text) as ClickHouseJsonCompactResponse
       return { json: parsed, summaryAffectedRows, rawText: text }
     } catch (err) {
+      if (allowPlainTextExplain) {
+        return { summaryAffectedRows, rawText: text, isPlainTextExplain: true }
+      }
       throw new DatabaseDriverError(
-        `Failed to parse ClickHouse JSONCompact response: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to parse ClickHouse JSONCompact response: ${formatClickHouseErrorMessage(err, 'Invalid JSON')}`,
         'CLICKHOUSE_PARSE_ERROR',
         'clickhouse',
         err
@@ -138,14 +161,26 @@ function sendHttpsRequest(
   })
 }
 
+function stripClickHouseUrlCredentials(rawUrl: string): string {
+  const scrubbed = scrubUrlCredentials(rawUrl)
+  if (scrubbed !== undefined) {
+    return scrubbed.replace(/\/+$/, '')
+  }
+  return scrubDriverErrorText(rawUrl)
+    .replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@\s]+@/g, '$1')
+    .replace(/\/+$/, '')
+}
+
 export function normalizeClickHouseBaseUrl(
   profile: ConnectionProfile,
   tlsOverride?: false | tls.ConnectionOptions
 ): string {
   if (tlsOverride === false) {
     // Explicit sslMode: 'disable' — force plain HTTP, never fall back to auto-SSL
-    const raw = (profile.url?.trim() || '').replace(/^clickhouses:\/\//i, 'http://')
-    if (raw.length > 0) return raw.replace(/^https:\/\//i, 'http://').replace(/\/+$/, '')
+    const raw = (profile.url?.trim() || '').replace(/^clickhouses?:\/\//i, 'http://')
+    if (raw.length > 0) {
+      return stripClickHouseUrlCredentials(raw.replace(/^https:\/\//i, 'http://'))
+    }
     return `http://${profile.host || 'localhost'}:${profile.port || 8123}`
   }
   if (tlsOverride) {
@@ -155,9 +190,11 @@ export function normalizeClickHouseBaseUrl(
     // Custom CA / mTLS requires HTTPS: upgrade plain http:// URLs so https.request
     // never throws ERR_INVALID_PROTOCOL
     const raw = rawUrl.replace(/\/+$/, '')
-    if (/^http:\/\//i.test(raw)) return raw.replace(/^http:\/\//i, 'https://')
-    if (/^clickhouses?:\/\//i.test(raw)) return raw.replace(/^clickhouses?:\/\//i, 'https://')
-    return raw
+    if (/^http:\/\//i.test(raw)) return stripClickHouseUrlCredentials(raw.replace(/^http:\/\//i, 'https://'))
+    if (/^clickhouses?:\/\//i.test(raw)) {
+      return stripClickHouseUrlCredentials(raw.replace(/^clickhouses?:\/\//i, 'https://'))
+    }
+    return stripClickHouseUrlCredentials(raw)
   }
   return resolveClickHouseBaseUrl(profile)
 }
@@ -170,7 +207,7 @@ function resolveClickHouseBaseUrl(profile: ConnectionProfile): string {
     } else if (/^clickhouse:\/\//i.test(raw)) {
       raw = raw.replace(/^clickhouse:\/\//i, 'http://')
     }
-    return raw
+    return stripClickHouseUrlCredentials(raw)
   }
 
   const ssl = Boolean(profile.ssl)
@@ -253,16 +290,20 @@ function buildClickHouseWhereSql(
   columnTypes?: Record<string, string>
 ): string {
   const parts: string[] = []
+  const emittedCols = new Set<string>()
   for (const [col, val] of Object.entries(conditions)) {
     if (val === undefined) continue
+    emittedCols.add(col)
     const qCol = quoteIdentForDialect(col, 'clickhouse')
     parts.push(val === null ? `${qCol} IS NULL` : `${qCol} = ${formatSqlValue(val, 'clickhouse')}`)
   }
   if (extraRow && changeKeys) {
     for (const col of changeKeys) {
+      if (emittedCols.has(col)) continue
       if (!Object.prototype.hasOwnProperty.call(extraRow, col)) continue
       const orig = extraRow[col]
       if (!canBindOptimisticLockValue(orig, columnTypes?.[col])) continue
+      emittedCols.add(col)
       const qCol = quoteIdentForDialect(col, 'clickhouse')
       parts.push(orig === null ? `${qCol} IS NULL` : `${qCol} = ${formatSqlValue(orig, 'clickhouse')}`)
     }
@@ -348,6 +389,7 @@ export class ClickHouseSession implements IDatabaseSession {
     options?: {
       queryId?: string
       expectJsonCompact?: boolean
+      allowPlainTextExplain?: boolean
       signal?: AbortSignal
       maxResultRows?: number
     },
@@ -356,6 +398,7 @@ export class ClickHouseSession implements IDatabaseSession {
     json?: ClickHouseJsonCompactResponse
     summaryAffectedRows?: number
     rawText: string
+    isPlainTextExplain?: boolean
   }> {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'clickhouse')
@@ -397,6 +440,7 @@ export class ClickHouseSession implements IDatabaseSession {
           method: 'POST',
           headers,
           body: bodySql,
+          redirect: 'error',
           signal: combinedSignal,
         })
         const text = await response.text()
@@ -405,7 +449,8 @@ export class ClickHouseSession implements IDatabaseSession {
           response.ok,
           response.status,
           response.headers.get('x-clickhouse-summary'),
-          Boolean(options?.expectJsonCompact)
+          Boolean(options?.expectJsonCompact),
+          Boolean(options?.allowPlainTextExplain)
         )
       }
       // Custom CA / client certs (mTLS) need node:https so tls.ConnectionOptions apply
@@ -415,7 +460,8 @@ export class ClickHouseSession implements IDatabaseSession {
         result.ok,
         result.status,
         result.summaryHeader,
-        Boolean(options?.expectJsonCompact)
+        Boolean(options?.expectJsonCompact),
+        Boolean(options?.allowPlainTextExplain)
       )
     } catch (err: unknown) {
       if (
@@ -443,8 +489,21 @@ export class ClickHouseSession implements IDatabaseSession {
       if (err instanceof DatabaseDriverError) {
         throw err
       }
+      const errMsg = err instanceof Error ? err.message : ''
+      const causeMsg =
+        err && typeof err === 'object' && 'cause' in err && (err as { cause?: unknown }).cause instanceof Error
+          ? ((err as { cause: Error }).cause.message || '')
+          : ''
+      if (/redirect/i.test(errMsg) || /redirect/i.test(causeMsg)) {
+        throw new DatabaseDriverError(
+          'ClickHouse HTTP redirect was blocked to protect credentials. Configure the final endpoint URL directly.',
+          'CLICKHOUSE_REDIRECT_BLOCKED',
+          'clickhouse',
+          err
+        )
+      }
       throw new DatabaseDriverError(
-        err instanceof Error ? err.message : 'ClickHouse HTTP request failed',
+        formatClickHouseErrorMessage(err, 'ClickHouse HTTP request failed'),
         'CONNECTION_FAILED',
         'clickhouse',
         err
@@ -462,7 +521,7 @@ export class ClickHouseSession implements IDatabaseSession {
     } catch (err: unknown) {
       return {
         ok: false,
-        message: err instanceof Error ? err.message : 'Failed to connect to ClickHouse',
+        message: formatClickHouseErrorMessage(err, 'Failed to connect to ClickHouse'),
       }
     }
   }
@@ -726,9 +785,11 @@ export class ClickHouseSession implements IDatabaseSession {
     )
     const checkRow = mapCompactRowsToObjects(checkRes.json?.meta || [], checkRes.json?.data || [])[0]
     const matchedRows = Number(checkRow?.total ?? checkRow?.['COUNT(*)'] ?? checkRow?.['count()'] ?? 0)
-    if (!Number.isFinite(matchedRows) || matchedRows === 0) {
+    if (!Number.isFinite(matchedRows) || matchedRows === 0 || matchedRows > 1) {
       throw new DatabaseDriverError(
-        'Record was modified or deleted by another session (optimistic lock conflict)',
+        matchedRows > 1
+          ? `ClickHouse cell update aborted: predicate matched ${matchedRows} rows (expected 1)`
+          : 'Record was modified or deleted by another session (optimistic lock conflict)',
         'conflict',
         'clickhouse'
       )
@@ -742,11 +803,16 @@ export class ClickHouseSession implements IDatabaseSession {
     if (Object.prototype.hasOwnProperty.call(effectivePkConditions, params.column)) {
       effectivePkConditions[params.column] = params.newValue
     }
-    const pkWhere = buildClickHouseWhereSql(effectivePkConditions)
+    const readbackWhere = buildClickHouseWhereSql(
+      effectivePkConditions,
+      { [params.column]: params.newValue },
+      [params.column],
+      originalColumnType ? { [params.column]: originalColumnType } : undefined
+    )
     let updatedRecord: Record<string, unknown> | undefined
     try {
       const sel = await this.executeHttp(
-        `SELECT * FROM ${qTable} WHERE ${pkWhere} LIMIT 1`,
+        `SELECT * FROM ${qTable} WHERE ${readbackWhere} LIMIT 1`,
         { expectJsonCompact: true }
       )
       updatedRecord = mapCompactRowsToObjects(sel.json?.meta || [], sel.json?.data || [])[0]
@@ -762,8 +828,8 @@ export class ClickHouseSession implements IDatabaseSession {
   }
 
   private buildChangeStatements(params: ApplyChangesParams): {
-    deletes: { preview: string; exec: string; rowCount: number }[]
-    updates: { preview: string; exec: string }[]
+    deletes: { preview: string; exec: string; whereSql: string; rowCount: number }[]
+    updates: { preview: string; exec: string; whereSql: string }[]
     inserts: { preview: string; exec: string; rowCount: number }[]
   } {
     const targetDb = params.schema || this.getDatabase()
@@ -775,11 +841,22 @@ export class ClickHouseSession implements IDatabaseSession {
       params.columnTypes
     )
 
-    const deletes: { preview: string; exec: string; rowCount: number }[] = []
+    const deletes: { preview: string; exec: string; whereSql: string; rowCount: number }[] = []
     const rawDeletes = params.deletes ?? []
-    let delIdx = 0
-    while (delIdx < rawDeletes.length) {
+    const rawDeleteRows = params.deleteRows
+    if (rawDeleteRows !== undefined) {
+      if (!Array.isArray(rawDeleteRows) || rawDeleteRows.length !== rawDeletes.length) {
+        throw new DatabaseDriverError(
+          'ClickHouse deleteRows length must match deletes length',
+          'invalid_params',
+          'clickhouse'
+        )
+      }
+    }
+
+    for (let delIdx = 0; delIdx < rawDeletes.length; delIdx++) {
       const pk = rawDeletes[delIdx]
+      const origRow = rawDeleteRows?.[delIdx]
       const pkEntries = Object.entries(pk || {}).filter(([, v]) => v !== undefined)
       if (pkEntries.length === 0) {
         throw new DatabaseDriverError(
@@ -788,40 +865,42 @@ export class ClickHouseSession implements IDatabaseSession {
           'clickhouse'
         )
       }
-      if (rawDeletes.length > 1 && pkEntries.length === 1 && pkEntries[0][1] !== null) {
-        const [pkCol, firstVal] = pkEntries[0]
-        const qCol = quoteIdentForDialect(pkCol, 'clickhouse')
-        const inLiterals: string[] = [formatSqlValue(firstVal, 'clickhouse')]
-        let nextDelIdx = delIdx + 1
-        while (nextDelIdx < rawDeletes.length && inLiterals.length < CLICKHOUSE_MAX_INSERT_ROWS_PER_STMT) {
-          const candEntries = Object.entries(rawDeletes[nextDelIdx] || {}).filter(([, v]) => v !== undefined)
-          if (candEntries.length !== 1 || candEntries[0][0] !== pkCol || candEntries[0][1] === null) {
-            break
-          }
-          inLiterals.push(formatSqlValue(candEntries[0][1], 'clickhouse'))
-          nextDelIdx += 1
+      if (rawDeleteRows !== undefined) {
+        if (!origRow || typeof origRow !== 'object' || Array.isArray(origRow)) {
+          throw new DatabaseDriverError(
+            'ClickHouse deleteRows entry must be a row object matching primary key values',
+            'invalid_params',
+            'clickhouse'
+          )
         }
-        if (inLiterals.length > 1) {
-          const whereInSql = `${qCol} IN (${inLiterals.join(', ')})`
-          deletes.push({
-            preview: `ALTER TABLE ${qTable} DELETE WHERE ${whereInSql};`,
-            exec: `ALTER TABLE ${qTable} DELETE WHERE ${whereInSql} SETTINGS mutations_sync = 1`,
-            rowCount: inLiterals.length,
-          })
-          delIdx = nextDelIdx
-          continue
+        for (const [pkCol, pkVal] of pkEntries) {
+          if (
+            !Object.prototype.hasOwnProperty.call(origRow, pkCol) ||
+            !Object.is(origRow[pkCol], pkVal)
+          ) {
+            throw new DatabaseDriverError(
+              `ClickHouse deleteRows primary key mismatch on column "${pkCol}"`,
+              'invalid_params',
+              'clickhouse'
+            )
+          }
         }
       }
-      const whereSql = buildClickHouseWhereSql(pk)
+      const whereSql = buildClickHouseWhereSql(
+        pk,
+        origRow,
+        origRow ? Object.keys(origRow) : undefined,
+        columnTypes
+      )
       deletes.push({
         preview: `ALTER TABLE ${qTable} DELETE WHERE ${whereSql};`,
         exec: `ALTER TABLE ${qTable} DELETE WHERE ${whereSql} SETTINGS mutations_sync = 1`,
+        whereSql,
         rowCount: 1,
       })
-      delIdx += 1
     }
 
-    const updates: { preview: string; exec: string }[] = []
+    const updates: { preview: string; exec: string; whereSql: string }[] = []
     for (const upd of params.updates ?? []) {
       const pkEntries = Object.entries(upd.primaryKeys || {}).filter(([, v]) => v !== undefined)
       if (pkEntries.length === 0) {
@@ -834,6 +913,28 @@ export class ClickHouseSession implements IDatabaseSession {
       const changeEntries = Object.entries(upd.changes || {}).filter(([, v]) => v !== undefined)
       if (changeEntries.length === 0) continue
 
+      if (upd.originalRow !== undefined) {
+        if (!upd.originalRow || typeof upd.originalRow !== 'object' || Array.isArray(upd.originalRow)) {
+          throw new DatabaseDriverError(
+            'ClickHouse UPDATE originalRow must be a row object matching primary key values',
+            'invalid_params',
+            'clickhouse'
+          )
+        }
+        for (const [pkCol, pkVal] of pkEntries) {
+          if (
+            Object.prototype.hasOwnProperty.call(upd.originalRow, pkCol) &&
+            !Object.is(upd.originalRow[pkCol], pkVal)
+          ) {
+            throw new DatabaseDriverError(
+              `ClickHouse UPDATE originalRow primary key mismatch on column "${pkCol}"`,
+              'invalid_params',
+              'clickhouse'
+            )
+          }
+        }
+      }
+
       const setSql = changeEntries
         .map(
           ([col, val]) =>
@@ -843,12 +944,13 @@ export class ClickHouseSession implements IDatabaseSession {
       const whereSql = buildClickHouseWhereSql(
         upd.primaryKeys,
         upd.originalRow,
-        changeEntries.map(([c]) => c),
+        upd.originalRow ? Object.keys(upd.originalRow) : changeEntries.map(([c]) => c),
         columnTypes
       )
       updates.push({
         preview: `ALTER TABLE ${qTable} UPDATE ${setSql} WHERE ${whereSql};`,
         exec: `ALTER TABLE ${qTable} UPDATE ${setSql} WHERE ${whereSql} SETTINGS mutations_sync = 1`,
+        whereSql,
       })
     }
 
@@ -915,12 +1017,58 @@ export class ClickHouseSession implements IDatabaseSession {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'clickhouse')
     }
     this.assertWritable()
+    const targetDb = params.schema || this.getDatabase()
+    const qTable = quoteQualifiedTable(params.table, targetDb, 'clickhouse')
     const built = this.buildChangeStatements(params)
 
+    // Phase 1 (Preflight): validate ALL delete and update predicates before issuing ANY mutation
+    const seenPredicates = new Set<string>()
+    for (const op of [...built.deletes, ...built.updates]) {
+      if (seenPredicates.has(op.whereSql)) {
+        throw new DatabaseDriverError(
+          'ClickHouse batch aborted: duplicate predicate targets the same record',
+          'conflict',
+          'clickhouse'
+        )
+      }
+      seenPredicates.add(op.whereSql)
+    }
+
+    const assertSingleMatch = async (whereSql: string, verb: 'DELETE' | 'UPDATE'): Promise<void> => {
+      const checkRes = await this.executeHttp(
+        `SELECT COUNT(*) AS total FROM ${qTable} WHERE ${whereSql}`,
+        { expectJsonCompact: true }
+      )
+      const checkRow = mapCompactRowsToObjects(
+        checkRes.json?.meta || [],
+        checkRes.json?.data || []
+      )[0]
+      const matchedRows = Number(
+        checkRow?.total ?? checkRow?.['COUNT(*)'] ?? checkRow?.['count()'] ?? 0
+      )
+      if (!Number.isFinite(matchedRows) || matchedRows !== 1) {
+        throw new DatabaseDriverError(
+          matchedRows > 1
+            ? `ClickHouse ${verb} aborted: predicate matched ${matchedRows} rows (expected 1)`
+            : 'Record was modified or deleted by another session (optimistic lock conflict)',
+          'conflict',
+          'clickhouse'
+        )
+      }
+    }
+
+    for (const d of built.deletes) {
+      await assertSingleMatch(d.whereSql, 'DELETE')
+    }
+    for (const u of built.updates) {
+      await assertSingleMatch(u.whereSql, 'UPDATE')
+    }
+
+    // Phase 2 (Execute): all preflight checks passed
     let deleted = 0
     for (const d of built.deletes) {
       await this.executeHttp(d.exec)
-      deleted += d.rowCount
+      deleted += 1
     }
 
     let updated = 0
@@ -1016,10 +1164,13 @@ export class ClickHouseSession implements IDatabaseSession {
         const explicitFormat = extractExplicitClickHouseFormat(stmtSql)
         const isCustomNonJsonCompact =
           explicitFormat !== null && explicitFormat.toLowerCase() !== 'jsoncompact'
+        const isPlainExplain =
+          /^\s*\(*\s*EXPLAIN\b/i.test(stripLeadingComments(stmtSql)) && explicitFormat === null
 
         const res = await this.executeHttp(stmtSql, {
           queryId: serverQueryId,
           expectJsonCompact: expectRows && !isCustomNonJsonCompact,
+          allowPlainTextExplain: isPlainExplain,
           signal: controller.signal,
           maxResultRows: expectRows && !isCustomNonJsonCompact && maxRows > 0 ? maxRows + 1 : undefined,
         })
@@ -1036,14 +1187,19 @@ export class ClickHouseSession implements IDatabaseSession {
             truncated: false,
             isSelect: false,
           })
-        } else if (isCustomNonJsonCompact) {
+        } else if (isCustomNonJsonCompact || res.isPlainTextExplain) {
           const normalizedText = res.rawText.replace(/\r?\n$/, '')
           const rawLines = normalizedText.length > 0 ? normalizedText.split(/\r?\n/) : []
           const limit = maxRows > 0 ? maxRows : rawLines.length
           const truncated = rawLines.length > limit
           const rows = rawLines.slice(0, limit).map((line) => [line])
           lastSelect = {
-            columns: [{ name: `result (${explicitFormat})`, type: 'String' }],
+            columns: [
+              {
+                name: isCustomNonJsonCompact ? `result (${explicitFormat})` : 'explain',
+                type: 'String',
+              },
+            ],
             rows,
             rowCount: rows.length,
             truncated,
@@ -1184,7 +1340,7 @@ export class ClickHouseDriver implements IDatabaseDriver {
   ): Promise<{ ok: boolean; message?: string }> {
     return runDriverConnectionTest(
       () => this.createSession(profile, secret, extraSecrets),
-      (err) => (err instanceof Error ? err.message : 'ClickHouse connection failed')
+      (err) => formatClickHouseErrorMessage(err, 'ClickHouse connection failed')
     )
   }
 }

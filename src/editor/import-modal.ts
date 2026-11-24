@@ -1,8 +1,9 @@
 // src/editor/import-modal.ts
 // CSV / TSV / JSON / NDJSON File Import, Column Mapping & Chunked Resumable Commit Modal
 
-import type { ColumnInfo, ConnectionProfile } from '../protocol.js'
+import type { ColumnInfo, ConnectionProfile, DatabaseDriverType } from '../protocol.js'
 import { DEFAULT_IMPORT_CHUNK_SIZE, DEFAULT_RPC_TIMEOUT_MS } from '../shared-constants.js'
+import { bindCtrlWheelHorizontalScroll } from '../shared-wheel-scroll.js'
 import { setButtonLoading } from './db-icons.js'
 import {
   autoMapImportColumns,
@@ -153,6 +154,38 @@ function parseImportNullHandlingOption(value: string): ImportNullHandling {
   return 'empty-and-null'
 }
 
+function buildInferredMongoColumns(headers: readonly string[]): ColumnInfo[] {
+  return headers.map((name) => ({
+    name,
+    type: 'JSON',
+    nativeType: 'JSON',
+    nullable: true,
+    defaultValue: null,
+    isPrimaryKey: false,
+    isAutoIncrement: false,
+  }))
+}
+
+export function buildImportCommandPreview(
+  rows: Record<string, unknown>[],
+  opts: {
+    driver: DatabaseDriverType
+    table: string
+    schema?: string
+    maxStatements?: number
+  }
+): string {
+  if (opts.driver === 'mongodb') {
+    const limit = Math.max(1, opts.maxStatements ?? 3)
+    const colCall = `db.getCollection(${JSON.stringify(opts.table)})`
+    return rows
+      .slice(0, limit)
+      .map((row) => `${colCall}.insertOne(${JSON.stringify(row)});`)
+      .join('\n')
+  }
+  return buildImportPreviewSql(rows, opts)
+}
+
 export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
   if (typeof document === 'undefined') return
   const conn = ctx.activeConnection
@@ -160,13 +193,18 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
     ctx.updateStatus('Cannot import data on a Read-Only or Redis connection')
     return
   }
-  if (!ctx.targetTable || !Array.isArray(ctx.targetColumns) || ctx.targetColumns.length === 0) {
+  const isMongo = conn.driver === 'mongodb'
+  if (
+    !ctx.targetTable ||
+    !Array.isArray(ctx.targetColumns) ||
+    (ctx.targetColumns.length === 0 && !isMongo)
+  ) {
     ctx.updateStatus('Select a table with columns before importing data')
     return
   }
 
   const driver = conn.driver
-  const mappableTargetColumns = ctx.targetColumns.filter((col) => col.isGenerated !== true)
+  let mappableTargetColumns = ctx.targetColumns.filter((col) => col.isGenerated !== true)
   const targetLabel = ctx.targetSchema ? `${ctx.targetSchema}.${ctx.targetTable}` : ctx.targetTable
 
   let isImporting = false
@@ -202,7 +240,9 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
   const head = document.createElement('div')
   head.className = 'datanoa-modal-head'
   const headTitle = document.createElement('span')
+  headTitle.id = 'datanoa-import-modal-title'
   headTitle.textContent = `Import File into "${targetLabel}"`
+  modal.setAttribute('aria-labelledby', headTitle.id)
   const badge = document.createElement('span')
   badge.className = 'datanoa-badge datanoa-badge-pk'
   badge.textContent = driver.toUpperCase()
@@ -215,8 +255,10 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
   // 1. File Picker & Drag-and-Drop Dropzone
   const fileInput = document.createElement('input')
   fileInput.type = 'file'
+  fileInput.id = 'datanoa-import-file-input'
   fileInput.className = 'datanoa-import-file-input'
   fileInput.accept = '.csv,.tsv,.tab,.txt,.json,.ndjson,.jsonl,text/csv,text/tab-separated-values,application/json'
+  fileInput.setAttribute('aria-label', 'Choose CSV, TSV, JSON, or NDJSON file to import')
   fileInput.style.display = 'none'
 
   const dropzone = document.createElement('div')
@@ -258,10 +300,14 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
   ): HTMLSelectElement => {
     const field = document.createElement('div')
     field.className = 'datanoa-conn-field'
+    const selectId = `${className}-field`
     const lbl = document.createElement('label')
+    lbl.htmlFor = selectId
     lbl.textContent = labelText
     const sel = document.createElement('select')
+    sel.id = selectId
     sel.className = `datanoa-conn-select ${className}`
+    sel.setAttribute('aria-label', labelText)
     for (const o of opts) {
       const el = document.createElement('option')
       el.value = o.value
@@ -415,6 +461,7 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
   mappingTable.appendChild(mappingTbody)
   mappingWrap.appendChild(mappingTable)
   body.appendChild(mappingWrap)
+  bindCtrlWheelHorizontalScroll(mappingWrap)
 
   // 5. Data Preview & Live SQL Preview
   const previewTitle = document.createElement('strong')
@@ -431,6 +478,7 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
   previewTable.appendChild(previewTbody)
   previewWrap.appendChild(previewTable)
   body.appendChild(previewWrap)
+  bindCtrlWheelHorizontalScroll(previewWrap)
 
   const sqlLabel = document.createElement('strong')
   sqlLabel.textContent = 'Live INSERT Preview'
@@ -579,8 +627,10 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
 
       const tdTarget = document.createElement('td')
       const targetSel = document.createElement('select')
+      targetSel.id = `datanoa-import-target-col-${entry.sourceIndex}`
       targetSel.className = 'datanoa-struct-cell-select datanoa-import-target-select'
       targetSel.dataset.sourceIndex = String(entry.sourceIndex)
+      targetSel.setAttribute('aria-label', `Target table column for "${entry.sourceName}"`)
 
       const skipOpt = document.createElement('option')
       skipOpt.value = ''
@@ -685,7 +735,9 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
       warnBox.style.display = 'none'
       builtResult = { rows: [], skippedEmptyRows: 0 }
       renderDataPreview([])
-      sqlPre.textContent = '-- Choose a CSV, TSV, JSON, or NDJSON file to preview INSERT statements.'
+      sqlPre.textContent = isMongo
+        ? '-- Choose a CSV, TSV, JSON, or NDJSON file to preview insertOne() commands.'
+        : '-- Choose a CSV, TSV, JSON, or NDJSON file to preview INSERT statements.'
       summaryEl.textContent = 'No file selected'
       importBtn.textContent = 'Import Rows'
       importBtn.disabled = true
@@ -694,9 +746,13 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
       return
     }
 
-    const validation = validateImportMapping(mapping, ctx.targetColumns)
+    const effectiveCols: ColumnInfo[] =
+      isMongo && ctx.targetColumns.length === 0
+        ? buildInferredMongoColumns(dataset.headers)
+        : ctx.targetColumns
+    const validation = validateImportMapping(mapping, effectiveCols)
     builtResult = validation.valid
-      ? buildMappedImportRecords(dataset, mapping, ctx.targetColumns, {
+      ? buildMappedImportRecords(dataset, mapping, effectiveCols, {
           nullHandling: nullHandlingOpt,
           trimValues,
           skipEmptyRows,
@@ -734,13 +790,15 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
     renderDataPreview(mappedHeaders)
     sqlPre.textContent =
       validation.valid && builtResult.rows.length > 0
-        ? buildImportPreviewSql(builtResult.rows, {
+        ? buildImportCommandPreview(builtResult.rows, {
             driver,
             table: ctx.targetTable,
             schema: ctx.targetSchema,
             maxStatements: 3,
           })
-        : '-- Fix mapping errors above to preview INSERT statements.'
+        : isMongo
+          ? '-- Fix mapping errors above to preview insertOne() commands.'
+          : '-- Fix mapping errors above to preview INSERT statements.'
 
     syncModeSelection()
 
@@ -788,8 +846,13 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
         trimValues,
         fileName: selectedFileName,
       })
+      if (isMongo && ctx.targetColumns.length === 0) {
+        mappableTargetColumns = buildInferredMongoColumns(dataset.headers)
+      }
+      const colsForMapping =
+        isMongo && ctx.targetColumns.length === 0 ? mappableTargetColumns : ctx.targetColumns
       if (resetMapping || mapping.length !== dataset.headers.length) {
-        mapping = autoMapImportColumns(dataset.headers, ctx.targetColumns, dataset.hasNamedHeaders)
+        mapping = autoMapImportColumns(dataset.headers, colsForMapping, dataset.hasNamedHeaders)
       }
     } catch (err: unknown) {
       dataset = null

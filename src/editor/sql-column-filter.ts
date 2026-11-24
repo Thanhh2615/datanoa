@@ -75,24 +75,18 @@ export function buildColumnHeaderPredicate(
       // MySQL uses '\' as default escape char inside LIKE
       return `${colIdent} LIKE ${literal}`
     }
+    if (dialect === 'mssql') {
+      return `CAST(${colIdent} AS NVARCHAR(MAX)) LIKE ${literal} ESCAPE '\\'`
+    }
+    if (dialect === 'oracle') {
+      return `LOWER(TO_CHAR(${colIdent})) LIKE LOWER(${literal}) ESCAPE '\\'`
+    }
     // SQLite / LibSQL / D1
     return `${colIdent} LIKE ${literal} ESCAPE '\\'`
   }
 
   const literal = formatSqlLiteral(value, dialect)
   return op === 'neq' ? `${colIdent} <> ${literal}` : `${colIdent} = ${literal}`
-}
-
-function readDollarTag(sql: string, pos: number): string | null {
-  if (sql[pos] !== '$') return null
-  let i = pos + 1
-  if (i < sql.length && sql[i] === '$') return '$$'
-  if (i >= sql.length || !/[A-Za-z_]/.test(sql[i])) return null
-  while (i < sql.length && /[A-Za-z0-9_]/.test(sql[i])) i++
-  if (i < sql.length && sql[i] === '$') {
-    return sql.slice(pos, i + 1)
-  }
-  return null
 }
 
 function scanTopLevelWords(
@@ -103,7 +97,8 @@ function scanTopLevelWords(
   const supportsDollarQuotes = supportsDollarQuoting(dialect)
   const backslashAndHash = usesBackslashAndHash(dialect)
   const nestedComments = supportsNestedBlockComments(dialect)
-  const bracketIdents = dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1'
+  const bracketIdents =
+    dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1' || dialect === 'mssql'
   let depth = 0
   let i = 0
   let trailingSemicolonPos = -1
@@ -222,7 +217,7 @@ export function injectSqlColumnFilter(
   if (!trimmed) {
     return { ok: false, reason: 'empty_sql' }
   }
-  if (dialect === 'redis') {
+  if (dialect === 'redis' || dialect === 'mongodb') {
     return { ok: false, reason: 'non_sql_dialect' }
   }
 

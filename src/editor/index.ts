@@ -11,6 +11,7 @@ import {
   createInitialTableDraft,
   formatSql,
   normalizeSqlDefaultExpression,
+  requiresSqliteTableRebuild,
   sanitizeFilterClause,
   validateTableStructureDraft,
   type AlterTableAction,
@@ -25,6 +26,7 @@ import {
   SqlConsoleController,
   type SqlDialectType,
   type EditorTypography,
+  type SqlExecutionRange,
   extractExecutableSql,
   extractCaretStatementSql,
   computeSmartSqlCompletions,
@@ -139,6 +141,7 @@ import {
   type ResultBannerState,
   type ResultSetTabRuntimeState,
   type EditableSqlTargetMeta,
+  type SqlFixTargetRange,
 } from './console-tabs.js'
 import {
   compactSqlPreview,
@@ -168,6 +171,11 @@ import {
   type DangerousSqlFinding,
   type DangerousSqlKind,
 } from './sql-safety.js'
+import {
+  containsSensitiveSqlText,
+  sanitizeSqlResultForStorage,
+} from '../shared-sql-safety.js'
+import { resolveSqlReplacementSpan } from '../shared-sql-core.js'
 import {
   openStudioDangerSqlModal,
   type StudioDangerSqlModalContext,
@@ -224,7 +232,12 @@ import { splitSqlStatements } from '../drivers/common/sql-lexer.js'
 export { analyzeEditableSelectQuery, type EditableSelectAnalysis }
 import {
   ACTIVE_CONNECTION_STORAGE_KEY,
+  SAVED_CONNECTIONS_STORAGE_KEY,
   sanitizeJsonPayload,
+  type AiExplainAnalysisResult,
+  type AiFixQueryResult,
+  type AiMetricKind,
+  type AiStatusSnapshot,
   type ColumnInfo,
   type ConnectionProfile,
   type DatabaseDriverType,
@@ -235,6 +248,15 @@ import {
   type SchemaObject,
   type SchemaObjectKind,
 } from '../protocol.js'
+import {
+  openSharedAiConfigModal,
+  renderAiStatusButtonContent,
+  renderSharedAiFixPanel,
+  renderSharedExplainAiPanel,
+  resolveExplainAiPhase,
+  saveOrcaSettingsPatch,
+  type ExplainAiPanelState,
+} from '../shared-ai-ui.js'
 import { DEFAULT_RPC_TIMEOUT_MS } from '../shared-constants.js'
 
 const BASE_EDITOR_TOKENS = `
@@ -437,6 +459,7 @@ export class DatanoaStudioEditor {
   private queryBannerReportBtn: HTMLButtonElement | null = null
   private queryBannerRetryBtn: HTMLButtonElement | null = null
   private queryBannerBackBtn: HTMLButtonElement | null = null
+  private queryBannerFixAiBtn: HTMLButtonElement | null = null
   private queryBannerRetryHandler: (() => void) | null = null
   private lastQueryErrorText = ''
   private whereInputEl: HTMLInputElement | null = null
@@ -476,12 +499,36 @@ export class DatanoaStudioEditor {
 
   private statusStateEl: HTMLSpanElement | null = null
   private statusSelectionEl: HTMLButtonElement | null = null
-  private shortcutHintEl: HTMLSpanElement | null = null
   private statusMetricsEl: HTMLSpanElement | null = null
   private shortcutsBtn: HTMLButtonElement | null = null
   private feedbackBtn: HTMLButtonElement | null = null
   private gridAreaEl: HTMLDivElement | null = null
+  private aiFixEl: HTMLDivElement | null = null
+  private explainAiEl: HTMLDivElement | null = null
   private inspectorAreaEl: HTMLDivElement | null = null
+  private aiBtn: HTMLButtonElement | null = null
+  private aiStatus: AiStatusSnapshot | null = null
+  private aiFixAbort: AbortController | null = null
+  private aiFixSeq = 0
+  private aiFixState: {
+    phase: 'hidden' | 'loading' | 'ready' | 'error'
+    result: AiFixQueryResult | null
+    error: string | null
+    failedSql: string
+    errorMessage: string
+    fixTargetRange: SqlFixTargetRange | null
+    originTabId: string
+    originResultSetIndex: number
+    originConnectionId: string | null
+    originLastResult: QueryResult | null
+  } | null = null
+  private explainAiAbort: AbortController | null = null
+  private explainAiSeq = 0
+  private explainAiLoadingTarget: {
+    tabId: string
+    resultSetIndex: number
+    originLastResult: QueryResult
+  } | null = null
 
   private tabButtons: {
     split: HTMLButtonElement
@@ -1115,7 +1162,9 @@ export class DatanoaStudioEditor {
         defaultSchema: this.defaultSchema || '',
         selectedSchema: this.selectedSchema || '',
         isShowingSqlResult: this.isShowingSqlResult,
-        whereClause: this.activeWhereClause || '',
+        whereClause: containsSensitiveSqlText(this.activeWhereClause || '')
+          ? ''
+          : this.activeWhereClause || '',
         orderByClause: this.activeOrderByClause || '',
         page: this.currentPage,
         pageSize: this.pageSize,
@@ -1136,12 +1185,12 @@ export class DatanoaStudioEditor {
         }
       }
       if (this.isShowingSqlResult && this.activeQueryResult) {
-        const candidate = {
+        const candidate = sanitizeSqlResultForStorage({
           ...this.activeQueryResult,
           rows: Array.isArray(this.activeQueryResult.rows)
             ? this.activeQueryResult.rows.slice(0, 200)
             : [],
-        }
+        })
         if (this.utf8ByteLength(candidate) < 360_000) {
           cachePayload.lastSqlResult = candidate
         }
@@ -1197,7 +1246,7 @@ export class DatanoaStudioEditor {
   private async requestPlugin<T = unknown>(
     name: string,
     input?: Record<string, unknown>,
-    options?: { timeoutMs?: number }
+    options?: { timeoutMs?: number; signal?: AbortSignal }
   ): Promise<T> {
     if (typeof window === 'undefined' || !window.orca?.plugin?.request) {
       throw new Error('Orca plugin bridge is not available')
@@ -1205,7 +1254,7 @@ export class DatanoaStudioEditor {
     const reqFn = window.orca.plugin.request as unknown as (
       reqName: string,
       reqInput?: unknown,
-      reqOptions?: { timeoutMs?: number }
+      reqOptions?: { timeoutMs?: number; signal?: AbortSignal }
     ) => Promise<T>
 
     if (input === undefined && options === undefined) {
@@ -1334,14 +1383,17 @@ export class DatanoaStudioEditor {
     this.queryBannerDetailEl = dom.queryBannerDetailEl
     this.queryBannerRetryBtn = dom.queryBannerRetryBtn
     this.queryBannerBackBtn = dom.queryBannerBackBtn
+    this.queryBannerFixAiBtn = dom.queryBannerFixAiBtn
     this.queryBannerCopyBtn = dom.queryBannerCopyBtn
     this.queryBannerReportBtn = dom.queryBannerReportBtn
+    this.aiFixEl = dom.aiFixEl
     this.gridAreaEl = dom.gridAreaEl
+    this.explainAiEl = dom.explainAiEl
+    this.aiBtn = dom.aiBtn
     this.resultSetsBarEl = dom.resultSetsBarEl
     this.inspectorAreaEl = dom.inspectorAreaEl
     this.statusStateEl = dom.statusStateEl
     this.statusSelectionEl = dom.statusSelectionEl
-    this.shortcutHintEl = dom.shortcutHintEl
     this.statusMetricsEl = dom.statusMetricsEl
     this.shortcutsBtn = dom.shortcutsBtn
     this.feedbackBtn = dom.feedbackBtn
@@ -1390,6 +1442,9 @@ export class DatanoaStudioEditor {
     })
     dom.savedQueriesBtn.addEventListener('click', () => this.openSavedQueriesModal())
     dom.findSqlBtn.addEventListener('click', () => this.sqlConsole?.openFindReplace())
+    dom.aiBtn.addEventListener('click', () => {
+      void this.openAiSettingsModal()
+    })
     dom.refreshBtn.addEventListener('click', () => {
       void this.handleRefreshAction()
     })
@@ -1624,6 +1679,9 @@ export class DatanoaStudioEditor {
         void this.loadTableData(this.activeConnectionId, this.activeTable, 1)
       }
     })
+    dom.queryBannerFixAiBtn.addEventListener('click', () => {
+      void this.handleFixWithAiClick()
+    })
     dom.queryBannerCopyBtn.addEventListener('click', () => {
       if (!this.lastQueryErrorText) return
       copyTextFallback(this.lastQueryErrorText, this.queryBannerCopyBtn)
@@ -1649,6 +1707,41 @@ export class DatanoaStudioEditor {
       initialDoc: '-- Datanoa SQL Console\nSELECT 1;\n',
       dialect: 'sqlite',
       schema: this.schemaMap,
+      aiInline: {
+        isEnabled: () => this.isAiInlineReady() && Boolean(this.activeConnectionId),
+        requestCompletion: async ({
+          prefix,
+          suffix,
+          signal,
+          manual,
+        }: {
+          prefix: string
+          suffix: string
+          offset: number
+          signal: AbortSignal
+          manual?: boolean
+        }) => {
+          const conn = this.getActiveConnection()
+          if (!conn) return null
+          return await this.requestPlugin<{ suggestion: string; id: number; replaceChars?: number }>(
+            'ai.complete',
+            {
+              connectionId: conn.id,
+              dialect: conn.driver,
+              prefix,
+              suffix,
+              ...(manual ? { manual: true } : {}),
+              activeSchema: this.selectedSchema,
+              activeTable: this.activeTable ?? undefined,
+              schemaMap: this.schemaMap,
+            },
+            { signal, timeoutMs: 18_000 }
+          )
+        },
+        onMetric: (id: number, kind: AiMetricKind) => {
+          void this.requestPlugin('ai.metrics.event', { id, kind }).catch(() => {})
+        },
+      },
       onExecute: () => {
         void this.executeSql(false)
       },
@@ -1715,6 +1808,7 @@ export class DatanoaStudioEditor {
     // Mount Schema Inspector
     this.schemaInspector = new SchemaInspectorView(this.inspectorAreaEl, {
       dialect: 'sqlite',
+      isManualTxActive: () => this.txToolbar.hasActiveOrManualTx(),
       onInsertDdl: (ddl) => {
         this.sqlConsole?.insertText(ddl)
         if (this.activeViewMode === 'grid' || this.activeViewMode === 'inspector') {
@@ -2417,16 +2511,33 @@ export class DatanoaStudioEditor {
         this.saveStudioDataCache()
         this.destroy()
       }
+      let lastVisibilityRefreshAt = 0
+      const refreshOnFocusOrVisible = () => {
+        if (this.isDestroyed) return
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+        const now = Date.now()
+        if (now - lastVisibilityRefreshAt < 150) return
+        lastVisibilityRefreshAt = now
+        void this.refreshConnections()
+      }
       window.addEventListener('mousedown', onWindowMouseDown)
       window.addEventListener('keydown', onWindowKeyDown)
       window.addEventListener('resize', onWindowResize)
+      window.addEventListener('focus', refreshOnFocusOrVisible)
       window.addEventListener('pagehide', onWindowPageHide)
+      if (typeof document !== 'undefined') {
+        document.addEventListener('visibilitychange', refreshOnFocusOrVisible)
+      }
       track({
         dispose: () => {
           window.removeEventListener('mousedown', onWindowMouseDown)
           window.removeEventListener('keydown', onWindowKeyDown)
           window.removeEventListener('resize', onWindowResize)
+          window.removeEventListener('focus', refreshOnFocusOrVisible)
           window.removeEventListener('pagehide', onWindowPageHide)
+          if (typeof document !== 'undefined') {
+            document.removeEventListener('visibilitychange', refreshOnFocusOrVisible)
+          }
         },
       })
     }
@@ -2505,6 +2616,18 @@ export class DatanoaStudioEditor {
           void this.refreshConnections()
         })
       )
+      if (typeof window.orca.storage?.onDidChange === 'function') {
+        track(
+          window.orca.storage.onDidChange((change) => {
+            if (
+              change?.key === SAVED_CONNECTIONS_STORAGE_KEY ||
+              change?.key === 'connections'
+            ) {
+              void this.refreshConnections()
+            }
+          })
+        )
+      }
       track(
         window.orca.plugin.on('studio.opened', (payload) => {
           const openedConnId =
@@ -2518,6 +2641,7 @@ export class DatanoaStudioEditor {
             this.dismissedCautionKey = null
             this.applyActiveConnectionPresentation(this.getActiveConnection())
           }
+          void this.refreshConnections()
         })
       )
       track(
@@ -2538,10 +2662,25 @@ export class DatanoaStudioEditor {
           }
         })
       )
+      track(
+        window.orca.plugin.on('ai.status.changed', (snapshot) => {
+          this.applyAiStatus(snapshot)
+        })
+      )
+      if (typeof window.orca.settings?.onDidChange === 'function') {
+        track(
+          window.orca.settings.onDidChange((change) => {
+            if (typeof change?.key === 'string' && change.key.startsWith('ai')) {
+              void this.hydrateAiStatus()
+            }
+          })
+        )
+      }
     } catch {
       // Ignore if plugin event bus is mocked minimally
     }
 
+    void this.hydrateAiStatus()
     void this.refreshConnections()
   }
 
@@ -2730,11 +2869,10 @@ export class DatanoaStudioEditor {
     this.isRefreshingSchema = true
     setButtonLoading(this.refreshBtn, true, 'Refreshing...')
     try {
+      await this.refreshConnections()
       if (this.activeConnectionId) {
         this.restoredPageOnBoot = this.currentPage
         await this.introspectSchema(this.activeConnectionId, true)
-      } else {
-        await this.refreshConnections()
       }
     } finally {
       this.isRefreshingSchema = false
@@ -2758,7 +2896,9 @@ export class DatanoaStudioEditor {
           : Promise.resolve(null),
       ])
       if (seq !== this.connectionsSeq || this.isDestroyed) return
+      const prevConnectionsSig = JSON.stringify(this.connections)
       this.connections = conns || []
+      const connsChanged = prevConnectionsSig !== JSON.stringify(this.connections)
       if (needsBootSnap) {
         this.hasRestoredBootState = true
         const hasLocalState = Boolean(this.readLocalStudioViewState())
@@ -2829,6 +2969,8 @@ export class DatanoaStudioEditor {
           this.sqlConsole?.updateSchema(this.schemaMap, this.activeTable || undefined)
         }
         this.saveStudioDataCache()
+      } else if (connsChanged) {
+        this.saveStudioDataCache()
       }
     } catch {
       // Non-blocking in testing / offline environments
@@ -2889,6 +3031,9 @@ export class DatanoaStudioEditor {
     enhanceStudioCollapsibleSelect(connSel, {
       tooltipPrefix: 'Active Database Connection',
       searchPlaceholder: 'Search connections or folders...',
+      onOpen: () => {
+        void this.refreshConnections()
+      },
     })
   }
 
@@ -2935,6 +3080,9 @@ export class DatanoaStudioEditor {
       this.dismissedCautionKey = null
       this.closeActiveModal()
       this.txToolbar.resetForConnectionSwitch(prevConnId)
+      this.sqlConsole?.clearAiGhost()
+      this.sqlConsole?.clearDbSyntaxError?.()
+      this.clearAiFixPanel()
     }
     this.activeConnectionId = connectionId
 
@@ -2984,6 +3132,7 @@ export class DatanoaStudioEditor {
       this.activeResultSetIndex = 0
       this.editableSqlTarget = null
       this.hideResultSetsBar()
+      this.renderExplainAiForActiveTab()
       if (
         changed &&
         (!this.pendingBootDataCache ||
@@ -3999,6 +4148,10 @@ export class DatanoaStudioEditor {
       )
       this.queryBannerBackBtn.style.display = canReturn ? 'inline-flex' : 'none'
     }
+    if (this.queryBannerFixAiBtn) {
+      const canFix = banner.kind === 'error' && Boolean(banner.failedSql?.trim())
+      this.queryBannerFixAiBtn.style.display = canFix ? 'inline-flex' : 'none'
+    }
   }
 
   private setQueryBannerVisible(visible: boolean): void {
@@ -4019,13 +4172,683 @@ export class DatanoaStudioEditor {
   }
 
   private syncQueryBannerForViewMode(): void {
-    if (!this.queryBannerEl) return
+    this.renderExplainAiForActiveTab()
+    if (!this.queryBannerEl) {
+      this.renderAiFixPanel()
+      return
+    }
     if (!this.shouldShowActiveBannerInViewMode() || !this.activeResultBannerState) {
       this.setQueryBannerVisible(false)
+      this.renderAiFixPanel()
       return
     }
     this.renderQueryBannerDom(this.activeResultBannerState, this.queryBannerRetryHandler)
     this.setQueryBannerVisible(true)
+    this.renderAiFixPanel()
+  }
+
+  private isAiInlineReady(): boolean {
+    return Boolean(
+      this.aiStatus?.enabled &&
+        this.aiStatus.state !== 'off' &&
+        this.aiStatus.state !== 'setup'
+    )
+  }
+
+  private isAiConfiguredAndEnabled(): boolean {
+    return Boolean(
+      this.aiStatus?.enabled &&
+        (this.aiStatus.state === 'on' ||
+          this.aiStatus.state === 'slow' ||
+          this.aiStatus.state === 'error')
+    )
+  }
+
+  private applyAiStatus(snapshot: AiStatusSnapshot | null): void {
+    this.aiStatus = snapshot
+    if (this.aiBtn) {
+      const badge = renderAiStatusButtonContent(this.aiBtn, snapshot)
+      this.aiBtn.className = `datanoa-btn datanoa-btn-sm datanoa-ai-toolbar-btn datanoa-status-ai-btn tone-${badge.tone}`
+    }
+    if (!this.isAiInlineReady()) {
+      this.sqlConsole?.clearAiGhost()
+    }
+    this.renderExplainAiForActiveTab()
+    if (this.aiFixState && this.aiFixState.phase !== 'hidden') {
+      this.renderAiFixPanel()
+    }
+  }
+
+  private async hydrateAiStatus(): Promise<void> {
+    try {
+      const snapshot = await this.requestPlugin<AiStatusSnapshot>('ai.status.get')
+      if (!this.isDestroyed) {
+        this.applyAiStatus(snapshot)
+      }
+    } catch {
+      // Ignore if worker not ready or running under test mock
+    }
+  }
+
+  private async openAiSettingsModal(): Promise<void> {
+    await openSharedAiConfigModal({
+      rpc: (name, input, opts) => this.requestPlugin(name, input, opts),
+      saveSettings: saveOrcaSettingsPatch,
+      initialStatus: this.aiStatus,
+      onStatusUpdated: (snapshot) => this.applyAiStatus(snapshot),
+      mountModal: (modalEl, canClose, onDismiss) =>
+        this.mountStudioModal(modalEl, canClose, onDismiss),
+      closeModal: () => this.closeActiveModal(),
+    })
+  }
+
+  private renderExplainAiForActiveTab(): void {
+    if (!this.explainAiEl) return
+    const wasHidden = this.explainAiEl.hidden
+    const tab = this.consoleTabs?.getActiveTab()
+    const idx = this.activeResultSetIndex
+    const res = tab?.lastResult
+    const sets = res ? getEffectiveResultSets(res, tab.executedSql || '') : []
+    const rs = sets[idx]
+    const rsState = tab?.resultStates?.[idx]
+    const gridVisible = !this.gridAreaEl || this.gridAreaEl.style.display !== 'none'
+    const isExplain = Boolean(
+      this.isShowingSqlResult &&
+        this.activeQueryResult !== null &&
+        gridVisible &&
+        tab &&
+        res &&
+        rs &&
+        !rs.isError &&
+        rsState?.banner?.isExplain
+    )
+
+    if (!isExplain || !tab || !rsState) {
+      if (!wasHidden) {
+        renderSharedExplainAiPanel(
+          this.explainAiEl,
+          {
+            phase: 'hidden',
+            aiEnabled: Boolean(this.aiStatus?.enabled),
+            aiReady: this.isAiConfiguredAndEnabled(),
+            explainLanguage: this.aiStatus?.explainLanguage || 'auto',
+          },
+          {
+            onAnalyze: () => {},
+            onConfigureAi: () => {},
+            onCancel: () => {},
+            onApplySql: () => {},
+            onOpenNewTab: () => {},
+            onCopyText: () => {},
+            onToggleCollapsed: () => {},
+          }
+        )
+        this.dataGrid?.handleViewportResize()
+      }
+      return
+    }
+
+    const originConnId = tab.executedConnectionId ?? this.activeConnectionId
+    const isLoading = Boolean(
+      this.explainAiLoadingTarget &&
+        this.explainAiLoadingTarget.tabId === tab.id &&
+        this.explainAiLoadingTarget.resultSetIndex === idx &&
+        this.explainAiLoadingTarget.originLastResult === res
+    )
+    const phase: ExplainAiPanelState['phase'] = resolveExplainAiPhase(
+      isLoading,
+      rsState.explainAnalysisError,
+      rsState.explainAnalysis
+    )
+
+    renderSharedExplainAiPanel(
+      this.explainAiEl,
+      {
+        phase,
+        aiEnabled: Boolean(this.aiStatus?.enabled),
+        aiReady: this.isAiConfiguredAndEnabled(),
+        explainLanguage: this.aiStatus?.explainLanguage || 'auto',
+        destination: this.aiStatus?.destination,
+        host: this.aiStatus?.host,
+        result: rsState.explainAnalysis ?? null,
+        error: rsState.explainAnalysisError ?? null,
+        collapsed: Boolean(rsState.explainAnalysisCollapsed),
+      },
+      {
+        onAnalyze: () => {
+          void this.runExplainAiAnalysis(tab.id, idx)
+        },
+        onConfigureAi: () => {
+          void this.openAiSettingsModal()
+        },
+        onCancel: () => {
+          this.explainAiSeq += 1
+          this.explainAiAbort?.abort()
+          this.explainAiAbort = null
+          this.explainAiLoadingTarget = null
+          this.renderExplainAiForActiveTab()
+        },
+        onApplySql: (sql: string) => {
+          const sqlConsole = this.sqlConsole
+          if (
+            !sqlConsole ||
+            this.activeConnectionId !== originConnId ||
+            this.consoleTabs.getActiveTabId() !== tab.id
+          ) {
+            return
+          }
+          const replaceFn:
+            | ((
+                target: {
+                  from: number
+                  to: number
+                  originalSlice?: string
+                  fallbackSql?: string
+                },
+                nextSql: string
+              ) => boolean)
+            | undefined = sqlConsole.replaceSqlRange
+          const target = {
+            ...(rsState.explainTargetRange ?? { from: -1, to: -1 }),
+            fallbackSql: rsState.statementSql,
+          }
+          if (typeof replaceFn === 'function') {
+            const replaced = replaceFn.call(sqlConsole, target, sql)
+            if (!replaced) {
+              this.updateStatus(
+                'Could not safely match target query in multi-statement script — use Copy SQL to apply manually'
+              )
+              return
+            }
+          } else {
+            const currentText = sqlConsole.getText()
+            const dialect = this.getActiveConnection()?.driver || 'sqlite'
+            const edit = resolveSqlReplacementSpan(currentText, target, sql, dialect)
+            if (!edit) {
+              this.updateStatus(
+                'Could not safely match target query in multi-statement script — use Copy SQL to apply manually'
+              )
+              return
+            }
+            sqlConsole.setText(
+              `${currentText.slice(0, edit.from)}${edit.insert}${currentText.slice(edit.to)}`
+            )
+          }
+          this.saveActiveConsoleTabState()
+          const latestDoc = sqlConsole.getText()
+          this.documentSession?.change?.(this.composeSerializedDocument(latestDoc))
+          this.saveStudioViewState(false)
+          sqlConsole.focus()
+          this.updateStatus('Replaced target query with optimized SQL (Ctrl+Z to undo)')
+        },
+        onOpenNewTab: (sql: string) => {
+          this.addConsoleTab()
+          this.sqlConsole?.setText(sql)
+          this.saveActiveConsoleTabState()
+          this.saveStudioViewState(false)
+          this.sqlConsole?.focus()
+          this.updateStatus('Opened optimized SQL in a new tab')
+        },
+        onCopyText: (text: string, label?: string) => {
+          copyTextFallback(text)
+          this.updateStatus(`Copied ${label || 'text'} to clipboard`)
+        },
+        onToggleCollapsed: () => {
+          const cur = this.consoleTabs.getResultTabState(idx, tab.id)
+          if (!cur) return
+          this.consoleTabs.setResultTabState(
+            idx,
+            { ...cur, explainAnalysisCollapsed: !cur.explainAnalysisCollapsed },
+            tab.id
+          )
+          this.renderExplainAiForActiveTab()
+        },
+        resizeEdge: 'top',
+        onResize: () => {
+          this.dataGrid?.handleViewportResize()
+        },
+      }
+    )
+
+    if (wasHidden || phase === 'ready' || phase === 'error') {
+      this.dataGrid?.handleViewportResize()
+    }
+  }
+
+  private async runExplainAiAnalysis(tabId: string, resultSetIndex: number): Promise<void> {
+    const tab = this.consoleTabs.getTabs().find((t) => t.id === tabId)
+    if (!tab?.lastResult) return
+    const originLastResult = tab.lastResult
+    const sets = getEffectiveResultSets(originLastResult, tab.executedSql || '')
+    const rs = sets[resultSetIndex]
+    const rsState = tab.resultStates?.[resultSetIndex]
+    if (!rs || rs.isError || !rsState) return
+
+    this.explainAiAbort?.abort()
+    const ac = new AbortController()
+    this.explainAiAbort = ac
+    const seq = ++this.explainAiSeq
+    this.explainAiLoadingTarget = { tabId, resultSetIndex, originLastResult }
+    this.consoleTabs.setResultTabState(
+      resultSetIndex,
+      { ...rsState, explainAnalysisError: null, explainAnalysisCollapsed: false },
+      tabId
+    )
+    this.renderExplainAiForActiveTab()
+
+    const sql = rsState.statementSql || rs.sql || tab.executedSql || ''
+    const connId = tab.executedConnectionId || this.activeConnectionId
+    const conn = tab.executedConnectionId
+      ? this.connections.find((c) => c.id === tab.executedConnectionId)
+      : connId
+        ? this.getActiveConnection()
+        : undefined
+    const uiLocale =
+      typeof window !== 'undefined'
+        ? (window.orca as unknown as { locale?: string } | undefined)?.locale
+        : undefined
+
+    try {
+      const result = await this.requestPlugin<AiExplainAnalysisResult>(
+        'ai.explainAnalyze',
+        {
+          connectionId: conn?.id,
+          dialect: conn?.driver || 'sqlite',
+          sql,
+          planColumns: rs.columns.map((c) => ({ name: c.name, type: c.type || '' })),
+          planRows: rs.rows,
+          language: this.aiStatus?.explainLanguage || 'auto',
+          uiLocale,
+        },
+        { signal: ac.signal, timeoutMs: 65_000 }
+      )
+      if (this.isDestroyed || seq !== this.explainAiSeq || ac.signal.aborted) return
+      const tabNow = this.consoleTabs.getTabs().find((t) => t.id === tabId)
+      if (!tabNow || tabNow.lastResult !== originLastResult) return
+      const latest = this.consoleTabs.getResultTabState(resultSetIndex, tabId) ?? rsState
+      this.consoleTabs.setResultTabState(
+        resultSetIndex,
+        {
+          ...latest,
+          explainAnalysis: result,
+          explainAnalysisError: null,
+          explainAnalysisCollapsed: false,
+        },
+        tabId
+      )
+    } catch (err: unknown) {
+      if (this.isDestroyed || seq !== this.explainAiSeq || ac.signal.aborted) return
+      const tabNow = this.consoleTabs.getTabs().find((t) => t.id === tabId)
+      if (!tabNow || tabNow.lastResult !== originLastResult) return
+      const msg = err instanceof Error ? err.message : String(err)
+      const latest = this.consoleTabs.getResultTabState(resultSetIndex, tabId) ?? rsState
+      this.consoleTabs.setResultTabState(
+        resultSetIndex,
+        { ...latest, explainAnalysisError: msg, explainAnalysisCollapsed: false },
+        tabId
+      )
+    } finally {
+      if (this.explainAiAbort === ac) {
+        this.explainAiAbort = null
+      }
+      if (
+        this.explainAiLoadingTarget?.tabId === tabId &&
+        this.explainAiLoadingTarget?.resultSetIndex === resultSetIndex &&
+        this.explainAiLoadingTarget?.originLastResult === originLastResult
+      ) {
+        this.explainAiLoadingTarget = null
+      }
+      if (!this.isDestroyed) {
+        this.renderExplainAiForActiveTab()
+      }
+    }
+  }
+
+  private clearAiFixPanel(): void {
+    this.aiFixSeq += 1
+    this.aiFixAbort?.abort()
+    this.aiFixAbort = null
+    this.aiFixState = null
+    this.renderAiFixPanel()
+  }
+
+  private renderAiFixPanel(): void {
+    if (!this.aiFixEl) return
+    const wasHidden = this.aiFixEl.hidden
+    const current = this.aiFixState
+    const visible = Boolean(
+      current &&
+        current.phase !== 'hidden' &&
+        this.shouldShowActiveBannerInViewMode() &&
+        this.activeResultBannerState?.kind === 'error'
+    )
+
+    if (!visible || !current) {
+      if (!wasHidden) {
+        renderSharedAiFixPanel(
+          this.aiFixEl,
+          {
+            phase: 'hidden',
+            aiEnabled: Boolean(this.aiStatus?.enabled),
+            aiReady: this.isAiConfiguredAndEnabled(),
+          },
+          {
+            onReplaceQuery: () => {},
+            onCopySql: () => {},
+            onRetry: () => {},
+            onCancel: () => {},
+            onDismiss: () => {},
+            onConfigureAi: () => {},
+          }
+        )
+        if (this.activeViewMode !== 'inspector') {
+          this.dataGrid?.handleViewportResize()
+        }
+      }
+      return
+    }
+
+    renderSharedAiFixPanel(
+      this.aiFixEl,
+      {
+        phase: current.phase,
+        aiEnabled: Boolean(this.aiStatus?.enabled),
+        aiReady: this.isAiConfiguredAndEnabled(),
+        destination: this.aiStatus?.destination,
+        host: this.aiStatus?.host,
+        result: current.result,
+        error: current.error,
+      },
+      {
+        onReplaceQuery: (sql: string) => {
+          if (
+            !this.sqlConsole ||
+            this.activeConnectionId !== current.originConnectionId ||
+            this.consoleTabs.getActiveTabId() !== current.originTabId
+          ) {
+            this.clearAiFixPanel()
+            return
+          }
+          const target = current.fixTargetRange
+            ? { ...current.fixTargetRange, fallbackSql: current.failedSql }
+            : { from: -1, to: -1, fallbackSql: current.failedSql }
+          const replaced = this.sqlConsole.replaceSqlRange(target, sql)
+          if (!replaced) {
+            this.updateStatus(
+              'Could not safely match failed statement in multi-statement script — use Copy SQL to apply manually'
+            )
+            return
+          }
+          const nextDoc = this.sqlConsole.getText()
+          this.consoleTabs.updateActiveSql(nextDoc, this.sqlConsole.getCursorOffset())
+          this.documentSession?.change?.(this.composeSerializedDocument(nextDoc))
+          this.saveStudioViewState(false)
+          this.clearAiFixPanel()
+          this.updateStatus('Replaced query with AI fix (Ctrl+Z to undo)')
+        },
+        onCopySql: (sql: string) => {
+          copyTextFallback(sql)
+          this.updateStatus('Copied AI fixed SQL to clipboard')
+        },
+        onRetry: () => {
+          void this.handleFixWithAiClick()
+        },
+        onCancel: () => {
+          this.clearAiFixPanel()
+        },
+        onDismiss: () => {
+          this.clearAiFixPanel()
+        },
+        onConfigureAi: () => {
+          void this.openAiSettingsModal()
+        },
+        resizeEdge: 'bottom',
+        onResize: () => {
+          this.dataGrid?.handleViewportResize()
+        },
+      }
+    )
+
+    if ((wasHidden || current.phase === 'ready' || current.phase === 'error') && this.activeViewMode !== 'inspector') {
+      this.dataGrid?.handleViewportResize()
+    }
+  }
+
+  private async handleFixWithAiClick(): Promise<void> {
+    const banner = this.activeResultBannerState
+    if (!banner || banner.kind !== 'error') return
+    const failedSql = String(banner.failedSql || '').trim()
+    if (!failedSql) return
+
+    const errorMessage = banner.errorText || banner.detail || banner.title || 'Query failed'
+    const fixTargetRange = banner.fixTargetRange ?? null
+    const originTabId = this.consoleTabs.getActiveTabId()
+    const originResultSetIndex = this.activeResultSetIndex
+    const originConnectionId = this.activeConnectionId
+    const originLastResult = this.activeQueryResult
+
+    if (!this.isAiConfiguredAndEnabled()) {
+      this.aiFixSeq += 1
+      this.aiFixAbort?.abort()
+      this.aiFixAbort = null
+      this.aiFixState = {
+        phase: 'error',
+        result: null,
+        error:
+          'AI SQL Assistant is not configured or disabled. Enable it in AI Settings to fix SQL errors.',
+        failedSql,
+        errorMessage,
+        fixTargetRange,
+        originTabId,
+        originResultSetIndex,
+        originConnectionId,
+        originLastResult,
+      }
+      this.renderAiFixPanel()
+      return
+    }
+
+    this.aiFixAbort?.abort()
+    const ac = new AbortController()
+    this.aiFixAbort = ac
+    const seq = ++this.aiFixSeq
+
+    this.aiFixState = {
+      phase: 'loading',
+      result: null,
+      error: null,
+      failedSql,
+      errorMessage,
+      fixTargetRange,
+      originTabId,
+      originResultSetIndex,
+      originConnectionId,
+      originLastResult,
+    }
+    this.renderAiFixPanel()
+
+    const conn = this.getActiveConnection()
+    const uiLocale =
+      typeof window !== 'undefined'
+        ? (window.orca as unknown as { locale?: string } | undefined)?.locale
+        : undefined
+
+    try {
+      const result = await this.requestPlugin<AiFixQueryResult>(
+        'ai.fixQuery',
+        {
+          connectionId: conn?.id,
+          dialect: conn?.driver || 'sqlite',
+          sql: failedSql,
+          errorMessage,
+          activeSchema: this.selectedSchema,
+          activeTable: this.activeTable ?? undefined,
+          schemaMap: this.schemaMap,
+          language: this.aiStatus?.explainLanguage || 'auto',
+          uiLocale,
+        },
+        { signal: ac.signal, timeoutMs: 65_000 }
+      )
+      if (
+        this.isDestroyed ||
+        seq !== this.aiFixSeq ||
+        ac.signal.aborted ||
+        this.activeConnectionId !== originConnectionId ||
+        this.consoleTabs.getActiveTabId() !== originTabId ||
+        this.activeResultSetIndex !== originResultSetIndex ||
+        this.activeQueryResult !== originLastResult
+      ) {
+        return
+      }
+      this.aiFixState = {
+        phase: 'ready',
+        result,
+        error: null,
+        failedSql,
+        errorMessage,
+        fixTargetRange,
+        originTabId,
+        originResultSetIndex,
+        originConnectionId,
+        originLastResult,
+      }
+      if (originLastResult !== null) {
+        const curState = this.consoleTabs.getResultTabState(originResultSetIndex, originTabId)
+        if (curState) {
+          this.consoleTabs.setResultTabState(
+            originResultSetIndex,
+            { ...curState, aiFixResult: result, aiFixError: null },
+            originTabId
+          )
+        }
+      }
+      this.renderAiFixPanel()
+    } catch (err: unknown) {
+      if (
+        this.isDestroyed ||
+        seq !== this.aiFixSeq ||
+        ac.signal.aborted ||
+        this.activeConnectionId !== originConnectionId ||
+        this.consoleTabs.getActiveTabId() !== originTabId ||
+        this.activeResultSetIndex !== originResultSetIndex ||
+        this.activeQueryResult !== originLastResult
+      ) {
+        return
+      }
+      const msg = err instanceof Error ? err.message : String(err)
+      this.aiFixState = {
+        phase: 'error',
+        result: null,
+        error: msg,
+        failedSql,
+        errorMessage,
+        fixTargetRange,
+        originTabId,
+        originResultSetIndex,
+        originConnectionId,
+        originLastResult,
+      }
+      if (originLastResult !== null) {
+        const curState = this.consoleTabs.getResultTabState(originResultSetIndex, originTabId)
+        if (curState) {
+          this.consoleTabs.setResultTabState(
+            originResultSetIndex,
+            { ...curState, aiFixResult: null, aiFixError: msg },
+            originTabId
+          )
+        }
+      }
+      this.renderAiFixPanel()
+    } finally {
+      if (this.aiFixAbort === ac) {
+        this.aiFixAbort = null
+      }
+    }
+  }
+
+  private resolveResultStatementRange(
+    targetSql: string,
+    idx: number,
+    totalSets: number,
+    stmtSlices: Array<{ text: string; start: number; end: number }>,
+    execRange: SqlExecutionRange | null
+  ): SqlFixTargetRange | null {
+    if (!execRange) return null
+    const matchingSlice =
+      stmtSlices[idx] &&
+      (stmtSlices.length === totalSets || stmtSlices[idx].text.trim() === targetSql)
+        ? stmtSlices[idx]
+        : null
+    if (matchingSlice) {
+      return {
+        from: execRange.from + matchingSlice.start,
+        to: execRange.from + matchingSlice.end,
+        originalSlice: execRange.sql.slice(matchingSlice.start, matchingSlice.end),
+      }
+    }
+    if (totalSets === 1 && stmtSlices.length <= 1) {
+      return {
+        from: execRange.from,
+        to: execRange.to,
+        originalSlice: execRange.originalSlice,
+      }
+    }
+    return null
+  }
+
+  private attachFixTargetsToResultStates(
+    states: Record<number, ResultSetTabRuntimeState>,
+    res: QueryResult,
+    overallSql: string,
+    driver: DatabaseDriverType,
+    execRange: SqlExecutionRange | null
+  ): void {
+    const sets = getEffectiveResultSets(res, overallSql)
+    const stmtSlices =
+      execRange && driver !== 'redis' ? splitSqlStatements(execRange.sql, driver) : []
+    sets.forEach((rs, idx) => {
+      const st = states[idx]
+      if (!st?.banner || st.banner.kind !== 'error') return
+      const failedSql = (st.statementSql || rs.sql || overallSql).trim()
+      if (!failedSql) return
+      const fixTargetRange = this.resolveResultStatementRange(
+        failedSql,
+        idx,
+        sets.length,
+        stmtSlices,
+        execRange
+      )
+      st.banner = {
+        ...st.banner,
+        failedSql,
+        fixTargetRange,
+      }
+    })
+  }
+
+  private attachExplainTargetsToResultStates(
+    states: Record<number, ResultSetTabRuntimeState>,
+    res: QueryResult,
+    overallSql: string,
+    driver: DatabaseDriverType,
+    execRange: SqlExecutionRange | null
+  ): void {
+    const sets = getEffectiveResultSets(res, overallSql)
+    const stmtSlices =
+      execRange && driver !== 'redis' ? splitSqlStatements(execRange.sql, driver) : []
+    sets.forEach((rs, idx) => {
+      const st = states[idx]
+      if (!st) return
+      const stmtSql = (st.statementSql || rs.sql || overallSql).trim()
+      if (!stmtSql) return
+      st.explainTargetRange = this.resolveResultStatementRange(
+        stmtSql,
+        idx,
+        sets.length,
+        stmtSlices,
+        execRange
+      )
+    })
   }
 
   private dismissActiveQueryBanner(): void {
@@ -4041,6 +4864,7 @@ export class DatanoaStudioEditor {
         }
       }
     }
+    this.clearAiFixPanel()
     this.setQueryBannerVisible(false)
   }
 
@@ -4048,8 +4872,15 @@ export class DatanoaStudioEditor {
     kind: 'success' | 'error',
     title: string,
     detail = '',
-    opts?: { onRetry?: () => void; showBackToTable?: boolean; isExplain?: boolean }
+    opts?: {
+      onRetry?: () => void
+      showBackToTable?: boolean
+      isExplain?: boolean
+      failedSql?: string
+      fixTargetRange?: SqlFixTargetRange | null
+    }
   ): void {
+    this.clearAiFixPanel()
     const banner: ResultBannerState = {
       kind,
       title,
@@ -4058,6 +4889,8 @@ export class DatanoaStudioEditor {
       showBackToTable: opts?.showBackToTable,
       errorText: kind === 'error' ? detail || title : undefined,
       isExplain: opts?.isExplain,
+      failedSql: opts?.failedSql,
+      fixTargetRange: opts?.fixTargetRange ?? null,
     }
     this.activeResultBannerState = banner
     this.queryBannerRetryHandler = opts?.onRetry ?? null
@@ -4070,6 +4903,9 @@ export class DatanoaStudioEditor {
     this.activeResultBannerState = null
     this.lastQueryErrorText = ''
     this.queryBannerRetryHandler = null
+    if (this.queryBannerFixAiBtn) {
+      this.queryBannerFixAiBtn.style.display = 'none'
+    }
     if (this.queryBannerReportBtn) {
       this.queryBannerReportBtn.style.display = 'none'
     }
@@ -4079,6 +4915,7 @@ export class DatanoaStudioEditor {
     if (this.queryBannerBackBtn) {
       this.queryBannerBackBtn.style.display = 'none'
     }
+    this.clearAiFixPanel()
     this.setQueryBannerVisible(false)
   }
 
@@ -4244,6 +5081,7 @@ export class DatanoaStudioEditor {
       }
       this.hideResultSetsBar()
       this.hideQueryBanner()
+      this.renderExplainAiForActiveTab()
       if (!silent) {
         this.updateStatus(`Loading ${table}...`)
         if (this.gridSubbarTitleEl) {
@@ -4682,6 +5520,7 @@ export class DatanoaStudioEditor {
     this.dataGrid?.clearSortIndicator()
     this.hideQueryBanner()
     this.hideResultSetsBar()
+    this.renderExplainAiForActiveTab()
     this.dataGrid?.setEmptyMessage('Run a query in this tab to see results.')
     this.dataGrid?.setData({
       columns: [],
@@ -4702,6 +5541,8 @@ export class DatanoaStudioEditor {
 
   private switchConsoleTab(tabId: string): void {
     if (tabId === this.consoleTabs.getActiveTabId()) return
+    this.clearAiFixPanel()
+    this.sqlConsole?.clearDbSyntaxError?.()
     this.captureActiveResultTabState()
     this.saveActiveConsoleTabState()
     if (!this.consoleTabs.switchTab(tabId)) return
@@ -4711,6 +5552,8 @@ export class DatanoaStudioEditor {
   }
 
   private addConsoleTab(): void {
+    this.clearAiFixPanel()
+    this.sqlConsole?.clearDbSyntaxError?.()
     this.captureActiveResultTabState()
     this.saveActiveConsoleTabState()
     this.consoleTabs.addTab('')
@@ -4723,6 +5566,8 @@ export class DatanoaStudioEditor {
   }
 
   private closeConsoleTab(tabId: string): void {
+    this.clearAiFixPanel()
+    this.sqlConsole?.clearDbSyntaxError?.()
     this.captureActiveResultTabState()
     this.saveActiveConsoleTabState()
     if (!this.consoleTabs.closeTab(tabId)) return
@@ -4774,6 +5619,12 @@ export class DatanoaStudioEditor {
       gridSubbarTitle: this.gridSubbarTitleEl?.textContent ?? existing?.gridSubbarTitle ?? 'SQL Result',
       gridPageInfo: this.gridPageInfoEl?.textContent ?? existing?.gridPageInfo ?? '0 rows',
       emptyMessage: existing?.emptyMessage ?? 'Query returned no rows.',
+      explainTargetRange: existing?.explainTargetRange ?? null,
+      explainAnalysis: existing?.explainAnalysis ?? null,
+      explainAnalysisError: existing?.explainAnalysisError ?? null,
+      explainAnalysisCollapsed: existing?.explainAnalysisCollapsed ?? false,
+      aiFixResult: existing?.aiFixResult ?? null,
+      aiFixError: existing?.aiFixError ?? null,
     }
     this.consoleTabs.setResultTabState(idx, nextState)
   }
@@ -4783,6 +5634,7 @@ export class DatanoaStudioEditor {
     tab: SqlConsoleTabState,
     opts?: { preserveScroll?: boolean }
   ): void {
+    this.clearAiFixPanel()
     const res = tab.lastResult
     if (!res) return
     const sets = getEffectiveResultSets(res, tab.executedSql || '')
@@ -4797,6 +5649,12 @@ export class DatanoaStudioEditor {
         res.executionTimeMs || 0,
         tab.lastResultMode ?? 'query'
       )[index]
+    if (existingState?.banner?.kind === 'error' && !existingState.banner.failedSql) {
+      const fallbackFailedSql = (existingState.statementSql || rs.sql || tab.executedSql || '').trim()
+      if (fallbackFailedSql) {
+        existingState.banner = { ...existingState.banner, failedSql: fallbackFailedSql }
+      }
+    }
     if (!tab.resultStates?.[index] && existingState) {
       this.consoleTabs.setResultTabState(index, existingState, tab.id)
     }
@@ -5233,7 +6091,8 @@ export class DatanoaStudioEditor {
     executeAll = false,
     skipBindCheck = false,
     sqlOverride?: string,
-    skipDangerGuard = false
+    skipDangerGuard = false,
+    execRangeOverride?: SqlExecutionRange | null
   ): Promise<void> {
     if (
       !this.sqlConsole ||
@@ -5246,6 +6105,12 @@ export class DatanoaStudioEditor {
       return
     }
     const driver = this.getActiveConnection()?.driver || 'sqlite'
+    const execRange =
+      execRangeOverride !== undefined
+        ? execRangeOverride
+        : sqlOverride
+          ? null
+          : this.sqlConsole.getExecutionRange?.(executeAll ? 'all' : 'caret', driver) ?? null
     const sqlText =
       sqlOverride ??
       (executeAll
@@ -5265,7 +6130,7 @@ export class DatanoaStudioEditor {
       const detectedParams = extractSqlParameters(sqlText, driver)
       if (detectedParams.length > 0) {
         this.promptBindParams(sqlText, driver, detectedParams, (boundSql) => {
-          void this.executeSql(executeAll, true, boundSql)
+          void this.executeSql(executeAll, true, boundSql, skipDangerGuard, execRange)
         })
         return
       }
@@ -5278,16 +6143,10 @@ export class DatanoaStudioEditor {
 
     if (!skipDangerGuard && !this.isActiveConnectionReadOnly()) {
       const conn = this.getActiveConnection()
-      const allFindings = analyzeDangerousSql(sqlText, driver)
-      const requiresAll = conn?.colorTag === 'prod' || conn?.colorTag === 'staging'
-      const activeFindings = requiresAll
-        ? allFindings
-        : allFindings.filter(
-            (finding) =>
-              finding.kind === 'delete_without_where' || finding.kind === 'update_without_where'
-          )
+      const activeFindings = analyzeDangerousSql(sqlText, driver)
       if (activeFindings.length > 0) {
         const expectedConnId = this.activeConnectionId
+        const expectedTabId = this.consoleTabs.getActiveTabId()
         openStudioDangerSqlModal({
           mountModal: (modalEl, canClose) => this.mountStudioModal(modalEl, canClose),
           closeModal: () => this.closeActiveModal(),
@@ -5296,11 +6155,14 @@ export class DatanoaStudioEditor {
           findings: activeFindings,
           sql: sqlText,
           onConfirm: () => {
-            if (this.activeConnectionId !== expectedConnId) {
-              this.updateStatus('Connection changed — query cancelled')
+            if (
+              this.activeConnectionId !== expectedConnId ||
+              this.consoleTabs.getActiveTabId() !== expectedTabId
+            ) {
+              this.updateStatus('Connection or tab changed — query cancelled')
               return
             }
-            void this.executeSql(executeAll, true, sqlText, true)
+            void this.executeSql(executeAll, true, sqlText, true, execRange)
           },
         })
         return
@@ -5313,6 +6175,7 @@ export class DatanoaStudioEditor {
     this.isTableLoading = false
     const targetConnId = this.activeConnectionId
     const originTabId = this.consoleTabs.getActiveTabId()
+    this.sqlConsole?.clearDbSyntaxError?.()
     this.hideQueryBanner()
     this.updateStatus('Running 0.0s...')
     const queryId = `query_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
@@ -5370,6 +6233,7 @@ export class DatanoaStudioEditor {
         durationMs,
         'query'
       )
+      this.attachFixTargetsToResultStates(initialStates, res, sqlText, driver, execRange)
       this.consoleTabs.setResultForTab(
         originTabId,
         res,
@@ -5412,6 +6276,15 @@ export class DatanoaStudioEditor {
       this.applyResultTabState(defaultIdx, this.consoleTabs.getActiveTab())
 
       const sets = getEffectiveResultSets(res, sqlText)
+      const firstErrIdx = sets.findIndex((s) => Boolean(s.isError))
+      if (firstErrIdx >= 0) {
+        const errSet = sets[firstErrIdx]
+        const errBanner = initialStates[firstErrIdx]?.banner
+        const errMsg = errSet.errorMessage || errBanner?.errorText || errBanner?.detail || ''
+        this.sqlConsole?.setDbSyntaxError?.(errMsg, errBanner?.fixTargetRange ?? null)
+      } else {
+        this.sqlConsole?.clearDbSyntaxError?.()
+      }
       const activeRs = sets[this.activeResultSetIndex] || sets[0]
       const rowCount = activeRs
         ? activeRs.rowCount ?? activeRs.rows.length
@@ -5448,10 +6321,19 @@ export class DatanoaStudioEditor {
       this.currentCanEdit = false
       this.currentPageRowCount = 0
       this.closeValueInspector()
-      this.showQueryBanner('error', 'SQL Execution Error', msg, { showBackToTable: true })
+      const errFixRange = execRange
+        ? { from: execRange.from, to: execRange.to, originalSlice: execRange.originalSlice }
+        : null
+      this.showQueryBanner('error', 'SQL Execution Error', msg, {
+        showBackToTable: true,
+        failedSql: sqlText,
+        fixTargetRange: errFixRange,
+      })
+      this.sqlConsole?.setDbSyntaxError?.(msg, errFixRange)
       this.activeQueryResult = null
       this.activeResultSetIndex = 0
       this.hideResultSetsBar()
+      this.renderExplainAiForActiveTab()
       this.dataGrid?.setEmptyMessage(`Query error: ${msg}`)
       this.dataGrid?.setData({
         columns: [],
@@ -5488,7 +6370,12 @@ export class DatanoaStudioEditor {
     }
   }
 
-  public async explainSql(skipBindCheck = false, sqlOverride?: string): Promise<void> {
+  public async explainSql(
+    skipBindCheck = false,
+    sqlOverride?: string,
+    skipDangerGuard = false,
+    execRangeOverride?: SqlExecutionRange | null
+  ): Promise<void> {
     if (
       !this.sqlConsole ||
       (this.activeQueryId !== null && !this.cancelledQueryIds.has(this.activeQueryId))
@@ -5496,6 +6383,12 @@ export class DatanoaStudioEditor {
       return
     }
     const driver = this.getActiveConnection()?.driver || 'sqlite'
+    const execRange =
+      execRangeOverride !== undefined
+        ? execRangeOverride
+        : sqlOverride
+          ? null
+          : this.sqlConsole.getExecutionRange?.('explain', driver) ?? null
     const selectedSql = sqlOverride ? '' : this.sqlConsole.getSelectedSql()
     const sqlText = sqlOverride ?? (selectedSql || this.sqlConsole.getText().trim())
     if (!sqlText) {
@@ -5520,7 +6413,34 @@ export class DatanoaStudioEditor {
       const detectedParams = extractSqlParameters(sqlText, driver)
       if (detectedParams.length > 0) {
         this.promptBindParams(sqlText, driver, detectedParams, (boundSql) => {
-          void this.explainSql(true, boundSql)
+          void this.explainSql(true, boundSql, skipDangerGuard, execRange)
+        })
+        return
+      }
+    }
+    if (!skipDangerGuard && !this.isActiveConnectionReadOnly()) {
+      const conn = this.getActiveConnection()
+      const findings = analyzeDangerousSql(sqlText, driver)
+      if (findings.length > 0) {
+        const expectedConnId = this.activeConnectionId
+        const expectedTabId = this.consoleTabs.getActiveTabId()
+        openStudioDangerSqlModal({
+          mountModal: (modalEl, canClose) => this.mountStudioModal(modalEl, canClose),
+          closeModal: () => this.closeActiveModal(),
+          connectionName: conn?.name ?? 'Active Connection',
+          colorTag: conn?.colorTag,
+          findings,
+          sql: sqlText,
+          onConfirm: () => {
+            if (
+              this.activeConnectionId !== expectedConnId ||
+              this.consoleTabs.getActiveTabId() !== expectedTabId
+            ) {
+              this.updateStatus('Connection or tab changed — explain cancelled')
+              return
+            }
+            void this.explainSql(true, sqlText, true, execRange)
+          },
         })
         return
       }
@@ -5535,6 +6455,7 @@ export class DatanoaStudioEditor {
     const originTabId = this.consoleTabs.getActiveTabId()
     const queryId = `explain_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
     this.activeWorkerQueryId = queryId
+    this.sqlConsole?.clearDbSyntaxError?.()
     this.hideQueryBanner()
     this.updateStatus(
       explainStmts.length > 1
@@ -5657,6 +6578,14 @@ export class DatanoaStudioEditor {
         totalMs,
         'explain'
       )
+      this.attachFixTargetsToResultStates(initialStates, combinedRes, sqlText, driver, execRange)
+      this.attachExplainTargetsToResultStates(
+        initialStates,
+        combinedRes,
+        sqlText,
+        driver,
+        execRange
+      )
       this.consoleTabs.setResultForTab(
         originTabId,
         combinedRes,
@@ -5679,6 +6608,15 @@ export class DatanoaStudioEditor {
       this.closeValueInspector()
       this.applyResultTabState(0, this.consoleTabs.getActiveTab())
 
+      const firstErrIdx = collectedSets.findIndex((s) => Boolean(s.isError))
+      if (firstErrIdx >= 0) {
+        const errSet = collectedSets[firstErrIdx]
+        const errBanner = initialStates[firstErrIdx]?.banner
+        const errMsg = errSet.errorMessage || errBanner?.errorText || errBanner?.detail || ''
+        this.sqlConsole?.setDbSyntaxError?.(errMsg, errBanner?.fixTargetRange ?? null)
+      } else {
+        this.sqlConsole?.clearDbSyntaxError?.()
+      }
       const firstSet = collectedSets[0]
       const errCount = collectedSets.filter((s) => s.isError).length
       this.updateStatus(
@@ -5704,10 +6642,20 @@ export class DatanoaStudioEditor {
       this.isShowingSqlResult = true
       this.currentCanEdit = false
       this.currentPageRowCount = 0
-      this.showQueryBanner('error', 'EXPLAIN Error', msg, { showBackToTable: true, isExplain: true })
+      const errFixRange = execRange
+        ? { from: execRange.from, to: execRange.to, originalSlice: execRange.originalSlice }
+        : null
+      this.showQueryBanner('error', 'EXPLAIN Error', msg, {
+        showBackToTable: true,
+        isExplain: true,
+        failedSql: sqlText,
+        fixTargetRange: errFixRange,
+      })
+      this.sqlConsole?.setDbSyntaxError?.(msg, errFixRange)
       this.activeQueryResult = null
       this.activeResultSetIndex = 0
       this.hideResultSetsBar()
+      this.renderExplainAiForActiveTab()
       this.dataGrid?.setEmptyMessage(`EXPLAIN error: ${msg}`)
       this.dataGrid?.setData({
         columns: [],
@@ -5944,6 +6892,9 @@ export class DatanoaStudioEditor {
         inserts: payload.inserts,
         updates: payload.updates,
         deletes: payload.deletes,
+        ...(payload.deleteRows && payload.deleteRows.length > 0
+          ? { deleteRows: payload.deleteRows }
+          : {}),
       })
       if (
         seq !== this.dmlPreviewSeq ||
@@ -6028,6 +6979,9 @@ export class DatanoaStudioEditor {
           inserts: payload.inserts,
           updates: payload.updates,
           deletes: payload.deletes,
+          ...(payload.deleteRows && payload.deleteRows.length > 0
+            ? { deleteRows: payload.deleteRows }
+            : {}),
         },
         { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
       )
@@ -6138,8 +7092,6 @@ export class DatanoaStudioEditor {
     if (!summary || summary.cellCount === 0) {
       this.statusSelectionEl.style.display = 'none'
       this.statusSelectionEl.textContent = ''
-      if (this.shortcutHintEl) this.shortcutHintEl.style.display = ''
-      if (this.statusMetricsEl) this.statusMetricsEl.style.marginLeft = ''
       return
     }
     const rowWord = summary.rowCount === 1 ? 'row' : 'rows'
@@ -6166,8 +7118,6 @@ export class DatanoaStudioEditor {
     }
     this.statusSelectionEl.textContent = parts.join(' · ')
     this.statusSelectionEl.style.display = 'inline-flex'
-    if (this.shortcutHintEl) this.shortcutHintEl.style.display = 'none'
-    if (this.statusMetricsEl) this.statusMetricsEl.style.marginLeft = 'auto'
   }
 
   private setGridSearchMode(mode: 'filter' | 'find'): void {
@@ -6406,8 +7356,11 @@ export class DatanoaStudioEditor {
     if (driver === 'redis') return
     const seq = ++this.countRowsSeq
     const targetConnId = this.activeConnectionId
-    const tableRef = this.formatQualifiedSqlTable(item, driver)
-    const sql = `SELECT COUNT(*) AS row_count FROM ${tableRef};`
+    const tableRef = driver === 'mongodb' ? '' : this.formatQualifiedSqlTable(item, driver)
+    const sql =
+      driver === 'mongodb'
+        ? `db.getCollection(${JSON.stringify(item.name)}).countDocuments({});`
+        : `SELECT COUNT(*) AS row_count FROM ${tableRef};`
     this.updateStatus(`Counting rows in ${item.name}...`)
     try {
       const res = await this.requestPlugin<QueryResult>(
@@ -6444,7 +7397,9 @@ export class DatanoaStudioEditor {
   }
 
   private closeActiveModal(): void {
-    closeActiveStudioCollapsibleDropdown()
+    if (this.activeModalKeyCleanup || this.activeModalBackdrop) {
+      closeActiveStudioCollapsibleDropdown()
+    }
     if (this.activeModalKeyCleanup) {
       this.activeModalKeyCleanup()
       this.activeModalKeyCleanup = null
@@ -6455,17 +7410,34 @@ export class DatanoaStudioEditor {
     }
   }
 
+  private static modalTitleSeq = 0
+
   private mountStudioModal(
     modalEl: HTMLElement,
     canClose: () => boolean = () => true,
     onDismiss?: () => void
   ): HTMLDivElement | null {
     this.closeActiveModal()
+    closeActiveStudioCollapsibleDropdown()
     if (typeof document === 'undefined' || !document.body) return null
     const backdrop = document.createElement('div')
     backdrop.className = 'datanoa-modal-backdrop'
     backdrop.setAttribute('role', 'dialog')
     backdrop.setAttribute('aria-modal', 'true')
+    const titleEl = modalEl.querySelector(
+      'h1, h2, h3, .datanoa-modal-title, .datanoa-modal-head span, .datanoa-feedback-title, .datanoa-import-title, .datanoa-cmd-title, [role="heading"]'
+    )
+    if (titleEl && (titleEl.textContent || '').trim().length > 0) {
+      if (!titleEl.id) {
+        titleEl.id = `datanoa-modal-title-${++DatanoaStudioEditor.modalTitleSeq}`
+      }
+      backdrop.setAttribute('aria-labelledby', titleEl.id)
+    } else if (
+      !backdrop.hasAttribute('aria-label') &&
+      !backdrop.hasAttribute('aria-labelledby')
+    ) {
+      backdrop.setAttribute('aria-label', modalEl.getAttribute('aria-label') || 'Dialog')
+    }
     backdrop.appendChild(modalEl)
     backdrop.addEventListener('click', (e) => {
       if (e.target === backdrop && canClose()) {
@@ -6921,6 +7893,18 @@ export class DatanoaStudioEditor {
       this.updateStatus('No schema changes to apply')
       return
     }
+    const activeConn = this.getActiveConnection()
+    if (
+      (activeConn?.driver === 'sqlite' || activeConn?.driver === 'libsql') &&
+      this.txToolbar.hasActiveOrManualTx() &&
+      requiresSqliteTableRebuild(draft)
+    ) {
+      const errMsg =
+        'Cannot rebuild SQLite/LibSQL table while a manual transaction is active (SQLite ignores PRAGMA foreign_keys = OFF inside a transaction). Commit or rollback the transaction first.'
+      this.showQueryBanner('error', 'Active Transaction Blocks Table Rebuild', errMsg)
+      this.updateStatus(errMsg)
+      throw new Error(errMsg)
+    }
 
     const targetConnId = this.activeConnectionId
     const sqlBatch = statements.join('\n')
@@ -7005,6 +7989,7 @@ export class DatanoaStudioEditor {
       return { ok: false }
     }
 
+    const targetConnId = this.activeConnectionId
     try {
       this.updateStatus(`Saving ${params.column}...`)
       const res = await this.requestPlugin<{
@@ -7012,7 +7997,7 @@ export class DatanoaStudioEditor {
         affectedRows?: number
         updatedRecord?: Record<string, unknown>
       }>('data.updateCell', {
-        connectionId: this.activeConnectionId,
+        connectionId: targetConnId,
         table: editTarget.table,
         ...(editTarget.schema ? { schema: editTarget.schema } : {}),
         primaryKeys: params.primaryKeys,
@@ -7031,6 +8016,8 @@ export class DatanoaStudioEditor {
       const msg = err instanceof Error ? err.message : String(err)
       this.updateStatus(`Update failed: ${msg}`)
       return { ok: false }
+    } finally {
+      void this.refreshTransactionState(targetConnId)
     }
   }
 
@@ -7058,6 +8045,14 @@ export class DatanoaStudioEditor {
   public destroy(): void {
     this.flushStudioViewState()
     this.isDestroyed = true
+    this.aiFixSeq += 1
+    this.aiFixAbort?.abort()
+    this.aiFixAbort = null
+    this.aiFixState = null
+    this.explainAiSeq += 1
+    this.explainAiAbort?.abort()
+    this.explainAiAbort = null
+    this.explainAiLoadingTarget = null
     this.cancelClientSearchDebounce()
     this.introspectToken++
     this.gridViewSeq++
@@ -7069,6 +8064,8 @@ export class DatanoaStudioEditor {
     this.queryHistoryDrawer.bumpSeq()
     this.dmlPreviewSeq++
     this.countRowsSeq++
+    this.txToolbar.rollbackOnUnload()
+    this.txToolbar.destroy()
     this.activeConnectionId = null
     this.cancelledQueryIds.clear()
     this.inFlightTableDetails.clear()
@@ -7079,8 +8076,6 @@ export class DatanoaStudioEditor {
       this.scrollRestoreRafId = null
     }
 
-    this.txToolbar.rollbackOnUnload()
-    this.txToolbar.destroy()
     this.valueInspector.destroy()
     this.queryHistoryDrawer.destroy()
 

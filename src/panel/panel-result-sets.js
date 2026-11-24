@@ -150,6 +150,9 @@ export function buildInitialPanelResultStates(
       sortDir: 'ASC',
       colWidths: [],
       scrollTop: 0,
+      explainAnalysis: null,
+      explainAnalysisError: null,
+      explainAnalysisCollapsed: false,
     }
   })
   return out

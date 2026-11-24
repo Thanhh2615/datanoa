@@ -49,7 +49,13 @@ export async function rpc(name, input, options) {
     const params = { name }
     if (payload !== undefined) params.input = payload
     if (options?.timeoutMs) params.timeoutMs = options.timeoutMs
-    const res = await window.orca.host.call('plugin.request', params)
+    const callOpts = {}
+    if (options?.signal !== undefined) callOpts.signal = options.signal
+    if (options?.timeoutMs !== undefined) callOpts.timeoutMs = options.timeoutMs
+    const res =
+      Object.keys(callOpts).length > 0
+        ? await window.orca.host.call('plugin.request', params, callOpts)
+        : await window.orca.host.call('plugin.request', params)
     return res?.output
   }
   throw new Error('Orca IPC bridge is unavailable')
@@ -85,7 +91,10 @@ export function applyTypographySnapshot(typo) {
 
 export async function syncOrcaTypography() {
   try {
-    if (window.orca?.host?.call) {
+    if (
+      window.orca?.host?.call &&
+      (typeof window.orca.host.has !== 'function' || window.orca.host.has('editor.readTypography'))
+    ) {
       const typo = await window.orca.host.call('editor.readTypography')
       applyTypographySnapshot(typo)
     }
@@ -198,21 +207,7 @@ export async function downloadTextFile(filename, content, mimeType = 'text/plain
   }
 }
 
-export function bindCtrlWheelHorizontalScroll(el) {
-  if (!el) return
-  el.addEventListener(
-    'wheel',
-    (e) => {
-      if (!e.ctrlKey && !e.metaKey) return
-      const raw = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX
-      if (!raw) return
-      e.preventDefault()
-      const step = e.deltaMode === 1 ? raw * 28 : e.deltaMode === 2 ? raw * 320 : raw * 1.25
-      el.scrollLeft += step
-    },
-    { passive: false }
-  )
-}
+export { bindCtrlWheelHorizontalScroll } from '../shared-wheel-scroll.js'
 
 export function createEnvBadge(colorTag) {
   if (!colorTag || colorTag === 'none') return null
@@ -335,7 +330,7 @@ const panelSelectController = createCollapsibleSelectController({
   apiProp: '_customDropdownApi',
   closeOnRefresh: true,
   fallbackQuerySelected: false,
-  setActionAriaLabel: false,
+  setActionAriaLabel: true,
   expandTitle: 'Expand all folders in dropdown',
   collapseTitle: 'Collapse all folders in dropdown',
   setLeadIconVisible: (el, visible) => {

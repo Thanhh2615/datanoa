@@ -1,14 +1,16 @@
 export interface CollapsibleSelectOptions {
   tooltipPrefix?: string
   searchPlaceholder?: string
+  searchAriaLabel?: string
   collapsedFolders?: Set<string>
   defaultCollapseNonActiveFolders?: boolean
   onFolderToggle?: (collapsedFolders: Set<string>) => void
   leadingIconType?: 'none' | 'workspace' | 'db'
+  onOpen?: () => void
 }
 
 export interface CollapsibleSelectApi {
-  refresh(): void
+  refresh(options?: CollapsibleSelectOptions): void
   close(): void
   triggerBtn: HTMLButtonElement
 }

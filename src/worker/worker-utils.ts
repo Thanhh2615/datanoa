@@ -19,6 +19,19 @@ import { scrubUrlCredentials, SUPPORTED_DRIVERS } from '../drivers/common/connec
 import { detectRecognizableSqlCredential } from '../drivers/common/sql-credentials'
 import { quoteIdentForDialect } from '../drivers/common/sql-tools'
 import {
+  ACTIONABLE_TLS_CERT_ERROR_HINT,
+  appendActionableTlsErrorHint,
+} from '../drivers/common/tls-and-tunnel'
+
+export { ACTIONABLE_TLS_CERT_ERROR_HINT, appendActionableTlsErrorHint }
+import {
+  containsSensitiveSqlText,
+  isSensitiveUriParamKey,
+  sanitizeSqlResultForStorage,
+  scrubConnectionNameForStorage,
+  scrubSensitiveText,
+} from '../shared-sql-safety.js'
+import {
   isLocalWorkspaceHost,
   normalizePathForCompare,
   resolveSqliteFilePath,
@@ -218,7 +231,7 @@ export function sanitizeConnectionProfile(conn: ConnectionProfile): ConnectionPr
 
   return sanitizeJsonPayload({
     id: conn.id,
-    name: conn.name,
+    name: scrubConnectionName(conn.name),
     driver: conn.driver,
     database: conn.database,
     filePath: conn.filePath,
@@ -422,9 +435,21 @@ export async function openStudioDocumentInOrca(
       options?.sql ||
       (dialect === 'redis'
         ? 'SCAN 0 MATCH * COUNT 50'
-        : qualifiedTable
-          ? `SELECT * FROM ${qualifiedTable} LIMIT 100;`
-          : '-- Datanoa SQL Studio\nSELECT 1;\n')
+        : dialect === 'mongodb'
+          ? options?.table
+            ? `db.getCollection(${JSON.stringify(options.table)}).find({}).limit(100);`
+            : 'db.stats();'
+          : dialect === 'mssql'
+            ? qualifiedTable
+              ? `SELECT TOP 100 * FROM ${qualifiedTable};`
+              : '-- Datanoa SQL Studio\nSELECT 1;\n'
+            : dialect === 'oracle'
+              ? qualifiedTable
+                ? `SELECT * FROM ${qualifiedTable} FETCH FIRST 100 ROWS ONLY;`
+                : '-- Datanoa SQL Studio\nSELECT 1 FROM DUAL;\n'
+              : qualifiedTable
+                ? `SELECT * FROM ${qualifiedTable} LIMIT 100;`
+                : '-- Datanoa SQL Studio\nSELECT 1;\n')
 
     const content = `${headerLines.join('\n')}\n${defaultSql}\n`
     await fs.promises.writeFile(fullFilePath, content, 'utf8')
@@ -574,22 +599,79 @@ export function clearInMemoryUiSessionSnapshots(): void {
 }
 
 function regexScrubUrlText(input: string): string {
-  // Scrub embedded scheme://user:pass@ (handles '#', '?', ':', '@' inside passwords)
-  let out = input.replace(
-    /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^:/\s?#@]*):([^\s/]*)@/g,
-    '$1$2@'
-  )
-  // Scrub sensitive query parameters even in malformed / partial URLs
-  out = out.replace(
-    /([?&])([^=&\s#]*(?:token|pass|pwd|secret|key|auth)[^=&\s#]*)=([^&\s#]*)/gi,
-    '$1$2=[REDACTED]'
-  )
-  return out
+  return scrubSensitiveText(input, { stripOpaqueFragment: true })
+}
+
+function scrubConnectionName(rawName: unknown): string {
+  return scrubConnectionNameForStorage(rawName)
 }
 
 export function scrubCredentialsInText(raw: string): string {
   if (!raw) return ''
   return regexScrubUrlText(raw)
+}
+
+function extractWorkerErrorTlsContext(err: unknown): {
+  rawCode?: unknown
+  tlsCode?: string
+  causeMessage?: string
+} {
+  if (!err || typeof err !== 'object') return {}
+  const rec = err as { code?: unknown; cause?: unknown }
+  const directCode = typeof rec.code === 'string' && rec.code.trim().length > 0 ? rec.code.trim() : undefined
+  if (rec.cause && typeof rec.cause === 'object') {
+    const causeRec = rec.cause as { code?: unknown; message?: unknown }
+    const causeCode =
+      typeof causeRec.code === 'string' && causeRec.code.trim().length > 0
+        ? causeRec.code.trim()
+        : undefined
+    const causeMessage = typeof causeRec.message === 'string' ? causeRec.message : undefined
+    return {
+      rawCode: rec.code,
+      tlsCode: directCode || causeCode,
+      causeMessage,
+    }
+  }
+  return { rawCode: rec.code, tlsCode: directCode }
+}
+
+export function formatActionableWorkerErrorMessage(rawMessage: string, err?: unknown): string {
+  const scrubbed = scrubCredentialsInText(rawMessage)
+  const ctx = extractWorkerErrorTlsContext(err)
+  const direct = appendActionableTlsErrorHint(scrubbed, ctx.tlsCode)
+  if (direct !== scrubbed || !ctx.causeMessage) {
+    return direct
+  }
+  const causeCheck = appendActionableTlsErrorHint(ctx.causeMessage, ctx.tlsCode)
+  if (causeCheck !== ctx.causeMessage && !scrubbed.includes(ACTIONABLE_TLS_CERT_ERROR_HINT)) {
+    return `${scrubbed.trimEnd()} — ${ACTIONABLE_TLS_CERT_ERROR_HINT}`
+  }
+  return scrubbed
+}
+
+export function scrubAndEnhanceWorkerError(err: unknown): unknown {
+  if (err instanceof Error) {
+    const rawMsg = err.message
+    const nextMsg = formatActionableWorkerErrorMessage(rawMsg, err)
+    if (nextMsg === rawMsg) {
+      return err
+    }
+    const sanitized = new Error(nextMsg)
+    sanitized.name = err.name
+    const rawCode = (err as Error & { code?: unknown }).code
+    if (rawCode !== undefined) {
+      ;(sanitized as Error & { code?: unknown }).code = rawCode
+    }
+    return sanitized
+  }
+  if (err !== null && typeof err === 'object' && 'message' in err) {
+    const obj = err as Record<string, unknown>
+    return {
+      ...obj,
+      message: formatActionableWorkerErrorMessage(String(obj.message ?? ''), err),
+    }
+  }
+  return formatActionableWorkerErrorMessage(String(err))
 }
 
 function scrubSensitiveUrlDraft(raw: unknown): string {
@@ -604,9 +686,28 @@ function scrubSensitiveUrlDraft(raw: unknown): string {
       const parsed = new URL(cleaned)
       let mutated = false
       for (const key of Array.from(parsed.searchParams.keys())) {
-        if (/(?:token|pass|pwd|secret|key|auth)/i.test(key)) {
+        if (isSensitiveUriParamKey(key)) {
           parsed.searchParams.delete(key)
           mutated = true
+        }
+      }
+      if (parsed.hash.length > 1) {
+        const cleanedHash = parsed.hash
+          .slice(1)
+          .split('&')
+          .filter((pair) => {
+            const eqIdx = pair.indexOf('=')
+            if (eqIdx <= 0) return true
+            const key = pair.slice(0, eqIdx)
+            if (isSensitiveUriParamKey(key)) {
+              mutated = true
+              return false
+            }
+            return true
+          })
+          .join('&')
+        if (mutated) {
+          parsed.hash = cleanedHash ? `#${cleanedHash}` : ''
         }
       }
       if (mutated) cleaned = parsed.toString()
@@ -618,38 +719,68 @@ function scrubSensitiveUrlDraft(raw: unknown): string {
   return preScrubbed
 }
 
+function hasSensitiveDraftOrFilterSql(value: string): boolean {
+  try {
+    if (detectRecognizableSqlCredential(value) !== null) {
+      return true
+    }
+  } catch {
+    // Ignore credential detector error
+  }
+  return containsSensitiveSqlText(value)
+}
+
+function scrubConsoleTabsObject(raw: unknown): unknown {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return raw
+  }
+  const ct = { ...(raw as Record<string, unknown>) }
+  if (Array.isArray(ct.tabs)) {
+    ct.tabs = ct.tabs.map((tab) => {
+      if (!tab || typeof tab !== 'object' || Array.isArray(tab)) return tab
+      const rec = { ...(tab as Record<string, unknown>) }
+      if (typeof rec.sql === 'string' && rec.sql.trim().length > 0) {
+        if (hasSensitiveDraftOrFilterSql(rec.sql)) {
+          rec.sql = ''
+        }
+      }
+      return rec
+    })
+  }
+  return ct
+}
+
 function stripSecretsFromViewState(
   viewState: Record<string, unknown>
 ): Record<string, unknown> {
   const out: Record<string, unknown> = { ...viewState }
   if (typeof out.sqlDraft === 'string' && out.sqlDraft.trim().length > 0) {
-    try {
-      if (detectRecognizableSqlCredential(out.sqlDraft) !== null) {
-        out.sqlDraft = ''
-      }
-    } catch {
-      // Ignore credential detector error
+    if (hasSensitiveDraftOrFilterSql(out.sqlDraft)) {
+      out.sqlDraft = ''
     }
   }
   if (out.consoleTabs && typeof out.consoleTabs === 'object' && !Array.isArray(out.consoleTabs)) {
-    const ct = { ...(out.consoleTabs as Record<string, unknown>) }
-    if (Array.isArray(ct.tabs)) {
-      ct.tabs = ct.tabs.map((tab) => {
-        if (!tab || typeof tab !== 'object' || Array.isArray(tab)) return tab
-        const rec = { ...(tab as Record<string, unknown>) }
-        if (typeof rec.sql === 'string' && rec.sql.trim().length > 0) {
-          try {
-            if (detectRecognizableSqlCredential(rec.sql) !== null) {
-              rec.sql = ''
-            }
-          } catch {
-            // Ignore detector error
-          }
-        }
-        return rec
-      })
+    out.consoleTabs = scrubConsoleTabsObject(out.consoleTabs)
+  }
+  if (
+    out.consoleTabsState &&
+    typeof out.consoleTabsState === 'object' &&
+    !Array.isArray(out.consoleTabsState)
+  ) {
+    out.consoleTabsState = scrubConsoleTabsObject(out.consoleTabsState)
+  }
+  if (typeof out.whereClause === 'string' && out.whereClause.trim().length > 0) {
+    if (hasSensitiveDraftOrFilterSql(out.whereClause)) {
+      out.whereClause = ''
     }
-    out.consoleTabs = ct
+  }
+  if (typeof out.activeWhereClause === 'string' && out.activeWhereClause.trim().length > 0) {
+    if (hasSensitiveDraftOrFilterSql(out.activeWhereClause)) {
+      out.activeWhereClause = ''
+    }
+  }
+  if (out.lastSqlResult && typeof out.lastSqlResult === 'object') {
+    out.lastSqlResult = sanitizeSqlResultForStorage(out.lastSqlResult)
   }
   if (out.formDraft && typeof out.formDraft === 'object' && !Array.isArray(out.formDraft)) {
     const draft = { ...(out.formDraft as Record<string, unknown>) }
@@ -659,6 +790,15 @@ function stripSecretsFromViewState(
     delete draft.sshPassword
     delete draft.sshPassphrase
     delete draft.sslKeyPassphrase
+    if (typeof draft.name === 'string') {
+      draft.name = scrubConnectionNameForStorage(draft.name)
+    }
+    if (typeof draft.url === 'string') {
+      draft.url = scrubSensitiveUrlDraft(draft.url)
+    }
+    if (typeof draft.options === 'string') {
+      draft.options = scrubSensitiveUrlDraft(draft.options)
+    }
     if (typeof draft.libsqlUrl === 'string') {
       draft.libsqlUrl = scrubSensitiveUrlDraft(draft.libsqlUrl)
     }
@@ -668,6 +808,24 @@ function stripSecretsFromViewState(
     out.formDraft = draft
   }
   return sanitizeJsonPayload(out)
+}
+
+function sanitizeUiDataCache(cache: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...cache }
+  if (typeof out.whereClause === 'string' && out.whereClause.trim().length > 0) {
+    if (hasSensitiveDraftOrFilterSql(out.whereClause)) {
+      out.whereClause = ''
+    }
+  }
+  if (typeof out.activeWhereClause === 'string' && out.activeWhereClause.trim().length > 0) {
+    if (hasSensitiveDraftOrFilterSql(out.activeWhereClause)) {
+      out.activeWhereClause = ''
+    }
+  }
+  if (out.lastSqlResult && typeof out.lastSqlResult === 'object') {
+    out.lastSqlResult = sanitizeSqlResultForStorage(out.lastSqlResult)
+  }
+  return out
 }
 
 export async function saveUiSessionSnapshot(
@@ -695,7 +853,7 @@ export async function saveUiSessionSnapshot(
     typeof input.dataCache === 'object' &&
     !Array.isArray(input.dataCache)
   ) {
-    nextDataCache = { ...(prev.dataCache || {}), ...input.dataCache }
+    nextDataCache = sanitizeUiDataCache({ ...(prev.dataCache || {}), ...input.dataCache })
   }
   const updatedAt = Date.now()
   inMemoryUiSessionSnapshots.set(surface, {
@@ -840,15 +998,21 @@ export function getDefaultByodDriverDirs(): {
     baseDir,
     platform: process.platform,
     paths: {
-      mssql: path.join(baseDir, 'mssql'),
-      oracle: path.join(baseDir, 'oracle'),
-      mongodb: path.join(baseDir, 'mongodb'),
+      duckdb: path.join(baseDir, 'duckdb'),
+      snowflake: path.join(baseDir, 'snowflake'),
+      bigquery: path.join(baseDir, 'bigquery'),
+      cassandra: path.join(baseDir, 'cassandra'),
+      elasticsearch: path.join(baseDir, 'elasticsearch'),
+      neo4j: path.join(baseDir, 'neo4j'),
       custom: path.join(baseDir, 'custom'),
     },
     templates: {
-      mssql: getCanonicalByodStarterCode('mssql'),
-      oracle: getCanonicalByodStarterCode('oracle'),
-      mongodb: getCanonicalByodStarterCode('mongodb'),
+      duckdb: getCanonicalByodStarterCode('duckdb'),
+      snowflake: getCanonicalByodStarterCode('snowflake'),
+      bigquery: getCanonicalByodStarterCode('bigquery'),
+      cassandra: getCanonicalByodStarterCode('cassandra'),
+      elasticsearch: getCanonicalByodStarterCode('elasticsearch'),
+      neo4j: getCanonicalByodStarterCode('neo4j'),
       custom: getCanonicalByodStarterCode('custom'),
     },
   }
@@ -1219,9 +1383,12 @@ export async function listDirectoryForPicker(
 }
 
 const ALLOWED_BYOD_NPM_PACKAGES: Readonly<Record<string, string>> = {
-  mssql: 'mssql',
-  oracle: 'oracledb',
-  mongodb: 'mongodb',
+  duckdb: '@duckdb/node-api',
+  snowflake: 'snowflake-sdk',
+  bigquery: '@google-cloud/bigquery',
+  cassandra: 'cassandra-driver',
+  elasticsearch: '@elastic/elasticsearch',
+  neo4j: 'neo4j-driver',
 }
 
 export { getCanonicalByodStarterCode }

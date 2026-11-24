@@ -53,6 +53,10 @@ export interface SanitizeDiagnosticErrorOptions {
   ellipsis?: boolean
 }
 
+export declare function parseJsonPreservingBigInts(raw: string): unknown
+
+export declare function formatJsonPreservingNumbers(raw: string, indent?: number): string
+
 export declare function parseDelimitedClipboard(
   text: string,
   options?: { delimiter?: '\t' | ',' }

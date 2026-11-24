@@ -28,6 +28,8 @@ import {
   runDriverConnectionTest,
 } from '../common/driver'
 import { validateD1EndpointUrl } from '../common/connection-uri'
+import { scrubDriverErrorText } from '../common/sql-credentials'
+import { parseJsonPreservingBigInts } from '../../shared-grid-paste.js'
 import {
   assembleTableBrowseResult,
   buildBatchStatements,
@@ -103,7 +105,7 @@ function parseD1Envelope(rawText: string): {
 } {
   let parsed: unknown
   try {
-    parsed = JSON.parse(rawText)
+    parsed = parseJsonPreservingBigInts(rawText)
   } catch {
     throw protocolError('Cloudflare D1 returned an unreadable JSON payload')
   }
@@ -292,7 +294,8 @@ export class D1Session implements IDatabaseSession {
         )
       }
       throw new DatabaseDriverError(
-        err instanceof Error ? err.message : 'Cloudflare D1 HTTP request failed',
+        scrubDriverErrorText(err instanceof Error ? err.message : '') ||
+          'Cloudflare D1 HTTP request failed',
         'CONNECTION_FAILED',
         'd1',
         err
@@ -300,10 +303,15 @@ export class D1Session implements IDatabaseSession {
     }
 
     const envelope = parseD1Envelope(rawText)
-    const detail = envelope.errors.join('; ')
+    const detail = scrubDriverErrorText(envelope.errors.join('; '))
+    if (detail.includes('__datanoa_fk_violation__')) {
+      throw new DatabaseDriverError('FOREIGN KEY constraint failed', 'D1_ERROR', 'd1')
+    }
     if (!responseOk) {
       throw new DatabaseDriverError(
-        detail || rawText.trim().slice(0, 400) || `Cloudflare D1 HTTP error ${responseStatus}`,
+        detail ||
+          scrubDriverErrorText(rawText.trim().slice(0, 400)) ||
+          `Cloudflare D1 HTTP error ${responseStatus}`,
         'D1_ERROR',
         'd1'
       )
@@ -340,7 +348,9 @@ export class D1Session implements IDatabaseSession {
     } catch (err: unknown) {
       return {
         ok: false,
-        message: err instanceof Error ? err.message : 'Failed to connect to Cloudflare D1',
+        message:
+          scrubDriverErrorText(err instanceof Error ? err.message : '') ||
+          'Failed to connect to Cloudflare D1',
       }
     }
   }
@@ -376,7 +386,10 @@ export class D1Session implements IDatabaseSession {
       dialect: 'd1',
       schemaName: targetSchema,
       objects,
-      getObjectDdl: (object) => this.getObjectDdl(object.name, object.kind, targetSchema),
+      getObjectDdl: (object) =>
+        object.kind === 'table' || object.kind === 'view'
+          ? this.fetchTableOrViewDdl(object.name, targetSchema, false)
+          : this.getObjectDdl(object.name, object.kind, targetSchema),
     })
   }
 
@@ -540,7 +553,8 @@ export class D1Session implements IDatabaseSession {
         )
       }
       throw new DatabaseDriverError(
-        err instanceof Error ? err.message : 'Cloudflare D1 HTTP request failed',
+        scrubDriverErrorText(err instanceof Error ? err.message : '') ||
+          'Cloudflare D1 HTTP request failed',
         'CONNECTION_FAILED',
         'd1',
         err
@@ -548,11 +562,13 @@ export class D1Session implements IDatabaseSession {
     }
 
     const envelope = parseD1Envelope(rawText)
-    const detail = envelope.errors.join('; ')
+    const detail = scrubDriverErrorText(envelope.errors.join('; '))
 
     if (!responseOk) {
       throw this.toBatchError(
-        detail || rawText.trim().slice(0, 400) || `Cloudflare D1 HTTP error ${responseStatus}`,
+        detail ||
+          scrubDriverErrorText(rawText.trim().slice(0, 400)) ||
+          `Cloudflare D1 HTTP error ${responseStatus}`,
         options?.conflictSentinel
       )
     }
@@ -569,6 +585,9 @@ export class D1Session implements IDatabaseSession {
   }
 
   private toBatchError(detail: string, conflictSentinel?: string): DatabaseDriverError {
+    if (detail.includes('__datanoa_fk_violation__')) {
+      return new DatabaseDriverError('FOREIGN KEY constraint failed', 'D1_ERROR', 'd1')
+    }
     if (conflictSentinel && isGuardConflictDetail(detail, conflictSentinel)) {
       return new DatabaseDriverError(
         'Record was modified or deleted by another session (optimistic lock conflict)',
@@ -758,18 +777,27 @@ export class D1Session implements IDatabaseSession {
   }
 
   async getDdl(table: string, schema?: string): Promise<string> {
+    return this.fetchTableOrViewDdl(table, schema, true)
+  }
+
+  private async fetchTableOrViewDdl(
+    table: string,
+    schema: string | undefined,
+    includeTriggers: boolean
+  ): Promise<string> {
     const targetSchema = schema?.trim()
     const masterTable =
       targetSchema && targetSchema.toLowerCase() !== 'main'
         ? `${quoteIdentForDialect(targetSchema, 'd1')}.sqlite_master`
         : 'sqlite_master'
+    const attachedTypes = includeTriggers ? "'index', 'trigger'" : "'index'"
     const rows = await this.queryExecutor(
       `
         SELECT type, sql
         FROM ${masterTable}
-        WHERE ((type IN ('table', 'view') AND name = ?) OR (type = 'index' AND tbl_name = ?))
+        WHERE ((type IN ('table', 'view') AND name = ?) OR (type IN (${attachedTypes}) AND tbl_name = ?))
           AND sql IS NOT NULL
-        ORDER BY CASE WHEN type IN ('table', 'view') THEN 0 ELSE 1 END, name ASC;
+        ORDER BY CASE WHEN type IN ('table', 'view') THEN 0 WHEN type = 'index' THEN 1 ELSE 2 END, name ASC;
       `,
       [table, table]
     )
@@ -804,13 +832,36 @@ export class D1Session implements IDatabaseSession {
       let lastSelect: Omit<QueryResult, 'executionTimeMs'> | null = null
       let totalAffected = 0
 
+      const payloads =
+        statements.length > 1
+          ? await this.executeBatch(
+              statements.map((stmtSql) => ({ sql: stmtSql, params: [] })),
+              controller.signal
+            )
+          : statements.length === 1
+            ? [await this.execute(statements[0], [], controller.signal)]
+            : []
+
+      if (payloads.length !== statements.length) {
+        throw protocolError('Cloudflare D1 returned an unexpected number of batch results')
+      }
+
       for (let index = 0; index < statements.length; index++) {
         const statement = statements[index]
-        const res = await this.execute(statement, [], controller.signal)
+        const res = payloads[index] || {}
         const rows = res.results || []
         const columns = columnsFromRows(rows)
         const affected = Number(res.meta?.changes ?? 0)
         const stripped = statement.replace(/^(?:\s|--[^\n]*\n|\/\*[\s\S]*?\*\/)+/, '').trim()
+        if (
+          statements.length > 1 &&
+          rows.length > 0 &&
+          /^PRAGMA\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?foreign_key_check(?:\s*\(|\s*;|\s*$)/i.test(
+            stripped
+          )
+        ) {
+          throw new DatabaseDriverError('FOREIGN KEY constraint failed', 'D1_ERROR', 'd1')
+        }
         const isSelect =
           columns.length > 0 ||
           (/^PRAGMA\b/i.test(stripped) && !stripped.includes('=') && !isMutatingStatement(statement, 'd1')) ||
@@ -924,7 +975,9 @@ export class D1Driver implements IDatabaseDriver {
   ): Promise<{ ok: boolean; message?: string }> {
     return runDriverConnectionTest(
       () => this.createSession(profile, authToken),
-      (err) => (err instanceof Error ? err.message : 'Cloudflare D1 connection failed')
+      (err) =>
+        scrubDriverErrorText(err instanceof Error ? err.message : '') ||
+        'Cloudflare D1 connection failed'
     )
   }
 }

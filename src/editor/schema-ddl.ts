@@ -336,6 +336,11 @@ export function normalizeTableDetailsForDraft(details: TableDetails): TableDetai
       isPrimaryKey: Boolean(col.isPrimaryKey || pkSet.has(col.name)),
       isAutoIncrement: Boolean(col.isAutoIncrement),
       isGenerated: Boolean(col.isGenerated),
+      ...(col.generatedExpression !== undefined
+        ? { generatedExpression: col.generatedExpression }
+        : {}),
+      ...(col.generatedStorage !== undefined ? { generatedStorage: col.generatedStorage } : {}),
+      ...(col.collate !== undefined ? { collate: col.collate } : {}),
     }
   })
 
@@ -344,6 +349,14 @@ export function normalizeTableDetailsForDraft(details: TableDetails): TableDetai
     columns: Array.isArray(idx.columns) ? [...idx.columns] : [],
     isUnique: Boolean(idx.isUnique),
     isPrimary: Boolean(idx.isPrimary),
+    ...(idx.origin !== undefined ? { origin: idx.origin } : {}),
+    ...(Array.isArray(idx.columnSpecs)
+      ? { columnSpecs: idx.columnSpecs.map((spec) => ({ ...spec })) }
+      : {}),
+    ...(idx.onConflict !== undefined ? { onConflict: idx.onConflict } : {}),
+    ...(idx.whereClause !== undefined ? { whereClause: idx.whereClause } : {}),
+    ...(idx.partial !== undefined ? { partial: Boolean(idx.partial) } : {}),
+    ...(idx.isExpression !== undefined ? { isExpression: Boolean(idx.isExpression) } : {}),
   }))
 
   const normalizedFks: ForeignKeyInfo[] = (details.foreignKeys || []).map((fk) => ({
@@ -361,5 +374,8 @@ export function normalizeTableDetailsForDraft(details: TableDetails): TableDetai
     columns: normalizedCols,
     indexes: normalizedIndexes,
     foreignKeys: normalizedFks,
+    ...(Array.isArray(details.checkConstraints)
+      ? { checkConstraints: [...details.checkConstraints] }
+      : {}),
   }
 }

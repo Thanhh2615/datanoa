@@ -256,6 +256,155 @@ const PANEL_REDIS_COMPLETIONS = [
   { label: 'DBSIZE', detail: 'key count', boost: 76 },
 ]
 
+const PANEL_MSSQL_COMPLETIONS = [
+  { label: 'TOP 100', detail: 'T-SQL limit', boost: 46 },
+  { label: 'OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY', detail: 'T-SQL paging', boost: 40 },
+  { label: 'WITH (NOLOCK)', detail: 'T-SQL hint', boost: 34 },
+  { label: 'CROSS APPLY', detail: 'T-SQL join', boost: 36 },
+  { label: 'GETDATE()', detail: 'scalar fn', boost: 38 },
+  { label: 'SYSDATETIME()', detail: 'scalar fn', boost: 34 },
+  { label: 'NEWID()', detail: 'scalar fn', boost: 34 },
+  { label: 'ISNULL()', detail: 'scalar fn', boost: 38 },
+  { label: 'TRY_CAST()', detail: 'scalar fn', boost: 34 },
+  { label: 'STRING_AGG()', detail: 'aggregate', boost: 34 },
+]
+
+const PANEL_ORACLE_COMPLETIONS = [
+  { label: 'FETCH FIRST 100 ROWS ONLY', detail: 'Oracle paging', boost: 44 },
+  { label: 'DUAL', detail: 'Oracle table', boost: 40 },
+  { label: 'ROWNUM', detail: 'Oracle pseudo', boost: 38 },
+  { label: 'CONNECT BY PRIOR', detail: 'Oracle tree', boost: 34 },
+  { label: 'SYSDATE', detail: 'Oracle date', boost: 40 },
+  { label: 'SYSTIMESTAMP', detail: 'Oracle time', boost: 36 },
+  { label: 'NVL()', detail: 'scalar fn', boost: 40 },
+  { label: 'NVL2()', detail: 'scalar fn', boost: 36 },
+  { label: 'DECODE()', detail: 'scalar fn', boost: 36 },
+  { label: 'TO_DATE()', detail: 'scalar fn', boost: 36 },
+  { label: 'TO_CHAR()', detail: 'scalar fn', boost: 36 },
+  { label: 'LISTAGG()', detail: 'aggregate', boost: 34 },
+  { label: 'EXPLAIN PLAN FOR', detail: 'Oracle plan', boost: 34 },
+]
+
+const PANEL_MONGO_COMPLETIONS = [
+  { label: 'db.getCollection("")', type: 'function', detail: 'MQL collection', boost: 95 },
+  { label: 'find({})', type: 'function', detail: 'MQL query', boost: 94 },
+  { label: 'findOne({})', type: 'function', detail: 'MQL query', boost: 92 },
+  { label: 'aggregate([])', type: 'function', detail: 'MQL pipeline', boost: 93 },
+  { label: 'countDocuments({})', type: 'function', detail: 'MQL count', boost: 90 },
+  { label: 'distinct("")', type: 'function', detail: 'MQL distinct', boost: 86 },
+  { label: 'insertOne({})', type: 'function', detail: 'MQL write', boost: 85 },
+  { label: 'updateOne({}, { $set: {} })', type: 'function', detail: 'MQL write', boost: 85 },
+  { label: 'deleteOne({})', type: 'function', detail: 'MQL delete', boost: 84 },
+  { label: 'explain("queryPlanner")', type: 'function', detail: 'MQL explain', boost: 86 },
+  { label: '$match', type: 'keyword', detail: 'MQL stage', boost: 92 },
+  { label: '$group', type: 'keyword', detail: 'MQL stage', boost: 91 },
+  { label: '$project', type: 'keyword', detail: 'MQL stage', boost: 90 },
+  { label: '$lookup', type: 'keyword', detail: 'MQL stage', boost: 89 },
+  { label: '$unwind', type: 'keyword', detail: 'MQL stage', boost: 88 },
+  { label: '$sort', type: 'keyword', detail: 'MQL stage', boost: 88 },
+  { label: '$limit', type: 'keyword', detail: 'MQL stage', boost: 87 },
+  { label: '$set', type: 'keyword', detail: 'MQL operator', boost: 88 },
+  { label: '$eq', type: 'keyword', detail: 'MQL operator', boost: 86 },
+  { label: '$gt', type: 'keyword', detail: 'MQL operator', boost: 86 },
+  { label: '$in', type: 'keyword', detail: 'MQL operator', boost: 86 },
+  { label: '$and', type: 'keyword', detail: 'MQL operator', boost: 85 },
+  { label: '$or', type: 'keyword', detail: 'MQL operator', boost: 85 },
+  { label: 'ObjectId()', type: 'function', detail: 'BSON helper', boost: 89 },
+  { label: 'ISODate()', type: 'function', detail: 'BSON helper', boost: 88 },
+]
+
+function computePanelMongoCompletions(before, safePos, safeSchema, explicit) {
+  const dbDotMatch = /\bdb\.([A-Za-z0-9_$-]*)$/.exec(before)
+  if (dbDotMatch) {
+    const prefix = dbDotMatch[1].toLowerCase()
+    const from = safePos - dbDotMatch[1].length
+    const options = []
+    if (!prefix || 'getcollection'.includes(prefix)) {
+      options.push({
+        label: 'getCollection',
+        apply: 'getCollection("")',
+        type: 'function',
+        detail: 'MongoDB collection',
+        boost: 99,
+      })
+    }
+    for (const colName of Object.keys(safeSchema)) {
+      const m = matchesCompletionWord(colName, prefix)
+      if (m.ok) {
+        options.push({
+          label: colName,
+          type: 'class',
+          detail: 'collection',
+          boost: m.starts ? 95 : 84,
+        })
+      }
+    }
+    return options.length > 0 ? { from, options } : null
+  }
+
+  const colMethodMatch =
+    /\bdb\.(?:getCollection\(\s*["'][^"']+["']\s*\)|[A-Za-z_][A-Za-z0-9_$-]*)\.([A-Za-z0-9_]*)$/.exec(
+      before
+    )
+  if (colMethodMatch) {
+    const prefix = colMethodMatch[1].toLowerCase()
+    const from = safePos - colMethodMatch[1].length
+    const options = PANEL_MONGO_COMPLETIONS.filter(
+      (item) =>
+        item.type === 'function' &&
+        !item.label.startsWith('db.') &&
+        !item.label.startsWith('ObjectId') &&
+        !item.label.startsWith('ISODate') &&
+        matchesCompletionWord(item.label, prefix).ok
+    )
+    return options.length > 0 ? { from, options } : null
+  }
+
+  const wordMatch = /\$?[A-Za-z0-9_]*$/.exec(before)
+  const word = wordMatch ? wordMatch[0] : ''
+  const lowerWord = word.toLowerCase()
+  const from = safePos - word.length
+  if (!word && !explicit) return null
+
+  const options = []
+  const seen = new Set()
+  for (const colName of Object.keys(safeSchema)) {
+    const m = matchesCompletionWord(colName, lowerWord)
+    if (m.ok) {
+      seen.add(colName)
+      options.push({
+        label: colName,
+        type: 'class',
+        detail: 'collection',
+        boost: m.starts ? 94 : 80,
+      })
+    }
+    for (const field of safeSchema[colName] || []) {
+      if (seen.has(field)) continue
+      const fm = matchesCompletionWord(field, lowerWord)
+      if (fm.ok) {
+        seen.add(field)
+        options.push({
+          label: field,
+          type: 'property',
+          detail: `${colName} field`,
+          boost: fm.starts ? 88 : 74,
+        })
+      }
+    }
+  }
+  for (const item of PANEL_MONGO_COMPLETIONS) {
+    const m = matchesCompletionWord(item.label, lowerWord)
+    if (m.ok) {
+      options.push({
+        ...item,
+        boost: m.starts ? item.boost : item.boost - 10,
+      })
+    }
+  }
+  return options.length > 0 ? { from, options } : null
+}
+
 function matchesCompletionWord(candidate, lowerWord) {
   if (!lowerWord) return { ok: true, starts: true }
   const lc = candidate.toLowerCase()
@@ -279,6 +428,10 @@ export function computePanelSqlCompletions(
   const safePos = Math.max(0, Math.min(pos, safeText.length))
   const before = safeText.slice(0, safePos)
   const safeSchema = schema && typeof schema === 'object' ? schema : {}
+
+  if (dialect === 'mongodb') {
+    return computePanelMongoCompletions(before, safePos, safeSchema, explicit)
+  }
 
   // Dot-qualified completion: `tableOrAlias.colPrefix` or `schema.tablePrefix`
   const dotMatch = /([A-Za-z0-9_"`[\]]+)\.([A-Za-z0-9_]*)$/.exec(before)
@@ -418,6 +571,20 @@ export function computePanelSqlCompletions(
     seenLabels.add(tblKey)
   }
 
+  if (dialect === 'oracle' && !seenLabels.has('tbl:dual')) {
+    const dualMatch = matchesCompletionWord('DUAL', lowerWord)
+    if (dualMatch.ok) {
+      const baseBoost = isTableContext ? 95 : 64
+      options.push({
+        label: 'DUAL',
+        type: 'class',
+        detail: 'Oracle table',
+        boost: dualMatch.starts ? baseBoost : baseBoost - 12,
+      })
+      seenLabels.add('tbl:dual')
+    }
+  }
+
   if (!isTableContext) {
     const orderedTables = [
       ...Array.from(referencedTables),
@@ -447,7 +614,13 @@ export function computePanelSqlCompletions(
   if (!isTableContext && (lowerWord.length > 0 || explicit)) {
     const isLowerInput =
       word.length > 0 && word === word.toLowerCase() && word !== word.toUpperCase()
-    for (const kw of PANEL_SQL_KEYWORD_COMPLETIONS) {
+    const dialectExtras =
+      dialect === 'mssql'
+        ? PANEL_MSSQL_COMPLETIONS
+        : dialect === 'oracle'
+          ? PANEL_ORACLE_COMPLETIONS
+          : []
+    for (const kw of [...PANEL_SQL_KEYWORD_COMPLETIONS, ...dialectExtras]) {
       const m = matchesCompletionWord(kw.label, lowerWord)
       if (!m.ok) continue
       const isFunc = kw.detail === 'aggregate' || kw.detail === 'scalar fn'
@@ -455,7 +628,7 @@ export function computePanelSqlCompletions(
       options.push({
         label: kw.label,
         apply: applyText,
-        type: isFunc ? 'function' : 'keyword',
+        type: isFunc ? 'function' : kw.detail === 'Oracle table' ? 'class' : 'keyword',
         detail: kw.detail,
         boost: m.starts ? kw.boost : kw.boost - 12,
       })

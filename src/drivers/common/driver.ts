@@ -1,4 +1,5 @@
-import type { DriverTlsOptions } from './tls-and-tunnel'
+import { appendActionableTlsErrorHint, type DriverTlsOptions } from './tls-and-tunnel'
+export { appendActionableTlsErrorHint }
 import type {
   ConnectionProfile,
   DatabaseDriverType,
@@ -41,6 +42,7 @@ export interface FetchPageParams {
   sortDirection?: 'ASC' | 'DESC'
   whereClause?: string
   orderByClause?: string
+  bypassTransaction?: boolean
 }
 
 export interface UpdateCellParams {
@@ -67,6 +69,7 @@ export interface ApplyChangesParams {
   inserts?: Record<string, unknown>[]
   updates?: ApplyChangesUpdate[]
   deletes?: Record<string, unknown>[]
+  deleteRows?: Record<string, unknown>[]
   columnTypes?: Record<string, string>
 }
 
@@ -186,21 +189,47 @@ export function buildCombinedAbortSignal(timeoutMs: number, signal?: AbortSignal
   return signal
 }
 
+function extractTlsErrorCode(err: unknown): string | undefined {
+  if (!err || typeof err !== 'object') return undefined
+  const rec = err as { code?: unknown; cause?: unknown }
+  if (typeof rec.code === 'string' && rec.code.trim().length > 0) {
+    return rec.code.trim()
+  }
+  if (rec.cause && typeof rec.cause === 'object' && 'code' in rec.cause) {
+    const causeCode = (rec.cause as { code?: unknown }).code
+    if (typeof causeCode === 'string' && causeCode.trim().length > 0) {
+      return causeCode.trim()
+    }
+  }
+  return undefined
+}
+
 export async function runDriverConnectionTest(
   createSession: () => Promise<IDatabaseSession>,
   formatError: (err: unknown) => string
 ): Promise<{ ok: boolean; message?: string }> {
   let session: IDatabaseSession | null = null
+  let result: { ok: boolean; message?: string }
   try {
     session = await createSession()
-    return await session.test()
+    result = await session.test()
+    if (!result.ok && typeof result.message === 'string') {
+      result = {
+        ...result,
+        message: appendActionableTlsErrorHint(result.message),
+      }
+    }
   } catch (err: unknown) {
-    return { ok: false, message: formatError(err) }
+    result = {
+      ok: false,
+      message: appendActionableTlsErrorHint(formatError(err), extractTlsErrorCode(err)),
+    }
   } finally {
     if (session) {
       await session.close().catch(() => {})
     }
   }
+  return result
 }
 
 export function createUnsupportedTransactionState(reason: string): TransactionState {

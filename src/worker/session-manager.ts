@@ -1,7 +1,8 @@
 import type { JsonValue, OrcaWorkerApi } from 'orca/worker'
 import type { ConnectionProfile, DatabaseDriverType } from '../protocol'
 import { SAVED_CONNECTIONS_STORAGE_KEY, sanitizeJsonPayload } from '../protocol'
-import { type IDatabaseDriver, type IDatabaseSession, getDriver } from '../drivers'
+import type { IDatabaseDriver, IDatabaseSession } from '../drivers/common/driver'
+import { loadBuiltinDriver } from '../drivers/lazy-loader'
 import { getByodDefaultPort, isByodDriverId } from '../drivers/driver-manager'
 import type { DriverTlsOptions, SshTunnelHandle } from '../drivers/common/tls-and-tunnel'
 import { openSshTunnel } from '../drivers/common/tls-and-tunnel'
@@ -9,6 +10,7 @@ import {
   BUILTIN_ENGINE_CATALOG,
   getDefaultPortForDriver,
 } from '../drivers/common/engine-catalog'
+import { appendActionableTlsErrorHint, scrubCredentialsInText } from './worker-utils'
 
 /** TCP engines that can be reached through an SSH bastion */
 const SSH_TUNNEL_ENGINES: ReadonlySet<DatabaseDriverType> = new Set(
@@ -34,14 +36,157 @@ export interface SessionManagerHostApi {
 /** Default port for URL-based engines when the URL does not spell one out */
 function defaultUrlPort(driver: DatabaseDriverType, protocol: string): number {
   if (driver === 'redis') return getDefaultPortForDriver('redis')
+  if (driver === 'mongodb') return getDefaultPortForDriver('mongodb')
   if (/^https:$/i.test(protocol)) return 443
   if (/^clickhouses:$/i.test(protocol)) return 8443
   return getDefaultPortForDriver(driver)
 }
 
+function isUrlTunnelDriver(driver: DatabaseDriverType): boolean {
+  return (
+    driver === 'clickhouse' ||
+    driver === 'redis' ||
+    driver === 'mongodb' ||
+    driver === 'mssql' ||
+    driver === 'oracle'
+  )
+}
+
+function parseAdoNetServerTarget(
+  rawUrl: string
+): { targetHost: string; targetPort: number } | null {
+  const match = /(?:^|;)\s*(?:Server|Data Source)\s*=\s*([^;]+)/i.exec(rawUrl)
+  if (!match) return null
+  const rawServer = match[1].trim().replace(/^tcp:/i, '')
+  if (!rawServer) return null
+  const commaIdx = rawServer.lastIndexOf(',')
+  if (commaIdx > 0) {
+    const hostPart = rawServer.slice(0, commaIdx).trim()
+    const portNum = Number(rawServer.slice(commaIdx + 1).trim())
+    if (hostPart) {
+      return {
+        targetHost: hostPart,
+        targetPort: Number.isInteger(portNum) && portNum > 0 ? portNum : 1433,
+      }
+    }
+  }
+  return { targetHost: rawServer, targetPort: 1433 }
+}
+
+function rewriteAdoNetServerTarget(rawUrl: string, localHost: string, localPort: number): string | null {
+  const match = /((?:^|;)\s*(?:Server|Data Source)\s*=\s*)([^;]+)/i.exec(rawUrl)
+  if (!match) return null
+  return (
+    rawUrl.slice(0, match.index) +
+    `${match[1]}${localHost},${localPort}` +
+    rawUrl.slice(match.index + match[0].length)
+  )
+}
+
+const HAS_URI_SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//
+const ORACLE_EASY_CONNECT_RE =
+  /^(?:(tcps?):\/\/|\/\/)?(\[[0-9a-fA-F:]+\]|[A-Za-z0-9_.-]+)(?::(\d{1,5}))?(\/[^\s]*)$/i
+const ORACLE_TNS_HOST_RE = /\(\s*HOST\s*=\s*([^)\s]+)\s*\)/gi
+const ORACLE_TNS_PORT_RE = /\(\s*PORT\s*=\s*(\d{1,5})\s*\)/gi
+
+const MONGODB_SRV_SSH_ERROR =
+  'SSH tunneling cannot be used with mongodb+srv:// URIs because SRV DNS lookup resolves multiple remote replica-set hosts dynamically. Use a standard mongodb://host:port URI or explicit Host/Port fields instead.'
+
+function hasMultiHostMongoAuthority(rawUrl: string): boolean {
+  const schemeIdx = rawUrl.indexOf('://')
+  if (schemeIdx < 0) return false
+  const rest = rawUrl.slice(schemeIdx + 3)
+  const endIdx = rest.search(/[/?#]/)
+  const authority = endIdx >= 0 ? rest.slice(0, endIdx) : rest
+  const atIdx = authority.lastIndexOf('@')
+  const hostPortPart = atIdx >= 0 ? authority.slice(atIdx + 1) : authority
+  return hostPortPart.includes(',')
+}
+
+function parseOracleEasyConnectTarget(
+  raw: string,
+  ssl?: boolean
+): { targetHost: string; targetPort: number; schemePrefix: string; tail: string } | null {
+  const slashIdx = raw.indexOf('/')
+  if (slashIdx > 0) {
+    const beforeSlash = raw.startsWith('//') ? raw.slice(2, raw.indexOf('/', 2)) : raw.slice(0, slashIdx)
+    if (beforeSlash.includes(',')) {
+      throw new Error(
+        'SSH tunneling cannot be used with multi-host Oracle Easy Connect strings. Use a single host:port/service string or explicit Host/Port fields instead.'
+      )
+    }
+  }
+  const match = ORACLE_EASY_CONNECT_RE.exec(raw)
+  if (!match) return null
+  const scheme = match[1]?.toLowerCase()
+  const targetHost = match[2].replace(/^\[|\]$/g, '')
+  if (!targetHost) return null
+  const parsedPort = match[3] ? Number(match[3]) : Number.NaN
+  if (match[3] && (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535)) {
+    throw new Error(`Invalid port in Oracle Easy Connect string for SSH tunnel: ${match[3]}`)
+  }
+  const targetPort = Number.isInteger(parsedPort)
+    ? parsedPort
+    : scheme === 'tcps' || ssl
+      ? 2484
+      : 1521
+  const schemePrefix = match[1] ? `${match[1]}://` : raw.startsWith('//') ? '//' : ''
+  return { targetHost, targetPort, schemePrefix, tail: match[4] }
+}
+
+function isOracleTnsDescriptor(raw: string): boolean {
+  return raw.trimStart().startsWith('(') && /\(\s*(?:DESCRIPTION|ADDRESS)\b/i.test(raw)
+}
+
+function parseOracleTnsTarget(
+  raw: string
+): { targetHost: string; targetPort: number; hasPort: boolean } {
+  const hostMatches = Array.from(raw.matchAll(ORACLE_TNS_HOST_RE))
+  if (hostMatches.length === 0) {
+    throw new Error(
+      'SSH tunneling requires a valid (HOST=...) entry in the Oracle TNS descriptor.'
+    )
+  }
+  if (hostMatches.length > 1) {
+    throw new Error(
+      'SSH tunneling cannot be used with multi-address Oracle TNS descriptors. Use a single-address descriptor or explicit Host/Port fields instead.'
+    )
+  }
+  const portMatches = Array.from(raw.matchAll(ORACLE_TNS_PORT_RE))
+  if (portMatches.length > 1) {
+    throw new Error(
+      'SSH tunneling cannot be used with multi-address Oracle TNS descriptors. Use a single-address descriptor or explicit Host/Port fields instead.'
+    )
+  }
+  const targetHost = hostMatches[0][1].replace(/^\[|\]$/g, '')
+  const isTcps = /\(\s*PROTOCOL\s*=\s*TCPS\s*\)/i.test(raw)
+  const parsedPort = portMatches[0] ? Number(portMatches[0][1]) : Number.NaN
+  const targetPort =
+    Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535
+      ? parsedPort
+      : isTcps
+        ? 2484
+        : 1521
+  return { targetHost, targetPort, hasPort: portMatches.length === 1 }
+}
+
+function rewriteOracleTnsTarget(raw: string, localHost: string, localPort: number): string {
+  const info = parseOracleTnsTarget(raw)
+  let rewritten = raw.replace(/\(\s*HOST\s*=\s*[^)\s]+\s*\)/i, `(HOST=${localHost})`)
+  if (info.hasPort) {
+    rewritten = rewritten.replace(/\(\s*PORT\s*=\s*\d{1,5}\s*\)/i, `(PORT=${localPort})`)
+  } else {
+    rewritten = rewritten.replace(
+      /\(\s*HOST\s*=\s*[^)\s]+\s*\)/i,
+      `(HOST=${localHost})(PORT=${localPort})`
+    )
+  }
+  return rewritten
+}
+
 /**
- * Resolves the real SSH forwarding target. URL-based engines (ClickHouse / Redis) carry the
- * remote host/port inside `profile.url`, which must win over the discrete host/port fields.
+ * Resolves the real SSH forwarding target. URL-based profiles carry the remote host/port
+ * inside `profile.url`, which must win over discrete fallback fields.
  */
 export function resolveSshTunnelTarget(profile: ConnectionProfile): {
   targetHost: string
@@ -50,26 +195,81 @@ export function resolveSshTunnelTarget(profile: ConnectionProfile): {
   const explicitPort =
     profile.port && Number.isInteger(profile.port) && profile.port > 0 ? profile.port : undefined
   const rawUrl = typeof profile.url === 'string' ? profile.url.trim() : ''
-  if (rawUrl && (profile.driver === 'clickhouse' || profile.driver === 'redis')) {
-    try {
-      const parsed = new URL(rawUrl)
+  const rawHost = typeof profile.host === 'string' ? profile.host.trim() : ''
+
+  if (rawUrl && isUrlTunnelDriver(profile.driver)) {
+    if (/^mongodb\+srv:\/\//i.test(rawUrl)) {
+      throw new Error(MONGODB_SRV_SSH_ERROR)
+    }
+    if (profile.driver === 'oracle') {
+      if (isOracleTnsDescriptor(rawUrl)) {
+        const tns = parseOracleTnsTarget(rawUrl)
+        return { targetHost: tns.targetHost, targetPort: tns.targetPort }
+      }
+      const easy = parseOracleEasyConnectTarget(rawUrl, profile.ssl)
+      if (easy) {
+        return { targetHost: easy.targetHost, targetPort: easy.targetPort }
+      }
+    }
+    if (HAS_URI_SCHEME_RE.test(rawUrl)) {
+      if (profile.driver === 'mongodb' && hasMultiHostMongoAuthority(rawUrl)) {
+        throw new Error(
+          'SSH tunneling cannot be used with multi-host MongoDB URIs. Use a single mongodb://host:port URI or explicit Host/Port fields instead.'
+        )
+      }
+      let parsed: URL
+      try {
+        parsed = new URL(rawUrl)
+      } catch {
+        throw new Error(
+          `SSH tunneling could not parse the connection URL for driver '${profile.driver}'. Use a single-host URI or explicit Host/Port fields instead.`
+        )
+      }
       const hostname = parsed.hostname.replace(/^\[|\]$/g, '')
-      if (hostname.length > 0) {
-        const parsedPort = parsed.port ? Number(parsed.port) : Number.NaN
+      if (hostname.length === 0) {
+        throw new Error(
+          `SSH tunneling requires a valid hostname in the connection URL for driver '${profile.driver}'.`
+        )
+      }
+      const parsedPort = parsed.port ? Number(parsed.port) : Number.NaN
+      return {
+        targetHost: hostname,
+        targetPort:
+          Number.isInteger(parsedPort) && parsedPort > 0
+            ? parsedPort
+            : defaultUrlPort(profile.driver, parsed.protocol),
+      }
+    }
+    if (profile.driver === 'mssql') {
+      const adoTarget = parseAdoNetServerTarget(rawUrl)
+      if (adoTarget) return adoTarget
+      if (!/(?:^|;)\s*(?:Server|Data Source)\s*=\s*[^;\s]+/i.test(rawUrl)) {
         return {
-          targetHost: hostname,
-          targetPort:
-            Number.isInteger(parsedPort) && parsedPort > 0
-              ? parsedPort
-              : defaultUrlPort(profile.driver, parsed.protocol),
+          targetHost: rawHost || 'localhost',
+          targetPort: explicitPort ?? getDefaultPortForDriver('mssql'),
         }
       }
-    } catch {
-      // Fall back to discrete host/port below
+    }
+    throw new Error(
+      `SSH tunneling could not rewrite connection URL for driver '${profile.driver}'. Use a standard single-host URI or explicit Host/Port fields instead.`
+    )
+  }
+
+  if (!rawUrl && profile.driver === 'oracle' && rawHost) {
+    if (isOracleTnsDescriptor(rawHost)) {
+      const tns = parseOracleTnsTarget(rawHost)
+      return { targetHost: tns.targetHost, targetPort: tns.targetPort }
+    }
+    if (rawHost.includes('/')) {
+      const easy = parseOracleEasyConnectTarget(rawHost, profile.ssl)
+      if (easy) {
+        return { targetHost: easy.targetHost, targetPort: easy.targetPort }
+      }
     }
   }
+
   return {
-    targetHost: (profile.host || 'localhost').trim(),
+    targetHost: rawHost || 'localhost',
     targetPort:
       explicitPort ??
       (isByodDriverId(profile.driver)
@@ -89,16 +289,80 @@ export function buildTunnelProxiedProfile(
     port: tunnel.localPort,
   }
   const rawUrl = typeof profile.url === 'string' ? profile.url.trim() : ''
-  if (rawUrl && (profile.driver === 'clickhouse' || profile.driver === 'redis')) {
-    try {
-      const parsed = new URL(rawUrl)
+  const rawHost = typeof profile.host === 'string' ? profile.host.trim() : ''
+
+  if (rawUrl && isUrlTunnelDriver(profile.driver)) {
+    if (/^mongodb\+srv:\/\//i.test(rawUrl)) {
+      throw new Error(MONGODB_SRV_SSH_ERROR)
+    }
+    if (profile.driver === 'oracle') {
+      if (isOracleTnsDescriptor(rawUrl)) {
+        proxied.url = rewriteOracleTnsTarget(rawUrl, tunnel.localHost, tunnel.localPort)
+        return proxied
+      }
+      const easy = parseOracleEasyConnectTarget(rawUrl, profile.ssl)
+      if (easy) {
+        proxied.url = `${easy.schemePrefix}${tunnel.localHost}:${tunnel.localPort}${easy.tail}`
+        return proxied
+      }
+    }
+    if (HAS_URI_SCHEME_RE.test(rawUrl)) {
+      if (profile.driver === 'mongodb' && hasMultiHostMongoAuthority(rawUrl)) {
+        throw new Error(
+          'SSH tunneling cannot be used with multi-host MongoDB URIs. Use a single mongodb://host:port URI or explicit Host/Port fields instead.'
+        )
+      }
+      let parsed: URL
+      try {
+        parsed = new URL(rawUrl)
+      } catch {
+        throw new Error(
+          `SSH tunneling could not parse the connection URL for driver '${profile.driver}'. Use a single-host URI or explicit Host/Port fields instead.`
+        )
+      }
+      if (!parsed.hostname) {
+        throw new Error(
+          `SSH tunneling requires a valid hostname in the connection URL for driver '${profile.driver}'.`
+        )
+      }
       parsed.hostname = tunnel.localHost
       parsed.port = String(tunnel.localPort)
       proxied.url = parsed.toString()
-    } catch {
-      // Keep the original URL; discrete host/port still target the tunnel
+      return proxied
+    }
+    if (profile.driver === 'mssql') {
+      const rewrittenAdo = rewriteAdoNetServerTarget(
+        rawUrl,
+        tunnel.localHost,
+        tunnel.localPort
+      )
+      if (rewrittenAdo) {
+        proxied.url = rewrittenAdo
+        return proxied
+      }
+      if (!/(?:^|;)\s*(?:Server|Data Source)\s*=\s*[^;\s]+/i.test(rawUrl)) {
+        return proxied
+      }
+    }
+    throw new Error(
+      `SSH tunneling could not rewrite connection URL for driver '${profile.driver}'. Use a standard single-host URI or explicit Host/Port fields instead.`
+    )
+  }
+
+  if (!rawUrl && profile.driver === 'oracle' && rawHost) {
+    if (isOracleTnsDescriptor(rawHost)) {
+      proxied.host = rewriteOracleTnsTarget(rawHost, tunnel.localHost, tunnel.localPort)
+      return proxied
+    }
+    if (rawHost.includes('/')) {
+      const easy = parseOracleEasyConnectTarget(rawHost, profile.ssl)
+      if (easy) {
+        proxied.host = `${easy.schemePrefix}${tunnel.localHost}:${tunnel.localPort}${easy.tail}`
+        return proxied
+      }
     }
   }
+
   return proxied
 }
 
@@ -124,7 +388,7 @@ export class SessionManager {
 
   private async resolveDriver(driverType: DatabaseDriverType): Promise<IDatabaseDriver> {
     if (BUILTIN_ENGINE_CATALOG.some((e) => e.id === driverType)) {
-      return getDriver(driverType)
+      return await loadBuiltinDriver(driverType)
     }
     if (this.driverManager) {
       return await this.driverManager.resolveVerifiedAdapter(driverType)
@@ -550,9 +814,16 @@ export class SessionManager {
     extraSecrets?: ExtendedSecrets
   ): Promise<{ ok: boolean; message?: string }> {
     const driver = await this.resolveDriver(profile.driver)
-    return await this.withTunnel(profile, extraSecrets, async (target, tlsOptions) =>
+    const result = await this.withTunnel(profile, extraSecrets, async (target, tlsOptions) =>
       await driver.testConnection(target, secret, tlsOptions)
     )
+    if (!result.ok && typeof result.message === 'string') {
+      return {
+        ...result,
+        message: appendActionableTlsErrorHint(scrubCredentialsInText(result.message)),
+      }
+    }
+    return result
   }
 
   hasActiveSession(connectionId: string): boolean {
@@ -577,7 +848,8 @@ export class SessionManager {
       try {
         await session.close()
       } catch (e) {
-        this.orca.log(`[SessionManager] Error closing session [${connectionId}]: ${e}`)
+        const msg = scrubCredentialsInText(e instanceof Error ? e.message : String(e))
+        this.orca.log(`[SessionManager] Error closing session [${connectionId}]: ${msg}`)
       }
     }
   }
@@ -619,14 +891,16 @@ export class SessionManager {
       try {
         await tunnel.close()
       } catch (e) {
-        this.orca.log(`[SessionManager] Error closing SSH tunnel on shutdown: ${e}`)
+        const msg = scrubCredentialsInText(e instanceof Error ? e.message : String(e))
+        this.orca.log(`[SessionManager] Error closing SSH tunnel on shutdown: ${msg}`)
       }
     })
     const closePromises = Array.from(this.activeSessions.values()).map(async (session) => {
       try {
         await session.close()
       } catch (e) {
-        this.orca.log(`[SessionManager] Error closing session on shutdown: ${e}`)
+        const msg = scrubCredentialsInText(e instanceof Error ? e.message : String(e))
+        this.orca.log(`[SessionManager] Error closing session on shutdown: ${msg}`)
       }
     })
     this.activeSessions.clear()

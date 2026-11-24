@@ -11,6 +11,7 @@ import {
   type BindParamValueType,
   type DetectedSqlParam,
 } from './sql-params.js'
+import { bindCtrlWheelHorizontalScroll } from '../shared-wheel-scroll.js'
 
 export interface StudioBindParamsModalContext extends StudioModalMountContext {
   sql: string
@@ -99,7 +100,9 @@ export function openStudioBindParamsModal(ctx: StudioBindParamsModalContext): vo
   const tableContainer = document.createElement('div')
   tableContainer.style.maxHeight = '240px'
   tableContainer.style.overflowY = 'auto'
+  tableContainer.style.overflowX = 'auto'
   tableContainer.style.marginBottom = '12px'
+  bindCtrlWheelHorizontalScroll(tableContainer)
 
   const table = document.createElement('table')
   table.className = 'datanoa-matrix-table'

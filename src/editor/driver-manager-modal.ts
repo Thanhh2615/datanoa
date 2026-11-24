@@ -17,12 +17,18 @@ export function getByodStarterTemplate(driverId: string): string {
 
 export function getByodNpmPackage(driverId: string): string {
   switch (driverId) {
-    case 'mssql':
-      return 'mssql'
-    case 'oracle':
-      return 'oracledb'
-    case 'mongodb':
-      return 'mongodb'
+    case 'duckdb':
+      return '@duckdb/node-api'
+    case 'snowflake':
+      return 'snowflake-sdk'
+    case 'bigquery':
+      return '@google-cloud/bigquery'
+    case 'cassandra':
+      return 'cassandra-driver'
+    case 'elasticsearch':
+      return '@elastic/elasticsearch'
+    case 'neo4j':
+      return 'neo4j-driver'
     default:
       return ''
   }
@@ -147,21 +153,21 @@ export function openStudioDriverManagerModal(ctx: StudioDriverManagerModalContex
   byodGuide.className = 'datanoa-driver-mgr-guide'
   const byodGuideSummary = document.createElement('summary')
   byodGuideSummary.className = 'datanoa-driver-mgr-guide-summary'
-  byodGuideSummary.textContent = 'How to install & load a local driver (MSSQL, Oracle, MongoDB)'
+  byodGuideSummary.textContent = 'How to install & load a local BYOD driver (DuckDB, Snowflake, BigQuery, Cassandra, Elasticsearch, Neo4j)'
   const byodGuideBody = document.createElement('div')
   byodGuideBody.className = 'datanoa-driver-mgr-guide-body'
 
   const guideIntro = document.createElement('p')
   guideIntro.className = 'datanoa-driver-mgr-meta'
   guideIntro.textContent =
-    'Configure a local driver folder for Microsoft SQL Server (mssql), Oracle (oracledb), MongoDB (mongodb), or a custom adapter, verify its SHA-256 digest below, then select it in New Database Connection.'
+    'Configure a local driver folder for DuckDB (@duckdb/node-api), Snowflake (snowflake-sdk), BigQuery (@google-cloud/bigquery), Cassandra (cassandra-driver), Elasticsearch (@elastic/elasticsearch), Neo4j (neo4j-driver), or a custom adapter, verify its SHA-256 digest below, then select it in New Database Connection.'
 
   const guideSteps = document.createElement('ol')
   guideSteps.className = 'datanoa-driver-mgr-guide-steps'
   const stepTexts = [
-    'Create a folder and install the official driver: mkdir datanoa-mssql && cd datanoa-mssql && npm init -y && npm pkg set type=module main=index.mjs && npm install --ignore-scripts mssql',
-    'Save index.mjs exporting default { type: "mssql", createSession, testConnection } (the starter template below includes the IDatabaseSession method contract).',
-    'Paste the folder or index.mjs absolute path into the MSSQL slot below, click Inspect SHA-256 to review its digest without executing code, then click Trust & Verify.',
+    'Create a folder and install the official driver: mkdir datanoa-duckdb && cd datanoa-duckdb && npm init -y && npm pkg set type=module main=index.mjs && npm install --ignore-scripts @duckdb/node-api',
+    'Save index.mjs exporting default { type: "duckdb", createSession, testConnection } (the starter template below includes the IDatabaseSession method contract).',
+    'Paste the folder or index.mjs absolute path into the BYOD slot below, click Inspect SHA-256 to review its digest without executing code, then click Trust & Verify.',
   ]
   for (const text of stepTexts) {
     const li = document.createElement('li')
@@ -172,9 +178,12 @@ export function openStudioDriverManagerModal(ctx: StudioDriverManagerModalContex
   const guideActions = document.createElement('div')
   guideActions.className = 'datanoa-driver-mgr-actions'
   const starterDefs: ReadonlyArray<{ label: string; pkg: string; code: string }> = [
-    { label: 'Copy MSSQL Starter Template', pkg: 'mssql', code: getByodStarterTemplate('mssql') },
-    { label: 'Copy Oracle Starter Template', pkg: 'oracledb', code: getByodStarterTemplate('oracle') },
-    { label: 'Copy MongoDB Starter Template', pkg: 'mongodb', code: getByodStarterTemplate('mongodb') },
+    { label: 'Copy DuckDB Starter', pkg: '@duckdb/node-api', code: getByodStarterTemplate('duckdb') },
+    { label: 'Copy Snowflake Starter', pkg: 'snowflake-sdk', code: getByodStarterTemplate('snowflake') },
+    { label: 'Copy BigQuery Starter', pkg: '@google-cloud/bigquery', code: getByodStarterTemplate('bigquery') },
+    { label: 'Copy Cassandra Starter', pkg: 'cassandra-driver', code: getByodStarterTemplate('cassandra') },
+    { label: 'Copy Elasticsearch Starter', pkg: '@elastic/elasticsearch', code: getByodStarterTemplate('elasticsearch') },
+    { label: 'Copy Neo4j Starter', pkg: 'neo4j-driver', code: getByodStarterTemplate('neo4j') },
   ]
   for (const def of starterDefs) {
     const btn = document.createElement('button')

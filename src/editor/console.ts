@@ -36,7 +36,25 @@ import {
   type SQLDialect,
 } from '../../vendor/codemirror.js'
 import { findStatementAtOffset } from '../drivers/common/sql-tools.js'
+import {
+  resolveSqlExecutionSpan,
+  resolveSqlReplacementSpan,
+  type SqlExecutionRange,
+  type SqlReplaceTarget,
+} from '../shared-sql-core.js'
+import {
+  clearGhostEffect,
+  createCmInlineAiExtension,
+  type CmInlineAiOptions,
+} from '../shared-cm-inline-ai.js'
+import {
+  clearDbSqlErrorEffect,
+  createCmSqlLintExtension,
+  setDbSqlErrorEffect,
+  triggerSqlLintEffect,
+} from '../shared-cm-sql-lint.js'
 import type { DatabaseDriverType } from '../protocol.js'
+import { bindCtrlWheelHorizontalScroll } from '../shared-wheel-scroll.js'
 
 export type SqlDialectType = DatabaseDriverType
 
@@ -55,6 +73,7 @@ export interface SqlConsoleOptions {
   dialect?: SqlDialectType
   schema?: Record<string, string[]>
   typography?: EditorTypography
+  aiInline?: CmInlineAiOptions
   onExecute?: (sql: string) => void
   onExecuteAll?: (sql: string) => void
   onFormatSql?: () => void
@@ -67,11 +86,251 @@ export interface ExecutableStateLike {
   doc: { toString: () => string }
 }
 
+export type { SqlExecutionRange, SqlReplaceTarget }
+
 const REDIS_MONOCHROME_LANG = StreamLanguage.define({
   name: 'redis',
   token(stream) {
     stream.skipToEnd()
     return null
+  },
+})
+
+interface BlockCommentParserState {
+  inBlockComment: boolean
+}
+
+function advanceBlockComment(stream: { match: (re: RegExp | string) => unknown; skipToEnd: () => void }, state: BlockCommentParserState): boolean {
+  if (!state.inBlockComment) return false
+  if (stream.match(/^.*?\*\//)) {
+    state.inBlockComment = false
+  } else {
+    stream.skipToEnd()
+  }
+  return true
+}
+
+function readSqlBracketOrQuoted(stream: { next: () => string | void; eol: () => boolean }, closeChar: string): void {
+  while (!stream.eol()) {
+    const ch = stream.next()
+    if (ch === closeChar) {
+      if (stream.next() !== closeChar) {
+        break
+      }
+    }
+  }
+}
+
+function readEscapedString(stream: { next: () => string | void; eol: () => boolean }, quoteChar: string): void {
+  while (!stream.eol()) {
+    const ch = stream.next()
+    if (ch === '\\') {
+      stream.next()
+      continue
+    }
+    if (ch === quoteChar) break
+  }
+}
+
+const MSSQL_KEYWORDS = new Set([
+  'SELECT', 'FROM', 'WHERE', 'INSERT', 'INTO', 'VALUES', 'UPDATE', 'SET', 'DELETE',
+  'MERGE', 'USING', 'MATCHED', 'OUTPUT', 'INSERTED', 'DELETED', 'JOIN', 'INNER', 'LEFT',
+  'RIGHT', 'FULL', 'OUTER', 'CROSS', 'APPLY', 'ON', 'AS', 'AND', 'OR', 'NOT', 'IN', 'IS',
+  'NULL', 'LIKE', 'BETWEEN', 'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'GROUP',
+  'BY', 'HAVING', 'ORDER', 'ASC', 'DESC', 'OFFSET', 'FETCH', 'NEXT', 'ROWS', 'ONLY',
+  'TOP', 'PERCENT', 'WITH', 'TIES', 'DISTINCT', 'UNION', 'ALL', 'INTERSECT', 'EXCEPT',
+  'OVER', 'PARTITION', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'TABLE', 'VIEW', 'INDEX',
+  'PRIMARY', 'KEY', 'FOREIGN', 'REFERENCES', 'CONSTRAINT', 'DEFAULT', 'CHECK', 'UNIQUE',
+  'DECLARE', 'BEGIN', 'TRY', 'CATCH', 'TRAN', 'TRANSACTION', 'COMMIT', 'ROLLBACK', 'EXEC',
+  'EXECUTE', 'GO', 'NOLOCK', 'ROWLOCK', 'UPDLOCK', 'PIVOT', 'UNPIVOT', 'SHOWPLAN_ALL',
+])
+
+const MSSQL_TYPES_AND_BUILTINS = new Set([
+  'INT', 'BIGINT', 'SMALLINT', 'TINYINT', 'BIT', 'DECIMAL', 'NUMERIC', 'MONEY', 'FLOAT',
+  'REAL', 'CHAR', 'VARCHAR', 'NVARCHAR', 'NCHAR', 'TEXT', 'NTEXT', 'DATE', 'DATETIME',
+  'DATETIME2', 'SMALLDATETIME', 'DATETIMEOFFSET', 'TIME', 'UNIQUEIDENTIFIER', 'VARBINARY',
+  'BINARY', 'XML', 'MAX', 'GETDATE', 'GETUTCDATE', 'SYSDATETIME', 'NEWID', 'ISNULL',
+  'COALESCE', 'NULLIF', 'CAST', 'CONVERT', 'TRY_CAST', 'TRY_CONVERT', 'DATEADD',
+  'DATEDIFF', 'DATENAME', 'DATEPART', 'STRING_AGG', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
+  'ROW_NUMBER', 'RANK', 'DENSE_RANK', 'LEN', 'SUBSTRING', 'TRIM', 'UPPER', 'LOWER',
+])
+
+const ORACLE_KEYWORDS = new Set([
+  'SELECT', 'FROM', 'WHERE', 'INSERT', 'INTO', 'VALUES', 'UPDATE', 'SET', 'DELETE',
+  'MERGE', 'USING', 'MATCHED', 'RETURNING', 'BULK', 'COLLECT', 'FORALL', 'JOIN', 'INNER',
+  'LEFT', 'RIGHT', 'FULL', 'OUTER', 'CROSS', 'ON', 'AS', 'AND', 'OR', 'NOT', 'IN', 'IS',
+  'NULL', 'LIKE', 'BETWEEN', 'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'ELSIF', 'END',
+  'GROUP', 'BY', 'HAVING', 'ORDER', 'ASC', 'DESC', 'OFFSET', 'FETCH', 'FIRST', 'NEXT',
+  'ROWS', 'ONLY', 'DISTINCT', 'UNION', 'ALL', 'INTERSECT', 'MINUS', 'CONNECT', 'PRIOR',
+  'START', 'WITH', 'OVER', 'PARTITION', 'CREATE', 'REPLACE', 'ALTER', 'DROP', 'TRUNCATE',
+  'TABLE', 'VIEW', 'MATERIALIZED', 'INDEX', 'SEQUENCE', 'SYNONYM', 'TRIGGER', 'PACKAGE',
+  'BODY', 'PROCEDURE', 'FUNCTION', 'PRAGMA', 'DECLARE', 'BEGIN', 'EXCEPTION', 'LOOP',
+  'IF', 'COMMIT', 'ROLLBACK', 'SAVEPOINT', 'EXPLAIN', 'PLAN', 'FOR', 'DUAL', 'ROWNUM',
+  'ROWID', 'LEVEL', 'PRIMARY', 'KEY', 'FOREIGN', 'REFERENCES', 'CONSTRAINT', 'DEFAULT',
+  'ENABLE', 'DISABLE', 'CASCADE', 'CONSTRAINTS',
+])
+
+const ORACLE_TYPES_AND_BUILTINS = new Set([
+  'NUMBER', 'BINARY_INTEGER', 'PLS_INTEGER', 'INTEGER', 'INT', 'FLOAT', 'VARCHAR2',
+  'NVARCHAR2', 'VARCHAR', 'CHAR', 'NCHAR', 'CLOB', 'NCLOB', 'BLOB', 'RAW', 'LONG',
+  'DATE', 'TIMESTAMP', 'INTERVAL', 'BOOLEAN', 'SYS_REFCURSOR', 'SYSDATE', 'SYSTIMESTAMP',
+  'CURRENT_TIMESTAMP', 'USER', 'NVL', 'NVL2', 'DECODE', 'COALESCE', 'NULLIF', 'CAST',
+  'TO_DATE', 'TO_CHAR', 'TO_NUMBER', 'TO_TIMESTAMP', 'LISTAGG', 'REGEXP_LIKE', 'SUBSTR',
+  'INSTR', 'LENGTH', 'TRIM', 'UPPER', 'LOWER', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
+  'ROW_NUMBER', 'RANK', 'DENSE_RANK', 'DBMS_XPLAN', 'DISPLAY',
+])
+
+const MONGODB_METHODS = new Set([
+  'getCollection', 'find', 'findOne', 'aggregate', 'countDocuments',
+  'estimatedDocumentCount', 'distinct', 'insertOne', 'insertMany', 'updateOne',
+  'updateMany', 'replaceOne', 'deleteOne', 'deleteMany', 'findOneAndUpdate',
+  'findOneAndDelete', 'findOneAndReplace', 'bulkWrite', 'explain', 'sort', 'limit',
+  'skip', 'projection', 'hint', 'maxTimeMS', 'collation', 'allowDiskUse', 'toArray',
+  'drop', 'dropDatabase', 'createCollection', 'createIndex', 'createIndexes',
+  'dropIndex', 'dropIndexes', 'getIndexes', 'stats', 'renameCollection',
+])
+
+const MONGODB_CONSTRUCTORS = new Set([
+  'db', 'ObjectId', 'ISODate', 'NumberInt', 'NumberLong', 'NumberDecimal', 'UUID',
+  'Timestamp', 'Binary', 'Code', 'MinKey', 'MaxKey', 'RegExp', 'true', 'false', 'null',
+])
+
+const MSSQL_TSQL_LANG = StreamLanguage.define<BlockCommentParserState>({
+  name: 'mssql',
+  startState: () => ({ inBlockComment: false }),
+  token(stream, state) {
+    if (advanceBlockComment(stream, state)) return 'comment'
+    if (stream.eatSpace()) return null
+    if (stream.match(/^--.*/)) return 'comment'
+    if (stream.match(/^\/\*/)) {
+      if (!stream.match(/^.*?\*\//)) state.inBlockComment = true
+      return 'comment'
+    }
+    if (stream.match(/^[Nn]?'/)) {
+      readSqlBracketOrQuoted(stream, "'")
+      return 'string'
+    }
+    if (stream.eat('[')) {
+      readSqlBracketOrQuoted(stream, ']')
+      return 'variableName'
+    }
+    if (stream.eat('"')) {
+      readSqlBracketOrQuoted(stream, '"')
+      return 'variableName'
+    }
+    if (stream.match(/^@@?[A-Za-z_][A-Za-z0-9_]*/)) return 'variableName'
+    if (stream.match(/^\d+(?:\.\d+)?/)) return 'number'
+    if (stream.match(/^[A-Za-z_][A-Za-z0-9_$#]*/)) {
+      const upper = stream.current().toUpperCase()
+      if (MSSQL_KEYWORDS.has(upper)) return 'keyword'
+      if (MSSQL_TYPES_AND_BUILTINS.has(upper)) return 'typeName'
+      return 'propertyName'
+    }
+    if (stream.match(/^[+\-*/%=<>!&|^~]+/)) return 'operator'
+    stream.next()
+    return 'punctuation'
+  },
+})
+
+interface OracleParserState extends BlockCommentParserState {
+  oracleQuoteClose: string | null
+}
+
+const ORACLE_Q_CLOSE_DELIM: Record<string, string> = {
+  '[': ']',
+  '(': ')',
+  '{': '}',
+  '<': '>',
+}
+
+function advanceOracleQuote(
+  stream: { pos: number; string: string; skipToEnd: () => void },
+  state: OracleParserState
+): boolean {
+  if (!state.oracleQuoteClose) return false
+  const rest = stream.string.slice(stream.pos)
+  const idx = rest.indexOf(`${state.oracleQuoteClose}'`)
+  if (idx >= 0) {
+    stream.pos += idx + 2
+    state.oracleQuoteClose = null
+  } else {
+    stream.skipToEnd()
+  }
+  return true
+}
+
+const ORACLE_PLSQL_LANG = StreamLanguage.define<OracleParserState>({
+  name: 'oracle',
+  startState: () => ({ inBlockComment: false, oracleQuoteClose: null }),
+  token(stream, state) {
+    if (advanceOracleQuote(stream, state)) return 'string'
+    if (advanceBlockComment(stream, state)) return 'comment'
+    if (stream.eatSpace()) return null
+    if (stream.match(/^--.*/)) return 'comment'
+    if (stream.match(/^\/\*/)) {
+      if (!stream.match(/^.*?\*\//)) state.inBlockComment = true
+      return 'comment'
+    }
+    const qMatch = stream.match(/^[Nn]?[Qq]'([^\s])/)
+    if (Array.isArray(qMatch) && typeof qMatch[1] === 'string') {
+      state.oracleQuoteClose = ORACLE_Q_CLOSE_DELIM[qMatch[1]] ?? qMatch[1]
+      advanceOracleQuote(stream, state)
+      return 'string'
+    }
+    if (stream.eat("'")) {
+      readSqlBracketOrQuoted(stream, "'")
+      return 'string'
+    }
+    if (stream.eat('"')) {
+      readSqlBracketOrQuoted(stream, '"')
+      return 'variableName'
+    }
+    if (stream.match(/^:[A-Za-z_][A-Za-z0-9_$#]*/)) return 'variableName'
+    if (stream.sol() && stream.match(/^\/\s*$/)) return 'keyword'
+    if (stream.match(/^\d+(?:\.\d+)?/)) return 'number'
+    if (stream.match(/^[A-Za-z_][A-Za-z0-9_$#]*/)) {
+      const upper = stream.current().toUpperCase()
+      if (ORACLE_KEYWORDS.has(upper)) return 'keyword'
+      if (ORACLE_TYPES_AND_BUILTINS.has(upper)) return 'typeName'
+      return 'propertyName'
+    }
+    if (stream.match(/^:=|=>|\|\||<>|!=|<=|>=|[+\-*/=<>]/)) return 'operator'
+    stream.next()
+    return 'punctuation'
+  },
+})
+
+const MONGODB_MQL_LANG = StreamLanguage.define<BlockCommentParserState>({
+  name: 'mongodb',
+  startState: () => ({ inBlockComment: false }),
+  token(stream, state) {
+    if (advanceBlockComment(stream, state)) return 'comment'
+    if (stream.eatSpace()) return null
+    if (stream.match(/^\/\/.*/) || stream.match(/^--.*/)) return 'comment'
+    if (stream.match(/^\/\*/)) {
+      if (!stream.match(/^.*?\*\//)) state.inBlockComment = true
+      return 'comment'
+    }
+    const ch = stream.peek()
+    if (ch === '"' || ch === "'" || ch === '`') {
+      stream.next()
+      readEscapedString(stream, ch)
+      const val = stream.current().slice(1, -1)
+      return /^\$[A-Za-z_][A-Za-z0-9_]*$/.test(val) ? 'keyword' : 'string'
+    }
+    if (stream.match(/^\$[A-Za-z_][A-Za-z0-9_]*/)) return 'keyword'
+    if (stream.match(/^-?\d+(?:\.\d+)?/)) return 'number'
+    if (stream.match(/^[A-Za-z_][A-Za-z0-9_]*/)) {
+      const word = stream.current()
+      if (word === 'true' || word === 'false') return 'bool'
+      if (word === 'null') return 'null'
+      if (MONGODB_METHODS.has(word)) return 'keyword'
+      if (MONGODB_CONSTRUCTORS.has(word)) return 'typeName'
+      return 'propertyName'
+    }
+    if (stream.match(/^[+\-*/%=<>!&|?:]+/)) return 'operator'
+    stream.next()
+    return 'punctuation'
   },
 })
 
@@ -150,12 +409,48 @@ export function extractCaretStatementSql(
 }
 
 /**
+ * Resolves the exact document range `{ from, to, sql, originalSlice }` targeted by execution.
+ * Uses selection when non-empty (for caret/explain), full doc for `'all'` or redis, or statement span at caret.
+ */
+export function extractExecutionRange(
+  target: EditorView | ExecutableStateLike,
+  mode: 'caret' | 'all' | 'explain' = 'caret',
+  dialect?: SqlDialectType
+): SqlExecutionRange | null {
+  const state = 'state' in target ? target.state : target
+  return resolveSqlExecutionSpan(state.doc.toString(), state.selection?.main, mode, dialect)
+}
+
+/**
+ * Replaces a targeted SQL span in a single undoable CodeMirror transaction (Ctrl+Z restores original).
+ * Never silently overwrites unrelated statements in a multi-statement script when target no longer matches.
+ */
+export function replaceEditorSqlRange(
+  view: EditorView,
+  target: SqlReplaceTarget | null,
+  nextSql: string,
+  dialect: SqlDialectType = 'sqlite'
+): boolean {
+  const edit = resolveSqlReplacementSpan(view.state.doc.toString(), target, nextSql, dialect)
+  if (!edit) return false
+
+  view.dispatch({
+    changes: { from: edit.from, to: edit.to, insert: edit.insert },
+    selection: { anchor: edit.from + edit.insert.length },
+    effects: clearGhostEffect.of(undefined),
+  })
+  view.focus()
+  return true
+}
+
+/**
  * Resolves the CodeMirror SQL dialect extension from a database driver name.
  */
 export function resolveSqlDialect(dialect: SqlDialectType = 'sqlite'): SQLDialect {
   switch (dialect) {
     case 'postgres':
     case 'cockroachdb':
+    case 'oracle':
       return PostgreSQL
     case 'mysql':
     case 'clickhouse':
@@ -165,17 +460,27 @@ export function resolveSqlDialect(dialect: SqlDialectType = 'sqlite'): SQLDialec
     case 'sqlite':
     case 'libsql':
     case 'd1':
+    case 'mssql':
     case 'redis':
+    case 'mongodb':
     default:
       return SQLite
   }
 }
 
-function buildLanguageExtension(dialect: SqlDialectType): Extension {
-  if (dialect === 'redis') {
-    return new LanguageSupport(REDIS_MONOCHROME_LANG)
+export function buildLanguageExtension(dialect: SqlDialectType): Extension {
+  switch (dialect) {
+    case 'redis':
+      return new LanguageSupport(REDIS_MONOCHROME_LANG)
+    case 'mongodb':
+      return new LanguageSupport(MONGODB_MQL_LANG)
+    case 'mssql':
+      return new LanguageSupport(MSSQL_TSQL_LANG)
+    case 'oracle':
+      return new LanguageSupport(ORACLE_PLSQL_LANG)
+    default:
+      return sql({ dialect: resolveSqlDialect(dialect) })
   }
-  return sql({ dialect: resolveSqlDialect(dialect) })
 }
 
 export interface SmartSqlCompletionItem {
@@ -242,6 +547,170 @@ const REDIS_COMMAND_COMPLETIONS: ReadonlyArray<{ label: string; detail: string; 
   { label: 'DBSIZE', detail: 'key count', boost: 76 },
 ]
 
+const MSSQL_EXTRA_COMPLETIONS: ReadonlyArray<{ label: string; detail: string; boost: number }> = [
+  { label: 'TOP 100', detail: 'T-SQL limit', boost: 46 },
+  { label: 'OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY', detail: 'T-SQL paging', boost: 40 },
+  { label: 'WITH (NOLOCK)', detail: 'T-SQL hint', boost: 34 },
+  { label: 'CROSS APPLY', detail: 'T-SQL join', boost: 36 },
+  { label: 'GETDATE()', detail: 'scalar fn', boost: 38 },
+  { label: 'SYSDATETIME()', detail: 'scalar fn', boost: 34 },
+  { label: 'NEWID()', detail: 'scalar fn', boost: 34 },
+  { label: 'ISNULL()', detail: 'scalar fn', boost: 38 },
+  { label: 'TRY_CAST()', detail: 'scalar fn', boost: 34 },
+  { label: 'STRING_AGG()', detail: 'aggregate', boost: 34 },
+  { label: 'EXEC', detail: 'T-SQL exec', boost: 32 },
+]
+
+const ORACLE_EXTRA_COMPLETIONS: ReadonlyArray<{ label: string; detail: string; boost: number }> = [
+  { label: 'FETCH FIRST 100 ROWS ONLY', detail: 'Oracle paging', boost: 44 },
+  { label: 'DUAL', detail: 'Oracle table', boost: 40 },
+  { label: 'ROWNUM', detail: 'Oracle pseudo', boost: 38 },
+  { label: 'CONNECT BY PRIOR', detail: 'Oracle tree', boost: 34 },
+  { label: 'SYSDATE', detail: 'Oracle date', boost: 40 },
+  { label: 'SYSTIMESTAMP', detail: 'Oracle time', boost: 36 },
+  { label: 'NVL()', detail: 'scalar fn', boost: 40 },
+  { label: 'NVL2()', detail: 'scalar fn', boost: 36 },
+  { label: 'DECODE()', detail: 'scalar fn', boost: 36 },
+  { label: 'TO_DATE()', detail: 'scalar fn', boost: 36 },
+  { label: 'TO_CHAR()', detail: 'scalar fn', boost: 36 },
+  { label: 'LISTAGG()', detail: 'aggregate', boost: 34 },
+  { label: 'EXPLAIN PLAN FOR', detail: 'Oracle plan', boost: 34 },
+]
+
+const MONGODB_COMPLETIONS: ReadonlyArray<SmartSqlCompletionItem> = [
+  { label: 'db.getCollection("")', type: 'function', detail: 'MQL collection', boost: 95 },
+  { label: 'find({})', type: 'function', detail: 'MQL query', boost: 94 },
+  { label: 'findOne({})', type: 'function', detail: 'MQL query', boost: 92 },
+  { label: 'aggregate([])', type: 'function', detail: 'MQL pipeline', boost: 93 },
+  { label: 'countDocuments({})', type: 'function', detail: 'MQL count', boost: 90 },
+  { label: 'distinct("")', type: 'function', detail: 'MQL distinct', boost: 86 },
+  { label: 'insertOne({})', type: 'function', detail: 'MQL write', boost: 85 },
+  { label: 'insertMany([])', type: 'function', detail: 'MQL write', boost: 83 },
+  { label: 'updateOne({}, { $set: {} })', type: 'function', detail: 'MQL write', boost: 85 },
+  { label: 'updateMany({}, { $set: {} })', type: 'function', detail: 'MQL write', boost: 83 },
+  { label: 'deleteOne({})', type: 'function', detail: 'MQL delete', boost: 84 },
+  { label: 'deleteMany({})', type: 'function', detail: 'MQL delete', boost: 80 },
+  { label: 'explain("queryPlanner")', type: 'function', detail: 'MQL explain', boost: 86 },
+  { label: '$match', type: 'keyword', detail: 'MQL stage', boost: 92 },
+  { label: '$group', type: 'keyword', detail: 'MQL stage', boost: 91 },
+  { label: '$project', type: 'keyword', detail: 'MQL stage', boost: 90 },
+  { label: '$lookup', type: 'keyword', detail: 'MQL stage', boost: 89 },
+  { label: '$unwind', type: 'keyword', detail: 'MQL stage', boost: 88 },
+  { label: '$sort', type: 'keyword', detail: 'MQL stage', boost: 88 },
+  { label: '$limit', type: 'keyword', detail: 'MQL stage', boost: 87 },
+  { label: '$skip', type: 'keyword', detail: 'MQL stage', boost: 85 },
+  { label: '$addFields', type: 'keyword', detail: 'MQL stage', boost: 84 },
+  { label: '$set', type: 'keyword', detail: 'MQL operator', boost: 88 },
+  { label: '$eq', type: 'keyword', detail: 'MQL operator', boost: 86 },
+  { label: '$ne', type: 'keyword', detail: 'MQL operator', boost: 85 },
+  { label: '$gt', type: 'keyword', detail: 'MQL operator', boost: 86 },
+  { label: '$gte', type: 'keyword', detail: 'MQL operator', boost: 85 },
+  { label: '$lt', type: 'keyword', detail: 'MQL operator', boost: 85 },
+  { label: '$lte', type: 'keyword', detail: 'MQL operator', boost: 84 },
+  { label: '$in', type: 'keyword', detail: 'MQL operator', boost: 86 },
+  { label: '$nin', type: 'keyword', detail: 'MQL operator', boost: 84 },
+  { label: '$and', type: 'keyword', detail: 'MQL operator', boost: 85 },
+  { label: '$or', type: 'keyword', detail: 'MQL operator', boost: 85 },
+  { label: '$exists', type: 'keyword', detail: 'MQL operator', boost: 84 },
+  { label: '$regex', type: 'keyword', detail: 'MQL operator', boost: 84 },
+  { label: 'ObjectId()', type: 'function', detail: 'BSON helper', boost: 89 },
+  { label: 'ISODate()', type: 'function', detail: 'BSON helper', boost: 88 },
+]
+
+function computeMongoCompletions(
+  before: string,
+  safePos: number,
+  schema: Record<string, string[]>,
+  explicit: boolean
+): { from: number; options: SmartSqlCompletionItem[] } | null {
+  const dbDotMatch = /\bdb\.([A-Za-z0-9_$-]*)$/.exec(before)
+  if (dbDotMatch) {
+    const prefix = dbDotMatch[1].toLowerCase()
+    const from = safePos - dbDotMatch[1].length
+    const options: SmartSqlCompletionItem[] = []
+    if (!prefix || 'getcollection'.includes(prefix)) {
+      options.push({
+        label: 'getCollection',
+        apply: 'getCollection("")',
+        type: 'function',
+        detail: 'MongoDB collection',
+        boost: 99,
+      })
+    }
+    for (const colName of Object.keys(schema)) {
+      if (!prefix || colName.toLowerCase().includes(prefix)) {
+        options.push({
+          label: colName,
+          type: 'class',
+          detail: 'collection',
+          boost: colName.toLowerCase().startsWith(prefix) ? 95 : 84,
+        })
+      }
+    }
+    return options.length > 0 ? { from, options } : null
+  }
+
+  const colMethodMatch =
+    /\bdb\.(?:getCollection\(\s*["'][^"']+["']\s*\)|[A-Za-z_][A-Za-z0-9_$-]*)\.([A-Za-z0-9_]*)$/.exec(
+      before
+    )
+  if (colMethodMatch) {
+    const prefix = colMethodMatch[1].toLowerCase()
+    const from = safePos - colMethodMatch[1].length
+    const options = MONGODB_COMPLETIONS.filter(
+      (item) =>
+        item.type === 'function' &&
+        !item.label.startsWith('db.') &&
+        !item.label.startsWith('ObjectId') &&
+        !item.label.startsWith('ISODate') &&
+        (!prefix || item.label.toLowerCase().includes(prefix))
+    )
+    return options.length > 0 ? { from, options } : null
+  }
+
+  const wordMatch = /\$?[A-Za-z0-9_]*$/.exec(before)
+  const word = wordMatch ? wordMatch[0] : ''
+  const lowerWord = word.toLowerCase()
+  const from = safePos - word.length
+  if (!word && !explicit) return null
+
+  const options: SmartSqlCompletionItem[] = []
+  const seen = new Set<string>()
+  for (const colName of Object.keys(schema)) {
+    if (!lowerWord || colName.toLowerCase().includes(lowerWord)) {
+      seen.add(colName)
+      options.push({
+        label: colName,
+        type: 'class',
+        detail: 'collection',
+        boost: colName.toLowerCase().startsWith(lowerWord) ? 94 : 80,
+      })
+    }
+    for (const field of schema[colName] || []) {
+      if (!seen.has(field) && (!lowerWord || field.toLowerCase().includes(lowerWord))) {
+        seen.add(field)
+        options.push({
+          label: field,
+          type: 'property',
+          detail: `${colName} field`,
+          boost: field.toLowerCase().startsWith(lowerWord) ? 88 : 74,
+        })
+      }
+    }
+  }
+  for (const item of MONGODB_COMPLETIONS) {
+    if (!lowerWord || item.label.toLowerCase().includes(lowerWord)) {
+      options.push({
+        ...item,
+        boost: item.label.toLowerCase().startsWith(lowerWord)
+          ? item.boost ?? 85
+          : (item.boost ?? 85) - 10,
+      })
+    }
+  }
+  return options.length > 0 ? { from, options } : null
+}
+
 export function computeSmartSqlCompletions(
   docText: string,
   pos: number,
@@ -252,6 +721,10 @@ export function computeSmartSqlCompletions(
 ): { from: number; options: SmartSqlCompletionItem[] } | null {
   const safePos = Math.max(0, Math.min(pos, docText.length))
   const before = docText.slice(0, safePos)
+
+  if (dialect === 'mongodb') {
+    return computeMongoCompletions(before, safePos, schema, explicit)
+  }
 
   // Check for dot-qualified completion: `tableOrAlias.colPrefix`
   const dotMatch = /([A-Za-z0-9_"`[\]]+)\.([A-Za-z0-9_]*)$/.exec(before)
@@ -375,6 +848,20 @@ export function computeSmartSqlCompletions(
     seenLabels.add(tblKey)
   }
 
+  if (dialect === 'oracle' && !seenLabels.has('tbl:dual')) {
+    const dualMatch = matchesWord('DUAL')
+    if (dualMatch.ok) {
+      const baseBoost = isTableContext ? 95 : 64
+      options.push({
+        label: 'DUAL',
+        type: 'class',
+        detail: 'Oracle table',
+        boost: dualMatch.starts ? baseBoost : baseBoost - 12,
+      })
+      seenLabels.add('tbl:dual')
+    }
+  }
+
   // 2. Column names (prioritize referenced tables in current query, then defaultTable, then other schema tables)
   if (!isTableContext) {
     const orderedTables = [
@@ -405,7 +892,13 @@ export function computeSmartSqlCompletions(
   // 3. SQL Keywords, Clauses & Aggregate Functions
   if (!isTableContext && lowerWord.length > 0) {
     const isLowerInput = word === word.toLowerCase() && word !== word.toUpperCase()
-    for (const kw of SQL_KEYWORD_COMPLETIONS) {
+    const dialectExtras =
+      dialect === 'mssql'
+        ? MSSQL_EXTRA_COMPLETIONS
+        : dialect === 'oracle'
+          ? ORACLE_EXTRA_COMPLETIONS
+          : []
+    for (const kw of [...SQL_KEYWORD_COMPLETIONS, ...dialectExtras]) {
       const m = matchesWord(kw.label)
       if (!m.ok) continue
       const isFunc = kw.detail === 'aggregate' || kw.detail === 'scalar fn'
@@ -413,7 +906,7 @@ export function computeSmartSqlCompletions(
       options.push({
         label: kw.label,
         apply: applyText,
-        type: isFunc ? 'function' : 'keyword',
+        type: isFunc ? 'function' : kw.detail === 'Oracle table' ? 'class' : 'keyword',
         detail: kw.detail,
         boost: m.starts ? kw.boost : kw.boost - 12,
       })
@@ -423,7 +916,22 @@ export function computeSmartSqlCompletions(
   return options.length > 0 ? { from, options } : null
 }
 
-function buildCompletionExtension(
+function resolveCompletionFacetData(dialect: SqlDialectType) {
+  switch (dialect) {
+    case 'redis':
+      return REDIS_MONOCHROME_LANG.data
+    case 'mongodb':
+      return MONGODB_MQL_LANG.data
+    case 'mssql':
+      return MSSQL_TSQL_LANG.data
+    case 'oracle':
+      return ORACLE_PLSQL_LANG.data
+    default:
+      return resolveSqlDialect(dialect).language.data
+  }
+}
+
+export function buildCompletionExtension(
   dialect: SqlDialectType,
   schema: Record<string, string[]>,
   defaultTable?: string
@@ -446,19 +954,20 @@ function buildCompletionExtension(
     return {
       from: computed.from,
       options: computed.options,
-      validFor: /^[A-Za-z0-9_]*$/,
+      validFor: /^[$A-Za-z0-9_]*$/,
     }
   }
 
-  if (dialect === 'redis') {
-    return REDIS_MONOCHROME_LANG.data.of({
+  return [
+    autocompletion({
+      override: [smartSource],
+      activateOnTyping: true,
+      maxRenderedOptions: 40,
+    }),
+    resolveCompletionFacetData(dialect).of({
       autocomplete: smartSource,
-    })
-  }
-  const dialectConfig = resolveSqlDialect(dialect)
-  return dialectConfig.language.data.of({
-    autocomplete: smartSource,
-  })
+    }),
+  ]
 }
 
 function buildTypographyExtension(typography: EditorTypography = {}): Extension {
@@ -577,6 +1086,40 @@ function buildEditorThemeExtension(isDark: boolean): Extension {
         fontStyle: 'normal',
         fontSize: '12px',
       },
+      '.cm-ai-replace-strike': {
+        textDecoration: 'line-through',
+        textDecorationColor: isDark
+          ? 'rgba(248, 113, 113, 0.78)'
+          : 'rgba(220, 38, 38, 0.78)',
+        textDecorationThickness: '1.4px',
+        opacity: '0.58',
+      },
+      '.cm-sql-diag-error': {
+        textDecorationLine: 'underline',
+        textDecorationStyle: 'wavy',
+        textDecorationColor: isDark
+          ? 'rgba(248, 113, 113, 0.72)'
+          : 'rgba(220, 38, 38, 0.75)',
+        textUnderlineOffset: '3px',
+        textDecorationThickness: '1.25px',
+      },
+      '.cm-sql-diag-warn': {
+        textDecorationLine: 'underline',
+        textDecorationStyle: 'wavy',
+        textDecorationColor: isDark
+          ? 'rgba(251, 191, 36, 0.72)'
+          : 'rgba(217, 119, 6, 0.75)',
+        textUnderlineOffset: '3px',
+        textDecorationThickness: '1.25px',
+      },
+      '.cm-sql-diag-tooltip': {
+        fontSize: '11.5px',
+        padding: '5px 8px',
+        maxWidth: '340px',
+        lineHeight: '1.4',
+        whiteSpace: 'pre-wrap',
+        color: 'var(--text, #e6e6e6)',
+      },
     },
     { dark: isDark }
   )
@@ -597,6 +1140,8 @@ export class SqlConsoleController {
   private readonly onExecuteAll?: (sql: string) => void
   private readonly onFormatSql?: () => void
   private readonly onChange?: (doc: string) => void
+  private detachWheelScroll: (() => void) | null = null
+  private readonly aiInline?: CmInlineAiOptions
 
   constructor(options: SqlConsoleOptions) {
     this.currentDialect = options.dialect || 'sqlite'
@@ -611,6 +1156,7 @@ export class SqlConsoleController {
     this.onExecuteAll = options.onExecuteAll
     this.onFormatSql = options.onFormatSql
     this.onChange = options.onChange
+    this.aiInline = options.aiInline
 
     this.initEditor(options.parent, options.initialDoc)
   }
@@ -662,7 +1208,6 @@ export class SqlConsoleController {
       highlightActiveLineGutter(),
       highlightActiveLine(),
       history(),
-      autocompletion({ activateOnTyping: true, maxRenderedOptions: 40 }),
       syntaxHighlighting(OLED_HIGHLIGHT_STYLE),
       search({ top: true }),
       highlightSelectionMatches(),
@@ -687,6 +1232,8 @@ export class SqlConsoleController {
       this.typographyCompartment.of(buildTypographyExtension(this.currentTypography)),
       docChangeListener,
       this.themeModeCompartment.of(buildEditorThemeExtension(this.isDarkTheme)),
+      createCmSqlLintExtension({ getDialect: () => this.currentDialect }),
+      ...(this.aiInline ? [createCmInlineAiExtension(this.aiInline)] : []),
     ]
 
     const state = EditorState.create({
@@ -698,6 +1245,7 @@ export class SqlConsoleController {
       state,
       parent,
     })
+    this.detachWheelScroll = bindCtrlWheelHorizontalScroll(this.view.scrollDOM)
   }
 
   /**
@@ -709,10 +1257,13 @@ export class SqlConsoleController {
 
     this.view.dispatch({
       effects: [
+        clearGhostEffect.of(undefined),
+        clearDbSqlErrorEffect.of(undefined),
         this.langCompartment.reconfigure(buildLanguageExtension(dialect)),
         this.completionCompartment.reconfigure(
           buildCompletionExtension(dialect, this.currentSchema, this.currentDefaultTable)
         ),
+        triggerSqlLintEffect.of(undefined),
       ],
     })
   }
@@ -827,6 +1378,25 @@ export class SqlConsoleController {
   }
 
   /**
+   * Resolves the exact document range targeted by execution (`caret`, `all`, or `explain`).
+   */
+  public getExecutionRange(
+    mode: 'caret' | 'all' | 'explain' = 'caret',
+    dialect?: SqlDialectType
+  ): SqlExecutionRange | null {
+    if (!this.view) return null
+    return extractExecutionRange(this.view.state, mode, dialect ?? this.currentDialect)
+  }
+
+  /**
+   * Replaces a targeted SQL range via a single undoable CodeMirror transaction.
+   */
+  public replaceSqlRange(target: SqlReplaceTarget | null, nextSql: string): boolean {
+    if (!this.view) return false
+    return replaceEditorSqlRange(this.view, target, nextSql, this.currentDialect)
+  }
+
+  /**
    * Returns the current caret offset, or 0 when the editor is unavailable.
    */
   public getCursorOffset(): number {
@@ -859,9 +1429,46 @@ export class SqlConsoleController {
   }
 
   /**
+   * Clears any visible inline AI ghost suggestion.
+   */
+  public clearAiGhost(): void {
+    this.view?.dispatch({ effects: clearGhostEffect.of(undefined) })
+  }
+
+  /**
+   * Overlays a live database syntax error underline on the offending SQL token/range.
+   */
+  public setDbSyntaxError(
+    errorMessage: string,
+    targetRange?: { from: number; to: number } | null
+  ): void {
+    if (!this.view) return
+    const clean = String(errorMessage || '').trim()
+    if (!clean) {
+      this.clearDbSyntaxError()
+      return
+    }
+    this.view.dispatch({
+      effects: setDbSqlErrorEffect.of({
+        errorMessage: clean,
+        targetRange: targetRange ?? null,
+      }),
+    })
+  }
+
+  /**
+   * Clears any live database syntax error overlay from the editor.
+   */
+  public clearDbSyntaxError(): void {
+    this.view?.dispatch({ effects: clearDbSqlErrorEffect.of(undefined) })
+  }
+
+  /**
    * Disposes the editor instance.
    */
   public destroy(): void {
+    this.detachWheelScroll?.()
+    this.detachWheelScroll = null
     this.view?.destroy()
     this.view = null
   }

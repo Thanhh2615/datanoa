@@ -3,7 +3,7 @@
   "manifestVersion": 2,
   "id": "datanoa",
   "name": "Datanoa Studio",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "license": "MIT",
   "author": {
     "name": "Thanhh2615",
@@ -14,41 +14,41 @@
   "icon": "assets/icon.png",
   "cover": {
     "path": "images/cover.webp",
-    "alt": "Datanoa Studio database client and SQL studio for Orca with multi-tab SQL editor, data grid, and schema explorer"
+    "alt": "Datanoa Studio v1.2.0 database client and SQL studio for Orca with multi-tab SQL editor, AI SQL Assistant, data grid, and schema explorer"
   },
   "screenshots": [
     {
       "path": "images/studio-split-view.webp",
-      "alt": "Datanoa Studio split view with multi-tab SQL console, transactions, data grid, and JSON inspector",
-      "caption": "Multi-tab SQL console, transactions, data grid, and JSON inspector",
+      "alt": "Datanoa Studio split view with multi-tab SQL console, AI inline ghost completion and EXPLAIN plan analyzer, transactions, data grid, and JSON inspector",
+      "caption": "Multi-tab SQL console, AI inline completion & EXPLAIN analyzer, transactions, and data grid",
       "theme": "dark"
     },
     {
       "path": "images/studio-connection-modal.webp",
-      "alt": "Datanoa Connection Manager with database engines, SSH tunnels, TLS/mTLS, folders, and auto-detect",
-      "caption": "Connection manager with SSH tunnels, TLS/mTLS, folders, and URI/.env auto-detect",
+      "alt": "Datanoa Connection Manager with 12 built-in engines, 7 local BYOD driver slots, SSH tunnels, TLS/mTLS, folders, and workspace auto-discovery",
+      "caption": "12 built-in engines, 7 local BYOD drivers, SSH tunnels, TLS/mTLS, and workspace auto-discovery",
       "theme": "dark"
     },
     {
       "path": "images/schema-designer.webp",
-      "alt": "Datanoa visual table designer showing staged column edits, data types, foreign keys, indexes, and SQL migration preview",
-      "caption": "Visual table designer with live SQL migration preview",
+      "alt": "Datanoa visual table designer showing staged column edits, data types, foreign keys, indexes, and live SQL migration preview",
+      "caption": "Visual table designer with staged schema edits and live SQL migration preview",
       "theme": "dark"
     },
     {
       "path": "images/studio-light-theme.webp",
       "alt": "Datanoa Studio in light theme with compact table bar, grouped schema objects, pinned columns, and find highlighting",
-      "caption": "Light theme with compact table bar and pinned columns",
+      "caption": "Light theme with compact table bar, grouped schema objects, and pinned columns",
       "theme": "light"
     },
     {
       "path": "images/side-panel-explorer.webp",
-      "alt": "Datanoa Side Panel with schema explorer tree, data grid with live aggregates, and quick SQL runner",
-      "caption": "Docked Side Panel explorer, data grid, and quick SQL runner",
+      "alt": "Datanoa Side Panel with schema explorer tree, data grid with live aggregates, multi-tab SQL runner, and AI EXPLAIN",
+      "caption": "Docked Side Panel explorer, data grid, multi-tab SQL runner, and AI assistant",
       "theme": "dark"
     }
   ],
-  "description": "Database client and SQL studio for Orca. Browse schemas, edit and import data, design tables, and run SQL or Redis queries over SSH and TLS across SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, LibSQL/Turso, Cloudflare D1, SQL Server (MSSQL), Oracle, and MongoDB.",
+  "description": "Database client and SQL studio for Orca with an opt-in AI SQL Assistant (inline ghost completion, real-time SQL syntax diagnostics, Fix with AI, and EXPLAIN plan analyzer). Browse schemas, edit and import data, design tables, and run SQL, MQL, or Redis queries over SSH and TLS across 12 built-in engines (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, LibSQL/Turso, Cloudflare D1, MSSQL, Oracle, MongoDB) plus 7 local BYOD drivers.",
   "engines": {
     "orca": ">=1.4.248"
   },
@@ -110,6 +110,96 @@
         "default": 30,
         "minimum": 1,
         "maximum": 110
+      },
+      {
+        "key": "aiEnabled",
+        "title": "AI SQL Assistant",
+        "description": "Enable AI inline SQL autocomplete (ghost text) and EXPLAIN plan analysis. When off, only local schema and keyword completion runs.",
+        "type": "boolean",
+        "default": false
+      },
+      {
+        "key": "aiFormat",
+        "title": "AI Provider Format",
+        "description": "API protocol used by the configured AI provider.",
+        "type": "string",
+        "enum": [
+          "openai",
+          "anthropic",
+          "ollama",
+          "mistral-fim"
+        ],
+        "enumLabels": [
+          "OpenAI-compatible (/chat/completions)",
+          "Anthropic-compatible (/v1/messages)",
+          "Ollama (/api/generate FIM & /api/chat)",
+          "Mistral / Codestral (/v1/fim/completions)"
+        ],
+        "default": "openai"
+      },
+      {
+        "key": "aiBaseUrl",
+        "title": "AI Base URL",
+        "description": "Root URL of your chosen AI provider.",
+        "type": "string",
+        "default": "https://api.openai.com/v1",
+        "placeholder": "http://localhost:11434/v1"
+      },
+      {
+        "key": "aiModel",
+        "title": "AI Model",
+        "description": "Fast model for inline SQL completion and EXPLAIN analysis.",
+        "type": "string",
+        "default": "gpt-4o-mini"
+      },
+      {
+        "key": "aiMaxTokens",
+        "title": "AI Max Completion Tokens",
+        "description": "Maximum tokens requested for each inline SQL suggestion.",
+        "type": "integer",
+        "default": 96,
+        "minimum": 16,
+        "maximum": 1024
+      },
+      {
+        "key": "aiExplainMaxTokens",
+        "title": "AI EXPLAIN Max Tokens",
+        "description": "Maximum tokens for AI EXPLAIN analysis responses (higher values prevent truncation in Vietnamese/CJK).",
+        "type": "integer",
+        "default": 2048,
+        "minimum": 256,
+        "maximum": 8192
+      },
+      {
+        "key": "aiExplainLanguage",
+        "title": "EXPLAIN Analysis Language",
+        "description": "Language used by AI when explaining execution plans and bottlenecks. SQL and DDL stay in standard SQL.",
+        "type": "string",
+        "enum": [
+          "auto",
+          "vi",
+          "en",
+          "ja",
+          "zh",
+          "ko",
+          "es",
+          "fr",
+          "de",
+          "pt"
+        ],
+        "enumLabels": [
+          "Auto (follow Orca UI)",
+          "Tiếng Việt (Vietnamese)",
+          "English",
+          "日本語 (Japanese)",
+          "中文 (Chinese)",
+          "한국어 (Korean)",
+          "Español (Spanish)",
+          "Français (French)",
+          "Deutsch (German)",
+          "Português (Portuguese)"
+        ],
+        "default": "auto"
       }
     ]
   },

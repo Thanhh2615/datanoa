@@ -67,7 +67,7 @@
       </div>
 
       <div class="header-actions">
-        <button id="newServerBtn" class="btn btn-sm" type="button" title="Add or Toggle Connection Form">
+        <button id="newServerBtn" class="btn btn-connect btn-sm" type="button" title="Add or Toggle Connection Form">
           <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <line x1="12" y1="5" x2="12" y2="19"></line>
             <line x1="5" y1="12" x2="19" y2="12"></line>
@@ -163,18 +163,17 @@
         <div class="field">
           <span class="field-label">Paste Connection URI</span>
           <div class="input-group">
-            <input id="uriInput" class="input" type="text" placeholder="postgres://, mysql://, redis://, libsql://, clickhouse://, sqlite://..." />
+            <input id="uriInput" class="input" type="text" aria-label="Paste Connection URI" placeholder="postgres://, mysql://, mssql://, mongodb://, redis://, libsql://, clickhouse://, sqlite://..." />
             <button id="parseUriBtn" class="btn" type="button">Parse URI</button>
           </div>
         </div>
 
-        <!-- Engine SVG Selector Grid -->
+        <!-- Engine SVG Selector Grid (Built-in vs Local Custom Drivers BYOD) -->
         <div class="field">
-          <span class="field-label">Database Engine</span>
-          <div id="engineGrid" class="engine-grid" role="group" aria-label="Database Driver"></div>
+          <div id="engineGrid" class="engine-groups" role="group" aria-label="Database Driver"></div>
         </div>
 
-        <!-- Inline BYOD Local Driver Setup (SQL Server / Oracle / MongoDB / Custom) -->
+        <!-- Inline BYOD Local Driver Setup (DuckDB / Snowflake / BigQuery / Cassandra / Elasticsearch / Neo4j / Custom) -->
         <div id="panelByodSetupBox" class="field" style="gap: 6px; padding: 8px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--card);" hidden>
           <div class="field-label" style="display: flex; align-items: center; justify-content: space-between;">
             <span id="panelByodTitle">Local Driver Setup (BYOD)</span>
@@ -182,11 +181,11 @@
           </div>
           <div id="panelByodGuide" style="font-size: 11px; color: var(--t2); line-height: 1.4;"></div>
           <div class="input-group">
-            <input id="panelByodFolderInput" class="input" type="text" placeholder="C:\Users\...\.datanoa\drivers\mssql" />
+            <input id="panelByodFolderInput" class="input" type="text" aria-label="Local driver folder path" placeholder="C:\Users\...\.datanoa\drivers\duckdb" />
             <button id="panelByodBrowseBtn" class="btn btn-sm" type="button">Browse Folder...</button>
           </div>
           <div class="input-group">
-            <input id="panelByodCmdInput" class="input" type="text" readonly title="Auto-updated terminal setup command" />
+            <input id="panelByodCmdInput" class="input" type="text" readonly aria-label="Driver setup command" title="Auto-updated terminal setup command" />
             <button id="panelByodCopyCmdBtn" class="btn btn-sm" type="button">Copy Cmd</button>
           </div>
           <div class="input-group input-wrap-wrap" style="gap: 4px;">
@@ -200,15 +199,16 @@
         <!-- Workspace Auto-Discovery (.env, Docker Compose & .db) -->
         <div id="discoveredFieldWrap" class="field" style="gap: 6px;">
           <div class="field-label" style="flex-shrink: 0; flex-wrap: wrap;">
-            <span>Workspace Auto-Discovery</span>
+            <span>Local Workspace &amp; Docker Auto-Discovery</span>
             <div class="input-group input-wrap-wrap" style="gap: 4px;">
               <button id="quickBrowseDbFileBtn" class="btn btn-sm" type="button" title="Browse and pick a local SQLite database file (.db, .sqlite, .sqlite3)">Browse DB File...</button>
               <button id="quickScanFolderBtn" class="btn btn-sm" type="button" title="Browse a folder on disk and scan it for .env, Docker Compose, and .db files">Scan Folder...</button>
-              <button id="detectWorkspaceBtn" class="btn btn-sm" type="button" title="Scan current workspace & local Docker Compose for .env, containers/compose files, and .db databases">Auto-Detect (.env, Docker, .db)</button>
+              <button id="detectWorkspaceBtn" class="btn btn-sm" type="button" title="Scan current workspace folder(s) for .env &amp; .db files plus local Docker Compose containers">Auto-Detect (.env, Docker, .db)</button>
             </div>
           </div>
+          <div id="discoveredScopeHint" class="discovery-scope-hint">Scans local workspace folders for .env / .db files &middot; Plus local Docker containers (non-workspace labeled &ldquo;Other Local Docker&rdquo;).</div>
           <div id="discoveredBox" class="discovery-box" hidden>
-            <input id="discoveredSearchInput" class="input discovery-search" type="search" placeholder="Search .env, Docker Compose &amp; .db files..." />
+            <input id="discoveredSearchInput" class="input discovery-search" type="search" aria-label="Search discovered connections" placeholder="Search .env, Docker Compose &amp; .db files..." />
             <div id="discoveredGroupsWrap" class="discovery-groups">
               <div id="discoveredEnvGroup" class="discovery-group" data-group="env" hidden>
                 <button id="discoveredEnvToggle" class="discovery-group-head" type="button" aria-expanded="true" aria-controls="discoveredEnvBody">
@@ -255,7 +255,7 @@
         <!-- Folder / Group & Workspace Scope Pin -->
         <div class="field" style="gap: 5px;">
           <span class="field-label">Folder / Group (Organize Connections)</span>
-          <input id="formFolder" class="input" type="text" maxlength="64" placeholder="Create or enter a folder name (optional)" />
+          <input id="formFolder" class="input" type="text" maxlength="64" aria-label="Folder or Group Name" placeholder="Create or enter a folder name (optional)" />
           <div id="formFolderChips" class="input-group input-wrap-wrap" style="gap: 4px;" hidden></div>
         </div>
 
@@ -266,12 +266,12 @@
           </select>
         </label>
 
-        <!-- SQLite Fields -->
+        <!-- SQLite / DuckDB File Fields -->
         <div id="sqliteFields" class="field" style="gap: 8px;">
           <div class="field">
             <span class="field-label">Database File or Folder Path</span>
             <div class="input-group">
-              <input id="formFilePath" class="input" type="text" placeholder="D:\project\data.db or folder path" />
+              <input id="formFilePath" class="input" type="text" aria-label="Database File or Folder Path" placeholder="D:\project\data.db or folder path" />
               <button id="browseSqliteFileBtn" class="btn btn-sm" type="button">Browse File...</button>
             </div>
           </div>
@@ -351,6 +351,10 @@
             <input id="formSsl" type="checkbox" />
             <span>Enable SSL / TLS</span>
           </label>
+          <label id="sslVerifyRow" class="checkbox-row" hidden>
+            <input id="formSslVerify" type="checkbox" checked />
+            <span>Verify TLS certificate</span>
+          </label>
         </div>
 
         <!-- Environment Color Tag & Read-Only Mode -->
@@ -384,14 +388,14 @@
             <path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3"></path>
           </svg>
           <div class="empty-title">No Connections Yet</div>
-          <div class="empty-desc">Connect SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, Turso/LibSQL, or Cloudflare D1 (via Studio) — or auto-detect from .env, Docker Compose, and .db files.</div>
+          <div class="empty-desc">Connect SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, Turso/LibSQL, Cloudflare D1 (via Studio), SQL Server, Oracle, MongoDB, or BYOD (DuckDB, Snowflake, BigQuery, Cassandra, Elasticsearch, Neo4j, Custom) — or auto-detect from .env, Docker Compose, and .db files.</div>
           <div class="input-group input-wrap-wrap" style="margin-top:4px; justify-content: center;">
             <button id="emptyAddConnBtn" class="btn btn-primary" type="button">+ Add Connection</button>
           </div>
         </div>
 
         <div id="schemaFilterWrap" class="explorer-top-row" hidden>
-          <input id="schemaFilter" class="input" type="search" placeholder="Filter connections, tables, views &amp; columns..." title="Filter connections, folders, tables, views, and columns" />
+          <input id="schemaFilter" class="input" type="search" aria-label="Filter connections, tables, views, and columns" placeholder="Filter connections, tables, views &amp; columns..." title="Filter connections, folders, tables, views, and columns" />
           <div class="input-group" style="gap: 3px; flex-shrink: 0;">
             <button id="expandAllTreeBtn" class="btn btn-ghost btn-icon btn-sm" type="button" title="Expand all folders and connections" aria-label="Expand All">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -530,6 +534,7 @@
 
         <!-- Collapsible Cell Value & JSON Prettifier Drawer -->
         <div id="valueInspectorDrawer" class="inline-drawer" hidden>
+          <div id="valueInspectorResizer" class="value-inspector-resizer" role="separator" aria-orientation="horizontal" aria-label="Resize Cell Inspector" tabindex="0" title="Drag up or down to resize · Double-click to reset"></div>
           <div class="drawer-head">
             <div class="input-group" style="min-width: 0; flex: 1;">
               <span id="valueInspectorTitle" class="drawer-title">Cell Inspector</span>
@@ -538,11 +543,11 @@
             </div>
             <div class="input-group">
               <button id="toggleInspectorBodyBtn" class="btn btn-ghost btn-sm" type="button">Collapse</button>
-              <button id="closeInspectorBtn" class="btn btn-ghost btn-sm" type="button">&times;</button>
+              <button id="closeInspectorBtn" class="btn btn-ghost btn-sm" type="button" aria-label="Close Cell Inspector">&times;</button>
             </div>
           </div>
-          <div id="valueInspectorBody" class="field" style="gap: 6px;">
-            <textarea id="valueInspectorText" class="textarea" style="min-height: 76px;" spellcheck="false"></textarea>
+          <div id="valueInspectorBody" class="field">
+            <textarea id="valueInspectorText" class="textarea" spellcheck="false" aria-label="Cell value editor"></textarea>
             <div class="inspector-meta-row">
               <span id="inspectorMetaCount">0 chars · 1 line</span>
               <span>Ctrl+Enter to Apply</span>
@@ -589,6 +594,7 @@
             <button id="formatSqlBtn" class="btn btn-sm" type="button" title="Format SQL (Shift+Alt+F)">Format</button>
             <button id="cancelSqlBtn" class="btn btn-danger btn-sm" type="button" hidden>Cancel</button>
             <button id="toggleHistoryBtn" class="btn btn-ghost btn-sm" type="button">History</button>
+            <button id="sqlAiBtn" class="btn btn-ghost btn-sm datanoa-ai-toolbar-btn tone-neutral" type="button" title="Configure AI SQL Assistant">AI · Off</button>
           </div>
           <span id="sqlMetaBadge" class="badge badge-neutral" hidden></span>
         </div>
@@ -600,10 +606,10 @@
             <div class="input-group">
               <button id="refreshHistoryBtn" class="btn btn-ghost btn-sm" type="button">Refresh</button>
               <button id="clearHistoryBtn" class="btn btn-danger btn-sm" type="button">Clear</button>
-              <button id="closeHistoryBtn" class="btn btn-ghost btn-sm" type="button">&times;</button>
+              <button id="closeHistoryBtn" class="btn btn-ghost btn-sm" type="button" aria-label="Close Query History">&times;</button>
             </div>
           </div>
-          <input id="historySearchInput" class="input" type="search" placeholder="Search history by SQL or connection..." style="height: 25px;" />
+          <input id="historySearchInput" class="input" type="search" aria-label="Search query history" placeholder="Search history by SQL or connection..." style="height: 25px;" />
           <div id="sqlHistoryList" class="chip-list"></div>
         </div>
 
@@ -619,12 +625,19 @@
 
         <div id="sqlErrorBanner" class="banner danger" role="alert" hidden>
           <span id="sqlErrorText" class="banner-text" style="font-family: var(--mono); white-space: pre-wrap; word-break: break-word;"></span>
-          <button id="sqlErrorCloseBtn" class="btn btn-ghost btn-icon btn-sm banner-close-btn" type="button" aria-label="Dismiss">&times;</button>
+          <div class="banner-actions">
+            <button id="sqlFixAiBtn" class="btn btn-primary btn-sm" type="button" hidden>Fix with AI</button>
+            <button id="sqlErrorCloseBtn" class="btn btn-ghost btn-icon btn-sm banner-close-btn" type="button" aria-label="Dismiss">&times;</button>
+          </div>
         </div>
+
+        <div id="sqlAiFixPanel" class="datanoa-ai-fix-panel" hidden></div>
 
         <div id="sqlResultWrap" class="grid-wrap" tabindex="0" title="Ctrl + Scroll to pan horizontally" hidden>
           <table id="sqlResultTable" class="data-table"></table>
         </div>
+
+        <div id="sqlExplainAiPanel" class="datanoa-ai-explain-panel" hidden></div>
 
         <div id="sqlResultMeta" class="tab-footer-safe" hidden>
           <div id="sqlSelectionStats" class="sel-stats-strip" title="Click to copy SQL result selection stats" hidden></div>
@@ -758,7 +771,7 @@
       <span class="drawer-title">Columns</span>
       <button id="dataColsShowAllBtn" class="btn btn-ghost btn-sm" type="button">Show All</button>
     </div>
-    <input id="dataColsSearchInput" class="input" type="search" placeholder="Filter columns..." style="height: 24px;" />
+    <input id="dataColsSearchInput" class="input" type="search" aria-label="Filter columns" placeholder="Filter columns..." style="height: 24px;" />
     <div id="dataColsList" class="col-popover-list"></div>
   </div>
 
@@ -846,6 +859,36 @@
     </div>
   </div>
 
+  <!-- Potentially Dangerous SQL Execution Guard Modal -->
+  <div id="dangerSqlModal" class="modal-backdrop" role="alertdialog" aria-modal="true" aria-labelledby="dangerSqlTitle" hidden>
+    <div class="modal-card modal-card-wide" style="max-width: 440px;">
+      <div class="drawer-head">
+        <h3 id="dangerSqlTitle" class="panel-title">Potentially Dangerous SQL</h3>
+        <span id="dangerSqlBadge" class="badge badge-danger">1 warning</span>
+      </div>
+      <div id="dangerSqlEnvWarn" class="banner danger" role="alert" hidden></div>
+      <div id="dangerSqlFindings" class="danger-sql-findings" role="alert"></div>
+      <div class="field">
+        <span class="field-label">SQL Statement Preview</span>
+        <pre id="dangerSqlPreview" class="code-block" style="max-height: 120px;"></pre>
+      </div>
+      <div id="dangerSqlProdGate" class="danger-sql-gate banner danger">
+        <label class="checkbox-row" style="cursor: pointer;">
+          <input id="dangerSqlConfirmCheck" type="checkbox" />
+          <span id="dangerSqlConfirmCheckText">I understand this query may permanently modify or delete data</span>
+        </label>
+        <label id="dangerSqlConfirmInputWrap" class="field" style="width: 100%; margin-top: 4px;" hidden>
+          <span class="field-label">Type <strong>CONFIRM</strong> to unlock execution:</span>
+          <input id="dangerSqlConfirmInput" class="input" type="text" placeholder="Type CONFIRM" aria-label="Type CONFIRM to enable execution" autocomplete="off" />
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button id="dangerSqlCancelBtn" class="btn btn-sm" type="button">Cancel</button>
+        <button id="dangerSqlExecuteBtn" class="btn btn-sm btn-danger-solid" type="button" disabled>Execute Anyway</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Feedback / Report a Bug / Request a Feature Modal -->
   <div id="feedbackModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="feedbackModalTitle" hidden>
     <div class="modal-card" style="max-width: 400px;">
@@ -881,7 +924,7 @@
   <!-- Side Panel Command Palette Modal (Ctrl+K) -->
   <div id="cmdPaletteModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="Command Palette" hidden>
     <div class="modal-card cmd-palette-card">
-      <input id="cmdPaletteInput" class="input" type="search" placeholder="Type a command (e.g. Report Bug, Format SQL, Connect)..." autocomplete="off" />
+      <input id="cmdPaletteInput" class="input" type="search" aria-label="Type a command" placeholder="Type a command (e.g. Report Bug, Format SQL, Connect)..." autocomplete="off" />
       <div id="cmdPaletteList" class="cmd-palette-list" role="listbox"></div>
     </div>
   </div>

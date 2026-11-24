@@ -3,7 +3,10 @@
 
 import type { ColumnInfo, DatabaseDriverType } from '../protocol.js'
 import { buildInsertStatement } from '../drivers/common/update-builder.js'
+import { parseJsonPreservingBigInts } from '../shared-grid-paste.js'
 import { coerceCellInputValue } from './grid-formatters.js'
+
+export { parseJsonPreservingBigInts }
 
 export type ImportFileFormat = 'auto' | 'csv' | 'tsv' | 'json' | 'ndjson'
 export type ResolvedImportFormat = 'csv' | 'tsv' | 'json' | 'ndjson'
@@ -239,10 +242,10 @@ export function detectImportDelimiter(text: string): ImportDelimiter {
     const nonZero = counts.filter((c) => c > 0)
     if (nonZero.length === 0) continue
 
-    const firstCount = counts[0] ?? 0
+    const firstCount = counts[0]
     const consistentLines = counts.filter((c) => c === firstCount && c > 0).length
     const avgCount = nonZero.reduce((acc, c) => acc + c, 0) / nonZero.length
-    const consistencyRatio = counts.length > 0 ? consistentLines / counts.length : 0
+    const consistencyRatio = consistentLines / counts.length
     const score = consistencyRatio * 1000 + Math.min(avgCount, 50) * 10 + (delim === '\t' ? 2 : 0)
 
     if (score > bestScore) {
@@ -472,7 +475,7 @@ export function parseImportText(
   if (resolvedFormat === 'json') {
     let parsed: unknown
     try {
-      parsed = JSON.parse(clean)
+      parsed = parseJsonPreservingBigInts(clean)
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err)
       throw new Error(`Invalid JSON syntax: ${msg}`)
@@ -499,7 +502,7 @@ export function parseImportText(
       const line = rawLines[idx].trim()
       if (!line) continue
       try {
-        parsedItems.push(JSON.parse(line))
+        parsedItems.push(parseJsonPreservingBigInts(line))
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err)
         throw new Error(`Invalid NDJSON at line ${idx + 1}: ${msg}`)
@@ -525,18 +528,6 @@ export function parseImportText(
         : detectImportDelimiter(clean)
 
   const matrix = parseDelimitedImportText(clean, resolvedDelimiter)
-  if (matrix.length === 0) {
-    return {
-      resolvedFormat,
-      resolvedDelimiter,
-      hasNamedHeaders: options.hasHeaderRow,
-      headers: [],
-      rows: [],
-      totalRows: 0,
-      warnings: [],
-    }
-  }
-
   const maxWidth = matrix.reduce((max, row) => Math.max(max, row.length), 0)
   const warnings: string[] = []
   let headers: string[]

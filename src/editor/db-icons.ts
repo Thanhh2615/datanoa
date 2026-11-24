@@ -1,5 +1,5 @@
 // src/editor/db-icons.ts
-// 9-Engine official brand vector SVG icon generators, engine metadata catalog, and pure Studio DOM/text helpers
+// 12-Engine official brand vector SVG icon generators, engine metadata catalog, and pure Studio DOM/text helpers
 
 import type { ConnectionColorTag, DatabaseDriverType } from '../protocol.js'
 import {
@@ -36,13 +36,19 @@ export const STUDIO_ENGINES: ReadonlyArray<StudioEngineMeta> = [
   { id: 'clickhouse', label: 'ClickHouse', defaultPort: 8123, defaultDb: 'default', defaultUser: 'default', defaultSsl: false },
   { id: 'redis', label: 'Redis', defaultPort: 6379, defaultDb: '0', defaultUser: '', defaultSsl: false },
   { id: 'libsql', label: 'LibSQL / Turso', defaultPort: 443, defaultDb: 'turso', defaultUser: '', defaultSsl: true },
-  { id: 'd1', label: 'Cloudflare D1', defaultPort: 443, defaultDb: 'd1', defaultUser: '', defaultSsl: true },
+  { id: 'd1', label: 'Cloudflare D1', defaultPort: 443, defaultDb: 'main', defaultUser: '', defaultSsl: true },
+  { id: 'mssql', label: 'SQL Server', defaultPort: 1433, defaultDb: 'master', defaultUser: 'sa', defaultSsl: false },
+  { id: 'oracle', label: 'Oracle', defaultPort: 1521, defaultDb: 'FREEPDB1', defaultUser: 'system', defaultSsl: false },
+  { id: 'mongodb', label: 'MongoDB', defaultPort: 27017, defaultDb: 'admin', defaultUser: 'admin', defaultSsl: false },
 ]
 
 export const BYOD_ENGINES: ReadonlyArray<StudioEngineMeta> = [
-  { id: 'mssql' as DatabaseDriverType, label: 'SQL Server', defaultPort: 1433, defaultDb: 'master', defaultUser: 'sa', defaultSsl: false },
-  { id: 'oracle' as DatabaseDriverType, label: 'Oracle', defaultPort: 1521, defaultDb: 'FREEPDB1', defaultUser: 'system', defaultSsl: false },
-  { id: 'mongodb' as DatabaseDriverType, label: 'MongoDB', defaultPort: 27017, defaultDb: 'admin', defaultUser: 'admin', defaultSsl: false },
+  { id: 'duckdb' as DatabaseDriverType, label: 'DuckDB', defaultPort: 0, defaultDb: 'analytics.duckdb', defaultUser: '', defaultSsl: false },
+  { id: 'snowflake' as DatabaseDriverType, label: 'Snowflake', defaultPort: 443, defaultDb: 'SNOWFLAKE_SAMPLE_DATA', defaultUser: 'admin', defaultSsl: true },
+  { id: 'bigquery' as DatabaseDriverType, label: 'BigQuery', defaultPort: 443, defaultDb: 'default', defaultUser: '', defaultSsl: true },
+  { id: 'cassandra' as DatabaseDriverType, label: 'Cassandra', defaultPort: 9042, defaultDb: 'system', defaultUser: 'cassandra', defaultSsl: false },
+  { id: 'elasticsearch' as DatabaseDriverType, label: 'Elasticsearch', defaultPort: 9200, defaultDb: '_all', defaultUser: 'elastic', defaultSsl: false },
+  { id: 'neo4j' as DatabaseDriverType, label: 'Neo4j', defaultPort: 7687, defaultDb: 'neo4j', defaultUser: 'neo4j', defaultSsl: false },
   { id: 'custom' as DatabaseDriverType, label: 'Custom BYOD', defaultPort: 5432, defaultDb: 'default', defaultUser: 'admin', defaultSsl: false },
 ]
 
@@ -113,14 +119,17 @@ export function createDbLogoSvg(driver: DatabaseDriverType): SVGElement {
 }
 
 export function createByodDriverLogoSvg(slotId: string): SVGElement {
-  const entry = BYOD_LOGO_PATHS[slotId] ?? BYOD_LOGO_PATHS.custom
+  const resolvedId = Object.prototype.hasOwnProperty.call(BYOD_LOGO_PATHS, slotId)
+    ? slotId
+    : 'custom'
+  const entry = BYOD_LOGO_PATHS[resolvedId]
   const svg = createSvgElement('svg', {
-    class: `db-svg db-byod-${slotId}`,
+    class: `db-svg db-${resolvedId} db-byod-${slotId}`,
     width: '14',
     height: '14',
     viewBox: '0 0 24 24',
     fill: 'currentColor',
-    style: `color: ${entry.color}`,
+    style: `color: var(--db-${resolvedId}, ${entry.color})`,
     'aria-hidden': 'true',
   })
   svg.appendChild(createSvgElement('path', { d: entry.d }))
@@ -365,7 +374,7 @@ export function copyTextFallback(text: string, triggerBtn?: HTMLButtonElement | 
     }
     const orig = triggerBtn.dataset.origLabel || triggerBtn.textContent || 'Copy'
     triggerBtn.dataset.origLabel = orig
-    triggerBtn.textContent = 'Copied!'
+    triggerBtn.textContent = 'Copied'
     extBtn._copyResetTimer = setTimeout(() => {
       extBtn._copyResetTimer = undefined
       triggerBtn.textContent = orig
@@ -653,6 +662,7 @@ export interface StudioCollapsibleSelectOptions {
   collapsedFolders?: Set<string>
   defaultCollapseNonActiveFolders?: boolean
   leadingIconType?: 'none' | 'workspace' | 'db'
+  onOpen?: () => void
 }
 
 export function enhanceStudioCollapsibleSelect(

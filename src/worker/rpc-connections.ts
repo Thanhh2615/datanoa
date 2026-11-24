@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import type { OrcaWorkerApi } from 'orca/worker'
@@ -7,11 +8,13 @@ import {
   type PersistedLocalDriverConfig,
 } from '../protocol'
 import { CUSTOM_DRIVERS_STORAGE_KEY } from '../shared-constants'
+import { maskConnectionUriSecret } from '../shared-sql-safety.js'
 import {
   isD1HttpLoopbackEndpoint,
   parseConnectionUri,
   SUPPORTED_DRIVERS,
   validateD1EndpointUrl,
+  validateLibsqlEndpointUrl,
 } from '../drivers/common/connection-uri'
 import { isByodDriverId, type DriverManager } from '../drivers/driver-manager'
 import {
@@ -22,9 +25,14 @@ import {
   scanDirectoryForSqliteFiles,
   type DiscoveredSqliteFile,
 } from './discovery'
-import { detectWorkspaceDockerComposeConnections } from './docker-compose-discovery'
+import {
+  detectDockerTargetLocality,
+  detectWorkspaceDockerComposeConnections,
+} from './docker-compose-discovery'
+import type { WorkerSchemaMetadataCache } from './ai-sql-context'
 import type { SessionManager } from './session-manager'
 import {
+  appendActionableTlsErrorHint,
   createHostError,
   createSerializedQueue,
   getDefaultByodDriverDirs,
@@ -36,6 +44,8 @@ import {
   sanitizeConnectionProfile,
   saveUiSessionSnapshot,
   scaffoldLocalDriverDirectory,
+  scrubAndEnhanceWorkerError,
+  scrubCredentialsInText,
   writeHostConfigBackupPatch,
   type WorkerRegisterHandler,
 } from './worker-utils'
@@ -45,6 +55,45 @@ export interface ConnectionHandlersDeps {
   registerHandler: WorkerRegisterHandler
   sessionManager: SessionManager
   driverManager: DriverManager
+  schemaCache?: WorkerSchemaMetadataCache
+}
+
+export interface ConnectionHandlersController {
+  clearDetectedCandidates: () => void
+}
+
+interface DetectedCandidateSecret {
+  kind: 'env' | 'docker'
+  rawUri?: string
+  rawPassword?: string
+  rawUrl?: string
+  expiresAt: number
+}
+
+const DETECTED_CANDIDATE_TTL_MS = 15 * 60 * 1000
+const DETECTED_CANDIDATE_MAX = 200
+
+function resolveLibsqlEndpointCandidate(profile: ConnectionProfile): string {
+  let raw = typeof profile.url === 'string' ? profile.url.trim() : ''
+  const preferredProto = profile.ssl === false ? 'http' : 'https'
+  if (!raw && typeof profile.host === 'string' && profile.host.trim().length > 0) {
+    const host = profile.host.trim()
+    const isDefaultPort =
+      !profile.port ||
+      (preferredProto === 'https' && profile.port === 443) ||
+      (preferredProto === 'http' && profile.port === 80)
+    raw = isDefaultPort
+      ? `${preferredProto}://${host}`
+      : `${preferredProto}://${host}:${profile.port}`
+  }
+  if (!raw) return ''
+  if (/^libsql:\/\//i.test(raw) && profile.ssl === false) {
+    return raw.replace(/^libsql:\/\//i, 'http://')
+  }
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) {
+    return `${preferredProto}://${raw}`
+  }
+  return raw
 }
 
 export function registerConnectionHandlers({
@@ -52,8 +101,43 @@ export function registerConnectionHandlers({
   registerHandler,
   sessionManager,
   driverManager,
-}: ConnectionHandlersDeps): void {
+  schemaCache,
+}: ConnectionHandlersDeps): ConnectionHandlersController {
   const connectionsQueue = createSerializedQueue()
+  const detectedCandidates = new Map<string, DetectedCandidateSecret>()
+
+  const pruneDetectedCandidates = (now = Date.now()): void => {
+    for (const [id, entry] of detectedCandidates.entries()) {
+      if (entry.expiresAt <= now) {
+        detectedCandidates.delete(id)
+      }
+    }
+    while (detectedCandidates.size > DETECTED_CANDIDATE_MAX) {
+      const oldest = detectedCandidates.keys().next().value
+      if (oldest === undefined) break
+      detectedCandidates.delete(oldest)
+    }
+  }
+
+  const storeDetectedCandidate = (entry: Omit<DetectedCandidateSecret, 'expiresAt'>): string => {
+    const now = Date.now()
+    pruneDetectedCandidates(now)
+    const id = `cand_${randomUUID()}`
+    detectedCandidates.set(id, { ...entry, expiresAt: now + DETECTED_CANDIDATE_TTL_MS })
+    pruneDetectedCandidates(now)
+    return id
+  }
+
+  const getDetectedCandidate = (candidateId: string): DetectedCandidateSecret | undefined => {
+    const now = Date.now()
+    const entry = detectedCandidates.get(candidateId)
+    if (!entry) return undefined
+    if (entry.expiresAt <= now) {
+      detectedCandidates.delete(candidateId)
+      return undefined
+    }
+    return entry
+  }
 
   const isLiveDesktopHost = Boolean(orca.host && typeof orca.host.call === 'function')
   if (isLiveDesktopHost) {
@@ -136,6 +220,20 @@ export function registerConnectionHandlers({
       }
     }
 
+    const libsqlSaveCandidate =
+      input.profile.driver === 'libsql' ? resolveLibsqlEndpointCandidate(input.profile) : ''
+    if (input.profile.driver === 'libsql' && libsqlSaveCandidate) {
+      const checked = validateLibsqlEndpointUrl(libsqlSaveCandidate, {
+        hasAuthToken: Boolean(
+          (typeof input.authToken === 'string' && input.authToken.trim().length > 0) ||
+            input.profile.hasAuthToken
+        ),
+      })
+      if (!checked.ok) {
+        throw createHostError('invalid_params', checked.error)
+      }
+    }
+
     const normalized = await normalizeSqliteProfile(input.profile)
     const id =
       normalized.id && !normalized.id.startsWith('ws_')
@@ -145,6 +243,10 @@ export function registerConnectionHandlers({
       normalized.driver === 'd1' &&
       typeof normalized.url === 'string' &&
       isD1HttpLoopbackEndpoint(normalized.url)
+    const libsqlHttpLoopback =
+      normalized.driver === 'libsql' &&
+      libsqlSaveCandidate.length > 0 &&
+      isD1HttpLoopbackEndpoint(libsqlSaveCandidate)
 
     const rawProfile = input.profile as unknown as Record<string, unknown>
     const hasOwn = (key: string): boolean => Object.prototype.hasOwnProperty.call(rawProfile, key)
@@ -168,6 +270,25 @@ export function registerConnectionHandlers({
             'invalid_params',
             'Cloudflare D1 cannot send an API token over plain HTTP; use an HTTPS endpoint or remove the token for a localhost/loopback emulator.'
           )
+        }
+      }
+      if (libsqlHttpLoopback) {
+        let effectiveToken: string | undefined
+        if (input.authToken !== undefined) {
+          effectiveToken = input.authToken
+        } else {
+          if (input.sourceConnectionId) {
+            effectiveToken = await sessionManager.getSecret(input.sourceConnectionId, 'libsql')
+          }
+          if (!effectiveToken) {
+            effectiveToken = await sessionManager.getSecret(id, 'libsql')
+          }
+        }
+        if (effectiveToken && effectiveToken.trim().length > 0) {
+          const checked = validateLibsqlEndpointUrl(libsqlSaveCandidate, { hasAuthToken: true })
+          if (!checked.ok) {
+            throw createHostError('invalid_params', checked.error)
+          }
         }
       }
 
@@ -272,6 +393,7 @@ export function registerConnectionHandlers({
       }
 
       await sessionManager.closeSession(id)
+      schemaCache?.invalidateConnection(id)
 
       orca.panels.post('connections.changed', { count: list.length })
       return { ok: true, id }
@@ -292,6 +414,7 @@ export function registerConnectionHandlers({
       }
       await sessionManager.deleteSecret(input.id)
       await sessionManager.closeSession(input.id)
+      schemaCache?.invalidateConnection(input.id)
 
       const validUpdated = updated.filter(
         (c) => c && typeof c.id === 'string' && c.id.length > 0 && !c.id.startsWith('ws_')
@@ -356,6 +479,20 @@ export function registerConnectionHandlers({
       }
     }
 
+    if (normalized.driver === 'libsql') {
+      const libsqlTestCandidate = resolveLibsqlEndpointCandidate(normalized)
+      if (libsqlTestCandidate) {
+        const checked = validateLibsqlEndpointUrl(libsqlTestCandidate, {
+          hasAuthToken: Boolean(
+            (typeof secret === 'string' && secret.trim().length > 0) || normalized.hasAuthToken
+          ),
+        })
+        if (!checked.ok) {
+          throw createHostError('invalid_params', checked.error)
+        }
+      }
+    }
+
     const storedSecrets = secretLookupId
       ? await sessionManager.getExtendedSecrets(secretLookupId)
       : {}
@@ -377,10 +514,33 @@ export function registerConnectionHandlers({
           ? storedSecrets.sshPassword
           : undefined),
     }
-    return await sessionManager.testConnection(normalized, secret, extraSecrets)
+    try {
+      const result = await sessionManager.testConnection(normalized, secret, extraSecrets)
+      if (!result.ok && typeof result.message === 'string') {
+        return {
+          ...result,
+          message: appendActionableTlsErrorHint(scrubCredentialsInText(result.message)),
+        }
+      }
+      return result
+    } catch (err: unknown) {
+      throw scrubAndEnhanceWorkerError(err)
+    }
   })
 
   registerHandler('connection.parseUri', async (input) => {
+    const candidateId = typeof input?.candidateId === 'string' ? input.candidateId.trim() : ''
+    if (candidateId) {
+      const candidate = getDetectedCandidate(candidateId)
+      if (!candidate) {
+        return {
+          ok: false,
+          error: 'Detected connection candidate expired. Run Auto-Detect again.',
+        }
+      }
+      const rawTarget = candidate.rawUri ?? candidate.rawUrl ?? ''
+      return parseConnectionUri(rawTarget)
+    }
     const rawUri = typeof input?.uri === 'string' ? input.uri : ''
     return parseConnectionUri(rawUri)
   })
@@ -419,6 +579,7 @@ export function registerConnectionHandlers({
   })
 
   registerHandler('workspace.detectConnections', async (input) => {
+    pruneDetectedCandidates()
     const stored = await sessionManager.getStoredConnections()
     const rawFolder = input?.folderPath?.trim()
     let targetDirs: string[] = []
@@ -449,15 +610,76 @@ export function registerConnectionHandlers({
       }),
     ])
 
-    return {
+    const maskedEnvConnections = envConnections.map((item) => {
+      const candidateId = storeDetectedCandidate({ kind: 'env', rawUri: item.uri })
+      return {
+        ...item,
+        candidateId,
+        uri: maskConnectionUriSecret(item.uri),
+      }
+    })
+
+    const maskedDockerComposeConnections = dockerComposeConnections.map((item) => {
+      const hasPassword = Boolean(item.password)
+      const candidateId = storeDetectedCandidate({
+        kind: 'docker',
+        rawPassword: item.password,
+        rawUrl: item.url,
+      })
+      return {
+        ...item,
+        candidateId,
+        password: undefined,
+        hasPassword,
+        url: item.url ? maskConnectionUriSecret(item.url) : undefined,
+      }
+    })
+
+    const folderScoped = Boolean(rawFolder)
+    const dockerLocality = detectDockerTargetLocality()
+    const detectResult = {
       sqliteFiles: items.map((d) => ({
         name: d.name.replace(/\s*\(Workspace\)$/, ''),
         filePath: d.filePath,
         sizeBytes: d.sizeBytes ?? 0,
         sizeLabel: d.sizeLabel || formatByteSize(d.sizeBytes ?? 0),
       })),
-      envConnections,
-      dockerComposeConnections,
+      envConnections: maskedEnvConnections,
+      dockerComposeConnections: maskedDockerComposeConnections,
+      scannedDirs: targetDirs,
+      folderScoped,
+      dockerIsLocal: dockerLocality.isLocal,
+      dockerScopeLabel: dockerLocality.contextLabel,
+    }
+    return detectResult
+  })
+
+  registerHandler('workspace.resolveDetectedCandidate', async (input) => {
+    const candidateId = typeof input?.candidateId === 'string' ? input.candidateId.trim() : ''
+    if (!candidateId) {
+      return { ok: false }
+    }
+    const candidate = getDetectedCandidate(candidateId)
+    if (!candidate) {
+      return { ok: false }
+    }
+    if (candidate.kind === 'env' && candidate.rawUri) {
+      const parsed = parseConnectionUri(candidate.rawUri)
+      return {
+        ok: parsed.ok,
+        parsed,
+        password: parsed.password,
+        authToken: parsed.authToken,
+        url: parsed.profile?.url,
+      }
+    }
+    const parsed = candidate.rawUrl ? parseConnectionUri(candidate.rawUrl) : undefined
+    return {
+      ok: true,
+      parsed,
+      password: candidate.rawPassword ?? parsed?.password,
+      authToken: parsed?.authToken,
+      url: candidate.rawUrl,
     }
   })
 
@@ -599,4 +821,10 @@ export function registerConnectionHandlers({
       dataCache: input?.dataCache,
     })
   })
+
+  return {
+    clearDetectedCandidates: () => {
+      detectedCandidates.clear()
+    },
+  }
 }

@@ -1,5 +1,10 @@
 import type { DatabaseDriverType } from '../../protocol'
-import { isCloudDatabaseHost } from './connection-uri'
+import {
+  detectRedisCredentialCommand,
+  findCredentialAuthorityAtIndex,
+  scrubSensitiveText,
+} from '../../shared-sql-safety.js'
+import { isCloudDatabaseHost, splitCommaSeedAuthority } from './connection-uri'
 import {
   isIdentContChar,
   isIdentStartChar,
@@ -38,6 +43,12 @@ const DB_SPECIFIC_SCHEMES: ReadonlySet<string> = new Set([
   'd1',
   'd1+http',
   'd1+https',
+  'mssql',
+  'sqlserver',
+  'oracle',
+  'oracledb',
+  'mongodb',
+  'mongodb+srv',
 ])
 
 const HTTP_SCHEMES: ReadonlySet<string> = new Set(['http', 'https'])
@@ -399,21 +410,42 @@ function hasAccountAuthLiteral(tokens: SqlToken[]): boolean {
 }
 
 function tryParseUrlSafely(rawUri: string): URL | null {
+  let direct: URL | null = null
   try {
-    return new URL(rawUri)
+    direct = new URL(rawUri)
   } catch {
-    const match =
-      /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^:/?#\s@]*):(.*)@((?:\[[0-9a-fA-F:%.]+\]|[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?)(?::\d{1,5})?(?:\/[^?#@]*)?(?:\?[^@]*)?(?:#[^@]*)?)$/.exec(
-        rawUri
-      )
-    if (!match) return null
-    try {
-      const encodedPass = encodeURIComponent(safeDecodeComponent(match[2]))
-      return new URL(`${match[1]}:${encodedPass}@${match[3]}`)
-    } catch {
-      return null
+    direct = null
+  }
+  if (
+    direct &&
+    direct.password.length > 0 &&
+    !(direct.hash.includes('@') && !/^#[^#@=]*=/.test(direct.hash))
+  ) {
+    return direct
+  }
+
+  const schemeEnd = rawUri.indexOf('://')
+  if (schemeEnd > 0) {
+    const schemePrefix = rawUri.slice(0, schemeEnd + 3)
+    const body = rawUri.slice(schemeEnd + 3)
+    const colonIdx = body.search(/[:/?#@[\]]/)
+    if (colonIdx >= 0 && body[colonIdx] === ':') {
+      const atIdx = findCredentialAuthorityAtIndex(schemePrefix, body, colonIdx)
+      if (atIdx > colonIdx) {
+        const user = body.slice(0, colonIdx)
+        const rawPass = body.slice(colonIdx + 1, atIdx)
+        const { primaryHostAndRest } = splitCommaSeedAuthority(body.slice(atIdx + 1))
+        try {
+          const encodedPass = encodeURIComponent(safeDecodeComponent(rawPass))
+          return new URL(`${schemePrefix}${user}:${encodedPass}@${primaryHostAndRest}`)
+        } catch {
+          // Fall through to direct URL if any
+        }
+      }
     }
   }
+
+  return direct
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -429,7 +461,6 @@ function isLoopbackHost(hostname: string): boolean {
 function inspectCandidateUri(rawUri: string, dialect?: DatabaseDriverType): boolean {
   const cleaned = rawUri.replace(/[),;]+$/, '')
   const schemeEnd = cleaned.indexOf('://')
-  if (schemeEnd <= 0) return false
   const scheme = cleaned.slice(0, schemeEnd).toLowerCase()
 
   const isExplicitDbScheme = DB_SPECIFIC_SCHEMES.has(scheme)
@@ -596,29 +627,37 @@ export function detectRecognizableSqlCredential(
   dialect?: DatabaseDriverType
 ): SqlCredentialMatchKind | null {
   if (typeof sql !== 'string' || sql.trim().length === 0) return null
-  try {
-    if (dialect !== undefined) {
-      return evaluateScannedStatements(scanStatements(sql, dialect), dialect)
-    }
-    // When dialect is omitted, scan under both PG/ANSI and MySQL lexical rules
-    const pgMatch = evaluateScannedStatements(
-      scanStatements(sql, undefined, {
-        hashComments: false,
-        backslashInPlainStrings: false,
-        nestedBlockComments: true,
-      }),
-      undefined
-    )
-    if (pgMatch !== null) return pgMatch
-    return evaluateScannedStatements(
-      scanStatements(sql, undefined, {
-        hashComments: true,
-        backslashInPlainStrings: true,
-        nestedBlockComments: false,
-      }),
-      undefined
-    )
-  } catch {
-    return null
+  if ((dialect === 'redis' || dialect === undefined) && detectRedisCredentialCommand(sql)) {
+    return 'sql-auth-literal'
   }
+  if (dialect !== undefined) {
+    return evaluateScannedStatements(scanStatements(sql, dialect), dialect)
+  }
+  // When dialect is omitted, scan under both PG/ANSI and MySQL lexical rules
+  const pgMatch = evaluateScannedStatements(
+    scanStatements(sql, undefined, {
+      hashComments: false,
+      backslashInPlainStrings: false,
+      nestedBlockComments: true,
+    }),
+    undefined
+  )
+  if (pgMatch !== null) return pgMatch
+  return evaluateScannedStatements(
+    scanStatements(sql, undefined, {
+      hashComments: true,
+      backslashInPlainStrings: true,
+      nestedBlockComments: false,
+    }),
+    undefined
+  )
+}
+
+/**
+ * Redacts embedded URI passwords, genuine sensitive query/fragment parameters (while
+ * preserving non-secret auth config keys like `authSource`/`authMechanism`/`authType`),
+ * Bearer/Basic tokens, and ADO.NET password attributes (including `{...}` / JSON-escaped values).
+ */
+export function scrubDriverErrorText(input: string): string {
+  return scrubSensitiveText(input, { stripAllFragments: true })
 }

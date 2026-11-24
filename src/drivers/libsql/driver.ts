@@ -1,3 +1,6 @@
+import * as net from 'node:net'
+import { validateLibsqlEndpointUrl } from '../common/connection-uri'
+import { scrubDriverErrorText } from '../common/sql-credentials'
 import type {
   ApplyChangesParams,
   ApplyChangesResult,
@@ -49,6 +52,65 @@ import {
 import { stripLeadingSqlComments } from '../common/sql-lexer'
 
 const LIBSQL_HTTP_TIMEOUT_MS = 30_000
+const MAX_LIBSQL_RESPONSE_BYTES = 32 * 1024 * 1024
+
+async function readBoundedResponseText(response: Response, maxBytes: number): Promise<string> {
+  const clHeader = response.headers?.get?.('content-length')
+  if (clHeader) {
+    const declared = Number(clHeader)
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      await response.body?.cancel?.().catch(() => {})
+      throw new DatabaseDriverError(
+        `LibSQL HTTP response (${declared} bytes) exceeded the ${maxBytes}-byte safety limit.`,
+        'RESPONSE_TOO_LARGE',
+        'libsql'
+      )
+    }
+  }
+
+  if (response.body && typeof response.body.getReader === 'function') {
+    const reader = response.body.getReader()
+    const chunks: Uint8Array[] = []
+    let totalBytes = 0
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (value) {
+          totalBytes += value.byteLength
+          if (totalBytes > maxBytes) {
+            await reader.cancel().catch(() => {})
+            throw new DatabaseDriverError(
+              `LibSQL HTTP response exceeded the ${maxBytes}-byte safety limit.`,
+              'RESPONSE_TOO_LARGE',
+              'libsql'
+            )
+          }
+          chunks.push(value)
+        }
+      }
+    } finally {
+      reader.releaseLock()
+    }
+    const decoder = new TextDecoder('utf-8')
+    let text = ''
+    for (const chunk of chunks) {
+      text += decoder.decode(chunk, { stream: true })
+    }
+    text += decoder.decode()
+    return text
+  }
+
+  const text = await response.text()
+  if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+    throw new DatabaseDriverError(
+      `LibSQL HTTP response exceeded the ${maxBytes}-byte safety limit.`,
+      'RESPONSE_TOO_LARGE',
+      'libsql'
+    )
+  }
+  return text
+}
 const LIBSQL_UNSUPPORTED_TX_REASON =
   'LibSQL does not support interactive multi-statement transactions'
 
@@ -113,7 +175,28 @@ interface HranaPipelineRawResponse {
   results?: HranaPipelineResponseItem[]
 }
 
-function resolveLibsqlPipelineUrl(profile: ConnectionProfile): string {
+const HRANA_CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]/
+
+function isIpLiteralHostname(hostname: string): boolean {
+  const clean = hostname.trim().replace(/^\[|\]$/g, '')
+  if (!clean) return false
+  if (net.isIP(clean) !== 0) return true
+  return /^\d+(?:\.\d+){3}$/.test(clean)
+}
+
+function formatHranaErrorMessage(message: string | undefined, fallback: string): string {
+  const msg = scrubLibsqlErrorText((message || '').trim())
+  if (msg.includes('__datanoa_fk_violation__')) {
+    return 'FOREIGN KEY constraint failed'
+  }
+  return msg || fallback
+}
+
+function scrubLibsqlErrorText(input: string): string {
+  return scrubDriverErrorText(input)
+}
+
+function resolveLibsqlPipelineUrl(profile: ConnectionProfile, authToken?: string): string {
   let raw = (profile.url || '').trim()
   if (!raw && profile.host) {
     const proto = profile.ssl === false ? 'http' : 'https'
@@ -132,17 +215,24 @@ function resolveLibsqlPipelineUrl(profile: ConnectionProfile): string {
   const preferredProto = profile.ssl === false ? 'http' : 'https'
   if (/^libsql:\/\//i.test(raw)) {
     raw = raw.replace(/^libsql:\/\//i, `${preferredProto}://`)
-  } else if (!/^https?:\/\//i.test(raw)) {
+  } else if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) {
     raw = `${preferredProto}://${raw}`
+  }
+
+  const validated = validateLibsqlEndpointUrl(raw, {
+    hasAuthToken: Boolean((authToken && authToken.trim().length > 0) || profile.hasAuthToken),
+  })
+  if (!validated.ok) {
+    throw new DatabaseDriverError(validated.error, 'INVALID_ENDPOINT', 'libsql')
   }
 
   let parsed: URL
   try {
-    parsed = new URL(raw)
+    parsed = new URL(validated.url)
   } catch (err) {
     throw new DatabaseDriverError(
-      `Invalid LibSQL URL: ${raw}`,
-      'invalid_params',
+      'Invalid LibSQL endpoint URL',
+      'INVALID_ENDPOINT',
       'libsql',
       err
     )
@@ -285,7 +375,7 @@ export class LibsqlSession implements IDatabaseSession {
   constructor(profile: ConnectionProfile, authToken?: string) {
     this.profile = profile
     this.authToken = authToken
-    this.pipelineUrl = resolveLibsqlPipelineUrl(profile)
+    this.pipelineUrl = resolveLibsqlPipelineUrl(profile, authToken)
   }
 
   isAlive(): boolean {
@@ -302,11 +392,91 @@ export class LibsqlSession implements IDatabaseSession {
     return headers
   }
 
-  private resolveTargetUrl(baseUrl?: string | null): string {
+  resolveTargetUrl(baseUrl?: string | null): string {
     if (!baseUrl) return this.pipelineUrl
-    const cleaned = baseUrl.trim().replace(/\/+$/, '')
-    if (!cleaned) return this.pipelineUrl
-    return cleaned.endsWith('/v2/pipeline') ? cleaned : `${cleaned}/v2/pipeline`
+    const raw = baseUrl.trim()
+    if (!raw) return this.pipelineUrl
+    if (HRANA_CONTROL_CHARS_RE.test(raw)) {
+      throw new DatabaseDriverError(
+        'LibSQL Hrana base_url must not contain control characters',
+        'INVALID_ENDPOINT',
+        'libsql'
+      )
+    }
+
+    let initial: URL
+    let next: URL
+    try {
+      initial = new URL(this.pipelineUrl)
+      next = new URL(raw)
+    } catch (err) {
+      throw new DatabaseDriverError(
+        'Invalid LibSQL Hrana base_url',
+        'INVALID_ENDPOINT',
+        'libsql',
+        err
+      )
+    }
+
+    if (next.protocol !== 'https:' && next.protocol !== 'http:') {
+      throw new DatabaseDriverError(
+        `Unsupported LibSQL Hrana base_url scheme "${next.protocol}"`,
+        'INVALID_ENDPOINT',
+        'libsql'
+      )
+    }
+    if (initial.protocol === 'https:' && next.protocol !== 'https:') {
+      throw new DatabaseDriverError(
+        'LibSQL Hrana base_url cannot downgrade from HTTPS to HTTP',
+        'INVALID_ENDPOINT',
+        'libsql'
+      )
+    }
+    if (next.username || next.password || next.search || next.hash || raw.includes('?') || raw.includes('#')) {
+      throw new DatabaseDriverError(
+        'LibSQL Hrana base_url must not include userinfo, query parameters, or hash fragments',
+        'INVALID_ENDPOINT',
+        'libsql'
+      )
+    }
+
+    const sameOrigin = next.origin === initial.origin
+    if (!sameOrigin) {
+      const initialHost = initial.hostname.toLowerCase()
+      const nextHost = next.hostname.toLowerCase()
+      const isTursoManagedHost =
+        initialHost.endsWith('.turso.io') && initialHost.length > '.turso.io'.length
+      const suffix = `.${initialHost}`
+      const replicaPrefix = nextHost.endsWith(suffix)
+        ? nextHost.slice(0, -suffix.length)
+        : ''
+      const isSingleLabelReplica =
+        replicaPrefix.length > 0 &&
+        !replicaPrefix.includes('.') &&
+        /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(replicaPrefix)
+      const isTrustedTursoReplica =
+        isTursoManagedHost &&
+        initial.protocol === 'https:' &&
+        next.protocol === 'https:' &&
+        initial.port === '' &&
+        next.port === '' &&
+        !isIpLiteralHostname(initialHost) &&
+        !isIpLiteralHostname(nextHost) &&
+        isSingleLabelReplica
+      if (!isTrustedTursoReplica) {
+        throw new DatabaseDriverError(
+          'Untrusted LibSQL Hrana base_url origin',
+          'INVALID_ENDPOINT',
+          'libsql'
+        )
+      }
+    }
+
+    const cleanPath = next.pathname.replace(/\/+$/, '')
+    const pipelinePath = cleanPath.endsWith('/v2/pipeline')
+      ? cleanPath
+      : `${cleanPath}/v2/pipeline`
+    return `${next.origin}${pipelinePath}`
   }
 
   private async sendHranaPipeline(
@@ -325,6 +495,7 @@ export class LibsqlSession implements IDatabaseSession {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'libsql')
     }
 
+    const targetUrl = this.resolveTargetUrl(options?.baseUrl)
     const payload: Record<string, unknown> = { requests }
     if (options?.baton) {
       payload.baton = options.baton
@@ -333,10 +504,11 @@ export class LibsqlSession implements IDatabaseSession {
     const combinedSignal = buildCombinedAbortSignal(LIBSQL_HTTP_TIMEOUT_MS, options?.signal)
     let response: Response
     try {
-      response = await fetch(this.resolveTargetUrl(options?.baseUrl), {
+      response = await fetch(targetUrl, {
         method: 'POST',
         headers: this.buildHeaders(),
         body: JSON.stringify(payload),
+        redirect: 'error',
         signal: combinedSignal,
       })
     } catch (err: unknown) {
@@ -353,17 +525,19 @@ export class LibsqlSession implements IDatabaseSession {
         )
       }
       throw new DatabaseDriverError(
-        err instanceof Error ? err.message : 'LibSQL HTTP request failed',
+        err instanceof Error
+          ? scrubLibsqlErrorText(err.message) || 'LibSQL HTTP request failed'
+          : 'LibSQL HTTP request failed',
         'CONNECTION_FAILED',
         'libsql',
         err
       )
     }
 
-    const rawText = await response.text()
+    const rawText = await readBoundedResponseText(response, MAX_LIBSQL_RESPONSE_BYTES)
     if (!response.ok) {
       throw new DatabaseDriverError(
-        rawText.trim() || `LibSQL HTTP error ${response.status}`,
+        scrubLibsqlErrorText(rawText.trim()) || `LibSQL HTTP error ${response.status}`,
         'LIBSQL_ERROR',
         'libsql'
       )
@@ -374,19 +548,24 @@ export class LibsqlSession implements IDatabaseSession {
       parsed = JSON.parse(rawText) as HranaPipelineRawResponse
     } catch (err) {
       throw new DatabaseDriverError(
-        `Invalid LibSQL Hrana response: ${err instanceof Error ? err.message : String(err)}`,
+        `Invalid LibSQL Hrana response: ${scrubLibsqlErrorText(err instanceof Error ? err.message : String(err))}`,
         'LIBSQL_PARSE_ERROR',
         'libsql',
         err
       )
     }
 
+    const nextBaseUrl =
+      typeof parsed.base_url === 'string' && parsed.base_url.trim().length > 0
+        ? parsed.base_url.trim()
+        : options?.baseUrl ?? null
+    if (nextBaseUrl) {
+      this.resolveTargetUrl(nextBaseUrl)
+    }
+
     return {
       baton: typeof parsed.baton === 'string' && parsed.baton.length > 0 ? parsed.baton : null,
-      baseUrl:
-        typeof parsed.base_url === 'string' && parsed.base_url.length > 0
-          ? parsed.base_url
-          : options?.baseUrl ?? null,
+      baseUrl: nextBaseUrl,
       results: Array.isArray(parsed.results) ? parsed.results : [],
     }
   }
@@ -409,7 +588,7 @@ export class LibsqlSession implements IDatabaseSession {
       }
       if (item.type === 'error') {
         throw new DatabaseDriverError(
-          item.error?.message || 'LibSQL statement execution failed',
+          formatHranaErrorMessage(item.error?.message, 'LibSQL statement execution failed'),
           item.error?.code || 'LIBSQL_ERROR',
           'libsql'
         )
@@ -499,7 +678,10 @@ export class LibsqlSession implements IDatabaseSession {
       dialect: 'libsql',
       schemaName: targetSchema,
       objects,
-      getObjectDdl: (object) => this.getObjectDdl(object.name, object.kind, targetSchema),
+      getObjectDdl: (object) =>
+        object.kind === 'table' || object.kind === 'view'
+          ? this.fetchTableOrViewDdl(object.name, targetSchema, false)
+          : this.getObjectDdl(object.name, object.kind, targetSchema),
     })
   }
 
@@ -691,7 +873,7 @@ export class LibsqlSession implements IDatabaseSession {
         }).catch(() => {})
       }
       throw new DatabaseDriverError(
-        beginItem?.error?.message || 'Failed to begin LibSQL transaction',
+        formatHranaErrorMessage(beginItem?.error?.message, 'Failed to begin LibSQL transaction'),
         beginItem?.error?.code || 'LIBSQL_ERROR',
         'libsql'
       )
@@ -708,7 +890,7 @@ export class LibsqlSession implements IDatabaseSession {
       if (item.type === 'error') {
         await rollbackAndClose()
         throw new DatabaseDriverError(
-          item.error?.message || 'LibSQL statement execution failed',
+          formatHranaErrorMessage(item.error?.message, 'LibSQL statement execution failed'),
           item.error?.code || 'LIBSQL_ERROR',
           'libsql'
         )
@@ -762,7 +944,7 @@ export class LibsqlSession implements IDatabaseSession {
     const commitItem = commitRes.results[0]
     if (!commitItem || commitItem.type === 'error') {
       throw new DatabaseDriverError(
-        commitItem?.error?.message || 'Failed to commit LibSQL transaction',
+        formatHranaErrorMessage(commitItem?.error?.message, 'Failed to commit LibSQL transaction'),
         commitItem?.error?.code || 'LIBSQL_ERROR',
         'libsql'
       )
@@ -780,6 +962,14 @@ export class LibsqlSession implements IDatabaseSession {
   }
 
   async getDdl(table: string, schema?: string): Promise<string> {
+    return this.fetchTableOrViewDdl(table, schema, true)
+  }
+
+  private async fetchTableOrViewDdl(
+    table: string,
+    schema: string | undefined,
+    includeTriggers: boolean
+  ): Promise<string> {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'libsql')
     }
@@ -788,14 +978,15 @@ export class LibsqlSession implements IDatabaseSession {
       targetSchema && targetSchema.toLowerCase() !== 'main'
         ? `${quoteIdentForDialect(targetSchema, 'libsql')}.sqlite_master`
         : 'sqlite_master'
+    const attachedTypes = includeTriggers ? "'index', 'trigger'" : "'index'"
 
     const rows = await this.queryExecutor(
       `
         SELECT type, sql
         FROM ${masterTable}
-        WHERE ((type IN ('table', 'view') AND name = ?) OR (type = 'index' AND tbl_name = ?))
+        WHERE ((type IN ('table', 'view') AND name = ?) OR (type IN (${attachedTypes}) AND tbl_name = ?))
           AND sql IS NOT NULL
-        ORDER BY CASE WHEN type IN ('table', 'view') THEN 0 ELSE 1 END, name ASC;
+        ORDER BY CASE WHEN type IN ('table', 'view') THEN 0 WHEN type = 'index' THEN 1 ELSE 2 END, name ASC;
       `,
       [table, table]
     )
@@ -916,7 +1107,7 @@ export class LibsqlSession implements IDatabaseSession {
         }
         if (batchItem.type === 'error') {
           throw new DatabaseDriverError(
-            batchItem.error?.message || 'LibSQL batch execution failed',
+            formatHranaErrorMessage(batchItem.error?.message, 'LibSQL batch execution failed'),
             batchItem.error?.code || 'LIBSQL_ERROR',
             'libsql'
           )
@@ -927,7 +1118,7 @@ export class LibsqlSession implements IDatabaseSession {
           const stepErr = stepErrors[i]
           if (stepErr) {
             throw new DatabaseDriverError(
-              stepErr.message || 'LibSQL statement execution failed',
+              formatHranaErrorMessage(stepErr.message, 'LibSQL statement execution failed'),
               stepErr.code || 'LIBSQL_ERROR',
               'libsql'
             )

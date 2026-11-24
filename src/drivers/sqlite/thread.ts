@@ -30,6 +30,25 @@ function getTransactionStatePayload(): {
   }
 }
 
+function beginManualTransaction(
+  database: DatabaseSync,
+  mode: 'BEGIN;' | 'BEGIN IMMEDIATE;' = 'BEGIN;'
+): void {
+  database.exec(mode)
+  inManualTx = true
+  txStatementCount = 0
+  txStartedAt = Date.now()
+}
+
+function ensureManualTxIfAutoCommitOff(
+  database: DatabaseSync,
+  mode: 'BEGIN;' | 'BEGIN IMMEDIATE;' = 'BEGIN;'
+): boolean {
+  if (autoCommit || inManualTx) return false
+  beginManualTransaction(database, mode)
+  return true
+}
+
 function compactSql(sql: string, maxLength = 80): string {
   const compact = sql.replace(/\s+/g, ' ').trim()
   return compact.length > maxLength ? `${compact.slice(0, maxLength - 3)}...` : compact
@@ -58,13 +77,23 @@ function stripLeadingSqlComments(sql: string): string {
 function extractSqliteErrorInfo(err: unknown): { message: string; code: string; stack?: string } {
   if (err && typeof err === 'object') {
     const rec = err as { message?: unknown; code?: unknown; stack?: unknown }
+    const rawMsg = typeof rec.message === 'string' && rec.message ? rec.message : String(err)
+    const isFkSentinel = rawMsg.includes('__datanoa_fk_violation__')
     return {
-      message: typeof rec.message === 'string' && rec.message ? rec.message : String(err),
-      code: typeof rec.code === 'string' && rec.code ? rec.code : 'SQLITE_ERROR',
+      message: isFkSentinel ? 'FOREIGN KEY constraint failed' : rawMsg,
+      code: isFkSentinel
+        ? 'SQLITE_CONSTRAINT_FOREIGNKEY'
+        : typeof rec.code === 'string' && rec.code
+          ? rec.code
+          : 'SQLITE_ERROR',
       stack: typeof rec.stack === 'string' ? rec.stack : undefined,
     }
   }
-  return { message: String(err), code: 'SQLITE_ERROR' }
+  const rawStr = String(err)
+  if (rawStr.includes('__datanoa_fk_violation__')) {
+    return { message: 'FOREIGN KEY constraint failed', code: 'SQLITE_CONSTRAINT_FOREIGNKEY' }
+  }
+  return { message: rawStr, code: 'SQLITE_ERROR' }
 }
 
 export function normalizeSqliteParam(val: unknown): SQLInputValue {
@@ -190,15 +219,20 @@ workerPort.on('message', (msg: WorkerRequest) => {
     }
 
     if (msg.type === 'run') {
+      ensureManualTxIfAutoCommitOff(db, 'BEGIN;')
       const stmt = db.prepare(msg.sql)
       const params = normalizeSqliteParams(msg.params)
       const res = stmt.run(...params)
+      if (inManualTx) {
+        txStatementCount += 1
+      }
       workerPort.postMessage({
         id: msg.id,
         ok: true,
         data: {
           changes: Number(res.changes ?? 0),
           lastInsertRowid: normalizeSqliteOutputValue(res.lastInsertRowid),
+          txState: getTransactionStatePayload(),
         },
       })
       return
@@ -229,10 +263,7 @@ workerPort.on('message', (msg: WorkerRequest) => {
       if (inManualTx) {
         throw new Error('Transaction is already active')
       }
-      db.exec('BEGIN;')
-      inManualTx = true
-      txStatementCount = 0
-      txStartedAt = Date.now()
+      beginManualTransaction(db, 'BEGIN;')
       workerPort.postMessage({ id: msg.id, ok: true, data: getTransactionStatePayload() })
       return
     }
@@ -275,6 +306,7 @@ workerPort.on('message', (msg: WorkerRequest) => {
     }
 
     if (msg.type === 'applyBatch') {
+      ensureManualTxIfAutoCommitOff(db, 'BEGIN IMMEDIATE;')
       const isNested = inManualTx
       if (isNested) {
         db.exec('SAVEPOINT datanoa_apply_batch;')
@@ -357,15 +389,20 @@ workerPort.on('message', (msg: WorkerRequest) => {
       const boundParams = execList.length === 1 ? normalizeSqliteParams(msg.params) : []
       const maxRows = msg.maxRows && msg.maxRows > 0 ? msg.maxRows : 1000
 
+      const isMultiStmtRebuild =
+        execList.length > 1 &&
+        execList.some((s) => /^PRAGMA\s+foreign_keys\s*=\s*(?:OFF|0|FALSE|NO)\b/i.test(stripLeadingSqlComments(s))) &&
+        execList.some((s) => /^(?:BEGIN|START\s+TRANSACTION)\b/i.test(stripLeadingSqlComments(s)))
+      if (isMultiStmtRebuild && (inManualTx || !autoCommit)) {
+        throw new Error(
+          'Cannot rebuild SQLite table while a manual transaction is active (SQLite ignores PRAGMA foreign_keys = OFF inside a transaction). Commit or rollback the transaction first.'
+        )
+      }
+
       // When !autoCommit and not yet in tx, auto-begin before running query
-      if (!autoCommit && !inManualTx) {
-        const firstStmt = stripLeadingSqlComments(execList[0] || '')
-        if (!/^(?:BEGIN|START\s+TRANSACTION)\b/i.test(firstStmt)) {
-          db.exec('BEGIN;')
-          inManualTx = true
-          txStatementCount = 0
-          txStartedAt = Date.now()
-        }
+      const firstStmt = stripLeadingSqlComments(execList[0] || '')
+      if (!/^(?:BEGIN|START\s+TRANSACTION)\b/i.test(firstStmt)) {
+        ensureManualTxIfAutoCommitOff(db, 'BEGIN;')
       }
 
       let totalAffectedRows = 0
@@ -396,7 +433,8 @@ workerPort.on('message', (msg: WorkerRequest) => {
             txStartedAt = Date.now()
             startedTx = true
           }
-          if (/^PRAGMA\s+foreign_keys\b/i.test(normalizedStmt)) {
+          const isFkPragmaSet = /^PRAGMA\s+foreign_keys\s*=/i.test(normalizedStmt)
+          if (isFkPragmaSet && execList.length > 1) {
             touchedForeignKeys = true
           }
 
@@ -419,6 +457,16 @@ workerPort.on('message', (msg: WorkerRequest) => {
               rows.push(normalizeSqliteArrayRow(row))
             }
 
+            if (
+              execList.length > 1 &&
+              rows.length > 0 &&
+              /^PRAGMA\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?foreign_key_check(?:\s*\(|\s*;|\s*$)/i.test(
+                normalizedStmt
+              )
+            ) {
+              throw new Error('FOREIGN KEY constraint failed')
+            }
+
             lastRowResult = {
               isSelect: true,
               columns: cols,
@@ -439,6 +487,16 @@ workerPort.on('message', (msg: WorkerRequest) => {
             })
           } else {
             const res = stmt.run(...boundParams)
+            if (isFkPragmaSet && execList.length === 1 && !inManualTx) {
+              try {
+                const fkRow = db.prepare('PRAGMA foreign_keys;').get() as { foreign_keys?: unknown } | undefined
+                if (fkRow && fkRow.foreign_keys !== undefined) {
+                  foreignKeysEnabled = Number(fkRow.foreign_keys) === 1
+                }
+              } catch {
+                // Ignore pragma read failure
+              }
+            }
             const changes = Number(res.changes ?? 0)
             totalAffectedRows += changes
             collectedSets.push({
@@ -454,7 +512,9 @@ workerPort.on('message', (msg: WorkerRequest) => {
               isSelect: false,
             })
             const isCommit = /^(?:COMMIT|END(?:\s+TRANSACTION)?)\b/i.test(normalizedStmt)
-            const isRollback = /^ROLLBACK\b(?!\s+TO\b)/i.test(normalizedStmt)
+            const isRollback = /^ROLLBACK\b(?!\s+(?:(?:TRANSACTION|WORK)\s+)?TO\b)/i.test(
+              normalizedStmt
+            )
             if (isCommit || isRollback) {
               inManualTx = false
               txStatementCount = 0
@@ -465,6 +525,13 @@ workerPort.on('message', (msg: WorkerRequest) => {
 
           if (inManualTx && !isStandaloneBegin) {
             txStatementCount++
+          }
+        }
+        if (touchedForeignKeys) {
+          try {
+            db.exec(`PRAGMA foreign_keys = ${foreignKeysEnabled ? 'ON' : 'OFF'};`)
+          } catch {
+            // Ignore pragma restore errors
           }
         }
       } catch (queryErr: unknown) {
@@ -539,6 +606,7 @@ workerPort.on('message', (msg: WorkerRequest) => {
       id: msg.id,
       ok: false,
       error: extractSqliteErrorInfo(err),
+      ...(db ? { txState: getTransactionStatePayload() } : {}),
     })
   }
 })

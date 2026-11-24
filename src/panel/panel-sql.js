@@ -9,6 +9,7 @@ import {
   formatExportData,
   formatSelectionAsOutput,
   formatRelativeTime,
+  analyzeDangerousSql,
 } from './panel-core.js'
 import {
   PANEL_SQL_EDITOR_MIN_HEIGHT,
@@ -19,6 +20,13 @@ import {
   createPanelConsoleTabsManager,
 } from './panel-sql-tabs.js'
 import { createPanelCodeMirrorEditor } from './panel-cm.js'
+import {
+  renderAiStatusButtonContent,
+  renderSharedAiFixPanel,
+  renderSharedExplainAiPanel,
+  resolveExplainAiPhase,
+} from '../shared-ai-ui.js'
+import { resolveSqlReplacementSpan } from '../shared-sql-core.js'
 import {
   getEffectiveResultSets,
   getDefaultResultSetIndex,
@@ -41,6 +49,58 @@ import {
 
 const DEFAULT_PANEL_SQL = 'SELECT * FROM sqlite_master LIMIT 25;'
 
+export function getPanelEditorPlaceholder(driver) {
+  if (driver === 'redis') return 'SCAN 0 MATCH * COUNT 50'
+  if (driver === 'mongodb') return 'db.getCollection("users").find({}).limit(25)'
+  return 'SELECT * FROM table_name LIMIT 25;'
+}
+
+export function getPanelDangerFindingBadgeLabel(kind, driver) {
+  if (driver === 'mongodb') {
+    switch (kind) {
+      case 'delete_without_where':
+        return 'DELETE ALL DOCUMENTS'
+      case 'update_without_where':
+        return 'UPDATE ALL DOCUMENTS'
+      case 'drop':
+        return 'DROP COLLECTION / DB'
+      default:
+        return 'DESTRUCTIVE COMMAND'
+    }
+  }
+  switch (kind) {
+    case 'delete_without_where':
+      return 'DELETE WITHOUT WHERE'
+    case 'update_without_where':
+      return 'UPDATE WITHOUT WHERE'
+    case 'drop':
+      return 'DROP OBJECT'
+    case 'truncate':
+      return 'TRUNCATE TABLE'
+    default:
+      return 'DESTRUCTIVE SQL'
+  }
+}
+
+export function findMongoStatementAtOffset(script, offset) {
+  const safeScript = String(script || '')
+  if (!safeScript.trim()) return ''
+  const pos = Math.max(
+    0,
+    Math.min(Number.isFinite(offset) ? offset : safeScript.length, safeScript.length)
+  )
+  return findStatementAtOffset(safeScript, pos, 'mongodb').trim()
+}
+
+export function splitPanelTargetStatements(sql, driver) {
+  const trimmed = String(sql || '').trim()
+  if (!trimmed) return []
+  if (driver === 'redis') return [trimmed]
+  return splitSqlStatements(trimmed, driver)
+    .map((s) => s.text.trim())
+    .filter(Boolean)
+}
+
 export function createPanelSqlController(ctx) {
   const {
     state,
@@ -60,6 +120,9 @@ export function createPanelSqlController(ctx) {
     scheduleSavePanelViewState,
     savePanelDataCache,
     onFormatSql,
+    getAiStatus,
+    openAiSettingsModal,
+    onRefreshAiStatus,
   } = ctx
 
   let sqlRunSeq = 0
@@ -68,8 +131,170 @@ export function createPanelSqlController(ctx) {
   let sqlStopTimer = null
   let sortedSqlRowsCache = { res: null, colIdx: null, dir: 'ASC', rows: [] }
   let dismissedSqlBannerKey = null
+  let explainAiAbort = null
+  let explainAiSeq = 0
+  let explainAiLoadingTarget = null
+  let aiFixAbort = null
+  let aiFixSeq = 0
+  let aiFixState = null
+  let boundFixAiBtn = null
   let activeSqlBannerKey = null
   let lastSqlBannerConnId = null
+  let pendingDangerSqlConfirm = null
+  let boundDangerSqlModal = null
+
+  function getDangerFindingBadgeLabel(kind, driver) {
+    return getPanelDangerFindingBadgeLabel(kind, driver)
+  }
+
+  function closePanelDangerSqlModal() {
+    pendingDangerSqlConfirm = null
+    const modal = $('dangerSqlModal')
+    if (modal) modal.hidden = true
+  }
+
+  function ensureDangerSqlModalListeners() {
+    const modal = $('dangerSqlModal')
+    const checkEl = $('dangerSqlConfirmCheck')
+    const inputEl = $('dangerSqlConfirmInput')
+    const cancelBtn = $('dangerSqlCancelBtn')
+    const execBtn = $('dangerSqlExecuteBtn')
+    if (!modal || !cancelBtn || !execBtn || !checkEl) return false
+    if (boundDangerSqlModal === modal) return true
+    boundDangerSqlModal = modal
+
+    const syncGate = () => {
+      if (!pendingDangerSqlConfirm) return
+      const curCheck = $('dangerSqlConfirmCheck')
+      const curInput = $('dangerSqlConfirmInput')
+      const checked = Boolean(curCheck?.checked)
+      if (!pendingDangerSqlConfirm.isProd) {
+        execBtn.disabled = !checked
+        return
+      }
+      const matched = String(curInput?.value || '').trim() === 'CONFIRM'
+      execBtn.disabled = !(checked && matched)
+    }
+
+    checkEl.addEventListener('change', syncGate)
+    inputEl?.addEventListener('input', syncGate)
+    inputEl?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !execBtn.disabled) {
+        e.preventDefault()
+        execBtn.click()
+      }
+    })
+    cancelBtn.addEventListener('click', () => {
+      closePanelDangerSqlModal()
+    })
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) closePanelDangerSqlModal()
+    })
+    execBtn.addEventListener('click', () => {
+      if (execBtn.disabled || !pendingDangerSqlConfirm) return
+      const confirmFn = pendingDangerSqlConfirm.onConfirm
+      closePanelDangerSqlModal()
+      confirmFn?.()
+    })
+    return true
+  }
+
+  function openPanelDangerSqlModal({ conn, findings, sql, onConfirm }) {
+    const modal = $('dangerSqlModal')
+    const cancelBtn = $('dangerSqlCancelBtn')
+    const execBtn = $('dangerSqlExecuteBtn')
+    const checkEl = $('dangerSqlConfirmCheck')
+    const inputEl = $('dangerSqlConfirmInput')
+    const envTag = String(conn?.colorTag || '').trim().toLowerCase()
+    const isProd = envTag === 'prod' || envTag === 'production'
+    const isStaging = envTag === 'staging'
+    const connName = conn?.name || 'Active Connection'
+
+    // Fail-closed: never auto-confirm if required confirmation modal DOM is missing
+    if (!modal || !cancelBtn || !execBtn || !checkEl || (isProd && !inputEl)) {
+      pendingDangerSqlConfirm = null
+      showBanner?.(
+        'Cannot open destructive SQL confirmation modal — execution aborted for safety.',
+        'danger'
+      )
+      return
+    }
+    if (!ensureDangerSqlModalListeners()) {
+      pendingDangerSqlConfirm = null
+      showBanner?.(
+        'Cannot open destructive SQL confirmation modal — execution aborted for safety.',
+        'danger'
+      )
+      return
+    }
+
+    pendingDangerSqlConfirm = { isProd, onConfirm }
+
+    const badgeEl = $('dangerSqlBadge')
+    if (badgeEl) {
+      badgeEl.textContent = `${findings.length} ${findings.length === 1 ? 'warning' : 'warnings'}`
+    }
+
+    const envWarnEl = $('dangerSqlEnvWarn')
+    if (envWarnEl) {
+      if (isProd) {
+        envWarnEl.className = 'banner danger'
+        envWarnEl.textContent = `[PRODUCTION CONNECTION]: "${connName}". Any destructive changes directly affect live production data!`
+        envWarnEl.hidden = false
+      } else if (isStaging) {
+        envWarnEl.className = 'banner warn'
+        envWarnEl.textContent = `[STAGING CONNECTION]: "${connName}".`
+        envWarnEl.hidden = false
+      } else {
+        envWarnEl.hidden = true
+        envWarnEl.textContent = ''
+      }
+    }
+
+    const findingsEl = $('dangerSqlFindings')
+    if (findingsEl) {
+      findingsEl.textContent = ''
+      for (const finding of findings) {
+        const row = document.createElement('div')
+        row.className = 'banner danger danger-sql-finding-item'
+        const b = document.createElement('span')
+        b.className = 'badge badge-danger'
+        b.style.flexShrink = '0'
+        b.textContent = getDangerFindingBadgeLabel(finding.kind, conn?.driver)
+        const msg = document.createElement('span')
+        msg.className = 'banner-text'
+        msg.textContent = finding.message
+        row.append(b, msg)
+        findingsEl.appendChild(row)
+      }
+    }
+
+    const previewEl = $('dangerSqlPreview')
+    if (previewEl) {
+      previewEl.textContent = String(sql || '').trim()
+    }
+
+    const gateEl = $('dangerSqlProdGate')
+    const checkTextEl = $('dangerSqlConfirmCheckText')
+    const inputWrapEl = $('dangerSqlConfirmInputWrap')
+    if (gateEl) gateEl.hidden = false
+    if (checkTextEl) {
+      checkTextEl.textContent = isProd
+        ? 'I understand this query modifies live production data'
+        : 'I understand this query may permanently modify or delete data'
+    }
+    if (inputWrapEl) {
+      inputWrapEl.hidden = !isProd
+    } else if (inputEl) {
+      inputEl.hidden = !isProd
+    }
+    checkEl.checked = false
+    if (inputEl) inputEl.value = ''
+    execBtn.disabled = true
+
+    modal.hidden = false
+    cancelBtn.focus?.()
+  }
   let suppressCmSync = false
   let currentSchemaMap = {}
   let currentSchemaTable = undefined
@@ -107,6 +332,35 @@ export function createPanelSqlController(ctx) {
             (document.documentElement.classList.contains('light') ||
               document.body?.classList.contains('light'))
         ),
+        aiInline: {
+          isEnabled: () => {
+            const s = getAiStatus?.()
+            return Boolean(
+              s?.enabled && s.state !== 'off' && s.state !== 'setup' && state.activeConnectionId
+            )
+          },
+          requestCompletion: async ({ prefix, suffix, signal, manual }) => {
+            const conn = getActiveConn()
+            if (!conn) return null
+            return await rpc(
+              'ai.complete',
+              {
+                connectionId: conn.id,
+                dialect: conn.driver || 'sqlite',
+                prefix,
+                suffix,
+                ...(manual ? { manual: true } : {}),
+                activeSchema: state.activeSchema || undefined,
+                activeTable: state.activeTable || undefined,
+                schemaMap: currentSchemaMap,
+              },
+              { signal, timeoutMs: 18000 }
+            )
+          },
+          onMetric: (id, kind) => {
+            void rpc('ai.metrics.event', { id, kind }).catch(() => {})
+          },
+        },
         onExecute: () => void runSql('caret'),
         onExecuteAll: () => void runSql('all'),
         onFormatSql: () => onFormatSql?.(),
@@ -338,6 +592,15 @@ export function createPanelSqlController(ctx) {
   }
 
   function destroySqlEditor() {
+    clearAiFixPanel()
+    if (boundFixAiBtn) {
+      boundFixAiBtn.removeEventListener('click', handleFixWithAiClick)
+      boundFixAiBtn = null
+    }
+    explainAiSeq += 1
+    explainAiAbort?.abort()
+    explainAiAbort = null
+    explainAiLoadingTarget = null
     if (activeResizerCleanup) {
       activeResizerCleanup()
       activeResizerCleanup = null
@@ -377,7 +640,7 @@ export function createPanelSqlController(ctx) {
     if (conn.readOnly && conn.colorTag === 'prod') {
       kind = 'prod-ro'
       cls = 'banner danger'
-      msg = 'PROD + READ-ONLY — Mutating SQL/Redis statements are blocked by worker policy.'
+      msg = 'PROD + READ-ONLY — Mutating SQL, MQL, and Redis commands are blocked by worker policy.'
     } else if (conn.colorTag === 'prod') {
       kind = 'prod'
       cls = 'banner danger'
@@ -385,7 +648,7 @@ export function createPanelSqlController(ctx) {
     } else if (conn.readOnly) {
       kind = 'ro'
       cls = 'banner warn'
-      msg = 'READ-ONLY connection — INSERT, UPDATE, DELETE, and DDL commands are blocked.'
+      msg = 'READ-ONLY connection — mutating commands and DDL are blocked.'
     }
 
     const bannerKey = kind ? `${conn.id}:${kind}` : null
@@ -402,11 +665,7 @@ export function createPanelSqlController(ctx) {
       }
     }
 
-    cmEditor?.setPlaceholder?.(
-      conn.driver === 'redis'
-        ? 'SCAN 0 MATCH * COUNT 50'
-        : 'SELECT * FROM table_name LIMIT 25;'
-    )
+    cmEditor?.setPlaceholder?.(getPanelEditorPlaceholder(conn.driver))
     setSqlDialect(conn.driver || 'sqlite')
   }
 
@@ -550,9 +809,598 @@ export function createPanelSqlController(ctx) {
     }
     if ($('sqlSuccessBanner')) $('sqlSuccessBanner').hidden = true
     if ($('sqlErrorBanner')) $('sqlErrorBanner').hidden = true
+    if ($('sqlFixAiBtn')) $('sqlFixAiBtn').hidden = true
     if ($('sqlMetaBadge')) $('sqlMetaBadge').hidden = true
     if ($('sqlResultWrap')) $('sqlResultWrap').hidden = true
     if ($('sqlResultMeta')) $('sqlResultMeta').hidden = true
+    clearDbSyntaxError()
+    clearAiFixPanel()
+    renderExplainAiForActiveTab()
+  }
+
+  function setDbSyntaxError(errorMessage, targetRange) {
+    cmEditor?.setDbSyntaxError?.(errorMessage, targetRange ?? null)
+  }
+
+  function clearDbSyntaxError() {
+    cmEditor?.clearDbSyntaxError?.()
+  }
+
+  function isPanelAiReady() {
+    const s = getAiStatus?.()
+    return Boolean(s?.enabled && s.state !== 'off' && s.state !== 'setup')
+  }
+
+  function syncPanelAiButton() {
+    const btn = $('sqlAiBtn')
+    if (!btn) return
+    const badge = renderAiStatusButtonContent(btn, getAiStatus?.())
+    btn.className = `btn btn-ghost btn-sm datanoa-ai-toolbar-btn tone-${badge.tone}`
+  }
+
+  function isAiConfiguredAndEnabled() {
+    const s = getAiStatus?.()
+    return Boolean(
+      s?.enabled && (s.state === 'on' || s.state === 'slow' || s.state === 'error')
+    )
+  }
+
+  function clearAiFixPanel() {
+    aiFixSeq += 1
+    aiFixAbort?.abort()
+    aiFixAbort = null
+    aiFixState = null
+    renderAiFixPanel()
+  }
+
+  function renderAiFixPanel() {
+    const panel = $('sqlAiFixPanel')
+    if (!panel) return
+    const ai = getAiStatus?.()
+    const current = aiFixState
+    if (!current || current.phase === 'hidden') {
+      renderSharedAiFixPanel(
+        panel,
+        {
+          phase: 'hidden',
+          aiEnabled: Boolean(ai?.enabled),
+          aiReady: isAiConfiguredAndEnabled(),
+        },
+        {
+          onReplaceQuery: () => {},
+          onCopySql: () => {},
+          onRetry: () => {},
+          onCancel: () => {},
+          onDismiss: () => {},
+          onConfigureAi: () => {},
+        }
+      )
+      return
+    }
+
+    renderSharedAiFixPanel(
+      panel,
+      {
+        phase: current.phase,
+        aiEnabled: Boolean(ai?.enabled),
+        aiReady: isAiConfiguredAndEnabled(),
+        destination: ai?.destination,
+        host: ai?.host,
+        result: current.result || null,
+        error: current.error || null,
+      },
+      {
+        onReplaceQuery: (sql) => {
+          if (
+            state.activeConnectionId !== current.originConnId ||
+            consoleTabs.getActiveTabId() !== current.originTabId
+          ) {
+            clearAiFixPanel()
+            return
+          }
+          const target = current.fixTargetRange
+            ? { ...current.fixTargetRange, fallbackSql: current.failedSql }
+            : { from: -1, to: -1, fallbackSql: current.failedSql }
+          if (cmEditor?.replaceSqlRange) {
+            const replaced = cmEditor.replaceSqlRange(target, sql)
+            if (!replaced) {
+              showBanner(
+                'Could not safely match failed statement in multi-statement script — use Copy SQL to apply manually.',
+                'warn'
+              )
+              return
+            }
+            consoleTabs.updateActiveSql(cmEditor.getValue(), cmEditor.getCursorOffset())
+            savePanelViewState?.()
+          } else {
+            const currentText = getSqlText()
+            const dialect = getActiveConn()?.driver || 'sqlite'
+            const edit = resolveSqlReplacementSpan(currentText, target, sql, dialect)
+            if (!edit) {
+              showBanner(
+                'Could not safely match failed statement in multi-statement script — use Copy SQL to apply manually.',
+                'warn'
+              )
+              return
+            }
+            setSqlText(
+              `${currentText.slice(0, edit.from)}${edit.insert}${currentText.slice(edit.to)}`,
+              { focus: true }
+            )
+          }
+          clearAiFixPanel()
+          showBanner('Replaced query with AI fix (Ctrl+Z to undo)', 'success')
+        },
+        onCopySql: (sql) => {
+          void copyText(sql, 'Fixed SQL copied')
+        },
+        onRetry: () => {
+          void handleFixWithAiClick()
+        },
+        onCancel: () => {
+          clearAiFixPanel()
+        },
+        onDismiss: () => {
+          clearAiFixPanel()
+        },
+        onConfigureAi: () => {
+          void openAiSettingsModal?.()
+        },
+        resizeEdge: 'bottom',
+      }
+    )
+  }
+
+  async function handleFixWithAiClick() {
+    const tab = consoleTabs.getActiveTab()
+    const idx = tab?.activeResultSetIndex || 0
+    const rsState = tab?.resultStates?.[idx]
+    const b = rsState?.banner
+    if (!tab || !b || b.kind !== 'error') return
+
+    const failedSql = String(b.failedSql || rsState?.statementSql || tab.executedSql || '').trim()
+    if (!failedSql) return
+
+    const errorMessage = String(b.errorMessage || b.text || 'Query failed')
+    const fixTargetRange = b.fixTargetRange || null
+    const originTabId = tab.id
+    const originResultSetIndex = idx
+    const originConnId = state.activeConnectionId
+    const originLastResult = tab.lastResult
+
+    if (!isAiConfiguredAndEnabled()) {
+      aiFixSeq += 1
+      aiFixAbort?.abort()
+      aiFixAbort = null
+      aiFixState = {
+        phase: 'error',
+        result: null,
+        error:
+          'AI SQL Assistant is not configured or disabled. Enable it in AI Settings to fix SQL errors.',
+        failedSql,
+        errorMessage,
+        fixTargetRange,
+        originTabId,
+        originResultSetIndex,
+        originConnId,
+        originLastResult,
+      }
+      renderAiFixPanel()
+      return
+    }
+
+    aiFixAbort?.abort()
+    const ac = new AbortController()
+    aiFixAbort = ac
+    const seq = ++aiFixSeq
+
+    aiFixState = {
+      phase: 'loading',
+      result: null,
+      error: null,
+      failedSql,
+      errorMessage,
+      fixTargetRange,
+      originTabId,
+      originResultSetIndex,
+      originConnId,
+      originLastResult,
+    }
+    renderAiFixPanel()
+
+    const conn = tab.executedConnectionId
+      ? getConnById?.(tab.executedConnectionId)
+      : getActiveConn()
+    const ai = getAiStatus?.()
+
+    try {
+      const result = await rpc(
+        'ai.fixQuery',
+        {
+          connectionId: conn?.id,
+          dialect: conn?.driver || 'sqlite',
+          sql: failedSql,
+          errorMessage,
+          activeSchema: state.activeSchema || undefined,
+          activeTable: state.activeTable || undefined,
+          schemaMap: currentSchemaMap,
+          language: ai?.explainLanguage || 'auto',
+          uiLocale: typeof window !== 'undefined' ? window.orca?.locale : undefined,
+        },
+        { signal: ac.signal, timeoutMs: 65000 }
+      )
+      const tabNow = consoleTabs.getActiveTab()
+      if (
+        seq !== aiFixSeq ||
+        ac.signal.aborted ||
+        state.activeConnectionId !== originConnId ||
+        !tabNow ||
+        tabNow.id !== originTabId ||
+        (tabNow.activeResultSetIndex || 0) !== originResultSetIndex ||
+        tabNow.lastResult !== originLastResult
+      ) {
+        return
+      }
+      aiFixState = {
+        phase: 'ready',
+        result,
+        error: null,
+        failedSql,
+        errorMessage,
+        fixTargetRange,
+        originTabId,
+        originResultSetIndex,
+        originConnId,
+        originLastResult,
+      }
+      const latest = consoleTabs.getResultTabState(originResultSetIndex, originTabId)
+      if (latest) {
+        consoleTabs.setResultTabState(
+          originResultSetIndex,
+          { ...latest, aiFixResult: result, aiFixError: null },
+          originTabId
+        )
+      }
+      renderAiFixPanel()
+    } catch (err) {
+      const tabNow = consoleTabs.getActiveTab()
+      if (
+        seq !== aiFixSeq ||
+        ac.signal.aborted ||
+        state.activeConnectionId !== originConnId ||
+        !tabNow ||
+        tabNow.id !== originTabId ||
+        (tabNow.activeResultSetIndex || 0) !== originResultSetIndex ||
+        tabNow.lastResult !== originLastResult
+      ) {
+        return
+      }
+      const msg = err instanceof Error ? err.message : String(err)
+      aiFixState = {
+        phase: 'error',
+        result: null,
+        error: msg,
+        failedSql,
+        errorMessage,
+        fixTargetRange,
+        originTabId,
+        originResultSetIndex,
+        originConnId,
+        originLastResult,
+      }
+      const latest = consoleTabs.getResultTabState(originResultSetIndex, originTabId)
+      if (latest) {
+        consoleTabs.setResultTabState(
+          originResultSetIndex,
+          { ...latest, aiFixResult: null, aiFixError: msg },
+          originTabId
+        )
+      }
+      renderAiFixPanel()
+    } finally {
+      if (aiFixAbort === ac) {
+        aiFixAbort = null
+      }
+    }
+  }
+
+  function resolvePanelStatementRange(targetSql, idx, totalSets, stmtSlices, execRange) {
+    if (!execRange) return null
+    const matchingSlice =
+      stmtSlices[idx] &&
+      (stmtSlices.length === totalSets || stmtSlices[idx].text.trim() === targetSql)
+        ? stmtSlices[idx]
+        : null
+    if (matchingSlice) {
+      return {
+        from: execRange.from + matchingSlice.start,
+        to: execRange.from + matchingSlice.end,
+        originalSlice: execRange.sql.slice(matchingSlice.start, matchingSlice.end),
+      }
+    }
+    if (totalSets === 1 && stmtSlices.length <= 1) {
+      return {
+        from: execRange.from,
+        to: execRange.to,
+        originalSlice: execRange.originalSlice,
+      }
+    }
+    return null
+  }
+
+  function attachPanelFixTargets(resultStates, res, overallSql, driver, execRange) {
+    const sets = getEffectiveResultSets(res, overallSql)
+    const stmtSlices =
+      execRange && driver !== 'redis' ? splitSqlStatements(execRange.sql, driver) : []
+    sets.forEach((rs, idx) => {
+      const st = resultStates[idx]
+      if (!st?.banner || st.banner.kind !== 'error') return
+      const failedSql = String(st.statementSql || rs.sql || overallSql || '').trim()
+      if (!failedSql) return
+      const fixTargetRange = resolvePanelStatementRange(
+        failedSql,
+        idx,
+        sets.length,
+        stmtSlices,
+        execRange
+      )
+      st.banner = {
+        ...st.banner,
+        failedSql,
+        errorMessage: rs.errorMessage || st.banner.text,
+        fixTargetRange,
+      }
+    })
+  }
+
+  function attachPanelExplainTargets(resultStates, res, overallSql, driver, execRange) {
+    const sets = getEffectiveResultSets(res, overallSql)
+    const stmtSlices =
+      execRange && driver !== 'redis' ? splitSqlStatements(execRange.sql, driver) : []
+    sets.forEach((rs, idx) => {
+      const st = resultStates[idx]
+      if (!st) return
+      const stmtSql = String(st.statementSql || rs.sql || overallSql || '').trim()
+      if (!stmtSql) return
+      st.explainTargetRange = resolvePanelStatementRange(
+        stmtSql,
+        idx,
+        sets.length,
+        stmtSlices,
+        execRange
+      )
+    })
+  }
+
+  function renderExplainAiForActiveTab() {
+    const panel = $('sqlExplainAiPanel')
+    if (!panel) return
+    const tab = consoleTabs.getActiveTab()
+    const idx = tab?.activeResultSetIndex || 0
+    const res = tab?.lastResult
+    const sets = res ? getEffectiveResultSets(res, tab.executedSql || '') : []
+    const rs = sets[idx]
+    const rsState = tab?.resultStates?.[idx]
+    const ai = getAiStatus?.()
+    const show = Boolean(tab && res && rs && !rs.isError && rsState?.isExplain)
+
+    if (!show) {
+      renderSharedExplainAiPanel(
+        panel,
+        {
+          phase: 'hidden',
+          aiEnabled: Boolean(ai?.enabled),
+          aiReady: isAiConfiguredAndEnabled(),
+          explainLanguage: ai?.explainLanguage || 'auto',
+        },
+        {
+          onAnalyze: () => {},
+          onConfigureAi: () => {},
+          onCancel: () => {},
+          onApplySql: () => {},
+          onOpenNewTab: () => {},
+          onCopyText: () => {},
+          onToggleCollapsed: () => {},
+        }
+      )
+      return
+    }
+
+    const isLoading = Boolean(
+      explainAiLoadingTarget &&
+        explainAiLoadingTarget.tabId === tab.id &&
+        explainAiLoadingTarget.resultSetIndex === idx &&
+        explainAiLoadingTarget.originLastResult === res
+    )
+    const phase = resolveExplainAiPhase(
+      isLoading,
+      rsState.explainAnalysisError,
+      rsState.explainAnalysis
+    )
+
+    renderSharedExplainAiPanel(
+      panel,
+      {
+        phase,
+        aiEnabled: Boolean(ai?.enabled),
+        aiReady: isAiConfiguredAndEnabled(),
+        explainLanguage: ai?.explainLanguage || 'auto',
+        destination: ai?.destination,
+        host: ai?.host,
+        result: rsState.explainAnalysis || null,
+        error: rsState.explainAnalysisError || null,
+        collapsed: Boolean(rsState.explainAnalysisCollapsed),
+      },
+      {
+        onAnalyze: () => void runExplainAiAnalysis(tab.id, idx),
+        onConfigureAi: () => {
+          void openAiSettingsModal?.()
+        },
+        onCancel: () => {
+          explainAiSeq += 1
+          explainAiAbort?.abort()
+          explainAiAbort = null
+          explainAiLoadingTarget = null
+          renderExplainAiForActiveTab()
+        },
+        onApplySql: (sql) => {
+          if (
+            (tab.executedConnectionId && state.activeConnectionId !== tab.executedConnectionId) ||
+            consoleTabs.getActiveTabId() !== tab.id
+          ) {
+            return
+          }
+          const target = {
+            ...(rsState.explainTargetRange ?? { from: -1, to: -1 }),
+            fallbackSql: rsState.statementSql,
+          }
+          if (cmEditor?.replaceSqlRange) {
+            const replaced = cmEditor.replaceSqlRange(target, sql)
+            if (!replaced) {
+              showBanner(
+                'Could not safely match target query in multi-statement script — use Copy SQL to apply manually.',
+                'warn'
+              )
+              return
+            }
+            savePanelViewState?.()
+          } else {
+            const currentText = getSqlText()
+            const conn = tab.executedConnectionId
+              ? getConnById?.(tab.executedConnectionId)
+              : getActiveConn()
+            const dialect = conn?.driver || 'sqlite'
+            const edit = resolveSqlReplacementSpan(currentText, target, sql, dialect)
+            if (!edit) {
+              showBanner(
+                'Could not safely match target query in multi-statement script — use Copy SQL to apply manually.',
+                'warn'
+              )
+              return
+            }
+            setSqlText(
+              `${currentText.slice(0, edit.from)}${edit.insert}${currentText.slice(edit.to)}`
+            )
+          }
+          saveActiveConsoleTabState()
+          cmEditor?.focus()
+          showBanner('Replaced target query with optimized SQL (Ctrl+Z to undo)', 'neutral')
+        },
+        onOpenNewTab: (sql) => {
+          addConsoleTab()
+          setSqlText(sql)
+          saveActiveConsoleTabState()
+          cmEditor?.focus()
+          showBanner('Opened optimized SQL in a new tab', 'neutral')
+        },
+        onCopyText: (text, label) => {
+          void copyText(text, `${label || 'Text'} copied`)
+        },
+        onToggleCollapsed: () => {
+          const cur = consoleTabs.getResultTabState(idx, tab.id)
+          if (!cur) return
+          consoleTabs.setResultTabState(
+            idx,
+            { ...cur, explainAnalysisCollapsed: !cur.explainAnalysisCollapsed },
+            tab.id
+          )
+          renderExplainAiForActiveTab()
+        },
+        resizeEdge: 'top',
+      }
+    )
+  }
+
+  async function runExplainAiAnalysis(tabId, resultSetIndex) {
+    const tab = consoleTabs.getTabs().find((t) => t.id === tabId)
+    if (!tab?.lastResult) return
+    const originLastResult = tab.lastResult
+    const sets = getEffectiveResultSets(originLastResult, tab.executedSql || '')
+    const rs = sets[resultSetIndex]
+    const rsState = tab.resultStates?.[resultSetIndex]
+    if (!rs || rs.isError || !rsState) return
+
+    explainAiAbort?.abort()
+    const ac = new AbortController()
+    explainAiAbort = ac
+    const seq = ++explainAiSeq
+    explainAiLoadingTarget = { tabId, resultSetIndex, originLastResult }
+    consoleTabs.setResultTabState(
+      resultSetIndex,
+      { ...rsState, explainAnalysisError: null, explainAnalysisCollapsed: false },
+      tabId
+    )
+    renderExplainAiForActiveTab()
+
+    const sql = rsState.statementSql || rs.sql || tab.executedSql || ''
+    const conn = tab.executedConnectionId
+      ? getConnById?.(tab.executedConnectionId)
+      : getActiveConn()
+    const ai = getAiStatus?.()
+
+    try {
+      const result = await rpc(
+        'ai.explainAnalyze',
+        {
+          connectionId: conn?.id,
+          dialect: conn?.driver || 'sqlite',
+          sql,
+          planColumns: (rs.columns || []).map((c) => ({ name: c.name, type: c.type || '' })),
+          planRows: rs.rows || [],
+          language: ai?.explainLanguage || 'auto',
+          uiLocale: typeof window !== 'undefined' ? window.orca?.locale : undefined,
+        },
+        { signal: ac.signal, timeoutMs: 65000 }
+      )
+      if (seq !== explainAiSeq || ac.signal.aborted) return
+      const tabNow = consoleTabs.getTabs().find((t) => t.id === tabId)
+      if (!tabNow || tabNow.lastResult !== originLastResult) return
+      const latest = consoleTabs.getResultTabState(resultSetIndex, tabId) || rsState
+      consoleTabs.setResultTabState(
+        resultSetIndex,
+        {
+          ...latest,
+          explainAnalysis: result,
+          explainAnalysisError: null,
+          explainAnalysisCollapsed: false,
+        },
+        tabId
+      )
+    } catch (err) {
+      if (seq !== explainAiSeq || ac.signal.aborted) return
+      const tabNow = consoleTabs.getTabs().find((t) => t.id === tabId)
+      if (!tabNow || tabNow.lastResult !== originLastResult) return
+      const latest = consoleTabs.getResultTabState(resultSetIndex, tabId) || rsState
+      const msg = err instanceof Error ? err.message : String(err)
+      consoleTabs.setResultTabState(
+        resultSetIndex,
+        { ...latest, explainAnalysisError: msg, explainAnalysisCollapsed: false },
+        tabId
+      )
+    } finally {
+      if (explainAiAbort === ac) {
+        explainAiAbort = null
+      }
+      if (
+        explainAiLoadingTarget?.tabId === tabId &&
+        explainAiLoadingTarget?.resultSetIndex === resultSetIndex &&
+        explainAiLoadingTarget?.originLastResult === originLastResult
+      ) {
+        explainAiLoadingTarget = null
+      }
+      renderExplainAiForActiveTab()
+    }
+  }
+
+  function onAiStatusChanged() {
+    syncPanelAiButton()
+    if (!isPanelAiReady()) {
+      cmEditor?.clearAiGhost?.()
+    }
+    if (aiFixState && aiFixState.phase !== 'hidden') {
+      renderAiFixPanel()
+    }
+    renderExplainAiForActiveTab()
   }
 
   function renderResultSetsBar(tab) {
@@ -598,12 +1446,14 @@ export function createPanelSqlController(ctx) {
     const okDetail = $('sqlSuccessDetail')
     const errBanner = $('sqlErrorBanner')
     const errText = $('sqlErrorText')
+    const fixAiBtn = $('sqlFixAiBtn')
     const scopeLbl = $('sqlResultScopeLabel')
     const b = rsState?.banner
     if (!b) {
       if (meta) meta.hidden = true
       if (okBanner) okBanner.hidden = true
       if (errBanner) errBanner.hidden = true
+      if (fixAiBtn) fixAiBtn.hidden = true
       return
     }
     if (meta) {
@@ -619,10 +1469,15 @@ export function createPanelSqlController(ctx) {
       if (errText) {
         errText.textContent = b.detail ? `${b.text}\n${b.detail}` : b.text
       }
+      if (fixAiBtn) {
+        const hasSql = Boolean(String(b.failedSql || rsState?.statementSql || '').trim())
+        fixAiBtn.hidden = !hasSql
+      }
       if (errBanner) errBanner.hidden = Boolean(b.dismissed)
       state.lastError = b.text
     } else {
       if (errBanner) errBanner.hidden = true
+      if (fixAiBtn) fixAiBtn.hidden = true
       if (okText) okText.textContent = b.text || ''
       if (okDetail) {
         const detailStr = b.detail || ''
@@ -634,6 +1489,7 @@ export function createPanelSqlController(ctx) {
   }
 
   function applyPanelResultTab(index, tab, opts = {}) {
+    clearAiFixPanel()
     if (!tab?.lastResult) {
       clearSqlResultDisplay()
       return
@@ -650,6 +1506,16 @@ export function createPanelSqlController(ctx) {
         tab.lastResult.executionTimeMs || 0,
         tab.lastResultMode || 'query'
       )[clampedIdx]
+    if (rsState?.banner?.kind === 'error' && !rsState.banner.failedSql) {
+      const fallbackFailedSql = String(rsState.statementSql || sets[clampedIdx]?.sql || tab.executedSql || '').trim()
+      if (fallbackFailedSql) {
+        rsState.banner = {
+          ...rsState.banner,
+          failedSql: fallbackFailedSql,
+          errorMessage: sets[clampedIdx]?.errorMessage || rsState.banner.errorMessage || rsState.banner.text,
+        }
+      }
+    }
     if (!tab.resultStates) tab.resultStates = {}
     if (rsState && !tab.resultStates[clampedIdx]) {
       tab.resultStates[clampedIdx] = rsState
@@ -666,6 +1532,7 @@ export function createPanelSqlController(ctx) {
     renderResultSetsBar(tab)
     applyBannerForResultTab(rsState)
     renderSqlResultTableOnly()
+    renderExplainAiForActiveTab()
 
     const wrap = $('sqlResultWrap')
     if (wrap && !opts.preserveScroll) {
@@ -694,6 +1561,8 @@ export function createPanelSqlController(ctx) {
 
   function switchConsoleTab(tabId) {
     if (tabId === consoleTabs.getActiveTabId()) return
+    clearAiFixPanel()
+    clearDbSyntaxError()
     saveActiveConsoleTabState()
     if (!consoleTabs.switchTab(tabId)) return
     loadActiveConsoleTabEditor()
@@ -702,6 +1571,8 @@ export function createPanelSqlController(ctx) {
   }
 
   function addConsoleTab() {
+    clearAiFixPanel()
+    clearDbSyntaxError()
     saveActiveConsoleTabState()
     consoleTabs.addTab('')
     loadActiveConsoleTabEditor()
@@ -711,6 +1582,8 @@ export function createPanelSqlController(ctx) {
   }
 
   function closeConsoleTab(tabId) {
+    clearAiFixPanel()
+    clearDbSyntaxError()
     saveActiveConsoleTabState()
     if (!consoleTabs.closeTab(tabId)) return
     loadActiveConsoleTabEditor()
@@ -751,6 +1624,7 @@ export function createPanelSqlController(ctx) {
     if (rsState?.banner) rsState.banner.dismissed = true
     if ($('sqlErrorBanner')) $('sqlErrorBanner').hidden = true
     if ($('sqlMetaBadge') && rsState?.banner?.badgeText) $('sqlMetaBadge').hidden = false
+    clearAiFixPanel()
   }
 
   function getSortedSqlRows() {
@@ -1234,6 +2108,23 @@ export function createPanelSqlController(ctx) {
       fallbackMs,
       mode
     )
+    const resolvedDriver = opts.runDriver || getActiveConn()?.driver || 'sqlite'
+    attachPanelFixTargets(
+      resultStates,
+      res,
+      overallSql,
+      resolvedDriver,
+      opts.execRange || null
+    )
+    if (mode === 'explain') {
+      attachPanelExplainTargets(
+        resultStates,
+        res,
+        overallSql,
+        resolvedDriver,
+        opts.execRange || null
+      )
+    }
     consoleTabs.setResultForTab(
       targetTabId,
       res,
@@ -1247,6 +2138,19 @@ export function createPanelSqlController(ctx) {
     if (targetTabId === consoleTabs.getActiveTabId()) {
       const tab = consoleTabs.getActiveTab()
       applyPanelResultTab(defaultIdx, tab, { preserveScroll: Boolean(opts.preserveScroll) })
+      if (!opts.preserveScroll) {
+        const sets = getEffectiveResultSets(res, overallSql)
+        const errIdx = sets.findIndex((s) => Boolean(s?.isError))
+        if (errIdx >= 0) {
+          const errRs = sets[errIdx]
+          const errState = resultStates[errIdx]
+          const errMsg =
+            errRs?.errorMessage || errState?.banner?.errorMessage || errState?.banner?.text || ''
+          setDbSyntaxError(errMsg, errState?.banner?.fixTargetRange || null)
+        } else {
+          clearDbSyntaxError()
+        }
+      }
     }
     if (!opts.skipCache) {
       savePanelDataCache?.()
@@ -1255,12 +2159,18 @@ export function createPanelSqlController(ctx) {
 
   function resolveTargetSql(mode, rawScript, runDriver) {
     const selectedSql = cmEditor ? cmEditor.getSelectedText() : ''
+    const execRange = cmEditor?.getExecutionRange
+      ? cmEditor.getExecutionRange(mode, runDriver)
+      : null
     let sql = rawScript.trim()
     if (mode === 'explain') {
       sql = selectedSql || rawScript.trim()
     } else if (mode === 'caret') {
       if (selectedSql) {
         sql = selectedSql
+      } else if (runDriver === 'mongodb') {
+        const cursorOffset = cmEditor?.getCursorOffset?.() ?? rawScript.length
+        sql = findMongoStatementAtOffset(rawScript, cursorOffset)
       } else if (runDriver !== 'redis') {
         sql = cmEditor
           ? cmEditor.getCaretStatementSql(runDriver)
@@ -1268,13 +2178,8 @@ export function createPanelSqlController(ctx) {
       }
     }
     if (!sql) return null
-    const statements =
-      runDriver === 'redis'
-        ? [sql]
-        : splitSqlStatements(sql, runDriver)
-            .map((s) => s.text.trim())
-            .filter(Boolean)
-    return statements.length > 0 ? { sql, statements } : null
+    const statements = splitPanelTargetStatements(sql, runDriver)
+    return statements.length > 0 ? { sql, statements, execRange } : null
   }
 
   function setSqlRunToolbarBusy(busy, cancelBtn) {
@@ -1376,22 +2281,20 @@ export function createPanelSqlController(ctx) {
     return { stale: false, res }
   }
 
-  async function runSql(mode = 'caret') {
-    if (!state.activeConnectionId || state.activeQueryId) return
-    const conn = getActiveConn()
-    const runConnId = state.activeConnectionId
-    const runDriver = conn?.driver || 'sqlite'
-    const originTabId = consoleTabs.getActiveTabId()
-    const resolved = resolveTargetSql(mode, getSqlText(), runDriver)
-    if (!resolved) return
-    const { sql, statements } = resolved
+  async function executeResolvedSql(snapshot) {
+    if (!snapshot || !snapshot.runConnId || state.activeQueryId) return
+    const { sql, statements, mode, runConnId, runDriver, originTabId, execRange } = snapshot
+    if (state.activeConnectionId !== runConnId) return
 
+    clearAiFixPanel()
+    clearDbSyntaxError()
     const runSeq = ++sqlRunSeq
     const queryId = `panel_sql_${Date.now()}`
     state.activeQueryId = queryId
     state.activeWorkerQueryId = queryId
     $('sqlSuccessBanner').hidden = true
     $('sqlErrorBanner').hidden = true
+    if ($('sqlFixAiBtn')) $('sqlFixAiBtn').hidden = true
     if ($('sqlResultSetsBar')) $('sqlResultSetsBar').hidden = true
     const cancelBtn = $('cancelSqlBtn')
     setSqlRunToolbarBusy(true, cancelBtn)
@@ -1439,6 +2342,8 @@ export function createPanelSqlController(ctx) {
           mode: 'explain',
           originTabId,
           connId: runConnId,
+          runDriver,
+          execRange,
           rawStatements: statements,
           overallSql: sql,
           defaultIndex: 0,
@@ -1458,6 +2363,8 @@ export function createPanelSqlController(ctx) {
         mode: 'query',
         originTabId,
         connId: runConnId,
+        runDriver,
+        execRange,
         rawStatements: statements,
         overallSql: sql,
       })
@@ -1473,6 +2380,8 @@ export function createPanelSqlController(ctx) {
         mode: mode === 'explain' ? 'explain' : 'query',
         originTabId,
         connId: runConnId,
+        runDriver,
+        execRange,
         rawStatements: statements,
         overallSql: sql,
         defaultIndex: 0,
@@ -1487,6 +2396,52 @@ export function createPanelSqlController(ctx) {
         setSqlRunToolbarBusy(false, cancelBtn)
       }
     }
+  }
+
+  async function runSql(mode = 'caret', options = {}) {
+    if (!state.activeConnectionId || state.activeQueryId) return
+    const conn = getActiveConn()
+    const runConnId = state.activeConnectionId
+    const runDriver = conn?.driver || 'sqlite'
+    const originTabId = consoleTabs.getActiveTabId()
+    const resolved = resolveTargetSql(mode, getSqlText(), runDriver)
+    if (!resolved) return
+    const snapshot = Object.freeze({
+      sql: resolved.sql,
+      statements: Object.freeze([...resolved.statements]),
+      execRange: resolved.execRange || null,
+      mode,
+      runConnId,
+      runDriver,
+      originTabId,
+    })
+
+    if (!options?.skipDangerGuard && !conn?.readOnly) {
+      const findings = analyzeDangerousSql(snapshot.sql, snapshot.runDriver)
+      if (findings.length > 0) {
+        openPanelDangerSqlModal({
+          conn,
+          findings,
+          sql: snapshot.sql,
+          onConfirm: () => {
+            if (
+              state.activeConnectionId !== snapshot.runConnId ||
+              consoleTabs.getActiveTabId() !== snapshot.originTabId
+            ) {
+              showBanner?.(
+                'Execution cancelled: active connection or tab changed before confirmation.',
+                'warn'
+              )
+              return
+            }
+            void executeResolvedSql(snapshot)
+          },
+        })
+        return
+      }
+    }
+
+    await executeResolvedSql(snapshot)
   }
 
   async function loadQueryHistory() {
@@ -1630,7 +2585,14 @@ export function createPanelSqlController(ctx) {
     historySeq++
   }
 
+  const fixAiBtnEl = $('sqlFixAiBtn')
+  if (fixAiBtnEl) {
+    boundFixAiBtn = fixAiBtnEl
+    fixAiBtnEl.addEventListener('click', handleFixWithAiClick)
+  }
+
   renderConsoleTabs()
+  syncPanelAiButton()
 
   return {
     sqlVirt,
@@ -1647,6 +2609,8 @@ export function createPanelSqlController(ctx) {
     restoreConsoleTabsState,
     getConsoleTabsPersistedState,
     clearSqlResultDisplay,
+    clearAiFixPanel,
+    clearDbSyntaxError,
     selectPanelResultSetIndex,
     renderSqlSafetyBanner,
     resetSqlSafetyBannerDismissal,
@@ -1671,5 +2635,6 @@ export function createPanelSqlController(ctx) {
     getSqlEditorHeight,
     setSqlEditorHeight,
     applyClampedSqlEditorHeight,
+    onAiStatusChanged,
   }
 }

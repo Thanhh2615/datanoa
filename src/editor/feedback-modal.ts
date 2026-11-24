@@ -75,7 +75,9 @@ export function openStudioFeedbackModal(
   const head = document.createElement('div')
   head.className = 'datanoa-modal-head'
   const titleEl = document.createElement('span')
+  titleEl.id = 'datanoa-feedback-modal-title'
   titleEl.textContent = 'Report Issue / Request Feature'
+  modal.setAttribute('aria-labelledby', titleEl.id)
   const closeBtn = document.createElement('button')
   closeBtn.type = 'button'
   closeBtn.className = 'datanoa-btn datanoa-btn-sm'
@@ -120,11 +122,14 @@ export function openStudioFeedbackModal(
   const titleField = document.createElement('div')
   titleField.className = 'datanoa-conn-field is-full'
   const titleLabel = document.createElement('label')
+  titleLabel.htmlFor = 'datanoa-feedback-title-input'
   titleLabel.textContent = 'Summary / Title'
   const titleInput = document.createElement('input')
   titleInput.type = 'text'
+  titleInput.id = 'datanoa-feedback-title-input'
   titleInput.className = 'datanoa-feedback-title-input datanoa-filter-input'
   titleInput.placeholder = 'Brief summary of the bug or feature request...'
+  titleInput.setAttribute('aria-label', 'Summary / Title')
   titleField.appendChild(titleLabel)
   titleField.appendChild(titleInput)
   body.appendChild(titleField)
@@ -133,11 +138,14 @@ export function openStudioFeedbackModal(
   const bodyField = document.createElement('div')
   bodyField.className = 'datanoa-conn-field is-full'
   const bodyLabel = document.createElement('label')
+  bodyLabel.htmlFor = 'datanoa-feedback-body-input'
   bodyLabel.textContent = 'Details / Steps to Reproduce'
   const bodyTextarea = document.createElement('textarea')
+  bodyTextarea.id = 'datanoa-feedback-body-input'
   bodyTextarea.className = 'datanoa-feedback-body-input datanoa-value-textarea'
   bodyTextarea.rows = 5
   bodyTextarea.placeholder = 'Steps to reproduce, expected behavior, and actual behavior...'
+  bodyTextarea.setAttribute('aria-label', 'Details / Steps to Reproduce')
   bodyField.appendChild(bodyLabel)
   bodyField.appendChild(bodyTextarea)
   body.appendChild(bodyField)
@@ -167,9 +175,11 @@ export function openStudioFeedbackModal(
     bugBtn.classList.toggle('datanoa-btn-primary', isBug)
     featureBtn.classList.toggle('active', !isBug)
     featureBtn.classList.toggle('datanoa-btn-primary', !isBug)
-    bodyLabel.textContent = isBug
+    const nextBodyLabel = isBug
       ? 'Details / Steps to Reproduce'
       : 'Feature Description / Use Case'
+    bodyLabel.textContent = nextBodyLabel
+    bodyTextarea.setAttribute('aria-label', nextBodyLabel)
     bodyTextarea.placeholder = isBug
       ? 'Steps to reproduce, expected behavior, and actual behavior...'
       : 'Describe the feature or UI improvement and how it helps your workflow...'

@@ -2,6 +2,7 @@
 // Cohesive Transaction Toolbar & Manual Transaction lifecycle controller for Datanoa Studio.
 
 import type { ConnectionProfile, TransactionState } from '../protocol.js'
+import { createSvgElement } from './db-icons.js'
 
 export interface TransactionToolbarHost {
   getActiveConnectionId: () => string | null
@@ -21,6 +22,13 @@ export interface TransactionToolbarHost {
   updateStatus: (stateText: string) => void
 }
 
+interface InFlightTxAcquire {
+  connId: string
+  token: number
+  done: Promise<void>
+  rollbackOnSettle: boolean
+}
+
 const DEFAULT_TX_STATE: TransactionState = {
   active: false,
   autoCommit: true,
@@ -30,12 +38,19 @@ const DEFAULT_TX_STATE: TransactionState = {
 
 export class TransactionToolbarController {
   private readonly host: TransactionToolbarHost
+  private groupEl: HTMLDivElement | null = null
+  private txToggleBtn: HTMLButtonElement | null = null
+  private txToggleDotEl: HTMLSpanElement | null = null
+  private txToggleLabelEl: HTMLSpanElement | null = null
+  private txToggleChevEl: HTMLSpanElement | null = null
+  private txTrayEl: HTMLDivElement | null = null
   private autoCommitBtn: HTMLButtonElement | null = null
   private beginBtn: HTMLButtonElement | null = null
   private commitBtn: HTMLButtonElement | null = null
   private rollbackBtn: HTMLButtonElement | null = null
   private badgeEl: HTMLSpanElement | null = null
   private state: TransactionState = { ...DEFAULT_TX_STATE }
+  private isExpanded = false
   private busy = false
   private contextGeneration = 0
   private mutationEpoch = 0
@@ -43,8 +58,10 @@ export class TransactionToolbarController {
   private activeMutationToken: number | null = null
   private refreshSeq = 0
   private destroyed = false
-  private inFlightBegin: { connId: string; token: number; done: Promise<void> } | null = null
+  private inFlightBegin: InFlightTxAcquire | null = null
+  private inFlightSetAutoCommit: InFlightTxAcquire | null = null
   private readonly pendingConnectionCleanups = new Map<string, Promise<void>>()
+  private readonly knownTxTokens = new Map<string, number>()
   private boundCleanups: Array<() => void> = []
 
   constructor(host: TransactionToolbarHost) {
@@ -56,6 +73,22 @@ export class TransactionToolbarController {
     this.boundCleanups.push(() => btn.removeEventListener('click', handler))
   }
 
+  private syncDrawerState(): void {
+    if (!this.groupEl || !this.txToggleBtn || !this.txTrayEl) return
+    this.groupEl.classList.toggle('is-expanded', this.isExpanded)
+    this.txToggleBtn.setAttribute('aria-expanded', String(this.isExpanded))
+    this.txTrayEl.setAttribute('aria-hidden', String(!this.isExpanded))
+    const tabIdx = this.isExpanded ? 0 : -1
+    for (const btn of [this.autoCommitBtn, this.beginBtn, this.commitBtn, this.rollbackBtn]) {
+      if (btn) btn.tabIndex = tabIdx
+    }
+  }
+
+  public toggleDrawer(): void {
+    this.isExpanded = !this.isExpanded
+    this.syncDrawerState()
+  }
+
   public mount(parent: HTMLElement): void {
     const sep = document.createElement('span')
     sep.className = 'datanoa-toolbar-sep'
@@ -63,6 +96,51 @@ export class TransactionToolbarController {
 
     const group = document.createElement('div')
     group.className = 'datanoa-tx-group'
+    this.groupEl = group
+
+    this.txToggleBtn = document.createElement('button')
+    this.txToggleBtn.type = 'button'
+    this.txToggleBtn.className = 'datanoa-btn datanoa-tx-toggle-btn'
+    this.txToggleBtn.setAttribute('aria-expanded', 'false')
+    this.txToggleBtn.title = 'Toggle transaction controls (Auto-Commit, BEGIN, COMMIT, ROLLBACK)'
+
+    this.txToggleDotEl = document.createElement('span')
+    this.txToggleDotEl.className = 'datanoa-tx-dot'
+    this.txToggleDotEl.setAttribute('aria-hidden', 'true')
+
+    this.txToggleLabelEl = document.createElement('span')
+    this.txToggleLabelEl.className = 'datanoa-tx-toggle-label'
+    this.txToggleLabelEl.textContent = 'TX'
+
+    this.txToggleChevEl = document.createElement('span')
+    this.txToggleChevEl.className = 'datanoa-tx-toggle-chev'
+    this.txToggleChevEl.setAttribute('aria-hidden', 'true')
+    const chevSvg = createSvgElement('svg', {
+      width: '12',
+      height: '12',
+      viewBox: '0 0 24 24',
+      fill: 'none',
+      stroke: 'currentColor',
+      'stroke-width': '2.2',
+      'stroke-linecap': 'round',
+      'stroke-linejoin': 'round',
+    })
+    chevSvg.appendChild(createSvgElement('polyline', { points: '9 18 15 12 9 6' }))
+    this.txToggleChevEl.appendChild(chevSvg)
+
+    this.txToggleBtn.appendChild(this.txToggleDotEl)
+    this.txToggleBtn.appendChild(this.txToggleLabelEl)
+    this.txToggleBtn.appendChild(this.txToggleChevEl)
+    this.addClickListener(this.txToggleBtn, () => {
+      this.toggleDrawer()
+    })
+
+    this.txTrayEl = document.createElement('div')
+    this.txTrayEl.className = 'datanoa-tx-tray'
+    this.txTrayEl.setAttribute('aria-hidden', 'true')
+
+    const trayInner = document.createElement('div')
+    trayInner.className = 'datanoa-tx-tray-inner'
 
     this.autoCommitBtn = document.createElement('button')
     this.autoCommitBtn.type = 'button'
@@ -98,19 +176,24 @@ export class TransactionToolbarController {
 
     this.badgeEl = document.createElement('span')
     this.badgeEl.className = 'datanoa-tx-badge'
-    this.badgeEl.textContent = 'TX OPEN'
+    this.badgeEl.textContent = 'TX open'
     this.badgeEl.style.display = 'none'
     this.badgeEl.setAttribute('role', 'status')
     this.badgeEl.setAttribute('aria-live', 'polite')
 
-    group.appendChild(this.autoCommitBtn)
-    group.appendChild(this.beginBtn)
-    group.appendChild(this.commitBtn)
-    group.appendChild(this.rollbackBtn)
-    group.appendChild(this.badgeEl)
+    trayInner.appendChild(this.autoCommitBtn)
+    trayInner.appendChild(this.beginBtn)
+    trayInner.appendChild(this.commitBtn)
+    trayInner.appendChild(this.rollbackBtn)
+    trayInner.appendChild(this.badgeEl)
+    this.txTrayEl.appendChild(trayInner)
+
+    group.appendChild(this.txToggleBtn)
+    group.appendChild(this.txTrayEl)
 
     parent.appendChild(sep)
     parent.appendChild(group)
+    this.syncDrawerState()
   }
 
   public getState(): TransactionState {
@@ -176,14 +259,32 @@ export class TransactionToolbarController {
     }
   }
 
+  private rememberTxToken(connId: string, state: TransactionState): void {
+    if (typeof state.txToken === 'number') {
+      this.knownTxTokens.set(connId, state.txToken)
+    } else if (!state.active && state.autoCommit) {
+      this.knownTxTokens.delete(connId)
+    }
+  }
+
   public resetForConnectionSwitch(prevConnId: string | null): void {
     if (prevConnId) {
+      const txToken = this.state.txToken ?? this.knownTxTokens.get(prevConnId)
       if (this.inFlightBegin && this.inFlightBegin.connId === prevConnId) {
+        this.inFlightBegin.rollbackOnSettle = true
         this.trackConnectionCleanup(prevConnId, this.inFlightBegin.done)
+      }
+      if (this.inFlightSetAutoCommit && this.inFlightSetAutoCommit.connId === prevConnId) {
+        this.inFlightSetAutoCommit.rollbackOnSettle = true
+        this.trackConnectionCleanup(prevConnId, this.inFlightSetAutoCommit.done)
       }
       if (this.hasActiveOrManualTx()) {
         const rollbackPromise = this.host
-          .requestPlugin<TransactionState>('tx.rollback', { connectionId: prevConnId })
+          .requestPlugin<TransactionState>('tx.rollback', {
+            connectionId: prevConnId,
+            onlyIfOwner: true,
+            ...(txToken !== undefined ? { txToken } : {}),
+          })
           .catch(() => {})
         this.trackConnectionCleanup(prevConnId, rollbackPromise)
       }
@@ -193,6 +294,7 @@ export class TransactionToolbarController {
     this.refreshSeq++
     this.activeMutationToken = null
     this.inFlightBegin = null
+    this.inFlightSetAutoCommit = null
     this.state = { ...DEFAULT_TX_STATE }
     this.busy = false
   }
@@ -205,19 +307,34 @@ export class TransactionToolbarController {
 
   public rollbackOnUnload(): void {
     const activeConnId = this.host.getActiveConnectionId()
+    const inFlightConnIds = new Set<string>()
+    if (this.inFlightBegin) {
+      this.inFlightBegin.rollbackOnSettle = true
+      inFlightConnIds.add(this.inFlightBegin.connId)
+    }
+    if (this.inFlightSetAutoCommit) {
+      this.inFlightSetAutoCommit.rollbackOnSettle = true
+      inFlightConnIds.add(this.inFlightSetAutoCommit.connId)
+    }
     const targets = new Set<string>()
-    if (
-      activeConnId &&
-      (this.hasActiveOrManualTx() || this.inFlightBegin?.connId === activeConnId)
-    ) {
+    if (activeConnId && this.hasActiveOrManualTx()) {
       targets.add(activeConnId)
     }
     for (const pendingConnId of this.pendingConnectionCleanups.keys()) {
-      targets.add(pendingConnId)
+      if (!inFlightConnIds.has(pendingConnId)) {
+        targets.add(pendingConnId)
+      }
     }
     for (const connId of targets) {
+      const txToken =
+        (connId === activeConnId ? this.state.txToken : undefined) ??
+        this.knownTxTokens.get(connId)
       void this.host
-        .requestPlugin<TransactionState>('tx.rollback', { connectionId: connId })
+        .requestPlugin<TransactionState>('tx.rollback', {
+          connectionId: connId,
+          onlyIfOwner: true,
+          ...(txToken !== undefined ? { txToken } : {}),
+        })
         .catch(() => {})
     }
   }
@@ -274,6 +391,7 @@ export class TransactionToolbarController {
           statementCount: 0,
         }
       : next
+    this.rememberTxToken(targetId, this.state)
     this.updateToolbar()
   }
 
@@ -308,6 +426,24 @@ export class TransactionToolbarController {
     this.commitBtn.classList.toggle('datanoa-btn-primary', this.state.active)
     this.rollbackBtn.classList.toggle('datanoa-btn-danger', this.state.active)
 
+    if (this.txToggleBtn && this.txToggleLabelEl) {
+      const isManual = !this.state.autoCommit
+      const isOpen = this.state.active
+      this.txToggleBtn.classList.toggle('is-manual', isManual)
+      this.txToggleBtn.classList.toggle('is-open', isOpen)
+      this.txToggleLabelEl.textContent = isOpen
+        ? 'TX Open'
+        : isManual
+          ? 'Manual TX'
+          : 'TX'
+      this.txToggleBtn.title = lockedReason
+        ? `Transaction controls (${lockedReason})`
+        : this.isExpanded
+          ? 'Collapse transaction controls'
+          : 'Expand transaction controls'
+    }
+    this.syncDrawerState()
+
     if (lockedReason) {
       for (const btn of [this.autoCommitBtn, this.beginBtn, this.commitBtn, this.rollbackBtn]) {
         btn.disabled = true
@@ -331,7 +467,7 @@ export class TransactionToolbarController {
     this.badgeEl.style.display = this.state.active ? 'inline-flex' : 'none'
     if (this.state.active) {
       this.badgeEl.textContent =
-        this.state.statementCount > 0 ? `TX OPEN · ${this.state.statementCount} stmt(s)` : 'TX OPEN'
+        this.state.statementCount > 0 ? `TX open · ${this.state.statementCount} stmt(s)` : 'TX open'
     }
   }
 
@@ -353,16 +489,41 @@ export class TransactionToolbarController {
     this.mutationEpoch++
     this.busy = true
     this.updateToolbar()
+
+    let resolveDone: () => void = () => {}
+    let setAutoCommitEntry: InFlightTxAcquire | null = null
+
     try {
       if (this.pendingConnectionCleanups.has(connId)) {
         await this.waitForConnectionCleanup(connId)
         if (!this.isCurrentMutation(token, gen, connId)) return
       }
+      if (!enabled) {
+        const done = new Promise<void>((resolve) => {
+          resolveDone = resolve
+        })
+        setAutoCommitEntry = { connId, token, done, rollbackOnSettle: false }
+        this.inFlightSetAutoCommit = setAutoCommitEntry
+      }
       const next = await this.host.requestPlugin<TransactionState>('tx.setAutoCommit', {
         connectionId: connId,
         enabled,
       })
-      if (!this.isCurrentMutation(token, gen, connId)) return
+      if (next) {
+        this.rememberTxToken(connId, next)
+      }
+      if (setAutoCommitEntry?.rollbackOnSettle || !this.isCurrentMutation(token, gen, connId)) {
+        if (setAutoCommitEntry && next && (next.active || !next.autoCommit)) {
+          await this.host
+            .requestPlugin<TransactionState>('tx.rollback', {
+              connectionId: connId,
+              onlyIfOwner: true,
+              ...(next.txToken !== undefined ? { txToken: next.txToken } : {}),
+            })
+            .catch(() => {})
+        }
+        return
+      }
       this.state = next
       this.host.updateStatus(
         next.autoCommit ? 'Auto-commit enabled' : 'Manual transaction mode enabled'
@@ -374,7 +535,11 @@ export class TransactionToolbarController {
         void this.refreshState(connId)
       }
     } finally {
+      if (setAutoCommitEntry && this.inFlightSetAutoCommit === setAutoCommitEntry) {
+        this.inFlightSetAutoCommit = null
+      }
       this.releaseMutation(token)
+      resolveDone()
     }
   }
 
@@ -391,7 +556,12 @@ export class TransactionToolbarController {
     this.updateToolbar()
 
     let resolveDone: () => void = () => {}
-    let beginEntry: { connId: string; token: number; done: Promise<void> } | null = null
+    let beginEntry: {
+      connId: string
+      token: number
+      done: Promise<void>
+      rollbackOnSettle: boolean
+    } | null = null
 
     try {
       if (this.pendingConnectionCleanups.has(connId)) {
@@ -403,21 +573,28 @@ export class TransactionToolbarController {
       const done = new Promise<void>((resolve) => {
         resolveDone = resolve
       })
-      beginEntry = { connId, token, done }
+      beginEntry = { connId, token, done, rollbackOnSettle: false }
       this.inFlightBegin = beginEntry
 
-      const next = await this.host.requestPlugin<TransactionState>('tx.begin', {
+      const state = await this.host.requestPlugin<TransactionState>('tx.begin', {
         connectionId: connId,
       })
-      if (!this.isCurrentMutation(token, gen, connId)) {
-        if (next?.active) {
+      if (state) {
+        this.rememberTxToken(connId, state)
+      }
+      if (beginEntry.rollbackOnSettle || !this.isCurrentMutation(token, gen, connId)) {
+        if (state?.active) {
           await this.host
-            .requestPlugin<TransactionState>('tx.rollback', { connectionId: connId })
+            .requestPlugin<TransactionState>('tx.rollback', {
+              connectionId: connId,
+              onlyIfOwner: true,
+              ...(state?.txToken !== undefined ? { txToken: state.txToken } : {}),
+            })
             .catch(() => {})
         }
         return
       }
-      this.state = next
+      this.state = state
       this.host.updateStatus('Transaction started')
     } catch (err) {
       if (this.isCurrentMutation(token, gen, connId)) {
@@ -453,6 +630,7 @@ export class TransactionToolbarController {
       })
       if (!this.isCurrentMutation(token, gen, connId)) return
       this.state = next
+      this.rememberTxToken(connId, next)
       this.host.updateStatus('Transaction committed')
       const activeTable = this.host.getActiveTable()
       if (!this.host.isShowingSqlResult() && activeTable) {
@@ -488,6 +666,7 @@ export class TransactionToolbarController {
       })
       if (!this.isCurrentMutation(token, gen, connId)) return
       this.state = next
+      this.rememberTxToken(connId, next)
       this.host.updateStatus('Transaction rolled back')
       const activeTable = this.host.getActiveTable()
       if (!this.host.isShowingSqlResult() && activeTable) {
@@ -511,10 +690,17 @@ export class TransactionToolbarController {
     this.refreshSeq++
     this.activeMutationToken = null
     this.inFlightBegin = null
+    this.inFlightSetAutoCommit = null
     this.busy = false
     while (this.boundCleanups.length > 0) {
       this.boundCleanups.pop()?.()
     }
+    this.groupEl = null
+    this.txToggleBtn = null
+    this.txToggleDotEl = null
+    this.txToggleLabelEl = null
+    this.txToggleChevEl = null
+    this.txTrayEl = null
     this.autoCommitBtn = null
     this.beginBtn = null
     this.commitBtn = null

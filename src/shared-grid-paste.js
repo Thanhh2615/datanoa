@@ -2,6 +2,221 @@
 // Pure clipboard delimiter parsing, smart grid paste planning & privacy-safe diagnostic redaction
 // shared between Fullscreen Studio and Docked Side Panel.
 
+export function parseJsonPreservingBigInts(raw) {
+  if (typeof raw !== 'string') {
+    return JSON.parse(raw)
+  }
+  const source = raw.startsWith('\uFEFF') ? raw.slice(1) : raw
+  if (!/\d{16}/.test(source)) {
+    return JSON.parse(source)
+  }
+
+  const chunks = []
+  let lastFlush = 0
+  let i = 0
+  const len = source.length
+
+  while (i < len) {
+    const ch = source[i]
+    if (ch === '"') {
+      i++
+      while (i < len) {
+        const sc = source[i]
+        if (sc === '\\') {
+          i += 2
+          continue
+        }
+        if (sc === '"') {
+          i++
+          break
+        }
+        i++
+      }
+      continue
+    }
+
+    const isMinusDigit = ch === '-' && i + 1 < len && source[i + 1] >= '0' && source[i + 1] <= '9'
+    const isDigit = ch >= '0' && ch <= '9'
+    if (isMinusDigit || isDigit) {
+      const start = i
+      if (ch === '-') i++
+      const digitsStart = i
+      while (i < len && source[i] >= '0' && source[i] <= '9') {
+        i++
+      }
+      const intEnd = i
+      const digitCount = intEnd - digitsStart
+
+      let hasDot = false
+      let fracStart = -1
+      let fracEnd = -1
+      let fracAllZero = true
+      if (i < len && source[i] === '.') {
+        hasDot = true
+        i++
+        fracStart = i
+        while (i < len && source[i] >= '0' && source[i] <= '9') {
+          if (source[i] !== '0') fracAllZero = false
+          i++
+        }
+        fracEnd = i
+      }
+
+      let hasExp = false
+      let expDigitsStart = -1
+      let expDigitsEnd = -1
+      let expAllZero = true
+      if (i < len && (source[i] === 'e' || source[i] === 'E')) {
+        hasExp = true
+        i++
+        if (i < len && (source[i] === '+' || source[i] === '-')) i++
+        expDigitsStart = i
+        while (i < len && source[i] >= '0' && source[i] <= '9') {
+          if (source[i] !== '0') expAllZero = false
+          i++
+        }
+        expDigitsEnd = i
+      }
+
+      const hasLeadingZero = digitCount > 1 && source[digitsStart] === '0'
+      const validFrac = !hasDot || (fracEnd > fracStart && fracAllZero)
+      const validExp = !hasExp || (expDigitsEnd > expDigitsStart && expAllZero)
+
+      if (!hasLeadingZero && digitCount >= 16 && validFrac && validExp) {
+        const intStr = source.slice(start, intEnd)
+        if (!Number.isSafeInteger(Number(intStr))) {
+          chunks.push(source.slice(lastFlush, start), `"${intStr}"`)
+          lastFlush = i
+        }
+      }
+      continue
+    }
+
+    i++
+  }
+
+  if (chunks.length === 0) {
+    return JSON.parse(source)
+  }
+  chunks.push(source.slice(lastFlush))
+  return JSON.parse(chunks.join(''))
+}
+
+/**
+ * Formats strict RFC 8259 JSON in a single O(n) pass without routing numeric literals
+ * through IEEE-754 floats, preserving arbitrary-precision BigInt / decimal tokens losslessly.
+ */
+export function formatJsonPreservingNumbers(raw, indent = 2) {
+  const source = typeof raw === 'string' && raw.startsWith('\uFEFF') ? raw.slice(1) : String(raw)
+  parseJsonPreservingBigInts(source)
+
+  const step =
+    typeof indent === 'number' && indent > 0
+      ? ' '.repeat(Math.min(indent, 10))
+      : typeof indent === 'string'
+        ? indent
+        : ''
+  const chunks = []
+  const len = source.length
+  let depth = 0
+  let i = 0
+
+  const skipWs = (pos) => {
+    let k = pos
+    while (
+      k < len &&
+      (source[k] === ' ' || source[k] === '\t' || source[k] === '\r' || source[k] === '\n')
+    ) {
+      k++
+    }
+    return k
+  }
+
+  while (i < len) {
+    i = skipWs(i)
+    if (i >= len) break
+    const ch = source[i]
+
+    if (ch === '"') {
+      const start = i
+      i++
+      while (i < len) {
+        const sc = source[i]
+        if (sc === '\\') {
+          i += 2
+          continue
+        }
+        if (sc === '"') {
+          i++
+          break
+        }
+        i++
+      }
+      chunks.push(source.slice(start, i))
+      continue
+    }
+
+    if (ch === '{' || ch === '[') {
+      const closeChar = ch === '{' ? '}' : ']'
+      const nextPos = skipWs(i + 1)
+      if (nextPos < len && source[nextPos] === closeChar) {
+        chunks.push(ch + closeChar)
+        i = nextPos + 1
+        continue
+      }
+      chunks.push(ch)
+      depth++
+      if (step) {
+        chunks.push('\n' + step.repeat(depth))
+      }
+      i++
+      continue
+    }
+
+    if (ch === '}' || ch === ']') {
+      depth = Math.max(0, depth - 1)
+      if (step) {
+        chunks.push('\n' + step.repeat(depth))
+      }
+      chunks.push(ch)
+      i++
+      continue
+    }
+
+    if (ch === ':') {
+      chunks.push(step ? ': ' : ':')
+      i++
+      continue
+    }
+
+    if (ch === ',') {
+      chunks.push(step ? ',\n' + step.repeat(depth) : ',')
+      i++
+      continue
+    }
+
+    const start = i
+    while (
+      i < len &&
+      source[i] !== ' ' &&
+      source[i] !== '\t' &&
+      source[i] !== '\r' &&
+      source[i] !== '\n' &&
+      source[i] !== '{' &&
+      source[i] !== '}' &&
+      source[i] !== '[' &&
+      source[i] !== ']' &&
+      source[i] !== ',' &&
+      source[i] !== ':'
+    ) {
+      i++
+    }
+    chunks.push(source.slice(start, i))
+  }
+
+  return chunks.join('')
+}
+
 function looksLikeJsonLiteral(trimmed) {
   if (
     (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
@@ -18,11 +233,6 @@ function looksLikeJsonLiteral(trimmed) {
 }
 
 function detectClipboardDelimiter(text) {
-  const trimmed = text.trim()
-  if (looksLikeJsonLiteral(trimmed)) {
-    return '\t'
-  }
-
   let inQuotes = false
   let atFieldStart = true
   let hasQuotedCommaBoundary = false
@@ -239,7 +449,7 @@ function resolveSourceHeaderMapping(sourceHeaders, clipWidth, allColumns) {
 function makeModelIndexResolver(mapping, allColumns, visColPosByModelIdx) {
   return (dc) => {
     const modelColIdx = mapping[dc]
-    if (modelColIdx === undefined || modelColIdx < 0 || modelColIdx >= allColumns.length) {
+    if (modelColIdx === undefined) {
       return null
     }
     return { modelColIdx, visColIdx: visColPosByModelIdx.get(modelColIdx) ?? -1 }
@@ -282,16 +492,6 @@ export function planGridPaste(input) {
   )
   const hadHeaders = headerColMapping !== null
   const dataRows = hadHeaders ? matrix.slice(1) : matrix
-  if (dataRows.length === 0) {
-    return {
-      mode: 'empty',
-      hadHeaders,
-      overwrites: [],
-      inserts: [],
-      startVisRow: 0,
-      startVisCol: 0,
-    }
-  }
 
   const visColPosByModelIdx = new Map()
   visibleColIndices.forEach((modelColIdx, visIdx) => visColPosByModelIdx.set(modelColIdx, visIdx))
@@ -369,7 +569,7 @@ export function planGridPaste(input) {
           insertColResolver = (dc) => {
             const modelColIdx = writableVisibleCols[dc]
             if (modelColIdx === undefined) return null
-            return { modelColIdx, visColIdx: visColPosByModelIdx.get(modelColIdx) ?? -1 }
+            return { modelColIdx, visColIdx: visColPosByModelIdx.get(modelColIdx) }
           }
         } else {
           insertColResolver = (dc) => {

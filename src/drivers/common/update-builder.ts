@@ -62,6 +62,12 @@ export function makePlaceholder(driver: DriverType, index: number): string {
   if (DOLLAR_PLACEHOLDER_DIALECTS.has(driver)) {
     return `$${index}`
   }
+  if (driver === 'mssql') {
+    return `@p${index}`
+  }
+  if (driver === 'oracle') {
+    return `:p${index}`
+  }
   return '?'
 }
 
@@ -70,7 +76,9 @@ export function makePlaceholder(driver: DriverType, index: number): string {
  */
 export function formatSqlValue(value: unknown, dialect: DriverType): string {
   if (value === null || value === undefined) return 'NULL'
-  if (typeof value === 'boolean') return value ? 'TRUE' : 'FALSE'
+  if (typeof value === 'boolean') {
+    return dialect === 'mssql' ? (value ? '1' : '0') : value ? 'TRUE' : 'FALSE'
+  }
   if (typeof value === 'number') return Number.isFinite(value) ? String(value) : 'NULL'
   if (typeof value === 'bigint') return value.toString()
 
@@ -335,6 +343,37 @@ export function buildDeleteStatement(options: BuildDeleteOptions): Parameterized
 }
 
 /**
+ * Projects full row objects down to primary key predicates (or primitive scalar columns
+ * when the table has no primary key) so `deleteRows` payloads do not include `[BLOB]` or
+ * nested object markers in `DELETE ... WHERE` clauses.
+ */
+export function projectDeleteRowsToPrimaryKeys(
+  deleteRows: Record<string, unknown>[],
+  primaryKey: string[]
+): Record<string, unknown>[] {
+  return deleteRows.map((row) => {
+    if (primaryKey.length > 0) {
+      const pkObj: Record<string, unknown> = {}
+      for (const pk of primaryKey) {
+        if (Object.prototype.hasOwnProperty.call(row, pk)) {
+          pkObj[pk] = row[pk]
+        }
+      }
+      if (Object.keys(pkObj).length === primaryKey.length) {
+        return pkObj
+      }
+    }
+    const fallbackObj: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(row)) {
+      if (v !== undefined && (v === null || typeof v !== 'object')) {
+        fallbackObj[k] = v
+      }
+    }
+    return fallbackObj
+  })
+}
+
+/**
  * Builds a multi-column parameterized UPDATE statement with optional optimistic row locking.
  */
 export function buildRowUpdateStatement(options: {
@@ -455,10 +494,11 @@ export function buildChunkedInsertStatements(options: {
     const cols = firstEntries.map(([col]) => col)
     const colSig = cols.join('\0')
     const colsSql = cols.map((col) => quoteIdentForDialect(col, driver)).join(', ')
-    const maxRows = Math.max(
-      1,
-      Math.min(MAX_CHUNKED_INSERT_ROWS, Math.floor(MAX_CHUNKED_INSERT_PARAMS / cols.length))
-    )
+    const maxChunkParams = driver === 'mssql' ? 2000 : MAX_CHUNKED_INSERT_PARAMS
+    const maxRows =
+      driver === 'oracle'
+        ? 1
+        : Math.max(1, Math.min(MAX_CHUNKED_INSERT_ROWS, Math.floor(maxChunkParams / cols.length)))
 
     const params: unknown[] = []
     const tuplePlaceholders: string[] = []
@@ -575,7 +615,8 @@ export function buildSelectPageSql(options: BuildSelectPageOptions): SelectPageQ
 
   const quotedTable = quoteQualifiedTable(table, schema, driver)
   const whereSql = sanitizedWhere ? ` WHERE ${sanitizedWhere}` : ''
-  const countSql = `SELECT COUNT(*) AS total FROM ${quotedTable}${whereSql};`
+  const countAlias = driver === 'oracle' ? '"total"' : 'total'
+  const countSql = `SELECT COUNT(*) AS ${countAlias} FROM ${quotedTable}${whereSql};`
 
   let orderClause = ''
   if (sanitizedOrderBy) {
@@ -586,12 +627,17 @@ export function buildSelectPageSql(options: BuildSelectPageOptions): SelectPageQ
   } else if (primaryKey && primaryKey.length > 0) {
     const pkQuoted = primaryKey.map((k) => quoteIdentForDialect(k, driver)).join(', ')
     orderClause = ` ORDER BY ${pkQuoted} ASC`
+  } else if (driver === 'mssql') {
+    orderClause = ' ORDER BY (SELECT NULL)'
   }
 
-  const limitPh = makePlaceholder(driver, 1)
-  const offsetPh = makePlaceholder(driver, 2)
-  const sql = `SELECT * FROM ${quotedTable}${whereSql}${orderClause} LIMIT ${limitPh} OFFSET ${offsetPh};`
-  const params: unknown[] = [pageSize, offset]
+  const firstPh = makePlaceholder(driver, 1)
+  const secondPh = makePlaceholder(driver, 2)
+  const usesOffsetFetch = driver === 'mssql' || driver === 'oracle'
+  const sql = usesOffsetFetch
+    ? `SELECT * FROM ${quotedTable}${whereSql}${orderClause} OFFSET ${firstPh} ROWS FETCH NEXT ${secondPh} ROWS ONLY;`
+    : `SELECT * FROM ${quotedTable}${whereSql}${orderClause} LIMIT ${firstPh} OFFSET ${secondPh};`
+  const params: unknown[] = usesOffsetFetch ? [offset, pageSize] : [pageSize, offset]
 
   return { sql, dataSql: sql, countSql, params, limit: pageSize, offset }
 }
@@ -607,8 +653,21 @@ export function assembleTableBrowseResult(options: {
   pageSize: number
 }): TableBrowseResult {
   const { tableDetails, rows, countRow, page, pageSize } = options
-  const rawTotal = countRow?.total ?? countRow?.['COUNT(*)'] ?? countRow?.['count'] ?? 0
-  const parsedTotal = Number(rawTotal)
+  let rawTotal: unknown =
+    countRow?.total ??
+    countRow?.TOTAL ??
+    countRow?.['COUNT(*)'] ??
+    countRow?.['count'] ??
+    countRow?.['COUNT']
+  if (rawTotal === undefined && countRow && typeof countRow === 'object') {
+    for (const [k, v] of Object.entries(countRow)) {
+      if (k.toLowerCase() === 'total' || k.toLowerCase() === 'count(*)') {
+        rawTotal = v
+        break
+      }
+    }
+  }
+  const parsedTotal = Number(rawTotal ?? 0)
   const totalRows = Number.isFinite(parsedTotal) && parsedTotal >= 0 ? parsedTotal : 0
 
   const canEdit = tableDetails.kind === 'table' && tableDetails.primaryKey.length > 0

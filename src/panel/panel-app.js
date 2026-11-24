@@ -11,10 +11,16 @@ import {
   formatPanelSql,
   buildDdlFallback,
   coerceTypedCellInput,
+  buildCreateObjectCommand,
   buildCreateTableSql,
+  buildInitialCreateTableDraftColumns,
+  buildSelectPreviewQuery,
   buildTruncateOrDropSql,
   createPanelStructDraft,
   countPanelStructChanges,
+  getPanelCreateTableRowAriaLabels,
+  resolvePanelFormDriver,
+  scrubClientUrlCredentials,
 } from './panel-core.js'
 import {
   $,
@@ -47,6 +53,17 @@ import {
   createPanelExplorerController,
 } from './panel-explorer.js'
 import { createPanelSqlController } from './panel-sql.js'
+import {
+  formatAiStatusBadge,
+  openSharedAiConfigModal,
+  saveOrcaSettingsPatch,
+} from '../shared-ai-ui.js'
+import { formatJsonPreservingNumbers } from '../shared-grid-paste.js'
+import {
+  containsSensitiveSqlText,
+  sanitizeSqlResultForStorage,
+  scrubConnectionNameForStorage,
+} from '../shared-sql-safety.js'
 import { createPanelStructureController } from './panel-structure.js'
 import { createPanelFeedbackAndPaletteController } from './panel-feedback-palette.js'
 import { createPanelDataGridController } from './panel-data-grid.js'
@@ -109,10 +126,14 @@ const state = {
   sourceSecretConnId: null,
   lastParsedUri: '',
   formOptions: '',
+  formSslMode: undefined,
+  formSslRejectUnauthorized: undefined,
+  formSslTouched: false,
   lastAutoFilledSqliteName: '',
   discoveredFiles: [],
   discoveredEnvs: [],
   discoveredDocker: [],
+  aiStatus: null,
   discoveredSearch: '',
   discoveryCollapsed: { env: null, docker: null, sqlite: null },
   initialBootLoading: true,
@@ -173,12 +194,14 @@ let submittingChanges = false
 let inspectorUserModified = false
 
 function isAnyModalOpen() {
+  if (document.querySelector('.datanoa-ai-backdrop')) return true
   const modalIds = [
     'confirmDeleteModal',
     'confirmMigrationModal',
     'bulkFillModal',
     'createTableModal',
     'dangerTableModal',
+    'dangerSqlModal',
     'feedbackModal',
     'cmdPaletteModal',
     'shortcutsModal',
@@ -202,14 +225,14 @@ function sanitizeWarmPanelConnections(list) {
     delete copy.sshPassword
     delete copy.sshPassphrase
     delete copy.sslKeyPassphrase
+    if (typeof copy.name === 'string') {
+      copy.name = scrubConnectionNameForStorage(copy.name)
+    }
     if (typeof copy.url === 'string') {
       copy.url = scrubDraftUrlForLocalStorage(copy.url)
     }
     if (typeof copy.options === 'string') {
-      copy.options = scrubDraftUrlForLocalStorage(copy.options).replace(
-        /\b(password|passwd|pwd|secret|token|auth_token)\s*=\s*([^\s;&]+)/gi,
-        '$1=[REDACTED]'
-      )
+      copy.options = scrubDraftUrlForLocalStorage(copy.options)
     }
     return copy
   })
@@ -222,30 +245,11 @@ function measureUtf8Bytes(str) {
 }
 
 function scrubDraftUrlForLocalStorage(raw) {
-  const s = String(raw || '').trim()
-  if (!s) return ''
-  let cleaned = s
-    .replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^:/\s?#@]*):([^\s/]*)@/g, '$1$2@')
-    .replace(/([?&])([^=&\s#]*(?:token|pass|pwd|secret|key|auth)[^=&\s#]*)=([^&\s#]*)/gi, '$1$2=[REDACTED]')
-  try {
-    const u = new URL(cleaned)
-    for (const k of Array.from(u.searchParams.keys())) {
-      if (/(?:token|pass|pwd|secret|key|auth)/i.test(k)) u.searchParams.delete(k)
-    }
-    cleaned = u.toString()
-  } catch {}
-  return cleaned
+  return scrubClientUrlCredentials(raw)
 }
 
 function sqlDraftLooksSensitive(sql) {
-  if (!sql) return false
-  return (
-    /\b(?:IDENTIFIED\s+BY|PASSWORD\s*=|SECRET\s*=|TOKEN\s*=|ALTER\s+(?:USER|ROLE)\b|CREATE\s+(?:USER|ROLE)\b|AUTH\s+['"]?\S|SET\s+PASSWORD)\b/i.test(
-      sql
-    ) ||
-    /:\/\/[^:/\s?#@]*:[^\s/]+@/i.test(sql) ||
-    /[?&][^=&\s#]*(?:token|pass|pwd|secret|key|auth)[^=&\s#]*=/i.test(sql)
-  )
+  return containsSensitiveSqlText(sql)
 }
 
 function readPanelScrollState() {
@@ -311,12 +315,12 @@ function savePanelDataCache() {
     activeSchema: state.activeSchema,
     page: state.page,
     pageSize: state.pageSize,
-    whereClause: state.whereClause || '',
+    whereClause: containsSensitiveSqlText(state.whereClause || '') ? '' : state.whereClause || '',
     orderByClause: state.orderByClause || '',
     schemaObjects: activeSchemaObjs ? { [state.activeConnectionId]: activeSchemaObjs } : null,
     tableDetails: activeDetails && activeKey ? { [activeKey]: activeDetails } : null,
     pageData: state.pageData || null,
-    lastSqlResult: state.lastSqlResult || null,
+    lastSqlResult: state.lastSqlResult ? sanitizeSqlResultForStorage(state.lastSqlResult) : null,
   }
 
   try {
@@ -387,7 +391,7 @@ function savePanelViewState() {
     pageSize: state.pageSize,
     sortCol: state.sortCol,
     sortDir: state.sortDir,
-    whereClause: state.whereClause,
+    whereClause: containsSensitiveSqlText(state.whereClause || '') ? '' : state.whereClause,
     orderByClause: state.orderByClause,
     transposed: state.transposed,
     collapsedFolders: Array.from(state.collapsedFolders || []),
@@ -406,7 +410,7 @@ function savePanelViewState() {
     formDriver: state.formDriver || 'sqlite',
     formColorTag: state.formColorTag || 'none',
     formDraft: {
-      name: $('formName')?.value || '',
+      name: scrubConnectionNameForStorage($('formName')?.value || ''),
       folder: $('formFolder')?.value || '',
       workspaceScope:
         typeof state.pendingWorkspaceScope === 'string'
@@ -420,12 +424,14 @@ function savePanelViewState() {
       database: $('formDatabase')?.value || '',
       user: $('formUser')?.value || '',
       clickhouseUrl: scrubDraftUrlForLocalStorage($('formClickhouseUrl')?.value || ''),
-      options: scrubDraftUrlForLocalStorage($('formOptions')?.value || '').replace(
-        /\b(password|passwd|pwd|secret|token|auth_token)\s*=\s*([^\s;&]+)/gi,
-        '$1=[REDACTED]'
-      ),
+      options: scrubDraftUrlForLocalStorage($('formOptions')?.value || ''),
       redisDb: $('formRedisDb')?.value || '0',
       ssl: Boolean($('formSsl')?.checked),
+      ...(typeof state.formSslMode === 'string' ? { sslMode: state.formSslMode } : {}),
+      ...(typeof state.formSslRejectUnauthorized === 'boolean'
+        ? { sslRejectUnauthorized: state.formSslRejectUnauthorized }
+        : {}),
+      ...(state.formSslTouched ? { sslTouched: true } : {}),
       readOnly: Boolean($('formReadOnly')?.checked),
       byodFolder: $('panelByodFolderInput')?.value || '',
     },
@@ -546,8 +552,8 @@ function applyPanelViewStateSnapshot(saved) {
     if (['explorer', 'data', 'sql', 'structure'].includes(saved.tab)) {
       switchTab(saved.tab)
     }
-    if (typeof saved.formDriver === 'string' && ENGINE_BY_ID[saved.formDriver]) {
-      setFormDriver(saved.formDriver, false)
+    if (typeof saved.formDriver === 'string' && ENGINE_BY_ID[saved.formDriver] && !ENGINE_BY_ID[saved.formDriver].studioOnly) {
+      setFormDriver(resolvePanelFormDriver(saved.formDriver), false)
     }
     if (typeof saved.formColorTag === 'string') {
       connFormCtrl.setFormColorTag(saved.formColorTag)
@@ -589,6 +595,21 @@ function applyPanelViewStateSnapshot(saved) {
         syncSelectTooltip($('formRedisDb'))
       }
       if (typeof fd.ssl === 'boolean' && $('formSsl')) $('formSsl').checked = fd.ssl
+      if (
+        fd.sslMode === 'auto' ||
+        fd.sslMode === 'disable' ||
+        fd.sslMode === 'require' ||
+        fd.sslMode === 'verify-ca' ||
+        fd.sslMode === 'verify-full'
+      ) {
+        state.formSslMode = fd.sslMode
+      } else {
+        state.formSslMode = undefined
+      }
+      state.formSslRejectUnauthorized =
+        typeof fd.sslRejectUnauthorized === 'boolean' ? fd.sslRejectUnauthorized : undefined
+      state.formSslTouched = Boolean(fd.sslTouched)
+      connFormCtrl.syncSslVerifyUi?.()
       if (typeof fd.readOnly === 'boolean' && $('formReadOnly')) $('formReadOnly').checked = fd.readOnly
       if (typeof fd.byodFolder === 'string' && fd.byodFolder && $('panelByodFolderInput')) {
         $('panelByodFolderInput').dataset.driver = state.formDriver
@@ -791,7 +812,7 @@ async function copyText(text, successMsg, triggerBtn) {
     if (triggerBtn._copyResetTimer) {
       clearTimeout(triggerBtn._copyResetTimer)
     }
-    triggerBtn.textContent = 'Copied!'
+    triggerBtn.textContent = 'Copied'
     triggerBtn._copyResetTimer = setTimeout(() => {
       triggerBtn._copyResetTimer = null
       triggerBtn.textContent = origLabel
@@ -810,7 +831,7 @@ function updateViewportLayout() {
   const active = getActiveConn()
   $('connFormBox').hidden = !state.formOpen
   $('activeConnCard').hidden = state.formOpen || !active
-  $('connMetaRow').hidden = state.formOpen || !active || state.tab !== 'explorer'
+  $('connMetaRow').hidden = state.formOpen || !active
   if ($('structureTableBar')) {
     $('structureTableBar').hidden = state.formOpen || !active || state.tab !== 'structure'
   }
@@ -994,6 +1015,9 @@ const sqlCtrl = createPanelSqlController({
   scheduleSavePanelViewState: (ms) => scheduleSavePanelViewState(ms),
   savePanelDataCache: () => savePanelDataCache(),
   onFormatSql: () => formatSqlInEditor(),
+  getAiStatus: () => state.aiStatus,
+  openAiSettingsModal: () => openAiSettingsModal(),
+  onRefreshAiStatus: () => hydrateAiStatus(),
 })
 const {
   sqlVirt,
@@ -1844,13 +1868,13 @@ async function loadTablePage(connectionId, table, page = 1, schema = state.activ
   state.dataLoading = true
   const isSilent = Boolean(opts.silent && state.pageData && state.pageData.columns?.length > 0)
   state.silentDataRefresh = isSilent
+  const pager = $('dataPager')
+  const pagerInfo = $('dataPagerInfo')
+  const footer = $('dataFooter')
   if (!isSilent) {
     renderDataGrid()
     syncDataControlsDisabled()
     renderStagingBar()
-    const pager = $('dataPager')
-    const pagerInfo = $('dataPagerInfo')
-    const footer = $('dataFooter')
     if (pager && pagerInfo) {
       if (footer) footer.hidden = false
       pager.hidden = false
@@ -2037,6 +2061,8 @@ function selectTableAndOpen(connectionId, tableName, schemaName, switchToData, o
     state.activeSchema !== schemaName
   if (state.activeConnectionId !== connectionId) {
     state.activeConnectionId = connectionId
+    sqlCtrl.clearAiFixPanel?.()
+    sqlCtrl.clearDbSyntaxError?.()
     void persistActiveConnectionId(connectionId)
     renderConnectionsBar()
   }
@@ -2065,21 +2091,18 @@ function selectTableAndOpen(connectionId, tableName, schemaName, switchToData, o
   $('clearFilterBtn').hidden = !state.whereClause
 
   if (!options.preserveSqlEditor) {
+    sqlCtrl.clearAiFixPanel?.()
+    sqlCtrl.clearDbSyntaxError?.()
     const activeConn = getActiveConn()
-    if (activeConn?.driver === 'redis') {
-      setSqlText(
-        tableName === '(root)' ? 'SCAN 0 MATCH * COUNT 50' : `SCAN 0 MATCH ${tableName} COUNT 50`,
-        { skipSave: true }
-      )
-    } else {
-      const qTable = quoteTableRef(tableName, schemaName, activeConn?.driver || 'sqlite')
-      setSqlText(
+    setSqlText(
+      buildSelectPreviewQuery(
+        activeConn?.driver || 'sqlite',
+        tableName,
+        schemaName,
         state.whereClause
-          ? `SELECT * FROM ${qTable} WHERE ${state.whereClause} LIMIT 100;`
-          : `SELECT * FROM ${qTable} LIMIT 100;`,
-        { skipSave: true }
-      )
-    }
+      ),
+      { skipSave: true }
+    )
   }
 
   renderExplorer()
@@ -2215,10 +2238,7 @@ $('newServerBtn').addEventListener('click', () => {
   }
   resetConnectionForm()
   const activeDriver = getActiveConn()?.driver
-  setFormDriver(
-    activeDriver && ENGINE_BY_ID[activeDriver] ? activeDriver : 'sqlite',
-    true
-  )
+  setFormDriver(resolvePanelFormDriver(activeDriver, 'sqlite'), true)
   setFormOpen(true)
 })
 
@@ -2296,12 +2316,13 @@ let createTableColSeq = 1
 function updateCreateTablePreview() {
   const conn = getActiveConn()
   const driver = conn?.driver || 'sqlite'
+  const isMongo = driver === 'mongodb'
   const tblName = $('createTableNameInput').value.trim()
   const errBox = $('createTableErrors')
   const previewEl = $('createTableDdlPreview')
   const execBtn = $('createTableExecuteBtn')
   try {
-    const ddl = buildCreateTableSql(tblName, createTableDraftCols, driver, state.activeSchema)
+    const ddl = buildCreateObjectCommand(tblName, createTableDraftCols, driver, state.activeSchema)
     errBox.hidden = true
     errBox.textContent = ''
     previewEl.textContent = ddl
@@ -2309,7 +2330,9 @@ function updateCreateTablePreview() {
   } catch (err) {
     errBox.hidden = false
     errBox.textContent = err?.message || String(err)
-    previewEl.textContent = '-- Fix validation errors above to preview CREATE TABLE SQL.'
+    previewEl.textContent = isMongo
+      ? '-- Enter a valid collection name above to preview db.createCollection(...) command.'
+      : '-- Fix validation errors above to preview CREATE TABLE SQL.'
     execBtn.disabled = true
   }
 }
@@ -2318,7 +2341,8 @@ function renderCreateTableRows() {
   const tbody = $('createTableColsBody')
   if (!tbody) return
   tbody.textContent = ''
-  for (const col of createTableDraftCols) {
+  createTableDraftCols.forEach((col, rowIdx) => {
+    const a11y = getPanelCreateTableRowAriaLabels(rowIdx)
     const tr = document.createElement('tr')
 
     const tdName = document.createElement('td')
@@ -2328,6 +2352,7 @@ function renderCreateTableRows() {
     nameInp.className = 'struct-cell-input'
     nameInp.value = col.name
     nameInp.placeholder = 'column_name'
+    nameInp.setAttribute('aria-label', a11y.name)
     nameInp.addEventListener('input', () => {
       col.name = nameInp.value
       updateCreateTablePreview()
@@ -2340,6 +2365,10 @@ function renderCreateTableRows() {
       col.dataType = nextVal
       updateCreateTablePreview()
     })
+    const typeInp = typeWrap.querySelector('input')
+    if (typeInp) typeInp.setAttribute('aria-label', a11y.type)
+    const typeToggleBtn = typeWrap.querySelector('button')
+    if (typeToggleBtn) typeToggleBtn.setAttribute('aria-label', a11y.typeToggle)
     tdType.appendChild(typeWrap)
 
     const tdPk = document.createElement('td')
@@ -2348,6 +2377,7 @@ function renderCreateTableRows() {
     pkCb.type = 'checkbox'
     pkCb.className = 'struct-checkbox'
     pkCb.checked = Boolean(col.isPrimaryKey)
+    pkCb.setAttribute('aria-label', a11y.primaryKey)
     tdPk.appendChild(pkCb)
 
     const tdNull = document.createElement('td')
@@ -2357,6 +2387,7 @@ function renderCreateTableRows() {
     nullCb.className = 'struct-checkbox'
     nullCb.checked = Boolean(col.nullable)
     nullCb.disabled = Boolean(col.isPrimaryKey)
+    nullCb.setAttribute('aria-label', a11y.nullable)
     tdNull.appendChild(nullCb)
 
     pkCb.addEventListener('change', () => {
@@ -2380,6 +2411,7 @@ function renderCreateTableRows() {
     defInp.className = 'struct-cell-input'
     defInp.value = col.defaultValue || ''
     defInp.placeholder = col.nullable ? 'NULL' : 'None'
+    defInp.setAttribute('aria-label', a11y.defaultValue)
     defInp.addEventListener('input', () => {
       col.defaultValue = defInp.value
       updateCreateTablePreview()
@@ -2392,6 +2424,7 @@ function renderCreateTableRows() {
     delBtn.className = 'btn btn-sm'
     delBtn.textContent = '×'
     delBtn.disabled = createTableDraftCols.length <= 1
+    delBtn.setAttribute('aria-label', a11y.remove)
     delBtn.addEventListener('click', () => {
       const idx = createTableDraftCols.indexOf(col)
       if (idx >= 0 && createTableDraftCols.length > 1) {
@@ -2403,7 +2436,7 @@ function renderCreateTableRows() {
 
     tr.append(tdName, tdType, tdPk, tdNull, tdDef, tdAct)
     tbody.appendChild(tr)
-  }
+  })
   updateCreateTablePreview()
 }
 
@@ -2411,20 +2444,34 @@ function openCreateTableModal() {
   const conn = getActiveConn()
   if (!conn || conn.driver === 'redis') return
   if (conn.readOnly) {
-    showBanner('Read-Only connection — cannot create tables.', 'danger')
+    showBanner('Read-Only connection — cannot create tables or collections.', 'danger')
     return
   }
+  const isMongo = conn.driver === 'mongodb'
+  if ($('createTableTitle')) {
+    $('createTableTitle').textContent = isMongo ? 'Create New Collection' : 'Create New Table'
+  }
   $('createTableDriverBadge').textContent = (ENGINE_BY_ID[conn.driver]?.label || conn.driver).toUpperCase()
-  $('createTableNameInput').value = ''
-  createTableDraftCols = [
-    { id: `ct_${createTableColSeq++}`, name: 'id', dataType: 'INTEGER', isPrimaryKey: true, nullable: false, defaultValue: '' },
-    { id: `ct_${createTableColSeq++}`, name: 'name', dataType: 'TEXT', isPrimaryKey: false, nullable: false, defaultValue: '' },
-  ]
-  setButtonLoading($('createTableExecuteBtn'), false)
+  const nameInp = $('createTableNameInput')
+  nameInp.value = ''
+  nameInp.placeholder = isMongo ? 'e.g. events' : 'e.g. audit_logs'
+  const nameFieldLabel = nameInp.closest('.field')?.querySelector('.field-label')
+  if (nameFieldLabel) nameFieldLabel.textContent = isMongo ? 'Collection Name' : 'Table Name'
+  const colsFieldWrap = $('createTableColsBody')?.closest('.field')
+  if (colsFieldWrap) colsFieldWrap.hidden = isMongo
+  const previewFieldLabel = $('createTableDdlPreview')?.closest('.field')?.querySelector('.field-label')
+  if (previewFieldLabel) previewFieldLabel.textContent = isMongo ? 'MongoDB Command Preview' : 'CREATE TABLE DDL Preview'
+  const execBtn = $('createTableExecuteBtn')
+  execBtn.textContent = isMongo ? 'Create Collection' : 'Create Table'
+  createTableDraftCols = buildInitialCreateTableDraftColumns(conn.driver).map((col) => ({
+    id: `ct_${createTableColSeq++}`,
+    ...col,
+  }))
+  setButtonLoading(execBtn, false)
   $('createTableCancelBtn').disabled = false
   renderCreateTableRows()
   $('createTableModal').hidden = false
-  $('createTableNameInput').focus()
+  nameInp.focus()
 }
 
 function closeCreateTableModal(force = false) {
@@ -2444,14 +2491,15 @@ function openDangerTableModal(action, conn, obj) {
   }
   pendingDangerTableOp = { action, conn, obj }
   const isDrop = action === 'drop'
-  const kindLabel = obj.kind === 'view' ? 'View' : 'Table'
-  const actionLabel = isDrop ? `Drop ${kindLabel}` : 'Truncate Table'
+  const isMongo = conn.driver === 'mongodb'
+  const kindLabel = isMongo ? 'Collection' : obj.kind === 'view' ? 'View' : 'Table'
+  const actionLabel = isDrop ? `Drop ${kindLabel}` : `Truncate ${kindLabel}`
   $('dangerTableTitle').textContent = `${actionLabel} — ${obj.name}`
   $('dangerTableBadge').textContent = isDrop ? 'DROP' : 'TRUNCATE'
   $('dangerTableProdWarn').hidden = conn.colorTag !== 'prod'
   $('dangerTableDesc').textContent = isDrop
     ? `This permanently deletes ${kindLabel.toLowerCase()} "${obj.name}" and cannot be undone.`
-    : `This permanently deletes all rows from "${obj.name}" while keeping the table schema.`
+    : `This permanently deletes all ${isMongo ? 'documents' : 'rows'} from "${obj.name}" while keeping the ${isMongo ? 'collection' : 'table schema'}.`
   const sql = buildTruncateOrDropSql(action, obj, conn.driver)
   $('dangerTableSqlPreview').textContent = sql
   $('dangerTableConfirmLabel').textContent = `Type "${obj.name}" to confirm`
@@ -2782,8 +2830,12 @@ $('discoveredSearchInput')?.addEventListener('input', () => {
   renderDiscoveredItems()
 })
 
+$('uriInput').addEventListener('input', () => {
+  connFormCtrl.clearActiveAutoUri?.()
+})
 $('parseUriBtn').addEventListener('click', () => void handleParseUri())
 $('uriInput').addEventListener('paste', (e) => {
+  connFormCtrl.clearActiveAutoUri?.()
   const pasted = e.clipboardData?.getData('text')
   if (pasted) {
     setTimeout(() => void handleParseUri($('uriInput').value || pasted), 0)
@@ -2843,7 +2895,7 @@ $('testFormBtn').addEventListener('click', async () => {
     showFormNotice('Testing connection...', 'neutral')
     const sub = buildFormSubmission(targetId)
     const res = await rpc('connection.test', sub, { timeoutMs: QUERY_TIMEOUT_MS })
-    showFormNotice(res?.message || (res?.ok ? 'Connection verified successfully!' : 'Connection test failed.'), res?.ok ? 'success' : 'danger')
+    showFormNotice(res?.message || (res?.ok ? 'Connection verified' : 'Connection test failed.'), res?.ok ? 'success' : 'danger')
   } catch (err) {
     showFormNotice(`Error: ${err?.message || err}`, 'danger')
   } finally {
@@ -2866,8 +2918,13 @@ $('saveFormBtn').addEventListener('click', async () => {
   })
   try {
     if (!(await ensureUriParsedBeforeAction())) return
-    if (state.formDriver === 'sqlite' && !$('formFilePath').value.trim()) {
-      showFormNotice('Please enter a SQLite database file or folder path.', 'danger')
+    if ((state.formDriver === 'sqlite' || state.formDriver === 'duckdb') && !$('formFilePath').value.trim()) {
+      showFormNotice(
+        state.formDriver === 'duckdb'
+          ? 'Please enter a DuckDB database file path (or :memory:).'
+          : 'Please enter a SQLite database file or folder path.',
+        'danger'
+      )
       return
     }
     if (state.formDriver === 'libsql' && !$('formLibsqlUrl').value.trim()) {
@@ -3145,7 +3202,7 @@ $('createTableExecuteBtn')?.addEventListener('click', async () => {
   let ddl = ''
   const tblName = $('createTableNameInput').value.trim()
   try {
-    ddl = buildCreateTableSql(tblName, createTableDraftCols, conn.driver, state.activeSchema)
+    ddl = buildCreateObjectCommand(tblName, createTableDraftCols, conn.driver, state.activeSchema)
   } catch (err) {
     $('createTableErrors').hidden = false
     $('createTableErrors').textContent = err?.message || String(err)
@@ -3161,6 +3218,7 @@ $('createTableExecuteBtn')?.addEventListener('click', async () => {
   })
   const targetConnId = conn.id
   const targetSchema = state.activeSchema
+  const objNoun = conn.driver === 'mongodb' ? 'collection' : 'table'
   try {
     await rpc('query.run', { connectionId: targetConnId, queryId: `panel_create_${Date.now()}`, sql: ddl }, { timeoutMs: QUERY_TIMEOUT_MS })
     stopTimer()
@@ -3168,7 +3226,7 @@ $('createTableExecuteBtn')?.addEventListener('click', async () => {
     setButtonLoading(execBtn, false)
     if (cancelBtn) cancelBtn.disabled = false
     closeCreateTableModal(true)
-    showBanner(`Created table "${tblName}"`, 'success')
+    showBanner(`Created ${objNoun} "${tblName}"`, 'success')
     await loadSchema(targetConnId)
     if (state.activeConnectionId === targetConnId) {
       selectTableAndOpen(targetConnId, tblName, targetSchema, true)
@@ -3664,6 +3722,93 @@ $('toggleInspectorBodyBtn').addEventListener('click', () => {
   state.inspectorCollapsed = !state.inspectorCollapsed
   renderValueInspector()
 })
+let inspectorResizeCleanup = null
+;(() => {
+  const resizer = $('valueInspectorResizer')
+  const drawer = $('valueInspectorDrawer')
+  if (!resizer || !drawer) return
+  const STORAGE_KEY = 'datanoa.panelValueInspectorPx'
+  const DEFAULT_PX = 220
+  const MIN_PX = 148
+  const STEP_PX = 24
+  let rafId = null
+
+  const clampPx = (px) => {
+    const parentH = drawer.parentElement?.getBoundingClientRect?.().height
+    const maxPx = parentH && Number.isFinite(parentH) && parentH > 0 ? Math.max(MIN_PX, Math.floor(parentH * 0.76)) : 560
+    return Math.max(MIN_PX, Math.min(maxPx, Math.round(px)))
+  }
+  const applyPx = (px, persist) => {
+    const clamped = clampPx(px)
+    drawer.style.height = `${clamped}px`
+    resizer.setAttribute('aria-valuenow', String(clamped))
+    if (persist) {
+      try { window.localStorage?.setItem(STORAGE_KEY, String(clamped)) } catch {}
+    }
+    if (typeof requestAnimationFrame === 'function') {
+      if (rafId !== null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(rafId)
+      rafId = requestAnimationFrame(() => {
+        rafId = null
+        if (dataVirt?.active) renderDataVirtualWindow(false)
+      })
+    } else if (dataVirt?.active) {
+      renderDataVirtualWindow(false)
+    }
+  }
+
+  resizer.addEventListener('mousedown', (e) => {
+    if (state.inspectorCollapsed) return
+    e.preventDefault()
+    inspectorResizeCleanup?.()
+    const startY = e.clientY
+    const startH = clampPx(drawer.getBoundingClientRect?.().height || DEFAULT_PX)
+    let currentH = startH
+    resizer.classList.add('is-resizing')
+    document.body.style.cursor = 'row-resize'
+    document.body.style.userSelect = 'none'
+
+    const onMove = (ev) => {
+      currentH = clampPx(startH + (startY - ev.clientY))
+      applyPx(currentH, false)
+    }
+    const cleanup = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onEnd)
+      window.removeEventListener('blur', onEnd)
+      if (rafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(rafId)
+        rafId = null
+      }
+      resizer.classList.remove('is-resizing')
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+      if (inspectorResizeCleanup === cleanup) inspectorResizeCleanup = null
+    }
+    const onEnd = () => {
+      cleanup()
+      applyPx(currentH, true)
+    }
+    inspectorResizeCleanup = cleanup
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onEnd)
+    window.addEventListener('blur', onEnd)
+  })
+
+  resizer.addEventListener('dblclick', () => applyPx(DEFAULT_PX, true))
+  resizer.addEventListener('keydown', (e) => {
+    if (state.inspectorCollapsed) return
+    const cur = clampPx(drawer.getBoundingClientRect?.().height || DEFAULT_PX)
+    let next = null
+    if (e.key === 'ArrowUp') next = cur + STEP_PX
+    else if (e.key === 'ArrowDown') next = cur - STEP_PX
+    else if (e.key === 'Home') next = MIN_PX
+    else if (e.key === 'End') next = clampPx(9999)
+    if (next !== null) {
+      e.preventDefault()
+      applyPx(next, true)
+    }
+  })
+})()
 $('closeInspectorBtn').addEventListener('click', () => {
   state.inspectorOpen = false
   renderValueInspector()
@@ -3687,7 +3832,7 @@ $('valueInspectorText')?.addEventListener('keydown', (e) => {
 $('inspectorFormatJsonBtn')?.addEventListener('click', () => {
   const inp = $('valueInspectorText')
   try {
-    inp.value = JSON.stringify(JSON.parse(inp.value.trim()), null, 2)
+    inp.value = formatJsonPreservingNumbers(inp.value.trim(), 2)
     inspectorUserModified = true
     updateInspectorMetaAndJson()
   } catch {}
@@ -3695,7 +3840,7 @@ $('inspectorFormatJsonBtn')?.addEventListener('click', () => {
 $('inspectorMinifyJsonBtn')?.addEventListener('click', () => {
   const inp = $('valueInspectorText')
   try {
-    inp.value = JSON.stringify(JSON.parse(inp.value.trim()))
+    inp.value = formatJsonPreservingNumbers(inp.value.trim(), 0)
     inspectorUserModified = true
     updateInspectorMetaAndJson()
   } catch {}
@@ -3807,6 +3952,9 @@ $('cancelSqlBtn').addEventListener('click', async () => {
   }
 })
 
+$('sqlAiBtn')?.addEventListener('click', () => {
+  void openAiSettingsModal()
+})
 $('toggleHistoryBtn').addEventListener('click', () => {
   state.historyOpen = !state.historyOpen
   $('sqlHistoryDrawer').hidden = !state.historyOpen
@@ -3861,6 +4009,12 @@ document.querySelectorAll('#tabStructure .grid-wrap').forEach((el) => {
   bindCtrlWheelHorizontalScroll(el)
   el.addEventListener('scroll', () => closePanelComboPopover(), { passive: true })
 })
+
+document.querySelectorAll('.modal-backdrop .grid-wrap').forEach((el) => {
+  bindCtrlWheelHorizontalScroll(el)
+})
+bindCtrlWheelHorizontalScroll($('sqlConsoleTabsBar'))
+bindCtrlWheelHorizontalScroll($('sqlResultSetsBar'))
 const panelViewportEl = document.querySelector('.viewport')
 if (panelViewportEl) {
   panelViewportEl.addEventListener(
@@ -3904,11 +4058,28 @@ window.addEventListener('blur', () => {
     activeResizeCleanup()
     activeResizeCleanup = null
   }
+  if (typeof inspectorResizeCleanup === 'function') {
+    inspectorResizeCleanup()
+  }
 })
 
 // Capture-phase Escape: dismiss overlays/popovers/modals before PanelGridSelection clears cell selection
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return
+  const aiBackdrop = document.querySelector('.datanoa-ai-backdrop')
+  if (aiBackdrop) {
+    e.preventDefault()
+    e.stopPropagation()
+    if (typeof aiBackdrop._closeAiModal === 'function') {
+      aiBackdrop._closeAiModal()
+    } else {
+      const closeBtn =
+        aiBackdrop.querySelector('[aria-label="Close AI SQL Assistant settings"]') ||
+        aiBackdrop.querySelector('.datanoa-ai-modal-head button')
+      closeBtn?.click()
+    }
+    return
+  }
   if (document.querySelector('.panel-fp-backdrop')) return
   const activeEl = document.activeElement
   if (activeEl instanceof HTMLInputElement && activeEl.classList.contains('cell-edit-input')) {
@@ -3960,6 +4131,12 @@ document.addEventListener('keydown', (e) => {
     e.preventDefault()
     e.stopPropagation()
     closeShortcutsModal()
+    return
+  }
+  if ($('dangerSqlModal') && !$('dangerSqlModal').hidden) {
+    e.preventDefault()
+    e.stopPropagation()
+    $('dangerSqlCancelBtn')?.click()
     return
   }
   if ($('dangerTableModal') && !$('dangerTableModal').hidden) {
@@ -4086,6 +4263,14 @@ if (window.orca?.on) {
 if (window.orca?.plugin?.on) {
   try {
     trackOrcaDisposable(window.orca.plugin.on('connections.changed', () => void refreshConnections()))
+    trackOrcaDisposable(window.orca.plugin.on('ai.status.changed', (snapshot) => applyAiStatus(snapshot)))
+    if (typeof window.orca.settings?.onDidChange === 'function') {
+      trackOrcaDisposable(window.orca.settings.onDidChange((change) => {
+        if (typeof change?.key === 'string' && change.key.startsWith('ai')) {
+          void hydrateAiStatus()
+        }
+      }))
+    }
     trackOrcaDisposable(window.orca.plugin.on('data.cellUpdated', (payload) => {
       if (!state.activeConnectionId || !state.activeTable) return
       if (payload?.connectionId && payload.connectionId !== state.activeConnectionId) return
@@ -4135,6 +4320,9 @@ window.addEventListener('pagehide', () => {
     activeResizeCleanup()
     activeResizeCleanup = null
   }
+  if (typeof inspectorResizeCleanup === 'function') {
+    inspectorResizeCleanup()
+  }
   dataGridSel?.destroy?.()
   sqlGridSel?.destroy?.()
   destroySqlEditor()
@@ -4147,7 +4335,38 @@ window.addEventListener('pagehide', () => {
   }
 })
 
+function applyAiStatus(snapshot) {
+  state.aiStatus = snapshot || null
+  const btn = $('sqlAiBtn')
+  if (btn) {
+    const badge = formatAiStatusBadge(state.aiStatus)
+    btn.textContent = badge.label
+    btn.title = badge.title
+    btn.className = `btn btn-ghost btn-sm datanoa-ai-toolbar-btn tone-${badge.tone}`
+  }
+  sqlCtrl?.onAiStatusChanged?.()
+}
+
+async function hydrateAiStatus() {
+  try {
+    const snapshot = await rpc('ai.status.get')
+    applyAiStatus(snapshot)
+  } catch {
+    // Non-blocking when worker is booting or under minimal mock
+  }
+}
+
+async function openAiSettingsModal() {
+  await openSharedAiConfigModal({
+    rpc,
+    saveSettings: saveOrcaSettingsPatch,
+    initialStatus: state.aiStatus,
+    onStatusUpdated: (snapshot) => applyAiStatus(snapshot),
+  })
+}
+
 restorePanelViewStateFromLocal()
+void hydrateAiStatus()
 bindSelectTooltipsInRoot(document)
 syncThemeFromTokens()
 setSqlColorScheme(document.documentElement.classList.contains('light'))

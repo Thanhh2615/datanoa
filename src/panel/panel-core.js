@@ -16,6 +16,7 @@ import {
 import {
   FORBIDDEN_SUBQUERY_VERBS,
   KNOWN_SQL_DEFAULT_KEYWORDS,
+  analyzeSqliteTriggerReferences as sharedAnalyzeSqliteTriggerReferences,
   containsDdlStatement as sharedContainsDdlStatement,
   findStatementAtOffset as sharedFindStatementAtOffset,
   findTopLevelPostgresCastIndex as sharedFindTopLevelPostgresCastIndex,
@@ -33,8 +34,15 @@ import {
   stripLeadingSqlComments as sharedStripLeadingSqlComments,
   validateColumnTypeSpec as sharedValidateColumnTypeSpec,
 } from '../shared-sql-core.js'
+import {
+  analyzeDangerousSql,
+  maskConnectionUriSecret,
+  scrubSensitiveText,
+} from '../shared-sql-safety.js'
 
-export const DATANOA_VERSION = '1.1.2'
+export { analyzeDangerousSql, maskConnectionUriSecret }
+
+export const DATANOA_VERSION = '1.2.0'
 export const DATANOA_GITHUB_ISSUES_URL = 'https://github.com/Thanhh2615/datanoa/issues/new'
 
 export const ENGINES = [
@@ -46,9 +54,16 @@ export const ENGINES = [
   { id: 'clickhouse', label: 'ClickHouse', defaultPort: 8123, supportsSsl: true, defaultDb: 'default', defaultUser: 'default' },
   { id: 'redis', label: 'Redis', defaultPort: 6379, supportsSsl: true, defaultDb: '0', defaultUser: '' },
   { id: 'libsql', label: 'LibSQL', defaultPort: 443, supportsSsl: true, defaultDb: 'turso', defaultUser: '' },
+  { id: 'd1', label: 'Cloudflare D1', defaultPort: 443, supportsSsl: true, defaultDb: 'main', defaultUser: '', studioOnly: true },
   { id: 'mssql', label: 'SQL Server', defaultPort: 1433, supportsSsl: true, defaultDb: 'master', defaultUser: 'sa' },
   { id: 'oracle', label: 'Oracle', defaultPort: 1521, supportsSsl: true, defaultDb: 'FREEPDB1', defaultUser: 'system' },
   { id: 'mongodb', label: 'MongoDB', defaultPort: 27017, supportsSsl: true, defaultDb: 'admin', defaultUser: 'admin' },
+  { id: 'duckdb', label: 'DuckDB', defaultPort: 0, supportsSsl: false, defaultDb: 'analytics.duckdb', defaultUser: '' },
+  { id: 'snowflake', label: 'Snowflake', defaultPort: 443, supportsSsl: true, defaultDb: 'SNOWFLAKE_SAMPLE_DATA', defaultUser: 'admin' },
+  { id: 'bigquery', label: 'BigQuery', defaultPort: 443, supportsSsl: true, defaultDb: 'default', defaultUser: '' },
+  { id: 'cassandra', label: 'Cassandra', defaultPort: 9042, supportsSsl: true, defaultDb: 'system', defaultUser: 'cassandra' },
+  { id: 'elasticsearch', label: 'Elasticsearch', defaultPort: 9200, supportsSsl: true, defaultDb: '_all', defaultUser: 'elastic' },
+  { id: 'neo4j', label: 'Neo4j', defaultPort: 7687, supportsSsl: true, defaultDb: 'neo4j', defaultUser: 'neo4j' },
   { id: 'custom', label: 'Custom BYOD', defaultPort: 5432, supportsSsl: true, defaultDb: 'default', defaultUser: 'admin' },
 ]
 
@@ -68,6 +83,21 @@ export const PANEL_REFERENTIAL_ACTIONS = [
   'SET DEFAULT',
 ]
 export const PANEL_REF_ACTIONS = new Set(PANEL_REFERENTIAL_ACTIONS)
+const SAFE_SQLITE_COLLATE_RE = /^[A-Za-z_][A-Za-z0-9_]*$/
+const VALID_SQLITE_ON_CONFLICT = new Set(['ROLLBACK', 'ABORT', 'FAIL', 'IGNORE', 'REPLACE'])
+const SQLITE_SERVER_FK_CHECK_SQL =
+  "SELECT json_extract('{}', '__datanoa_fk_violation__') FROM pragma_foreign_key_check LIMIT 1;"
+
+function sanitizeSqliteCollate(raw) {
+  const trimmed = String(raw || '').trim()
+  if (!trimmed || trimmed.toUpperCase() === 'BINARY') return undefined
+  return SAFE_SQLITE_COLLATE_RE.test(trimmed) ? trimmed : undefined
+}
+
+function sanitizeSqliteOnConflict(raw) {
+  const upper = String(raw || '').trim().toUpperCase()
+  return VALID_SQLITE_ON_CONFLICT.has(upper) ? upper : undefined
+}
 
 export const PANEL_COL_TYPES = [
   'VARCHAR(255)',
@@ -100,6 +130,9 @@ export const PANEL_TYPE_SUGGESTIONS_BY_DRIVER = {
   libsql: [
     'INTEGER', 'TEXT', 'REAL', 'BLOB', 'NUMERIC', 'BOOLEAN', 'DATETIME', 'DATE', 'JSON', 'VARCHAR(255)',
   ],
+  d1: [
+    'INTEGER', 'TEXT', 'REAL', 'BLOB', 'NUMERIC', 'BOOLEAN', 'DATETIME', 'DATE', 'JSON', 'VARCHAR(255)',
+  ],
   postgres: [
     'BIGINT', 'INTEGER', 'INT4', 'INT8', 'TEXT', 'VARCHAR(255)', 'BOOLEAN', 'NUMERIC(10,2)',
     'DOUBLE PRECISION', 'TIMESTAMPTZ', 'TIMESTAMP', 'DATE', 'UUID', 'JSONB', 'JSON', 'BYTEA',
@@ -119,6 +152,16 @@ export const PANEL_TYPE_SUGGESTIONS_BY_DRIVER = {
   clickhouse: [
     'UInt64', 'Int64', 'Int32', 'String', 'LowCardinality(String)', 'Float64',
     'Decimal(10, 2)', 'Bool', 'DateTime', 'DateTime64(3)', 'Date', 'UUID', 'Nullable(String)',
+  ],
+  mssql: [
+    'INT', 'BIGINT', 'SMALLINT', 'TINYINT', 'BIT', 'DECIMAL(18,2)', 'FLOAT',
+    'NVARCHAR(255)', 'NVARCHAR(MAX)', 'VARCHAR(255)', 'DATE', 'DATETIME2', 'DATETIMEOFFSET',
+    'UNIQUEIDENTIFIER', 'VARBINARY(MAX)', 'JSON',
+  ],
+  oracle: [
+    'NUMBER(10)', 'NUMBER(19)', 'NUMBER(10,2)', 'BINARY_DOUBLE',
+    'VARCHAR2(255)', 'NVARCHAR2(255)', 'CLOB', 'DATE', 'TIMESTAMP',
+    'TIMESTAMP WITH TIME ZONE', 'RAW(16)', 'BLOB', 'JSON',
   ],
   redis: ['STRING', 'HASH', 'LIST', 'SET', 'ZSET', 'STREAM', 'JSON'],
 }
@@ -183,13 +226,6 @@ export function compactPathLabel(fullPath) {
   const parts = String(fullPath || '').split(/[\\/]/).filter(Boolean)
   if (parts.length <= 4) return String(fullPath || '').replace(/\\/g, '/')
   return `.../${parts.slice(-4).join('/')}`
-}
-
-export function maskConnectionUriSecret(rawUri) {
-  return String(rawUri || '').replace(
-    /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^:/?#\s@]*:)([^@]+)(@)/,
-    '$1***$3'
-  )
 }
 
 // ============================================================================
@@ -419,6 +455,7 @@ export function formatSelectionAsOutput(
 }
 
 export function formatPanelSql(sql, driver) {
+  if (driver === 'redis' || driver === 'mongodb') return String(sql || '')
   return sharedFormatSql(String(sql || ''), driver || 'postgres')
 }
 
@@ -647,6 +684,9 @@ export function formatDdlForDisplay(ddl) {
 }
 
 export function buildCreateTableSql(tableName, cols, driver, schema) {
+  if (driver === 'redis' || driver === 'mongodb') {
+    throw new Error(`CREATE TABLE SQL is not supported on ${driver}.`)
+  }
   const cleanName = String(tableName || '').trim()
   if (!cleanName) throw new Error('Table name is required.')
   if (FORBIDDEN_DEFAULT_TOKENS_RE.test(cleanName)) throw new Error('Table name contains invalid characters.')
@@ -664,9 +704,15 @@ export function buildCreateTableSql(tableName, cols, driver, schema) {
     const ct = validatePanelTypeSpec(col.dataType)
     if (col.isPrimaryKey) pkCols.push(cn)
     let line = `${quoteIdent(cn, driver)} ${ct}`
-    if (!col.nullable && !col.isPrimaryKey) line += ' NOT NULL'
     const defVal = String(col.defaultValue || '').trim()
-    if (defVal) line += ` DEFAULT ${normalizePanelDefaultExpr(defVal, ct)}`
+    const defClause = defVal ? ` DEFAULT ${normalizePanelDefaultExpr(defVal, ct)}` : ''
+    if (driver === 'oracle') {
+      if (defClause) line += defClause
+      if (!col.nullable && !col.isPrimaryKey) line += ' NOT NULL'
+    } else {
+      if (!col.nullable && !col.isPrimaryKey) line += ' NOT NULL'
+      if (defClause) line += defClause
+    }
     colLines.push(line)
   }
   if (driver !== 'clickhouse') {
@@ -685,7 +731,23 @@ export function buildCreateTableSql(tableName, cols, driver, schema) {
   return `CREATE TABLE ${qTable} (\n  ${colLines.join(',\n  ')}\n);`
 }
 
+export function buildCreateObjectCommand(tableName, cols, driver, schema) {
+  if (driver === 'mongodb') {
+    const cleanName = String(tableName || '').trim()
+    if (!cleanName) throw new Error('Collection name is required.')
+    if (FORBIDDEN_DEFAULT_TOKENS_RE.test(cleanName)) throw new Error('Collection name contains invalid characters.')
+    return `db.createCollection(${JSON.stringify(cleanName)});`
+  }
+  return buildCreateTableSql(tableName, cols, driver, schema)
+}
+
 export function buildTruncateOrDropSql(action, obj, driver) {
+  if (driver === 'mongodb') {
+    const cleanName = String(obj?.name || '').trim()
+    if (!cleanName) throw new Error('Collection name is required.')
+    const colCall = `db.getCollection(${JSON.stringify(cleanName)})`
+    return action === 'truncate' ? `${colCall}.deleteMany({});` : `${colCall}.drop();`
+  }
   const qTable = quoteTableRef(obj.name, obj.schema, driver)
   if (action === 'truncate') {
     if (driver === 'sqlite' || driver === 'libsql' || driver === 'd1') {
@@ -709,6 +771,7 @@ export const normalizePanelDefaultExpr = sharedNormalizeSqlDefaultExpression
 export function createPanelStructDraft(details) {
   const columns = (details.columns || []).map((c, idx) => {
     const defVal = c.defaultValue !== undefined && c.defaultValue !== null ? String(c.defaultValue) : ''
+    const cleanCollate = sanitizeSqliteCollate(c.collate)
     return {
       id: `pcol_${idx}_${c.name}`,
       originalName: c.name,
@@ -718,6 +781,12 @@ export function createPanelStructDraft(details) {
       defaultValue: defVal,
       isPrimaryKey: Boolean(c.isPrimaryKey),
       isAutoIncrement: Boolean(c.isAutoIncrement),
+      isGenerated: Boolean(c.isGenerated),
+      ...(c.generatedExpression !== undefined ? { generatedExpression: String(c.generatedExpression) } : {}),
+      ...(c.generatedStorage === 'STORED' || c.generatedStorage === 'VIRTUAL'
+        ? { generatedStorage: c.generatedStorage }
+        : {}),
+      ...(cleanCollate ? { collate: cleanCollate } : {}),
       status: 'existing',
       originalDataType: c.nativeType || c.type || 'TEXT',
       originalNullable: c.nullable !== false,
@@ -731,19 +800,44 @@ export function createPanelStructDraft(details) {
     tableName: details.name,
     schema: details.schema,
     columns,
-    indexes: (details.indexes || []).map((idxInfo, idx) => ({
-      id: `pidx_${idx}_${idxInfo.name}`,
-      originalName: idxInfo.name,
-      name: idxInfo.name,
-      columns: [...(idxInfo.columns || [])],
-      columnRefs: (idxInfo.columns || []).map((cn) => ({
-        colId: colIdByName.get(cn) || null,
-        fallbackName: cn,
-      })),
-      unique: Boolean(idxInfo.isUnique ?? idxInfo.unique),
-      isPrimary: Boolean(idxInfo.isPrimary),
-      status: 'existing',
-    })),
+    indexes: (details.indexes || []).map((idxInfo, idx) => {
+      const rawSpecs =
+        Array.isArray(idxInfo.columnSpecs) && idxInfo.columnSpecs.length > 0
+          ? idxInfo.columnSpecs
+          : (idxInfo.columns || []).map((cn) => ({ name: cn }))
+      const columnSpecs = rawSpecs
+        .filter((s) => s && typeof s.name === 'string' && s.name.trim())
+        .map((s) => {
+          const nm = s.name.trim()
+          const spCollate = sanitizeSqliteCollate(s.collate)
+          return {
+            name: nm,
+            colId: colIdByName.get(nm) || null,
+            ...(spCollate ? { collate: spCollate } : {}),
+            ...(s.desc ? { desc: true } : {}),
+          }
+        })
+      const onConflict = sanitizeSqliteOnConflict(idxInfo.onConflict)
+      return {
+        id: `pidx_${idx}_${idxInfo.name}`,
+        originalName: idxInfo.name,
+        name: idxInfo.name,
+        columns: [...(idxInfo.columns || [])],
+        columnRefs: (idxInfo.columns || []).map((cn) => ({
+          colId: colIdByName.get(cn) || null,
+          fallbackName: cn,
+        })),
+        columnSpecs,
+        ...(onConflict ? { onConflict } : {}),
+        ...(idxInfo.whereClause !== undefined ? { whereClause: String(idxInfo.whereClause) } : {}),
+        ...(idxInfo.partial !== undefined ? { partial: Boolean(idxInfo.partial) } : {}),
+        ...(idxInfo.isExpression !== undefined ? { isExpression: Boolean(idxInfo.isExpression) } : {}),
+        unique: Boolean(idxInfo.isUnique ?? idxInfo.unique),
+        isPrimary: Boolean(idxInfo.isPrimary),
+        origin: idxInfo.origin,
+        status: 'existing',
+      }
+    }),
     foreignKeys: (details.foreignKeys || []).map((fk, idx) => ({
       id: `pfk_${idx}_${fk.column}_${fk.referencedTable || fk.foreignTable || ''}`,
       constraintName: fk.constraintName || `fk_${details.name}_${fk.column}`,
@@ -755,8 +849,31 @@ export function createPanelStructDraft(details) {
       onUpdate: (fk.onUpdate || 'NO ACTION').toUpperCase(),
       status: 'existing',
     })),
+    triggers: Array.isArray(details.triggers)
+      ? details.triggers
+          .filter((t) => t && typeof t.sql === 'string' && t.sql.trim())
+          .map((t) => ({ name: String(t.name || '').trim(), sql: String(t.sql).trim() }))
+      : [],
+    inboundForeignKeys: Array.isArray(details.inboundForeignKeys)
+      ? details.inboundForeignKeys
+          .filter((fk) => fk && typeof fk.fromTable === 'string' && fk.fromTable.trim())
+          .map((fk) => ({
+            fromTable: String(fk.fromTable).trim(),
+            fromColumn: String(fk.fromColumn || '').trim(),
+            toColumn: String(fk.toColumn || '').trim(),
+            ...(fk.onDelete ? { onDelete: String(fk.onDelete).trim().toUpperCase() } : {}),
+            ...(fk.onUpdate ? { onUpdate: String(fk.onUpdate).trim().toUpperCase() } : {}),
+          }))
+      : [],
+    checkConstraints: Array.isArray(details.checkConstraints)
+      ? details.checkConstraints.map((c) => String(c || '').trim()).filter(Boolean)
+      : [],
+    strict: Boolean(details.strict),
+    withoutRowid: Boolean(details.withoutRowid),
   }
 }
+
+export const createPanelMigrationDraft = createPanelStructDraft
 
 export function getIndexColNames(draft, idx) {
   if (!draft || !idx) return []
@@ -781,24 +898,154 @@ export function getIndexColNames(draft, idx) {
 
 export function getActiveIndexColNames(draft, idx) {
   if (!draft || !idx) return []
+  const activeCols = (draft.columns || []).filter((c) => c.status !== 'deleted')
+  const renameMap = new Map()
+  const activeByLower = new Map()
+  for (const c of activeCols) {
+    const cur = String(c.name || '').trim()
+    if (!cur) continue
+    activeByLower.set(cur.toLowerCase(), cur)
+    if (c.originalName) {
+      renameMap.set(String(c.originalName).trim().toLowerCase(), cur)
+    }
+    renameMap.set(cur.toLowerCase(), cur)
+  }
   if (Array.isArray(idx.columnRefs)) {
-    const activeColById = new Map(draft.columns.filter((c) => c.status !== 'deleted').map((c) => [c.id, c]))
-    const activeNames = new Set(
-      draft.columns.filter((c) => c.status !== 'deleted').map((c) => String(c.name || '').trim().toLowerCase())
-    )
+    const activeColById = new Map(activeCols.map((c) => [c.id, c]))
     const names = []
     for (const ref of idx.columnRefs) {
       if (ref.colId) {
         const c = activeColById.get(ref.colId)
         const nm = c ? String(c.name || '').trim() : ''
         if (nm) names.push(nm)
-      } else if (ref.fallbackName && activeNames.has(String(ref.fallbackName).trim().toLowerCase())) {
-        names.push(String(ref.fallbackName).trim())
+      } else if (ref.fallbackName) {
+        const mapped =
+          renameMap.get(String(ref.fallbackName).trim().toLowerCase()) ||
+          activeByLower.get(String(ref.fallbackName).trim().toLowerCase())
+        if (mapped) names.push(mapped)
       }
     }
     return names
   }
-  return (idx.columns || []).filter(Boolean)
+  const out = []
+  for (const rawCol of idx.columns || []) {
+    const key = String(rawCol || '').trim().toLowerCase()
+    const mapped = renameMap.get(key) || activeByLower.get(key)
+    if (mapped) out.push(mapped)
+  }
+  return out
+}
+
+function tokenizeSqlTriggerHeader(sql) {
+  const tokens = []
+  const len = sql.length
+  let i = 0
+  while (i < len) {
+    const ch = sql[i]
+    if (/\s/.test(ch)) {
+      i++
+      continue
+    }
+    if (ch === '-' && sql[i + 1] === '-') {
+      const nl = sql.indexOf('\n', i + 2)
+      i = nl === -1 ? len : nl + 1
+      continue
+    }
+    if (ch === '/' && sql[i + 1] === '*') {
+      const end = sql.indexOf('*/', i + 2)
+      i = end === -1 ? len : end + 2
+      continue
+    }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      const start = i
+      const q = ch
+      i++
+      let unquoted = ''
+      while (i < len) {
+        if (sql[i] === q) {
+          if (sql[i + 1] === q) {
+            unquoted += q
+            i += 2
+            continue
+          }
+          i++
+          break
+        }
+        unquoted += sql[i]
+        i++
+      }
+      tokens.push({
+        kind: q === "'" ? 'string' : 'ident',
+        text: sql.slice(start, i),
+        unquoted,
+        start,
+        end: i,
+      })
+      continue
+    }
+    if (ch === '[') {
+      const start = i
+      i++
+      let unquoted = ''
+      while (i < len) {
+        if (sql[i] === ']') {
+          if (sql[i + 1] === ']') {
+            unquoted += ']'
+            i += 2
+            continue
+          }
+          i++
+          break
+        }
+        unquoted += sql[i]
+        i++
+      }
+      tokens.push({ kind: 'ident', text: sql.slice(start, i), unquoted, start, end: i })
+      continue
+    }
+    if (isIdentStart(sql.charCodeAt(i))) {
+      const start = i
+      i++
+      while (i < len && isIdentCont(sql.charCodeAt(i))) i++
+      const text = sql.slice(start, i)
+      if (text.toUpperCase() === 'BEGIN') break
+      tokens.push({ kind: 'word', text, unquoted: text, start, end: i })
+      continue
+    }
+    tokens.push({ kind: 'punct', text: ch, unquoted: ch, start: i, end: i + 1 })
+    i++
+  }
+  return tokens
+}
+
+function rewriteSqliteTriggerTableTarget(rawSql, origTable, finalTable, driver) {
+  const sql = String(rawSql || '').trim().replace(/;+\s*$/, '')
+  if (!sql) return ''
+  if (origTable && finalTable && origTable !== finalTable) {
+    const tokens = tokenizeSqlTriggerHeader(sql)
+    const origLower = origTable.toLowerCase()
+    for (let idx = 0; idx < tokens.length; idx++) {
+      const tok = tokens[idx]
+      if (tok.kind !== 'word' || tok.unquoted.toUpperCase() !== 'ON') continue
+      const next = tokens[idx + 1]
+      if (!next || (next.kind !== 'word' && next.kind !== 'ident')) continue
+      let targetTok = next
+      let afterIdx = idx + 2
+      if (tokens[idx + 2]?.text === '.' && (tokens[idx + 3]?.kind === 'word' || tokens[idx + 3]?.kind === 'ident')) {
+        targetTok = tokens[idx + 3]
+        afterIdx = idx + 4
+      }
+      const afterTok = tokens[afterIdx]
+      const validFollow =
+        !afterTok ||
+        (afterTok.kind === 'word' && /^(?:FOR|WHEN|BEGIN)$/i.test(afterTok.unquoted))
+      if (validFollow && targetTok.unquoted.toLowerCase() === origLower) {
+        const rewritten = `${sql.slice(0, targetTok.start)}${quoteIdent(finalTable, driver)}${sql.slice(targetTok.end)}`
+        return `${rewritten};`
+      }
+    }
+  }
+  return `${sql};`
 }
 
 export function getFkColName(draft, fk) {
@@ -873,6 +1120,322 @@ export function countPanelStructChanges(draft) {
   return count
 }
 
+function isDeclaredSqliteUniqueIndex(idx) {
+  return Boolean(
+    idx &&
+      !idx.isPrimary &&
+      (idx.origin === 'u' || (idx.unique && /^sqlite_autoindex_/i.test(String(idx.name || ''))))
+  )
+}
+
+function resolvePanelIndexColumnSpecs(draft, idx) {
+  if (!draft || !idx) return { activeSpecs: [], originalCount: 0, missingCols: [] }
+  const activeCols = (draft.columns || []).filter((c) => c.status !== 'deleted')
+  const activeColById = new Map(activeCols.map((c) => [c.id, c]))
+  const allColById = new Map((draft.columns || []).map((c) => [c.id, c]))
+  const renameMap = new Map()
+  const activeByLower = new Map()
+  const droppedLowerSet = new Set()
+  for (const c of draft.columns || []) {
+    if (c.status === 'deleted') {
+      const droppedName = String(c.originalName || c.name || '').trim()
+      if (droppedName) droppedLowerSet.add(droppedName.toLowerCase())
+      continue
+    }
+    const cur = String(c.name || '').trim()
+    if (!cur) continue
+    activeByLower.set(cur.toLowerCase(), cur)
+    if (c.originalName) {
+      renameMap.set(String(c.originalName).trim().toLowerCase(), cur)
+    }
+    renameMap.set(cur.toLowerCase(), cur)
+  }
+
+  const rawEntries =
+    Array.isArray(idx.columnSpecs) && idx.columnSpecs.length > 0
+      ? idx.columnSpecs.map((s) => ({
+          name: String(s?.name || '').trim(),
+          colId: s?.colId || null,
+          collate: sanitizeSqliteCollate(s?.collate),
+          desc: Boolean(s?.desc),
+        }))
+      : Array.isArray(idx.columnRefs) && idx.columnRefs.length > 0
+        ? idx.columnRefs.map((ref) => ({
+            name: String(ref?.fallbackName || '').trim(),
+            colId: ref?.colId || null,
+            collate: undefined,
+            desc: false,
+          }))
+        : (idx.columns || []).map((cn) => ({
+            name: String(cn || '').trim(),
+            colId: null,
+            collate: undefined,
+            desc: false,
+          }))
+
+  const activeSpecs = []
+  const missingCols = []
+  let originalCount = 0
+  for (const entry of rawEntries) {
+    if (!entry.name && !entry.colId) continue
+    originalCount++
+    let resolvedName = null
+    if (entry.colId) {
+      const activeC = activeColById.get(entry.colId)
+      if (activeC && String(activeC.name || '').trim()) {
+        resolvedName = String(activeC.name).trim()
+      } else {
+        const origC = allColById.get(entry.colId)
+        missingCols.push(String(origC?.originalName || origC?.name || entry.name || '(column)').trim())
+      }
+    } else {
+      const key = entry.name.toLowerCase()
+      const mapped = renameMap.get(key) || activeByLower.get(key)
+      if (mapped) {
+        resolvedName = mapped
+      } else if (droppedLowerSet.has(key) || entry.name) {
+        missingCols.push(entry.name)
+      }
+    }
+    if (resolvedName) {
+      activeSpecs.push({
+        name: resolvedName,
+        ...(entry.collate ? { collate: entry.collate } : {}),
+        ...(entry.desc ? { desc: true } : {}),
+      })
+    }
+  }
+  return { activeSpecs, originalCount, missingCols }
+}
+
+function formatPanelIndexColSpec(spec, driver) {
+  let out = quoteIdent(spec.name, driver)
+  const colCollate = sanitizeSqliteCollate(spec.collate)
+  if (colCollate) out += ` COLLATE ${colCollate}`
+  if (spec.desc) out += ' DESC'
+  return out
+}
+
+function findPanelReferencedSqliteColumns(exprSql, candidateCols) {
+  if (!exprSql || !candidateCols || candidateCols.size === 0) return []
+  const found = []
+  const seen = new Set()
+  const record = (rawIdent) => {
+    const key = String(rawIdent || '').trim().toLowerCase()
+    const canonical = candidateCols.get(key)
+    if (canonical && !seen.has(key)) {
+      seen.add(key)
+      found.push(canonical)
+    }
+  }
+  const len = exprSql.length
+  let i = 0
+  while (i < len) {
+    const ch = exprSql[i]
+    if (ch === '-' && i + 1 < len && exprSql[i + 1] === '-') {
+      const nl = exprSql.indexOf('\n', i + 2)
+      i = nl >= 0 ? nl + 1 : len
+      continue
+    }
+    if (ch === '/' && i + 1 < len && exprSql[i + 1] === '*') {
+      const end = exprSql.indexOf('*/', i + 2)
+      i = end >= 0 ? end + 2 : len
+      continue
+    }
+    if (ch === "'") {
+      i = sharedScanQuotedSegmentEnd(exprSql, i, "'", false).end
+      continue
+    }
+    if (ch === '"' || ch === '`') {
+      const seg = sharedScanQuotedSegmentEnd(exprSql, i, ch, false)
+      const inner = exprSql.slice(i + 1, seg.closed ? seg.end - 1 : seg.end)
+      record(ch === '"' ? inner.replace(/""/g, '"') : inner.replace(/``/g, '`'))
+      i = seg.end
+      continue
+    }
+    if (ch === '[') {
+      const closeBracket = exprSql.indexOf(']', i + 1)
+      const end = closeBracket < 0 ? len : closeBracket + 1
+      record(exprSql.slice(i + 1, closeBracket < 0 ? len : closeBracket))
+      i = end
+      continue
+    }
+    if (sharedIsIdentStartChar(exprSql.charCodeAt(i))) {
+      let end = i + 1
+      while (end < len && sharedIsIdentContChar(exprSql.charCodeAt(end))) end++
+      record(exprSql.slice(i, end))
+      i = end
+      continue
+    }
+    i++
+  }
+  return found
+}
+
+function findPanelSqliteRebuildBlockers(draft, driver, isRebuild = requiresPanelSqliteRebuild(draft)) {
+  const blockers = []
+  if (!(driver === 'sqlite' || driver === 'libsql' || driver === 'd1')) return blockers
+
+  const origTbl = String(draft.originalTableName || '').trim()
+  const nextTbl = String(draft.tableName || origTbl).trim()
+  const activeCols = (draft.columns || []).filter((c) => c.status !== 'deleted')
+
+  if (isRebuild && driver === 'd1') {
+    const origLower = origTbl.toLowerCase()
+    const deletedSelfRefCols = new Set(
+      (draft.foreignKeys || [])
+        .filter(
+          (fk) =>
+            fk.status === 'deleted' &&
+            String(fk.foreignTable || '').trim().toLowerCase() === origLower
+        )
+        .map((fk) => String(getFkColName(draft, fk) || fk.column || '').trim().toLowerCase())
+        .filter(Boolean)
+    )
+    const externalInbound = (draft.inboundForeignKeys || []).filter(
+      (fk) => String(fk.fromTable || '').trim().toLowerCase() !== origLower
+    )
+    const activeSelfRefCols = new Map()
+    for (const fk of draft.foreignKeys || []) {
+      if (
+        fk.status !== 'deleted' &&
+        String(fk.foreignTable || '').trim().toLowerCase() === origLower
+      ) {
+        const col = String(getFkColName(draft, fk) || fk.column || '').trim()
+        if (col) activeSelfRefCols.set(col.toLowerCase(), `${origTbl}.${col}`)
+      }
+    }
+    for (const fk of draft.inboundForeignKeys || []) {
+      if (String(fk.fromTable || '').trim().toLowerCase() !== origLower) continue
+      const col = String(fk.fromColumn || '').trim()
+      if (col && !deletedSelfRefCols.has(col.toLowerCase())) {
+        activeSelfRefCols.set(col.toLowerCase(), `${origTbl}.${col}`)
+      }
+    }
+    const blockingRefs = [
+      ...externalInbound.map((fk) => `${fk.fromTable}${fk.fromColumn ? `.${fk.fromColumn}` : ''}`),
+      ...Array.from(activeSelfRefCols.values()),
+    ]
+    if (blockingRefs.length > 0) {
+      const fkKindLabel =
+        externalInbound.length > 0 && activeSelfRefCols.size > 0
+          ? 'inbound and self-referencing foreign key(s)'
+          : activeSelfRefCols.size > 0
+            ? 'self-referencing foreign key(s)'
+            : 'inbound foreign key(s)'
+      blockers.push(
+        `Cloudflare D1 table rebuild is blocked while ${fkKindLabel} reference "${origTbl}" (${blockingRefs.join(', ')}). Drop or migrate referencing foreign keys before rebuilding on D1.`
+      )
+    }
+  }
+
+  for (const idx of draft.indexes || []) {
+    const isUniqueConstraint = isDeclaredSqliteUniqueIndex(idx)
+    if (idx.status === 'deleted' || idx.isPrimary || (!idx.unique && !isUniqueConstraint)) continue
+    const resolved = resolvePanelIndexColumnSpecs(draft, idx)
+    if (resolved.originalCount >= 2 && resolved.missingCols.length > 0) {
+      const kindLabel = isUniqueConstraint ? 'constraint' : 'index'
+      blockers.push(
+        `Cannot silently narrow composite UNIQUE ${kindLabel} "${idx.name || 'UNIQUE'}" after dropping column(s): ${resolved.missingCols.join(', ')}. Delete the UNIQUE ${kindLabel} explicitly before dropping its columns.`
+      )
+    }
+  }
+
+  const changedColMap = new Map()
+  for (const col of draft.columns || []) {
+    const origCol = String(col.originalName || col.name || '').trim()
+    if (!origCol) continue
+    if (col.status === 'deleted') {
+      changedColMap.set(origCol.toLowerCase(), origCol)
+    } else if (col.status === 'existing') {
+      const cur = String(col.name || '').trim()
+      if (cur && (cur.toLowerCase() !== origCol.toLowerCase() || cur !== origCol)) {
+        changedColMap.set(origCol.toLowerCase(), origCol)
+      }
+    }
+  }
+
+  if (Array.isArray(draft.triggers) && draft.triggers.length > 0) {
+    const mutatedCols = Array.from(changedColMap.values())
+    const tableRenamed = Boolean(nextTbl && origTbl && nextTbl !== origTbl)
+    for (const trg of draft.triggers) {
+      if (!trg || typeof trg.sql !== 'string' || !trg.sql.trim()) continue
+      const trgName = String(trg.name || 'trigger').trim()
+      const analysis = sharedAnalyzeSqliteTriggerReferences(trg.sql, origTbl, mutatedCols)
+      if (analysis.referencedIdents.length > 0) {
+        blockers.push(
+          `Trigger "${trgName}" references renamed or deleted column(s) (${analysis.referencedIdents.join(', ')}). Update or drop the trigger before rebuilding this table.`
+        )
+      } else if (tableRenamed && (!isRebuild || analysis.referencesOrigTableInBody || !analysis.onTargetMatchesOrigTable)) {
+        blockers.push(
+          !isRebuild
+            ? `Trigger "${trgName}" exists on "${origTbl}". Direct table rename to "${nextTbl}" does not recreate triggers; update or drop the trigger before renaming.`
+            : `Trigger "${trgName}" references renamed table "${origTbl}". Drop or recreate the trigger manually after renaming the table.`
+        )
+      }
+    }
+  }
+
+  if (isRebuild) {
+    for (const col of activeCols) {
+      if (!col.isGenerated) continue
+      const expr = String(col.generatedExpression || '').trim()
+      if (!expr) {
+        blockers.push(
+          `Generated column "${col.name}" is missing its SQL expression and cannot be safely preserved during table rebuild.`
+        )
+        continue
+      }
+      const refs = findPanelReferencedSqliteColumns(expr, changedColMap)
+      if (refs.length > 0) {
+        blockers.push(
+          `Generated column "${col.name}" references renamed or dropped column(s) (${refs.join(', ')}); update or drop the generated column before rebuilding this table.`
+        )
+      }
+    }
+
+    if (Array.isArray(draft.checkConstraints) && changedColMap.size > 0) {
+      for (const chk of draft.checkConstraints) {
+        const trimmedChk = String(chk || '').trim()
+        if (!trimmedChk) continue
+        const refs = findPanelReferencedSqliteColumns(trimmedChk, changedColMap)
+        if (refs.length > 0) {
+          blockers.push(
+            `CHECK constraint "${trimmedChk}" references renamed or dropped column(s) (${refs.join(', ')}); update table constraints before rebuilding this table.`
+          )
+        }
+      }
+    }
+
+    for (const idx of draft.indexes || []) {
+      if (idx.status === 'deleted' || idx.isPrimary) continue
+      if (idx.isExpression) {
+        blockers.push(
+          `Expression index "${idx.name}" cannot be reconstructed safely during a SQLite table rebuild. Drop the expression index before rebuilding and recreate it afterwards.`
+        )
+        continue
+      }
+      if (idx.partial) {
+        const whereSql = String(idx.whereClause || '').trim()
+        if (!whereSql) {
+          blockers.push(
+            `Partial index "${idx.name}" is missing its WHERE predicate and cannot be preserved safely during table rebuild.`
+          )
+          continue
+        }
+        const refs = findPanelReferencedSqliteColumns(whereSql, changedColMap)
+        if (refs.length > 0) {
+          blockers.push(
+            `Partial index "${idx.name}" WHERE clause references renamed or dropped column(s) (${refs.join(', ')}); drop or update the index before rebuilding this table.`
+          )
+        }
+      }
+    }
+  }
+
+  return blockers
+}
+
 export function requiresPanelSqliteRebuild(draft) {
   const hasDefChange = draft.columns.some((col) => {
     if (col.status !== 'existing') return false
@@ -907,12 +1470,15 @@ export function requiresPanelSqliteRebuild(draft) {
     }
     return (i.columns || []).some((cn) => droppedSet.has(cn))
   })
+  const hasDroppedDeclaredUnique = (draft.indexes || []).some(
+    (i) => i.status === 'deleted' && isDeclaredSqliteUniqueIndex(i)
+  )
   const hasFkChg = draft.foreignKeys.some((fk) => fk.status === 'new' || fk.status === 'deleted')
-  return hasDefChange || hasNewPk || hasDropPk || hasDropIdxCol || hasFkChg
+  return hasDefChange || hasNewPk || hasDropPk || hasDropIdxCol || hasDroppedDeclaredUnique || hasFkChg
 }
 
 export function buildPanelMigrationSql(draft, driver) {
-  if (!draft || driver === 'redis') return []
+  if (!draft || driver === 'redis' || driver === 'mongodb') return []
   const count = countPanelStructChanges(draft)
   if (count === 0) return []
   const origTable = draft.originalTableName.trim()
@@ -929,7 +1495,16 @@ export function buildPanelMigrationSql(draft, driver) {
     seenActive.add(cn.toLowerCase())
   }
 
-  if ((driver === 'sqlite' || driver === 'libsql') && requiresPanelSqliteRebuild(draft)) {
+  const isSqliteFamily = driver === 'sqlite' || driver === 'libsql' || driver === 'd1'
+  const isSqliteRebuild = isSqliteFamily && requiresPanelSqliteRebuild(draft)
+  if (isSqliteFamily) {
+    const blockers = findPanelSqliteRebuildBlockers(draft, driver, isSqliteRebuild)
+    if (blockers.length > 0) {
+      throw new Error(blockers[0])
+    }
+  }
+
+  if (isSqliteRebuild) {
     const activeCols = activeColsCheck
     const pkCols = activeCols.filter((c) => c.isPrimaryKey)
     const singlePk = pkCols.length === 1
@@ -938,6 +1513,16 @@ export function buildPanelMigrationSql(draft, driver) {
     for (const col of activeCols) {
       const cn = col.name.trim()
       const ct = validatePanelTypeSpec(col.dataType)
+      if (col.isGenerated) {
+        const genExpr = String(col.generatedExpression || '').trim()
+        const genStorage = col.generatedStorage === 'STORED' ? 'STORED' : 'VIRTUAL'
+        let line = `${quoteIdent(cn, driver)} ${ct} GENERATED ALWAYS AS (${genExpr}) ${genStorage}`
+        if (!col.nullable) line += ' NOT NULL'
+        const colCollate = sanitizeSqliteCollate(col.collate)
+        if (colCollate) line += ` COLLATE ${colCollate}`
+        colDefs.push(line)
+        continue
+      }
       let line = `${quoteIdent(cn, driver)} ${ct}`
       if (singlePk && col.isPrimaryKey) {
         line += ' PRIMARY KEY'
@@ -951,11 +1536,35 @@ export function buildPanelMigrationSql(draft, driver) {
         defVal === origDef &&
         String(col.dataType || '').trim().toUpperCase() === String(col.originalDataType || '').trim().toUpperCase()
       if (defVal) line += ` DEFAULT ${isUntouchedExistingDef ? defVal : normalizePanelDefaultExpr(defVal, ct)}`
+      const colCollate = sanitizeSqliteCollate(col.collate)
+      if (colCollate) line += ` COLLATE ${colCollate}`
       colDefs.push(line)
     }
 
     if (pkCols.length > 1) {
       colDefs.push(`PRIMARY KEY (${pkCols.map((c) => quoteIdent(c.name.trim(), driver)).join(', ')})`)
+    }
+
+    const seenUniqueSigs = new Set()
+    if (singlePk && pkCols[0]) {
+      seenUniqueSigs.add(pkCols[0].name.trim().toLowerCase())
+    } else if (pkCols.length > 1) {
+      seenUniqueSigs.add(pkCols.map((c) => c.name.trim().toLowerCase()).join('\u0000'))
+    }
+    for (const idx of draft.indexes || []) {
+      if (idx.status === 'deleted' || !isDeclaredSqliteUniqueIndex(idx)) continue
+      const { activeSpecs } = resolvePanelIndexColumnSpecs(draft, idx)
+      if (activeSpecs.length === 0) continue
+      const sig = activeSpecs
+        .map((s) => `${s.name.toLowerCase()}|${(s.collate || '').toUpperCase()}|${s.desc ? 'D' : 'A'}`)
+        .join('\u0000')
+      if (seenUniqueSigs.has(sig)) continue
+      seenUniqueSigs.add(sig)
+      const onConflict = sanitizeSqliteOnConflict(idx.onConflict)
+      const conflictClause = onConflict ? ` ON CONFLICT ${onConflict}` : ''
+      colDefs.push(
+        `UNIQUE (${activeSpecs.map((s) => formatPanelIndexColSpec(s, driver)).join(', ')})${conflictClause}`
+      )
     }
 
     for (const fk of draft.foreignKeys.filter((f) => f.status !== 'deleted')) {
@@ -974,18 +1583,40 @@ export function buildPanelMigrationSql(draft, driver) {
       )
     }
 
+    for (const chk of Array.isArray(draft.checkConstraints) ? draft.checkConstraints : []) {
+      const trimmedChk = String(chk || '').trim()
+      if (trimmedChk) {
+        colDefs.push(
+          /^(?:CONSTRAINT\s+.+\s+)?CHECK\s*\(/i.test(trimmedChk) ? trimmedChk : `CHECK (${trimmedChk})`
+        )
+      }
+    }
+
     const tmpName = `__datanoa_new_${origTable.replace(/[^A-Za-z0-9_]/g, '_')}`
     const qOrig = quoteTableRef(origTable, draft.schema, driver)
     const qTmp = quoteTableRef(tmpName, draft.schema, driver)
     const qFinalIdent = quoteIdent(finalTable, driver)
     const qFinalFull = quoteTableRef(finalTable, draft.schema, driver)
-    const stmts = [
-      'PRAGMA foreign_keys = OFF;',
-      'BEGIN IMMEDIATE;',
-      `CREATE TABLE ${qTmp} (\n  ${colDefs.join(',\n  ')}\n);`,
-    ]
+    const tableOptList = [
+      draft.withoutRowid ? 'WITHOUT ROWID' : '',
+      draft.strict ? 'STRICT' : '',
+    ].filter(Boolean)
+    const tableOptSuffix = tableOptList.length > 0 ? ` ${tableOptList.join(', ')}` : ''
+    const createTmpSql = `CREATE TABLE ${qTmp} (\n  ${colDefs.join(',\n  ')}\n)${tableOptSuffix};`
+    const stmts =
+      driver === 'd1'
+        ? [
+            'PRAGMA defer_foreign_keys = ON;',
+            createTmpSql,
+          ]
+        : [
+            'PRAGMA foreign_keys = OFF;',
+            'BEGIN IMMEDIATE;',
+            'PRAGMA defer_foreign_keys = ON;',
+            createTmpSql,
+          ]
 
-    const surviving = activeCols.filter((c) => c.status === 'existing' && c.originalName)
+    const surviving = activeCols.filter((c) => c.status === 'existing' && c.originalName && !c.isGenerated)
     if (surviving.length > 0) {
       const targetList = surviving.map((c) => quoteIdent(c.name.trim(), driver)).join(', ')
       const srcList = surviving
@@ -1005,28 +1636,44 @@ export function buildPanelMigrationSql(draft, driver) {
     stmts.push(`ALTER TABLE ${qTmp} RENAME TO ${qFinalIdent};`)
 
     for (const idx of draft.indexes.filter(
-      (i) => i.status !== 'deleted' && !i.isPrimary && !/^sqlite_autoindex_/i.test(i.name)
+      (i) => i.status !== 'deleted' && !i.isPrimary && !isDeclaredSqliteUniqueIndex(i)
     )) {
-      const cols = getActiveIndexColNames(draft, idx)
-      if (cols.length === 0) continue
+      const { activeSpecs } = resolvePanelIndexColumnSpecs(draft, idx)
+      if (activeSpecs.length === 0) continue
       const idxName =
-        String(idx.name || '').trim() || `idx_${finalTable}_${cols.join('_')}`.replace(/[^A-Za-z0-9_]/g, '_')
+        String(idx.name || '').trim() ||
+        `idx_${finalTable}_${activeSpecs.map((s) => s.name).join('_')}`.replace(/[^A-Za-z0-9_]/g, '_')
       const uniqKw = idx.unique ? 'UNIQUE ' : ''
+      const whereClause =
+        idx.partial && String(idx.whereClause || '').trim()
+          ? ` WHERE ${String(idx.whereClause).trim()}`
+          : ''
       stmts.push(
-        `CREATE ${uniqKw}INDEX IF NOT EXISTS ${quoteIdent(idxName, driver)} ON ${qFinalFull} (${cols
-          .map((c) => quoteIdent(c, driver))
-          .join(', ')});`
+        `CREATE ${uniqKw}INDEX IF NOT EXISTS ${quoteTableRef(idxName, draft.schema, driver)} ON ${qFinalIdent} (${activeSpecs
+          .map((s) => formatPanelIndexColSpec(s, driver))
+          .join(', ')})${whereClause};`
       )
     }
 
-    stmts.push('COMMIT;')
-    stmts.push('PRAGMA foreign_keys = ON;')
+    for (const trg of Array.isArray(draft.triggers) ? draft.triggers : []) {
+      if (!trg || typeof trg.sql !== 'string' || !trg.sql.trim()) continue
+      const trgSql = rewriteSqliteTriggerTableTarget(trg.sql, origTable, finalTable, driver)
+      if (trgSql) stmts.push(trgSql)
+    }
+
+    stmts.push(SQLITE_SERVER_FK_CHECK_SQL)
+    if (driver !== 'd1') {
+      stmts.push('COMMIT;')
+      stmts.push('PRAGMA foreign_keys = ON;')
+    }
     return stmts
   }
 
   const stmts = []
   const curTbl = origTable
   const qCur = () => quoteTableRef(curTbl, draft.schema, driver)
+  const escapeSqlLit = (s) => String(s || '').replace(/'/g, "''")
+  let mssqlDfVarSeq = 0
 
   for (const fk of draft.foreignKeys) {
     if (fk.status === 'deleted' && fk.constraintName) {
@@ -1040,13 +1687,15 @@ export function buildPanelMigrationSql(draft, driver) {
 
   for (const idx of draft.indexes) {
     if (idx.status === 'deleted' && (idx.originalName || idx.name)) {
-      const qIdx = quoteIdent(idx.originalName || idx.name, driver)
+      const rawIdxName = idx.originalName || idx.name
+      const qIdx = quoteIdent(rawIdxName, driver)
+      const qIdxQualified = quoteTableRef(rawIdxName, draft.schema, driver)
       stmts.push(
-        driver === 'mysql' || driver === 'mariadb'
+        driver === 'mysql' || driver === 'mariadb' || driver === 'mssql'
           ? `DROP INDEX ${qIdx} ON ${qCur()};`
           : driver === 'clickhouse'
             ? `ALTER TABLE ${qCur()} DROP INDEX ${qIdx};`
-            : `DROP INDEX ${qIdx};`
+            : `DROP INDEX ${qIdxQualified};`
       )
     }
   }
@@ -1067,7 +1716,16 @@ export function buildPanelMigrationSql(draft, driver) {
     const newName = col.name.trim()
     if (!newName) throw new Error('Column name cannot be empty.')
     if (oldName !== newName) {
-      stmts.push(`ALTER TABLE ${qCur()} RENAME COLUMN ${quoteIdent(oldName, driver)} TO ${quoteIdent(newName, driver)};`)
+      if (driver === 'mssql') {
+        const prefix = draft.schema
+          ? `${quoteIdent(draft.schema, driver)}.${quoteIdent(curTbl, driver)}`
+          : quoteIdent(curTbl, driver)
+        stmts.push(
+          `EXEC sp_rename '${escapeSqlLit(`${prefix}.${quoteIdent(oldName, driver)}`)}', '${escapeSqlLit(newName)}', 'COLUMN';`
+        )
+      } else {
+        stmts.push(`ALTER TABLE ${qCur()} RENAME COLUMN ${quoteIdent(oldName, driver)} TO ${quoteIdent(newName, driver)};`)
+      }
     }
     const origType = (col.originalDataType || 'TEXT').trim().toUpperCase()
     const curType = validatePanelTypeSpec(col.dataType).toUpperCase()
@@ -1102,6 +1760,44 @@ export function buildPanelMigrationSql(draft, driver) {
             ? ' DEFAULT NULL'
             : ''
         stmts.push(`ALTER TABLE ${qCur()} MODIFY COLUMN ${qCol} ${validatePanelTypeSpec(col.dataType)}${nullCls}${defCls};`)
+      } else if (driver === 'mssql') {
+        if (origType !== curType || Boolean(col.nullable) !== Boolean(col.originalNullable)) {
+          const nullCls = col.nullable === false ? ' NOT NULL' : ' NULL'
+          stmts.push(`ALTER TABLE ${qCur()} ALTER COLUMN ${qCol} ${validatePanelTypeSpec(col.dataType)}${nullCls};`)
+        }
+        if (!defEq) {
+          if (origDef) {
+            const constraintName =
+              typeof col.defaultConstraintName === 'string' ? col.defaultConstraintName.trim() : ''
+            if (constraintName) {
+              stmts.push(`ALTER TABLE ${qCur()} DROP CONSTRAINT ${quoteIdent(constraintName, driver)};`)
+            } else {
+              const dfVar = `@df_${++mssqlDfVarSeq}`
+              const objRef = escapeSqlLit(qCur())
+              const colLit = escapeSqlLit(newName)
+              stmts.push(
+                `DECLARE ${dfVar} NVARCHAR(256); SELECT ${dfVar} = QUOTENAME(dc.name) FROM sys.default_constraints AS dc INNER JOIN sys.columns AS c ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id WHERE dc.parent_object_id = OBJECT_ID(N'${objRef}') AND c.name = N'${colLit}'; IF ${dfVar} IS NOT NULL EXEC(N'ALTER TABLE ${objRef} DROP CONSTRAINT ' + ${dfVar} + N';');`
+              )
+            }
+          }
+          if (curDef) {
+            stmts.push(`ALTER TABLE ${qCur()} ADD DEFAULT ${normalizePanelDefaultExpr(curDef, curType)} FOR ${qCol};`)
+          }
+        }
+      } else if (driver === 'oracle') {
+        const parts = [`${qCol} ${validatePanelTypeSpec(col.dataType)}`]
+        if (!defEq) {
+          const isUntouchedExistingDef = col.status === 'existing' && curDef === origDef && origType === curType
+          parts.push(
+            curDef
+              ? `DEFAULT ${isUntouchedExistingDef ? curDef : normalizePanelDefaultExpr(curDef, curType)}`
+              : 'DEFAULT NULL'
+          )
+        }
+        if (Boolean(col.nullable) !== Boolean(col.originalNullable)) {
+          parts.push(col.nullable === false ? 'NOT NULL' : 'NULL')
+        }
+        stmts.push(`ALTER TABLE ${qCur()} MODIFY (${parts.join(' ')});`)
       } else if (driver === 'clickhouse') {
         const isUntouchedExistingDef = col.status === 'existing' && curDef === origDef && origType === curType
         const defCls = curDef
@@ -1119,10 +1815,16 @@ export function buildPanelMigrationSql(draft, driver) {
     const qCol = quoteIdent(cn, driver)
     const defVal = String(col.defaultValue || '').trim()
     let defCls = defVal ? ` DEFAULT ${normalizePanelDefaultExpr(defVal, ct)}` : ''
-    if (!defCls && col.nullable === false && (driver === 'sqlite' || driver === 'libsql')) {
+    if (!defCls && col.nullable === false && (driver === 'sqlite' || driver === 'libsql' || driver === 'd1')) {
       defCls = /INT|REAL|FLOAT|NUMERIC|DECIMAL|BOOL/i.test(ct) ? ' DEFAULT 0' : " DEFAULT ''"
     }
-    stmts.push(`ALTER TABLE ${qCur()} ADD COLUMN ${qCol} ${ct}${col.nullable === false ? ' NOT NULL' : ''}${defCls};`)
+    if (driver === 'mssql') {
+      stmts.push(`ALTER TABLE ${qCur()} ADD ${qCol} ${ct}${col.nullable === false ? ' NOT NULL' : ''}${defCls};`)
+    } else if (driver === 'oracle') {
+      stmts.push(`ALTER TABLE ${qCur()} ADD (${qCol} ${ct}${defCls}${col.nullable === false ? ' NOT NULL' : ''});`)
+    } else {
+      stmts.push(`ALTER TABLE ${qCur()} ADD COLUMN ${qCol} ${ct}${col.nullable === false ? ' NOT NULL' : ''}${defCls};`)
+    }
   }
 
   if (pkMembershipChanged) {
@@ -1137,6 +1839,22 @@ export function buildPanelMigrationSql(draft, driver) {
       if (nextPkCols.length) stmts.push(`ALTER TABLE ${qCur()} ADD PRIMARY KEY (${nextPkCols.join(', ')});`)
     } else if (driver === 'mysql' || driver === 'mariadb') {
       if (hadOrigPk) stmts.push(`ALTER TABLE ${qCur()} DROP PRIMARY KEY;`)
+      if (nextPkCols.length) stmts.push(`ALTER TABLE ${qCur()} ADD PRIMARY KEY (${nextPkCols.join(', ')});`)
+    } else if (driver === 'mssql') {
+      if (hadOrigPk) {
+        const pkConstraint = draft.indexes.find((i) => i.isPrimary)?.name || `PK_${curTbl}`
+        stmts.push(`ALTER TABLE ${qCur()} DROP CONSTRAINT ${quoteIdent(pkConstraint, driver)};`)
+      }
+      if (nextPkCols.length) stmts.push(`ALTER TABLE ${qCur()} ADD PRIMARY KEY (${nextPkCols.join(', ')});`)
+    } else if (driver === 'oracle') {
+      if (hadOrigPk) {
+        const pkConstraint = draft.indexes.find((i) => i.isPrimary)?.name
+        stmts.push(
+          pkConstraint
+            ? `ALTER TABLE ${qCur()} DROP CONSTRAINT ${quoteIdent(pkConstraint, driver)};`
+            : `ALTER TABLE ${qCur()} DROP PRIMARY KEY;`
+        )
+      }
       if (nextPkCols.length) stmts.push(`ALTER TABLE ${qCur()} ADD PRIMARY KEY (${nextPkCols.join(', ')});`)
     }
   }
@@ -1154,8 +1872,12 @@ export function buildPanelMigrationSql(draft, driver) {
           .join(', ')}) TYPE minmax GRANULARITY 1;`
       )
     } else {
+      const idxTarget = isSqliteFamily
+        ? quoteTableRef(idxName, draft.schema, driver)
+        : quoteIdent(idxName, driver)
+      const onTableTarget = isSqliteFamily ? quoteIdent(curTbl, driver) : qCur()
       stmts.push(
-        `CREATE ${idx.unique ? 'UNIQUE ' : ''}INDEX ${quoteIdent(idxName, driver)} ON ${qCur()} (${cols
+        `CREATE ${idx.unique ? 'UNIQUE ' : ''}INDEX ${idxTarget} ON ${onTableTarget} (${cols
           .map((c) => quoteIdent(c, driver))
           .join(', ')});`
       )
@@ -1182,6 +1904,18 @@ export function buildPanelMigrationSql(draft, driver) {
   if (finalTable !== curTbl) {
     if (driver === 'mysql' || driver === 'mariadb' || driver === 'clickhouse') {
       stmts.push(`RENAME TABLE ${qCur()} TO ${quoteTableRef(finalTable, draft.schema, driver)};`)
+    } else if (driver === 'mssql') {
+      stmts.push(`EXEC sp_rename '${escapeSqlLit(qCur())}', '${escapeSqlLit(finalTable)}';`)
+    } else if (
+      (driver === 'sqlite' || driver === 'libsql' || driver === 'd1') &&
+      finalTable.toLowerCase() === curTbl.toLowerCase()
+    ) {
+      const tmpRename =
+        curTbl.toLowerCase() === '__datanoa_case_rename_tmp'
+          ? '__datanoa_case_rename_tmp_2'
+          : '__datanoa_case_rename_tmp'
+      stmts.push(`ALTER TABLE ${qCur()} RENAME TO ${quoteIdent(tmpRename, driver)};`)
+      stmts.push(`ALTER TABLE ${quoteTableRef(tmpRename, draft.schema, driver)} RENAME TO ${quoteIdent(finalTable, driver)};`)
     } else {
       stmts.push(`ALTER TABLE ${qCur()} RENAME TO ${quoteIdent(finalTable, driver)};`)
     }
@@ -1195,6 +1929,15 @@ export function validatePanelStructDraft(draft, driver, knownTableNames = []) {
   const warnings = []
   const diffs = []
   if (!draft) return { valid: false, errors: [], warnings: [], diffs: [], statements: [] }
+  if (driver === 'redis' || driver === 'mongodb') {
+    return {
+      valid: false,
+      errors: [`Visual SQL table structure migration is not supported on ${driver}.`],
+      warnings: [],
+      diffs: [],
+      statements: [],
+    }
+  }
 
   const origTbl = String(draft.originalTableName || '').trim()
   const nextTbl = String(draft.tableName || '').trim()
@@ -1312,8 +2055,26 @@ export function validatePanelStructDraft(draft, driver, knownTableNames = []) {
     }
   }
 
-  if ((driver === 'sqlite' || driver === 'libsql') && countPanelStructChanges(draft) > 0 && requiresPanelSqliteRebuild(draft)) {
-    warnings.push('SQLite 12-Step Table Rebuild will recreate the table and copy surviving rows transactionally.')
+  const isSqliteFamily = driver === 'sqlite' || driver === 'libsql' || driver === 'd1'
+  const hasStructChanges = countPanelStructChanges(draft) > 0
+  const isSqliteRebuild = isSqliteFamily && hasStructChanges && requiresPanelSqliteRebuild(draft)
+
+  if (isSqliteFamily && hasStructChanges) {
+    for (const blocker of findPanelSqliteRebuildBlockers(draft, driver, isSqliteRebuild)) {
+      errors.push(blocker)
+    }
+  }
+
+  if (isSqliteRebuild) {
+    if (driver === 'd1') {
+      warnings.push(
+        'Cloudflare D1 Table Rebuild executes in a single D1 batch HTTP request with PRAGMA defer_foreign_keys = ON and server-side foreign key verification (D1 does not support BEGIN/COMMIT SQL statements).'
+      )
+    } else {
+      warnings.push(
+        'SQLite 12-Step Table Rebuild will recreate the table and copy surviving rows transactionally.'
+      )
+    }
   }
 
   let statements = []
@@ -1322,6 +2083,8 @@ export function validatePanelStructDraft(draft, driver, knownTableNames = []) {
   }
   return { valid: errors.length === 0 && diffs.length > 0, errors, warnings, diffs, statements }
 }
+
+export const validatePanelMigrationDraft = validatePanelStructDraft
 
 // ============================================================================
 // Pure Privacy-Safe Feedback & GitHub Issue Report Builders
@@ -1409,6 +2172,74 @@ export function buildGithubIssueUrl({ kind = 'bug', title = '', markdownBody = '
     params.set('body', safeBody)
   }
   return `${DATANOA_GITHUB_ISSUES_URL}?${params.toString()}`
+}
+
+export function buildSelectPreviewQuery(driver, tableName, schemaName, whereClause = '') {
+  const effectiveDriver = driver || 'sqlite'
+  if (effectiveDriver === 'redis') {
+    return tableName === '(root)' ? 'SCAN 0 MATCH * COUNT 50' : `SCAN 0 MATCH ${tableName} COUNT 50`
+  }
+  const where = String(whereClause || '').trim()
+  if (effectiveDriver === 'mongodb') {
+    const filter = where.startsWith('{') ? where : '{}'
+    return `db.getCollection(${JSON.stringify(tableName)}).find(${filter}).limit(100);`
+  }
+  const qTable = quoteTableRef(tableName, schemaName, effectiveDriver)
+  if (effectiveDriver === 'mssql') {
+    return where
+      ? `SELECT TOP 100 * FROM ${qTable} WHERE ${where};`
+      : `SELECT TOP 100 * FROM ${qTable};`
+  }
+  if (effectiveDriver === 'oracle') {
+    return where
+      ? `SELECT * FROM ${qTable} WHERE ${where} FETCH FIRST 100 ROWS ONLY;`
+      : `SELECT * FROM ${qTable} FETCH FIRST 100 ROWS ONLY;`
+  }
+  return where
+    ? `SELECT * FROM ${qTable} WHERE ${where} LIMIT 100;`
+    : `SELECT * FROM ${qTable} LIMIT 100;`
+}
+
+export function buildInitialCreateTableDraftColumns(driver) {
+  const idType = driver === 'oracle' ? 'NUMBER(10)' : driver === 'mssql' ? 'INT' : 'INTEGER'
+  const textType =
+    driver === 'oracle' ? 'VARCHAR2(255)' : driver === 'mssql' ? 'NVARCHAR(255)' : 'TEXT'
+  return [
+    { name: 'id', dataType: idType, isPrimaryKey: true, nullable: false, defaultValue: '' },
+    { name: 'name', dataType: textType, isPrimaryKey: false, nullable: false, defaultValue: '' },
+  ]
+}
+
+export function scrubClientUrlCredentials(raw) {
+  const trimmed = String(raw || '').trim()
+  if (!trimmed) return ''
+  return scrubSensitiveText(trimmed, {
+    stripOpaqueFragment: false,
+    stripAllFragments: false,
+  })
+}
+
+export function getPanelCreateTableRowAriaLabels(idx) {
+  const n = idx + 1
+  return {
+    name: `Column ${n} name`,
+    type: `Column ${n} type`,
+    typeToggle: `Choose type for column ${n}`,
+    primaryKey: `Column ${n} primary key`,
+    nullable: `Column ${n} nullable`,
+    defaultValue: `Column ${n} default value`,
+    remove: `Remove column ${n}`,
+  }
+}
+
+export function resolvePanelFormDriver(candidate, fallback = 'sqlite') {
+  const validFallback =
+    typeof fallback === 'string' && ENGINE_BY_ID[fallback] && !ENGINE_BY_ID[fallback].studioOnly
+      ? fallback
+      : 'sqlite'
+  if (typeof candidate !== 'string') return validFallback
+  const entry = ENGINE_BY_ID[candidate]
+  return entry && !entry.studioOnly ? candidate : validFallback
 }
 
 export {

@@ -25,11 +25,36 @@ import {
   runDriverConnectionTest,
 } from '../common/driver'
 import type { DriverTlsOptions } from '../common/tls-and-tunnel'
-import { resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
+import { buildDefaultTlsOptions, resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
+import { scrubDriverErrorText } from '../common/sql-credentials'
 import { assembleTableBrowseResult } from '../common/update-builder'
+import { tokenizeRedisCommandLine } from '../../shared-sql-safety.js'
 
 const REDIS_UNSUPPORTED_TX_REASON =
   'Redis does not support interactive multi-statement transactions'
+
+function scrubRedisError(err: unknown): unknown {
+  if (err instanceof Error && err.message) {
+    const clean = scrubDriverErrorText(err.message)
+    if (clean !== err.message) {
+      try {
+        err.message = clean
+      } catch {
+        const code =
+          err && typeof err === 'object' && 'code' in err && typeof err.code === 'string'
+            ? err.code
+            : 'REDIS_ERROR'
+        return new DatabaseDriverError(clean, code, 'redis', err)
+      }
+    }
+  }
+  return err
+}
+
+function formatRedisErrorMessage(err: unknown, fallback: string): string {
+  const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : ''
+  return scrubDriverErrorText(raw).trim() || fallback
+}
 
 const MAX_SCAN_KEYS = 2000
 const MAX_SCAN_ITERATIONS = 500
@@ -327,7 +352,7 @@ class RespSocketClient {
       const tlsOpts: tls.ConnectionOptions = {
         host: options.host,
         port: options.port,
-        rejectUnauthorized: false,
+        rejectUnauthorized: true,
       }
       if (!net.isIP(options.host)) {
         tlsOpts.servername = options.host
@@ -351,7 +376,14 @@ class RespSocketClient {
       })
       sock.once('error', (err) => {
         clearTimeout(timer)
-        reject(new DatabaseDriverError(err.message, 'CONNECTION_FAILED', 'redis', err))
+        reject(
+          new DatabaseDriverError(
+            formatRedisErrorMessage(err, 'Redis connection failed'),
+            'SOCKET_ERROR',
+            'redis',
+            scrubRedisError(err)
+          )
+        )
       })
     })
 
@@ -386,7 +418,13 @@ class RespSocketClient {
         continue
       }
       if (decoded.value instanceof RespProtocolError) {
-        waiter.reject(new DatabaseDriverError(decoded.value.message, 'REDIS_ERROR', 'redis'))
+        waiter.reject(
+          new DatabaseDriverError(
+            formatRedisErrorMessage(decoded.value, 'Redis command failed'),
+            'REDIS_ERROR',
+            'redis'
+          )
+        )
       } else {
         waiter.resolve(decoded.value)
       }
@@ -397,12 +435,12 @@ class RespSocketClient {
     if (this.pending.length === 0) return
     const wrapped =
       err instanceof DatabaseDriverError
-        ? err
+        ? scrubRedisError(err)
         : new DatabaseDriverError(
-            err instanceof Error ? err.message : String(err),
+            formatRedisErrorMessage(err, 'Redis socket error'),
             'SOCKET_ERROR',
             'redis',
-            err
+            scrubRedisError(err)
           )
     while (this.pending.length > 0) {
       const waiter = this.pending.shift()
@@ -465,93 +503,12 @@ class RespSocketClient {
 
 export function tokenizeRedisCommandScript(script: string): string[][] {
   const commands: string[][] = []
-  let currentArgs: string[] = []
-  let token = ''
-  let inToken = false
-  let quoteChar: '"' | "'" | null = null
-  let i = 0
-  const len = script.length
-
-  const pushToken = (): void => {
-    if (inToken) {
-      currentArgs.push(token)
-      token = ''
-      inToken = false
+  for (const rawLine of script.split(/\r?\n/)) {
+    const args = tokenizeRedisCommandLine(rawLine, { strict: true })
+    if (args.length > 0) {
+      commands.push(args)
     }
   }
-
-  const pushCommand = (): void => {
-    pushToken()
-    if (currentArgs.length > 0) {
-      commands.push(currentArgs)
-      currentArgs = []
-    }
-  }
-
-  while (i < len) {
-    const ch = script[i]
-
-    if (quoteChar !== null) {
-      if (ch === '\\' && i + 1 < len) {
-        const next = script[i + 1]
-        if (next === 'n') token += '\n'
-        else if (next === 'r') token += '\r'
-        else if (next === 't') token += '\t'
-        else if (next === 'x' && i + 3 < len && /^[0-9a-fA-F]{2}$/.test(script.slice(i + 2, i + 4))) {
-          token += String.fromCharCode(parseInt(script.slice(i + 2, i + 4), 16))
-          i += 2
-        } else {
-          token += next
-        }
-        i += 2
-        continue
-      }
-      if (ch === quoteChar) {
-        quoteChar = null
-        i++
-        continue
-      }
-      token += ch
-      i++
-      continue
-    }
-
-    // Ignore comment lines when at start of command
-    if (!inToken && currentArgs.length === 0) {
-      if (ch === '#' || ((ch === '-' && script[i + 1] === '-') || (ch === '/' && script[i + 1] === '/'))) {
-        while (i < len && script[i] !== '\n') i++
-        continue
-      }
-    }
-
-    if (ch === '\r' || ch === '\n') {
-      pushCommand()
-      i++
-      continue
-    }
-
-    if (ch === ' ' || ch === '\t') {
-      pushToken()
-      i++
-      continue
-    }
-
-    if (ch === '"' || ch === "'") {
-      quoteChar = ch
-      inToken = true
-      i++
-      continue
-    }
-
-    token += ch
-    inToken = true
-    i++
-  }
-
-  if (quoteChar !== null) {
-    throw new Error(`Unterminated ${quoteChar} quote in Redis command`)
-  }
-  pushCommand()
   return commands
 }
 
@@ -566,6 +523,81 @@ function quoteRedisArg(arg: string): string {
     return `"${escaped}"`
   }
   return arg
+}
+
+export function redactRedisCommandArgs(cmdArgs: readonly string[]): string[] {
+  const out = [...cmdArgs]
+  if (out.length < 2) return out
+  const cmd = (out[0] || '').toUpperCase()
+
+  if (cmd === 'AUTH') {
+    if (out.length === 2) {
+      out[1] = '***'
+    } else {
+      for (let i = 2; i < out.length; i++) {
+        out[i] = '***'
+      }
+    }
+    return out
+  }
+
+  if (cmd === 'HELLO') {
+    for (let i = 1; i < out.length; i++) {
+      if ((out[i] || '').toUpperCase() === 'AUTH') {
+        if (i + 2 < out.length) {
+          out[i + 2] = '***'
+          i += 2
+        } else if (i + 1 < out.length) {
+          out[i + 1] = '***'
+          i += 1
+        }
+      }
+    }
+    return out
+  }
+
+  if (cmd === 'ACL' && (out[1] || '').toUpperCase() === 'SETUSER') {
+    for (let i = 3; i < out.length; i++) {
+      const rule = out[i] || ''
+      if (
+        (rule.startsWith('>') ||
+          rule.startsWith('#') ||
+          rule.startsWith('<') ||
+          rule.startsWith('!')) &&
+        rule.length > 1
+      ) {
+        out[i] = `${rule[0]}***`
+      }
+    }
+    return out
+  }
+
+  if (cmd === 'CONFIG' && (out[1] || '').toUpperCase() === 'SET') {
+    for (let i = 2; i + 1 < out.length; i += 2) {
+      const param = (out[i] || '').toLowerCase()
+      if (param === 'requirepass' || param === 'masterauth') {
+        out[i + 1] = '***'
+      }
+    }
+    return out
+  }
+
+  if (cmd === 'MIGRATE') {
+    for (let i = 1; i < out.length; i++) {
+      const opt = (out[i] || '').toUpperCase()
+      if (opt === 'KEYS') break
+      if (opt === 'AUTH' && i + 1 < out.length) {
+        out[i + 1] = '***'
+        i += 1
+      } else if (opt === 'AUTH2' && i + 2 < out.length) {
+        out[i + 2] = '***'
+        i += 2
+      }
+    }
+    return out
+  }
+
+  return out
 }
 
 function globToRegex(glob: string): RegExp {
@@ -634,8 +666,8 @@ function formatRedisStructureValue(type: string, raw: unknown): string | null {
 }
 
 function serializeRespValue(value: unknown): unknown {
-  if (value instanceof RespProtocolError) return value.message
-  if (value instanceof Error) return value.message
+  if (value instanceof RespProtocolError) return scrubDriverErrorText(value.message)
+  if (value instanceof Error) return scrubDriverErrorText(value.message)
   if (Array.isArray(value)) return value.map(serializeRespValue)
   if (value !== null && typeof value === 'object') {
     const out: Record<string, unknown> = {}
@@ -649,8 +681,8 @@ function serializeRespValue(value: unknown): unknown {
 
 function formatRedisReplyCell(value: unknown): string | number | boolean | null {
   if (value === null || value === undefined) return null
-  if (value instanceof RespProtocolError) return value.message
-  if (value instanceof Error) return value.message
+  if (value instanceof RespProtocolError) return scrubDriverErrorText(value.message)
+  if (value instanceof Error) return scrubDriverErrorText(value.message)
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
     return value
   }
@@ -750,7 +782,14 @@ export class RedisSession implements IDatabaseSession {
     }
     const tlsOverride = await this.tlsOptionsPromise
     const useTls = shouldUseRedisTls(tlsOverride, ssl)
-    const tlsOptions = tlsOverride === false ? undefined : tlsOverride
+    const tlsOptions =
+      tlsOverride === false
+        ? undefined
+        : tlsOverride !== undefined
+          ? tlsOverride
+          : useTls
+            ? buildDefaultTlsOptions(this.extraSecrets?.tlsServername)
+            : undefined
     const client = await RespSocketClient.connect({ host, port, ssl: useTls, tlsOptions })
     try {
       if (this.secret && this.secret.length > 0) {
@@ -779,35 +818,45 @@ export class RedisSession implements IDatabaseSession {
       return client
     } catch (err) {
       client.destroy()
-      throw err
+      throw scrubRedisError(err)
+    }
+  }
+
+  private async runScrubbed<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn()
+    } catch (err: unknown) {
+      throw scrubRedisError(err)
     }
   }
 
   private async getClient(): Promise<RespSocketClient> {
-    if (this.isClosed) {
-      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'redis')
-    }
-    if (this.sharedClient && this.sharedClient.isAlive()) {
-      return this.sharedClient
-    }
-    if (this.connectPromise) {
+    return this.runScrubbed(async () => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'redis')
+      }
+      if (this.sharedClient && this.sharedClient.isAlive()) {
+        return this.sharedClient
+      }
+      if (this.connectPromise) {
+        return this.connectPromise
+      }
+
+      this.connectPromise = this.openAuthenticatedClient()
+        .then((client) => {
+          if (this.isClosed) {
+            client.destroy()
+            throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'redis')
+          }
+          this.sharedClient = client
+          return client
+        })
+        .finally(() => {
+          this.connectPromise = null
+        })
+
       return this.connectPromise
-    }
-
-    this.connectPromise = this.openAuthenticatedClient()
-      .then((client) => {
-        if (this.isClosed) {
-          client.destroy()
-          throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'redis')
-        }
-        this.sharedClient = client
-        return client
-      })
-      .finally(() => {
-        this.connectPromise = null
-      })
-
-    return this.connectPromise
+    })
   }
 
   async init(): Promise<void> {
@@ -828,7 +877,7 @@ export class RedisSession implements IDatabaseSession {
     } catch (err: unknown) {
       return {
         ok: false,
-        message: err instanceof Error ? err.message : 'Failed to connect to Redis',
+        message: formatRedisErrorMessage(err, 'Failed to connect to Redis'),
       }
     }
   }
@@ -1583,7 +1632,10 @@ export class RedisSession implements IDatabaseSession {
             if (entry.cancelled) return
             const reply = await queryClient.sendCommand(cmdArgs)
             if (entry.cancelled) return
-            allRows.push([cmdArgs.map(quoteRedisArg).join(' '), formatRedisReplyCell(reply)])
+            allRows.push([
+              redactRedisCommandArgs(cmdArgs).map(quoteRedisArg).join(' '),
+              formatRedisReplyCell(reply),
+            ])
           }
 
           const executionTimeMs = Math.round(performance.now() - start)
@@ -1602,7 +1654,7 @@ export class RedisSession implements IDatabaseSession {
           })
         } catch (err) {
           if (!entry.cancelled) {
-            reject(err)
+            reject(scrubRedisError(err))
           }
         } finally {
           this.activeQueries.delete(queryId)
@@ -1664,9 +1716,13 @@ export class RedisDriver implements IDatabaseDriver {
     secret?: string,
     extraSecrets?: DriverTlsOptions
   ): Promise<IDatabaseSession> {
-    const session = new RedisSession(profile, secret, extraSecrets)
-    await session.init()
-    return session
+    try {
+      const session = new RedisSession(profile, secret, extraSecrets)
+      await session.init()
+      return session
+    } catch (err: unknown) {
+      throw scrubRedisError(err)
+    }
   }
 
   async testConnection(
@@ -1676,7 +1732,7 @@ export class RedisDriver implements IDatabaseDriver {
   ): Promise<{ ok: boolean; message?: string }> {
     return runDriverConnectionTest(
       () => this.createSession(profile, secret, extraSecrets),
-      (err) => (err instanceof Error ? err.message : 'Redis connection failed')
+      (err) => formatRedisErrorMessage(err, 'Redis connection failed')
     )
   }
 }

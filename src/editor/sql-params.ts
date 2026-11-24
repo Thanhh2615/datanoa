@@ -50,10 +50,6 @@ function scanSqlParameterTokens(
   sql: string,
   dialect: DatabaseDriverType
 ): ScannedSqlToken[] {
-  if (!sql || typeof sql !== 'string' || dialect === 'redis') {
-    return []
-  }
-
   const tokens: ScannedSqlToken[] = []
   const assignedMysqlUserVars = new Set<string>()
   const len = sql.length
@@ -100,8 +96,11 @@ function scanSqlParameterTokens(
       continue
     }
 
-    // 6. Bracket identifiers: [...] (SQLite / LibSQL only)
-    if (ch === '[' && (dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1')) {
+    // 6. Bracket identifiers: [...] (SQLite / LibSQL / D1 / MSSQL)
+    if (
+      ch === '[' &&
+      (dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1' || dialect === 'mssql')
+    ) {
       let j = i + 1
       while (j < len) {
         if (sql[j] === ']') {
@@ -250,13 +249,13 @@ function scanSqlParameterTokens(
 /**
  * Extracts bind parameters from a SQL script according to dialect rules.
  * Preserves first-seen order, deduplicates by key (`:user_id`, `@email`, `$1`), and counts occurrences.
- * Returns [] for redis dialect.
+ * Returns [] for non-SQL dialects (redis, mongodb).
  */
 export function extractSqlParameters(
   sql: string,
   dialect: DatabaseDriverType
 ): DetectedSqlParam[] {
-  if (!sql || typeof sql !== 'string' || dialect === 'redis') {
+  if (!sql || typeof sql !== 'string' || dialect === 'redis' || dialect === 'mongodb') {
     return []
   }
 
@@ -396,14 +395,14 @@ function getOwnParamValue(
 /**
  * Replaces real parameter placeholders with safely formatted SQL literals using `formatSqlValue`.
  * Preserves all comments, string literals, dollar quotes, and casts.
- * Returns sql unchanged for redis dialect.
+ * Returns sql unchanged for non-SQL dialects (redis, mongodb).
  */
 export function bindSqlParameters(
   sql: string,
   values: Record<string, BindParamInput>,
   dialect: DatabaseDriverType
 ): string {
-  if (!sql || typeof sql !== 'string' || dialect === 'redis') {
+  if (!sql || typeof sql !== 'string' || dialect === 'redis' || dialect === 'mongodb') {
     return sql ?? ''
   }
 

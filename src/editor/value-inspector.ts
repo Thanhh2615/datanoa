@@ -1,6 +1,7 @@
 // src/editor/value-inspector.ts
 // Collapsible Cell Value / JSON Inspector Drawer controller for Datanoa Studio.
 
+import { formatJsonPreservingNumbers } from '../shared-grid-paste.js'
 import { copyTextFallback, setButtonLoading } from './db-icons.js'
 import {
   coerceCellInputValue,
@@ -30,9 +31,17 @@ export interface ValueInspectorHost {
   updateStatus: (stateText: string) => void
 }
 
+const VALUE_INSPECTOR_STORAGE_KEY = 'datanoa.studioValueInspectorPx'
+const DEFAULT_INSPECTOR_HEIGHT_PX = 220
+const MIN_INSPECTOR_HEIGHT_PX = 140
+const MAX_INSPECTOR_HEIGHT_RATIO = 0.75
+const FALLBACK_MAX_INSPECTOR_HEIGHT_PX = 560
+const INSPECTOR_KEY_STEP_PX = 24
+
 export class ValueInspectorController {
   private readonly host: ValueInspectorHost
   private rootEl: HTMLDivElement | null = null
+  private resizerEl: HTMLDivElement | null = null
   private titleEl: HTMLSpanElement | null = null
   private nullBadgeEl: HTMLSpanElement | null = null
   private statusEl: HTMLDivElement | null = null
@@ -42,10 +51,123 @@ export class ValueInspectorController {
   private selectedCell: SelectedCellInfo | null = null
   private openState = false
   private savingCell = false
+  private userModified = false
+  private initialDisplayText = ''
+  private heightPx = DEFAULT_INSPECTOR_HEIGHT_PX
+  private resizeRafId: number | null = null
+  private resizeDragCleanup: (() => void) | null = null
   private boundCleanups: Array<() => void> = []
 
   constructor(host: ValueInspectorHost) {
     this.host = host
+    this.heightPx = this.readPersistedHeight()
+  }
+
+  private readPersistedHeight(): number {
+    try {
+      const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(VALUE_INSPECTOR_STORAGE_KEY) : null
+      const parsed = raw ? Number(raw) : Number.NaN
+      return Number.isFinite(parsed) && parsed >= MIN_INSPECTOR_HEIGHT_PX
+        ? Math.round(parsed)
+        : DEFAULT_INSPECTOR_HEIGHT_PX
+    } catch {
+      return DEFAULT_INSPECTOR_HEIGHT_PX
+    }
+  }
+
+  private persistHeight(px: number): void {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(VALUE_INSPECTOR_STORAGE_KEY, String(Math.round(px)))
+      }
+    } catch {
+      // Ignore storage quota errors
+    }
+  }
+
+  private clampHeight(px: number): number {
+    const parentH = this.rootEl?.parentElement?.getBoundingClientRect?.().height
+    const maxAllowed =
+      parentH && Number.isFinite(parentH) && parentH > 0
+        ? Math.max(MIN_INSPECTOR_HEIGHT_PX, Math.floor(parentH * MAX_INSPECTOR_HEIGHT_RATIO))
+        : FALLBACK_MAX_INSPECTOR_HEIGHT_PX
+    return Math.max(MIN_INSPECTOR_HEIGHT_PX, Math.min(maxAllowed, Math.round(px)))
+  }
+
+  private applyHeight(px: number, notifyGrid: boolean): void {
+    const clamped = this.clampHeight(px)
+    this.heightPx = clamped
+    if (this.rootEl) {
+      this.rootEl.style.height = `${clamped}px`
+    }
+    this.resizerEl?.setAttribute('aria-valuenow', String(clamped))
+    if (notifyGrid) {
+      this.host.getDataGrid()?.handleViewportResize()
+    }
+  }
+
+  private startResizeDrag(e: MouseEvent): void {
+    if (!this.rootEl || typeof window === 'undefined') return
+    e.preventDefault()
+    this.resizeDragCleanup?.()
+
+    const startY = e.clientY
+    const rectH = this.rootEl.getBoundingClientRect?.().height
+    const startHeight = this.clampHeight(
+      rectH && Number.isFinite(rectH) && rectH > 0 ? rectH : this.heightPx
+    )
+    this.resizerEl?.classList.add('resizing')
+    if (typeof document !== 'undefined' && document.body) {
+      document.body.style.cursor = 'row-resize'
+      document.body.style.userSelect = 'none'
+    }
+
+    const scheduleApply = (nextPx: number) => {
+      if (typeof requestAnimationFrame === 'function') {
+        if (this.resizeRafId !== null && typeof cancelAnimationFrame === 'function') {
+          cancelAnimationFrame(this.resizeRafId)
+        }
+        this.resizeRafId = requestAnimationFrame(() => {
+          this.resizeRafId = null
+          this.applyHeight(nextPx, true)
+        })
+      } else {
+        this.applyHeight(nextPx, true)
+      }
+    }
+
+    const onMove = (moveEv: MouseEvent) => {
+      scheduleApply(startHeight + (startY - moveEv.clientY))
+    }
+
+    const cleanup = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onEnd)
+      window.removeEventListener('blur', onEnd)
+      if (this.resizeRafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(this.resizeRafId)
+        this.resizeRafId = null
+      }
+      this.resizerEl?.classList.remove('resizing')
+      if (typeof document !== 'undefined' && document.body) {
+        document.body.style.cursor = ''
+        document.body.style.userSelect = ''
+      }
+      if (this.resizeDragCleanup === cleanup) {
+        this.resizeDragCleanup = null
+      }
+    }
+
+    const onEnd = () => {
+      cleanup()
+      this.persistHeight(this.heightPx)
+      this.host.getDataGrid()?.handleViewportResize()
+    }
+
+    this.resizeDragCleanup = cleanup
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onEnd)
+    window.addEventListener('blur', onEnd)
   }
 
   private addListener<K extends keyof HTMLElementEventMap>(
@@ -62,6 +184,33 @@ export class ValueInspectorController {
     root.className = 'datanoa-value-inspector'
     root.style.display = 'none'
     this.rootEl = root
+
+    const resizer = document.createElement('div')
+    resizer.className = 'datanoa-value-inspector-resizer'
+    resizer.setAttribute('role', 'separator')
+    resizer.setAttribute('aria-orientation', 'horizontal')
+    resizer.setAttribute('aria-label', 'Resize Value Inspector')
+    resizer.tabIndex = 0
+    resizer.title = 'Drag up or down to resize · Double-click to reset'
+    this.resizerEl = resizer
+    this.addListener(resizer, 'mousedown', (e) => this.startResizeDrag(e))
+    this.addListener(resizer, 'dblclick', () => {
+      this.applyHeight(DEFAULT_INSPECTOR_HEIGHT_PX, true)
+      this.persistHeight(this.heightPx)
+    })
+    this.addListener(resizer, 'keydown', (e) => {
+      let next: number | null = null
+      if (e.key === 'ArrowUp') next = this.heightPx + INSPECTOR_KEY_STEP_PX
+      else if (e.key === 'ArrowDown') next = this.heightPx - INSPECTOR_KEY_STEP_PX
+      else if (e.key === 'Home') next = MIN_INSPECTOR_HEIGHT_PX
+      else if (e.key === 'End') next = FALLBACK_MAX_INSPECTOR_HEIGHT_PX
+      if (next !== null) {
+        e.preventDefault()
+        this.applyHeight(next, true)
+        this.persistHeight(this.heightPx)
+      }
+    })
+    root.appendChild(resizer)
 
     const valHead = document.createElement('div')
     valHead.className = 'datanoa-drawer-head'
@@ -89,8 +238,9 @@ export class ValueInspectorController {
     this.addListener(valPrettyBtn, 'click', () => {
       if (!this.textEl) return
       try {
-        const parsed: unknown = JSON.parse(this.textEl.value)
-        this.textEl.value = JSON.stringify(parsed, null, 2)
+        this.textEl.value = formatJsonPreservingNumbers(this.textEl.value, 2)
+        this.userModified = this.textEl.value !== this.initialDisplayText
+        this.syncActionButtons()
         this.updateMeta(false)
       } catch {
         this.host.updateStatus('Value is not valid JSON')
@@ -104,8 +254,9 @@ export class ValueInspectorController {
     this.addListener(valMinifyBtn, 'click', () => {
       if (!this.textEl) return
       try {
-        const parsed: unknown = JSON.parse(this.textEl.value)
-        this.textEl.value = JSON.stringify(parsed)
+        this.textEl.value = formatJsonPreservingNumbers(this.textEl.value, 0)
+        this.userModified = this.textEl.value !== this.initialDisplayText
+        this.syncActionButtons()
         this.updateMeta(false)
       } catch {
         this.host.updateStatus('Value is not valid JSON')
@@ -162,6 +313,8 @@ export class ValueInspectorController {
     this.textEl.className = 'datanoa-value-textarea'
     this.textEl.spellcheck = false
     this.addListener(this.textEl, 'input', () => {
+      this.userModified = true
+      this.syncActionButtons()
       this.updateMeta(false)
     })
     this.addListener(this.textEl, 'keydown', (e) => {
@@ -180,12 +333,27 @@ export class ValueInspectorController {
     return root
   }
 
+  private canApplyCurrentValue(): boolean {
+    if (!this.selectedCell?.isEditable || this.savingCell) return false
+    if (this.selectedCell.value === null || this.selectedCell.value === undefined) return true
+    return this.userModified
+  }
+
+  private syncActionButtons(): void {
+    const editable = Boolean(this.selectedCell?.isEditable)
+    const canSetNull = editable && this.selectedCell?.isNullable !== false
+    if (this.applyBtn) this.applyBtn.disabled = !this.canApplyCurrentValue()
+    if (this.nullBtn) this.nullBtn.disabled = !canSetNull || this.savingCell
+  }
+
   public getSelectedCell(): SelectedCellInfo | null {
     return this.selectedCell
   }
 
   public clearSelection(): void {
     this.selectedCell = null
+    this.userModified = false
+    this.initialDisplayText = ''
     const btn = this.host.getInspectButton()
     if (btn) btn.disabled = true
     this.close()
@@ -274,6 +442,7 @@ export class ValueInspectorController {
   private render(info: SelectedCellInfo): void {
     if (!this.rootEl || !this.titleEl || !this.textEl) return
     this.rootEl.style.display = 'flex'
+    this.applyHeight(this.heightPx, false)
     const typeLabel = info.columnType ? ` (${info.columnType})` : ''
     this.titleEl.textContent = `Value Inspector · ${info.columnName}${typeLabel} · Row ${info.rowIndex + 1}`
 
@@ -294,7 +463,7 @@ export class ValueInspectorController {
         (trimmed.startsWith('[') && trimmed.endsWith(']'))
       ) {
         try {
-          formattedText = JSON.stringify(JSON.parse(trimmed), null, 2)
+          formattedText = formatJsonPreservingNumbers(trimmed, 2)
         } catch {
           formattedText = info.value
         }
@@ -306,11 +475,11 @@ export class ValueInspectorController {
     }
 
     this.textEl.value = formattedText
+    this.initialDisplayText = formattedText
+    this.userModified = false
     this.textEl.placeholder = isNullVal ? 'NULL (type to set text value)' : ''
     this.textEl.readOnly = !info.isEditable
-    const canSetNull = info.isEditable && info.isNullable !== false
-    if (this.applyBtn) this.applyBtn.disabled = !info.isEditable || this.savingCell
-    if (this.nullBtn) this.nullBtn.disabled = !canSetNull || this.savingCell
+    this.syncActionButtons()
     this.updateMeta(isNullVal)
   }
 
@@ -320,6 +489,7 @@ export class ValueInspectorController {
     const info = this.selectedCell
     if (!info.isEditable) return
     if (setNull && info.isNullable === false) return
+    if (!setNull && !this.canApplyCurrentValue()) return
 
     const nextValue: unknown = setNull
       ? null
@@ -327,6 +497,9 @@ export class ValueInspectorController {
 
     if (grid.isBatchMode() || grid.getStagedCount() > 0 || info.isInserted) {
       grid.stageCellEdit(info.rowIndex, info.colIndex, nextValue)
+      this.initialDisplayText = setNull ? '' : this.textEl.value
+      this.userModified = false
+      this.syncActionButtons()
       this.updateMeta(setNull)
       this.host.updateStatus(
         setNull ? `Staged NULL for ${info.columnName}` : `Staged edit for ${info.columnName}`
@@ -361,6 +534,10 @@ export class ValueInspectorController {
         originalValue: info.value,
         rowIndex: info.rowIndex,
       })
+      if (res.ok) {
+        this.initialDisplayText = setNull ? '' : this.textEl.value
+        this.userModified = false
+      }
       const latest = this.host.getActiveTarget()
       if (
         res.ok &&
@@ -378,18 +555,18 @@ export class ValueInspectorController {
     } finally {
       this.savingCell = false
       setButtonLoading(triggerBtn, false)
-      const editable = Boolean(this.selectedCell?.isEditable)
-      const nullable = this.selectedCell?.isNullable !== false
-      if (this.applyBtn) this.applyBtn.disabled = !editable
-      if (this.nullBtn) this.nullBtn.disabled = !(editable && nullable)
+      this.syncActionButtons()
     }
   }
 
   public destroy(): void {
+    this.resizeDragCleanup?.()
+    this.resizeDragCleanup = null
     while (this.boundCleanups.length > 0) {
       this.boundCleanups.pop()?.()
     }
     this.rootEl = null
+    this.resizerEl = null
     this.titleEl = null
     this.nullBadgeEl = null
     this.statusEl = null
@@ -398,5 +575,7 @@ export class ValueInspectorController {
     this.nullBtn = null
     this.selectedCell = null
     this.openState = false
+    this.userModified = false
+    this.initialDisplayText = ''
   }
 }

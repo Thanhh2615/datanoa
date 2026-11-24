@@ -1,4 +1,6 @@
 import type { DatabaseDriverType } from '../../protocol'
+import { isMssqlReadOnlyBlocked } from './mssql-sql'
+import { splitOracleStatements } from './oracle-sql'
 import {
   containsDdlStatement,
   formatSqlBinaryLiteral,
@@ -15,7 +17,6 @@ import {
   scanLineCommentEnd,
   scanQuotedSegmentEnd,
   splitSqlStatements,
-  stripCommentsAndLiterals,
   stripLeadingSqlComments,
   supportsDollarQuoting,
   supportsNestedBlockComments,
@@ -40,13 +41,114 @@ export {
   scanLineCommentEnd,
   scanQuotedSegmentEnd,
   splitSqlStatements,
-  stripCommentsAndLiterals,
   stripLeadingSqlComments,
   supportsDollarQuoting,
   supportsNestedBlockComments,
   usesBackslashAndHash,
   findStatementAtOffset,
   type SqlStatementSlice,
+}
+
+function scanMssqlBracketIdentEnd(sql: string, start: number): { end: number; closed: boolean } {
+  let i = start + 1
+  const len = sql.length
+  while (i < len) {
+    if (sql[i] === ']') {
+      if (i + 1 < len && sql[i + 1] === ']') {
+        i += 2
+        continue
+      }
+      return { end: i + 1, closed: true }
+    }
+    i++
+  }
+  return { end: len, closed: false }
+}
+
+/**
+ * Strips SQL comments and string/dollar literals to spaces while preserving
+ * quoted identifiers (including MSSQL `[...]`) as neutral `x` placeholders so
+ * `SELECT * INTO [dbo].[copy]` does not degenerate into `INTO  . `.
+ */
+export function stripCommentsAndLiterals(
+  sql: string,
+  dialect?: DatabaseDriverType,
+  preserveMysqlExecComments = true
+): string {
+  const backslashAndHash = usesBackslashAndHash(dialect)
+  const nestedComments = supportsNestedBlockComments(dialect)
+  const dollarQuotes = supportsDollarQuoting(dialect)
+  let out = ''
+  let i = 0
+  let execCommentDepth = 0
+  const len = sql.length
+
+  while (i < len) {
+    const ch = sql[i]
+    if (ch === '-' && i + 1 < len && sql[i + 1] === '-') {
+      out += ' '
+      i = scanLineCommentEnd(sql, i)
+      continue
+    }
+    if (ch === '#' && backslashAndHash) {
+      out += ' '
+      i = scanLineCommentEnd(sql, i - 1)
+      continue
+    }
+    if (execCommentDepth > 0 && ch === '*' && i + 1 < len && sql[i + 1] === '/') {
+      out += ' '
+      execCommentDepth--
+      i += 2
+      continue
+    }
+    if (ch === '/' && i + 1 < len && sql[i + 1] === '*') {
+      const execLen = preserveMysqlExecComments
+        ? matchMysqlExecCommentPrefix(sql, i, dialect)
+        : 0
+      if (execLen > 0) {
+        out += ' '
+        execCommentDepth++
+        i += execLen
+        continue
+      }
+      out += ' '
+      i = scanBlockCommentEnd(sql, i, nestedComments)
+      continue
+    }
+    if (isPostgresEscapeStringStart(sql, i, dialect)) {
+      out += ' '
+      i = scanQuotedSegmentEnd(sql, i + 1, "'", true).end
+      continue
+    }
+    if (ch === "'") {
+      out += ' '
+      i = scanQuotedSegmentEnd(sql, i, "'", backslashAndHash).end
+      continue
+    }
+    if (ch === '"' || ch === '`') {
+      out += ' x '
+      i = scanQuotedSegmentEnd(sql, i, ch, false).end
+      continue
+    }
+    if (ch === '[' && dialect === 'mssql') {
+      out += ' x '
+      i = scanMssqlBracketIdentEnd(sql, i).end
+      continue
+    }
+    if (dollarQuotes && ch === '$') {
+      const tag = matchDollarQuoteTag(sql, i)
+      if (tag !== null) {
+        out += ' '
+        const closeIdx = sql.indexOf(tag, i + tag.length)
+        i = closeIdx >= 0 ? closeIdx + tag.length : len
+        continue
+      }
+    }
+    out += ch
+    i++
+  }
+
+  return out
 }
 
 /** Collapses SQL to a single line and bounds its length for display previews. */
@@ -92,6 +194,14 @@ export function sanitizeFilterClause(
       const seg = scanQuotedSegmentEnd(trimmed, i, ch, allowBackslash)
       if (!seg.closed) {
         throw new Error(`Invalid filter clause: unclosed ${ch} quote literal.`)
+      }
+      i = seg.end
+      continue
+    }
+    if (ch === '[' && dialect === 'mssql') {
+      const seg = scanMssqlBracketIdentEnd(trimmed, i)
+      if (!seg.closed) {
+        throw new Error('Invalid filter clause: unclosed [ bracket identifier.')
       }
       i = seg.end
       continue
@@ -160,11 +270,8 @@ export function buildQuickFilterPredicate(
           : `${qCol} != ${formatSqlLiteral(value, dialect)}`
       break
   }
-  const sanitized = sanitizeFilterClause(predicate, dialect)
-  if (!sanitized) {
-    throw new Error('Failed to build a valid quick filter predicate.')
-  }
-  return sanitized
+  sanitizeFilterClause(predicate, dialect)
+  return predicate
 }
 
 const SQL_MUTATING_VERBS: ReadonlySet<string> = new Set([
@@ -373,25 +480,27 @@ interface ParsedExplainInfo {
   remainder: string
 }
 
+function findMatchingParenIndex(text: string, openIdx: number): number {
+  let depth = 0
+  for (let i = openIdx; i < text.length; i++) {
+    if (text[i] === '(') depth++
+    else if (text[i] === ')') {
+      depth--
+      if (depth === 0) return i
+    }
+  }
+  return -1
+}
+
 function parseExplainOptions(afterExplain: string): ParsedExplainInfo {
   let rest = afterExplain.trimStart()
   let hasAnalyze = false
   let hasWriteOption = false
+  let allowParenOptions = true
 
   while (rest.length > 0) {
-    if (rest.startsWith('(')) {
-      let depth = 0
-      let closeIdx = -1
-      for (let i = 0; i < rest.length; i++) {
-        if (rest[i] === '(') depth++
-        else if (rest[i] === ')') {
-          depth--
-          if (depth === 0) {
-            closeIdx = i
-            break
-          }
-        }
-      }
+    if (allowParenOptions && rest.startsWith('(')) {
+      const closeIdx = findMatchingParenIndex(rest, 0)
       if (closeIdx < 0) {
         hasWriteOption = true
         break
@@ -405,12 +514,14 @@ function parseExplainOptions(afterExplain: string): ParsedExplainInfo {
         hasWriteOption = true
       }
       rest = rest.slice(closeIdx + 1).trimStart()
+      allowParenOptions = false
       continue
     }
 
     const analyzeOpt = /^ANALY[ZS]E\b/i.exec(rest)
     if (analyzeOpt) {
       hasAnalyze = true
+      allowParenOptions = false
       rest = rest.slice(analyzeOpt[0].length).trimStart()
       continue
     }
@@ -420,13 +531,39 @@ function parseExplainOptions(afterExplain: string): ParsedExplainInfo {
         rest
       )
     if (stdOpt) {
+      allowParenOptions = false
       rest = rest.slice(stdOpt[0].length).trimStart()
+      continue
+    }
+
+    // Oracle EXPLAIN PLAN [SET STATEMENT_ID = ...] [INTO [schema.]table[@dblink]] FOR <stmt>
+    const oracleSetOpt = /^SET\s+STATEMENT_ID\s*=\s*(?:[A-Za-z0-9_]+)?(?=\s*(?:\bINTO\b|\bFOR\b))/i.exec(
+      rest
+    )
+    if (oracleSetOpt) {
+      allowParenOptions = false
+      rest = rest.slice(oracleSetOpt[0].length).trimStart()
+      continue
+    }
+
+    const oracleIntoOpt = /^INTO\s+(?!OUTFILE\b|DUMPFILE\b)[\s\S]*?(?=\bFOR\b)/i.exec(rest)
+    if (oracleIntoOpt) {
+      allowParenOptions = false
+      rest = rest.slice(oracleIntoOpt[0].length).trimStart()
+      continue
+    }
+
+    const oracleForOpt = /^FOR\b(?!\s+CONNECTION\b)/i.exec(rest)
+    if (oracleForOpt) {
+      allowParenOptions = false
+      rest = rest.slice(oracleForOpt[0].length).trimStart()
       continue
     }
 
     // ClickHouse EXPLAIN PLAN settings e.g. `header = 1, actions = 1`
     const chSettingOpt = /^[A-Za-z_][A-Za-z0-9_]*\s*=\s*[A-Za-z0-9_]+\s*,?/i.exec(rest)
     if (chSettingOpt) {
+      allowParenOptions = false
       rest = rest.slice(chSettingOpt[0].length).trimStart()
       continue
     }
@@ -468,35 +605,130 @@ export function isExplainTargetMutating(sql: string, dialect?: DatabaseDriverTyp
   return isCleanSingleStatementMutating(parsed.remainder)
 }
 
-function isCleanSingleStatementMutating(rawClean: string): boolean {
-  const clean = rawClean.replace(/^[\s(]+/, '').trim()
-  if (!clean) return false
+const SQL_READONLY_FOLLOWING_WITH_VERBS: ReadonlySet<string> = new Set([
+  'SELECT',
+  'VALUES',
+  'TABLE',
+  'SHOW',
+  'DESCRIBE',
+  'DESC',
+])
 
-  const firstMatch = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(clean)
-  if (!firstMatch) return false
-
-  const verb = firstMatch[1].toUpperCase()
-  if (verb === 'SHOW' || verb === 'DESCRIBE' || verb === 'DESC') {
-    return false
-  }
-  if (verb === 'SELECT') {
-    if (/\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i.test(clean)) return true
-    if (/\bINTO\s+(?:(?:TEMP|TEMPORARY|UNLOGGED)\s+)?(?:TABLE\s+)?[A-Za-z_"]/i.test(clean)) {
-      const fromMatch = /\bFROM\b/i.exec(clean)
-      const intoMatch = /\bINTO\b/i.exec(clean)
-      if (intoMatch && (!fromMatch || intoMatch.index < fromMatch.index)) {
-        return true
-      }
+function isSelectStatementMutating(clean: string): boolean {
+  if (/\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i.test(clean)) return true
+  if (/\bINTO\s+(?:(?:TEMP|TEMPORARY|UNLOGGED)\s+)?(?:TABLE\s+)?[#\[A-Za-z_"]/i.test(clean)) {
+    const fromMatch = /\bFROM\b/i.exec(clean)
+    const intoMatch = /\bINTO\b/i.exec(clean)
+    if (intoMatch && (!fromMatch || intoMatch.index < fromMatch.index)) {
+      return true
     }
-    if (/\bFOR\s+(?:NO\s+KEY\s+)?UPDATE\b/i.test(clean)) return true
+  }
+  if (/\bFOR\s+(?:NO\s+KEY\s+)?UPDATE\b/i.test(clean)) return true
+  if (
+    /\b(?:setval|pg_terminate_backend|pg_cancel_backend|lo_unlink|lo_import|lo_export)\s*\(/i.test(
+      clean
+    )
+  ) {
+    return true
+  }
+  return false
+}
+
+function parseWithCteStatement(
+  clean: string
+): { cteBodies: string[]; remainder: string } | null {
+  let rest = clean.replace(/^WITH\b/i, '').trimStart()
+  if (/^RECURSIVE\b/i.test(rest)) {
+    rest = rest.replace(/^RECURSIVE\b/i, '').trimStart()
+  }
+  const cteBodies: string[] = []
+  while (rest.length > 0) {
+    const nameMatch = /^[A-Za-z_\u0080-\uFFFF][A-Za-z0-9_$\u0080-\uFFFF]*/.exec(rest)
+    if (!nameMatch) return null
+    rest = rest.slice(nameMatch[0].length).trimStart()
+
+    if (rest.startsWith('(')) {
+      const closeColsIdx = findMatchingParenIndex(rest, 0)
+      if (closeColsIdx < 0) return null
+      rest = rest.slice(closeColsIdx + 1).trimStart()
+    }
+
+    const asMatch = /^AS\b(?:\s+(?:NOT\s+)?MATERIALIZED\b)?\s*/i.exec(rest)
+    if (!asMatch) return null
+    rest = rest.slice(asMatch[0].length).trimStart()
+
+    if (!rest.startsWith('(')) return null
+    const closeBodyIdx = findMatchingParenIndex(rest, 0)
+    if (closeBodyIdx < 0) return null
+    const body = rest.slice(1, closeBodyIdx).trim()
+    if (!body) return null
+    cteBodies.push(body)
+
+    rest = rest.slice(closeBodyIdx + 1).trimStart()
+    if (rest.startsWith(',')) {
+      rest = rest.slice(1).trimStart()
+      if (!rest) return null
+      continue
+    }
+    break
+  }
+  if (cteBodies.length === 0 || !rest) return null
+  return { cteBodies, remainder: rest }
+}
+
+function isCleanSingleStatementMutating(
+  rawClean: string,
+  failClosedOnUnknown = false
+): boolean {
+  const clean = rawClean.trim()
+  if (!clean) return failClosedOnUnknown
+
+  if (clean.startsWith('(')) {
+    const closeIdx = findMatchingParenIndex(clean, 0)
+    if (closeIdx < 0) return true
+    const inner = clean.slice(1, closeIdx).trim()
+    if (!inner || isCleanSingleStatementMutating(inner, failClosedOnUnknown)) return true
+
+    const after = clean.slice(closeIdx + 1).trim()
+    if (!after) return false
     if (
-      /\b(?:setval|pg_terminate_backend|pg_cancel_backend|lo_unlink|lo_import|lo_export)\s*\(/i.test(
-        clean
-      )
+      /\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i.test(after) ||
+      /\bFOR\s+(?:NO\s+KEY\s+)?UPDATE\b/i.test(after)
     ) {
       return true
     }
+    const setOpMatch =
+      /^(?:UNION(?:\s+(?:ALL|DISTINCT))?|INTERSECT(?:\s+(?:ALL|DISTINCT))?|EXCEPT(?:\s+(?:ALL|DISTINCT))?)\b\s*/i.exec(
+        after
+      )
+    if (setOpMatch) {
+      const afterSetOp = after.slice(setOpMatch[0].length).trim()
+      return !afterSetOp || isCleanSingleStatementMutating(afterSetOp, failClosedOnUnknown)
+    }
+    if (/^(?:ORDER\s+BY|LIMIT|OFFSET|FETCH)\b/i.test(after)) {
+      return false
+    }
+    return true
+  }
+
+  const firstMatch = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(clean)
+  if (!firstMatch) return failClosedOnUnknown
+
+  const verb = firstMatch[1].toUpperCase()
+  if (failClosedOnUnknown && !SQL_READONLY_FOLLOWING_WITH_VERBS.has(verb)) {
+    return true
+  }
+  if (verb === 'SHOW' || verb === 'DESCRIBE' || verb === 'DESC') {
     return false
+  }
+  if (verb === 'VALUES' || verb === 'TABLE') {
+    return (
+      /\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i.test(clean) ||
+      /\bFOR\s+(?:NO\s+KEY\s+)?UPDATE\b/i.test(clean)
+    )
+  }
+  if (verb === 'SELECT') {
+    return isSelectStatementMutating(clean)
   }
   if (verb === 'PRAGMA') {
     const upper = clean.toUpperCase()
@@ -520,10 +752,20 @@ function isCleanSingleStatementMutating(rawClean: string): boolean {
     if (parsed.hasAnalyze || parsed.hasWriteOption) {
       return true
     }
-    return isCleanSingleStatementMutating(parsed.remainder)
+    return isCleanSingleStatementMutating(parsed.remainder, failClosedOnUnknown)
   }
   if (verb === 'WITH') {
-    return SQL_CTE_MUTATING_REGEX.test(clean) || /\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i.test(clean)
+    if (SQL_CTE_MUTATING_REGEX.test(clean) || /\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i.test(clean)) {
+      return true
+    }
+    const parsedWith = parseWithCteStatement(clean)
+    if (!parsedWith) {
+      return true
+    }
+    if (parsedWith.cteBodies.some((body) => isCleanSingleStatementMutating(body))) {
+      return true
+    }
+    return isCleanSingleStatementMutating(parsedWith.remainder, true)
   }
   return SQL_MUTATING_VERBS.has(verb)
 }
@@ -569,14 +811,500 @@ function isRedisCommandMutating(script: string): boolean {
   return false
 }
 
+const MONGODB_READONLY_COMMANDS: ReadonlySet<string> = new Set([
+  'find',
+  'count',
+  'distinct',
+  'ping',
+  'listcollections',
+  'listdatabases',
+  'collstats',
+  'dbstats',
+  'explain',
+  'hello',
+  'ismaster',
+  'buildinfo',
+  'serverstatus',
+  'whatsmyuri',
+  'getlasterror',
+])
+
+function hasMongoPipelineWriteStage(node: unknown): boolean {
+  if (Array.isArray(node)) {
+    return node.some((item) => hasMongoPipelineWriteStage(item))
+  }
+  if (node !== null && typeof node === 'object') {
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      if (k === '$out' || k === '$merge') return true
+      if (hasMongoPipelineWriteStage(v)) return true
+    }
+  }
+  return false
+}
+
+const MONGODB_READONLY_COLL_METHODS: ReadonlySet<string> = new Set([
+  'find',
+  'findOne',
+  'aggregate',
+  'countDocuments',
+  'estimatedDocumentCount',
+  'distinct',
+  'getIndexes',
+  'indexes',
+  'stats',
+  'explain',
+])
+
+const MONGODB_READONLY_CURSOR_CHAIN_METHODS: ReadonlySet<string> = new Set([
+  'sort',
+  'limit',
+  'skip',
+  'projection',
+  'project',
+  'collation',
+  'hint',
+  'maxTimeMS',
+  'toArray',
+  'explain',
+  'count',
+  'find',
+  'findOne',
+  'aggregate',
+  'countDocuments',
+  'estimatedDocumentCount',
+  'distinct',
+])
+
+const MONGODB_READONLY_DB_METHODS: ReadonlySet<string> = new Set([
+  'stats',
+  'serverStatus',
+  'getCollectionNames',
+])
+
+const MONGODB_COLLECTION_SHORTHAND_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,127};?$/
+
+function skipMongoJsString(text: string, start: number): { end: number; value: string } {
+  const quote = text[start]
+  let i = start + 1
+  let value = ''
+  while (i < text.length) {
+    const ch = text[i]
+    if (ch === '\\') {
+      if (i + 1 < text.length) value += text[i + 1]
+      i += 2
+      continue
+    }
+    if (ch === quote) {
+      return { end: i + 1, value }
+    }
+    value += ch
+    i++
+  }
+  return { end: text.length, value }
+}
+
+function scanMongoGroupEnd(text: string, openPos: number, openChar: string, closeChar: string): number {
+  let i = openPos + 1
+  let depth = 1
+  let prevSig = openChar
+  while (i < text.length && depth > 0) {
+    const ch = text[i]
+    if (ch === "'" || ch === '"' || ch === '`') {
+      i = skipMongoJsString(text, i).end
+      prevSig = '"'
+      continue
+    }
+    if (ch === '/' && (prevSig === '' || '([{:,;=!&|?^~+-*%<>'.includes(prevSig))) {
+      let j = i + 1
+      let inClass = false
+      while (j < text.length) {
+        const rch = text[j]
+        if (rch === '\\') {
+          j += 2
+          continue
+        }
+        if (rch === '[') inClass = true
+        else if (rch === ']') inClass = false
+        else if (rch === '/' && !inClass) {
+          j++
+          while (j < text.length && /[a-z]/i.test(text[j])) j++
+          break
+        }
+        j++
+      }
+      i = j
+      prevSig = '/'
+      continue
+    }
+    if (ch === openChar) depth++
+    else if (ch === closeChar) depth--
+    if (!/\s/.test(ch)) prevSig = ch
+    i++
+  }
+  return i
+}
+
+function stripMongoComments(raw: string): string {
+  let out = ''
+  let i = 0
+  let prevSig = ''
+  while (i < raw.length) {
+    const ch = raw[i]
+    if (ch === "'" || ch === '"' || ch === '`') {
+      const seg = skipMongoJsString(raw, i)
+      out += raw.slice(i, seg.end)
+      i = seg.end
+      prevSig = '"'
+      continue
+    }
+    if (ch === '/' && i + 1 < raw.length && raw[i + 1] === '/') {
+      const nl = raw.indexOf('\n', i + 2)
+      out += '\n'
+      i = nl < 0 ? raw.length : nl + 1
+      continue
+    }
+    if (ch === '/' && i + 1 < raw.length && raw[i + 1] === '*') {
+      const close = raw.indexOf('*/', i + 2)
+      out += ' '
+      i = close < 0 ? raw.length : close + 2
+      continue
+    }
+    if (ch === '/' && (prevSig === '' || '([{:,;=!&|?^~+-*%<>'.includes(prevSig))) {
+      let j = i + 1
+      let inClass = false
+      while (j < raw.length) {
+        const rch = raw[j]
+        if (rch === '\\') {
+          j += 2
+          continue
+        }
+        if (rch === '[') inClass = true
+        else if (rch === ']') inClass = false
+        else if (rch === '/' && !inClass) {
+          j++
+          while (j < raw.length && /[a-z]/i.test(raw[j])) j++
+          break
+        }
+        j++
+      }
+      out += raw.slice(i, j)
+      i = j
+      prevSig = '/'
+      continue
+    }
+    if (!/\s/.test(ch)) prevSig = ch
+    out += ch
+    i++
+  }
+  return out
+}
+
+function splitMongoShellStatements(raw: string): string[] {
+  const clean = stripMongoComments(raw)
+  const stmts: string[] = []
+  let i = 0
+  let start = 0
+  let parenDepth = 0
+  let bracketDepth = 0
+  let braceDepth = 0
+  let prevSig = ''
+
+  while (i < clean.length) {
+    const ch = clean[i]
+    if (ch === "'" || ch === '"' || ch === '`') {
+      i = skipMongoJsString(clean, i).end
+      prevSig = '"'
+      continue
+    }
+    if (ch === '/' && (prevSig === '' || '([{:,;=!&|?^~+-*%<>'.includes(prevSig))) {
+      let j = i + 1
+      let inClass = false
+      while (j < clean.length) {
+        const rch = clean[j]
+        if (rch === '\\') {
+          j += 2
+          continue
+        }
+        if (rch === '[') inClass = true
+        else if (rch === ']') inClass = false
+        else if (rch === '/' && !inClass) {
+          j++
+          while (j < clean.length && /[a-z]/i.test(clean[j])) j++
+          break
+        }
+        j++
+      }
+      i = j
+      prevSig = '/'
+      continue
+    }
+    if (ch === '(') parenDepth++
+    else if (ch === ')' && parenDepth > 0) parenDepth--
+    else if (ch === '[') bracketDepth++
+    else if (ch === ']' && bracketDepth > 0) bracketDepth--
+    else if (ch === '{') braceDepth++
+    else if (ch === '}' && braceDepth > 0) braceDepth--
+
+    const atTop = parenDepth === 0 && bracketDepth === 0 && braceDepth === 0
+    if (atTop && (ch === ';' || ch === '\n')) {
+      if (ch === '\n') {
+        let nextNonWs = i + 1
+        while (nextNonWs < clean.length && /\s/.test(clean[nextNonWs])) nextNonWs++
+        if (clean[nextNonWs] === '.') {
+          i++
+          continue
+        }
+      }
+      const seg = clean.slice(start, i).trim()
+      if (seg) stmts.push(seg)
+      start = i + 1
+      if (ch === ';') prevSig = ''
+      i++
+      continue
+    }
+    if (!/\s/.test(ch)) prevSig = ch
+    i++
+  }
+
+  const tail = clean.slice(start).trim()
+  if (tail) stmts.push(tail)
+  return stmts
+}
+
+function hasMongoWriteKeyInObjectText(text: string): boolean {
+  let i = 0
+  while (i < text.length) {
+    const ch = text[i]
+    if (ch === "'" || ch === '"' || ch === '`') {
+      const seg = skipMongoJsString(text, i)
+      let k = seg.end
+      while (k < text.length && /\s/.test(text[k])) k++
+      if (text[k] === ':' && (seg.value === '$out' || seg.value === '$merge')) {
+        return true
+      }
+      i = seg.end
+      continue
+    }
+    if (ch === '$') {
+      const m = /^\$(?:out|merge)\b/.exec(text.slice(i))
+      if (m) {
+        let k = i + m[0].length
+        while (k < text.length && /\s/.test(text[k])) k++
+        if (text[k] === ':') return true
+      }
+    }
+    i++
+  }
+  return false
+}
+
+function extractFirstObjectKey(objText: string): string | null {
+  let i = 0
+  while (i < objText.length && (/\s/.test(objText[i]) || objText[i] === '{')) i++
+  if (i >= objText.length || objText[i] === '}') return null
+  if (objText[i] === '"' || objText[i] === "'" || objText[i] === '`') {
+    const seg = skipMongoJsString(objText, i)
+    let k = seg.end
+    while (k < objText.length && /\s/.test(objText[k])) k++
+    return objText[k] === ':' ? seg.value : null
+  }
+  const keyMatch = /^([A-Za-z_$][A-Za-z0-9_$]*)\s*:/.exec(objText.slice(i))
+  return keyMatch ? keyMatch[1] : null
+}
+
+function isMongoRawCommandObjectMutating(rawObjText: string): boolean {
+  const trimmed = rawObjText.trim()
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return true
+  try {
+    const rec = JSON.parse(trimmed) as Record<string, unknown>
+    const keys = Object.keys(rec)
+    if (keys.length === 0) return true
+    const cmd = keys[0].toLowerCase()
+    if (cmd === 'aggregate') return hasMongoPipelineWriteStage(rec)
+    if (cmd === 'explain') {
+      if (hasMongoPipelineWriteStage(rec.explain)) return true
+      if (rec.explain && typeof rec.explain === 'object' && !Array.isArray(rec.explain)) {
+        const innerKeys = Object.keys(rec.explain as Record<string, unknown>)
+        if (innerKeys.length > 0 && !MONGODB_READONLY_COMMANDS.has(innerKeys[0].toLowerCase())) {
+          return true
+        }
+      }
+      return false
+    }
+    return !MONGODB_READONLY_COMMANDS.has(cmd)
+  } catch {
+    if (hasMongoWriteKeyInObjectText(trimmed)) return true
+    const firstKey = extractFirstObjectKey(trimmed)
+    if (!firstKey) return true
+    const lower = firstKey.toLowerCase()
+    if (lower === 'explain') {
+      const innerStart = trimmed.indexOf('{', trimmed.indexOf(':'))
+      if (innerStart < 0) return true
+      const innerEnd = scanMongoGroupEnd(trimmed, innerStart, '{', '}')
+      const innerKey = extractFirstObjectKey(trimmed.slice(innerStart, innerEnd))
+      return !innerKey || !MONGODB_READONLY_COMMANDS.has(innerKey.toLowerCase())
+    }
+    return !MONGODB_READONLY_COMMANDS.has(lower)
+  }
+}
+
+function parseSingleMongoShellStatementMutating(stmt: string): boolean {
+  const trimmed = stmt.replace(/;+\s*$/, '').trim()
+  if (MONGODB_COLLECTION_SHORTHAND_RE.test(trimmed)) return false
+  if (/^show\s+(?:dbs|databases|collections|tables)\s*$/i.test(trimmed)) return false
+  if (/^use\s+[A-Za-z0-9_.-]+\s*$/i.test(trimmed)) return false
+
+  if (trimmed.startsWith('{')) {
+    return isMongoRawCommandObjectMutating(trimmed)
+  }
+
+  if (!/^db\s*(?:\.|\[)/.test(trimmed)) {
+    return true
+  }
+
+  let cursor = 2
+  const len = trimmed.length
+  const skipWs = (): void => {
+    while (cursor < len && /\s/.test(trimmed[cursor])) cursor++
+  }
+
+  interface MongoParsedCallSegment {
+    name: string
+    argsText: string | null
+  }
+  const segments: MongoParsedCallSegment[] = []
+
+  while (cursor < len) {
+    skipWs()
+    if (trimmed[cursor] === '.') {
+      cursor++
+      skipWs()
+      const idMatch = /^([A-Za-z_$][A-Za-z0-9_$-]*)/.exec(trimmed.slice(cursor))
+      if (!idMatch) return true
+      const name = idMatch[1]
+      cursor += name.length
+      skipWs()
+      let argsText: string | null = null
+      if (cursor < len && trimmed[cursor] === '(') {
+        const endParen = scanMongoGroupEnd(trimmed, cursor, '(', ')')
+        if (endParen > len || trimmed[endParen - 1] !== ')') return true
+        argsText = trimmed.slice(cursor + 1, endParen - 1)
+        cursor = endParen
+      }
+      segments.push({ name, argsText })
+      continue
+    }
+    if (trimmed[cursor] === '[') {
+      const endBracket = scanMongoGroupEnd(trimmed, cursor, '[', ']')
+      if (endBracket > len || trimmed[endBracket - 1] !== ']') return true
+      const inner = trimmed.slice(cursor + 1, endBracket - 1).trim()
+      if (!inner || (inner[0] !== "'" && inner[0] !== '"' && inner[0] !== '`')) return true
+      const strSeg = skipMongoJsString(inner, 0)
+      if (!strSeg.value) return true
+      cursor = endBracket
+      segments.push({ name: strSeg.value, argsText: null })
+      continue
+    }
+    return true
+  }
+
+  const first = segments[0]
+  if (segments.length === 1 && first.argsText !== null) {
+    if (MONGODB_READONLY_DB_METHODS.has(first.name)) return false
+    if (first.name === 'runCommand' || first.name === 'adminCommand') {
+      return isMongoRawCommandObjectMutating(first.argsText)
+    }
+    return true
+  }
+
+  let methodIdx = -1
+  if (first.name === 'getCollection' && first.argsText !== null) {
+    methodIdx = 1
+  } else {
+    if (first.argsText !== null) {
+      return true
+    }
+    methodIdx = segments.findIndex((seg, idx) => idx >= 1 && seg.argsText !== null)
+  }
+  if (methodIdx < 1 || methodIdx >= segments.length) {
+    return true
+  }
+  const primary = segments[methodIdx]
+  const primaryArgs = primary.argsText
+  if (primaryArgs === null) {
+    return true
+  }
+  if (!MONGODB_READONLY_COLL_METHODS.has(primary.name)) {
+    return true
+  }
+  if (primary.name === 'aggregate' && hasMongoWriteKeyInObjectText(primaryArgs)) {
+    return true
+  }
+
+  for (let i = methodIdx + 1; i < segments.length; i++) {
+    const chain = segments[i]
+    if (chain.argsText === null || !MONGODB_READONLY_CURSOR_CHAIN_METHODS.has(chain.name)) {
+      return true
+    }
+    if (chain.name === 'aggregate' && hasMongoWriteKeyInObjectText(chain.argsText)) {
+      return true
+    }
+  }
+  return false
+}
+
+function isMongoCommandMutating(raw: string): boolean {
+  const stmts = splitMongoShellStatements(raw)
+  if (stmts.length === 0) return false
+  return stmts.some((stmt) => parseSingleMongoShellStatementMutating(stmt))
+}
+
+export const SQL_STANDALONE_ROLLBACK_RE = /^ROLLBACK\b(?!\s+(?:(?:TRANSACTION|WORK)\s+)?TO\b)/i
+
+const MYSQL_IMPLICIT_COMMIT_RE =
+  /^(?:(?:CREATE|DROP)\s+(?!TEMPORARY\s+TABLE\b)|ALTER\b|TRUNCATE\b|RENAME\b|LOCK\s+TABLES\b|UNLOCK\s+TABLES\b|LOAD\s+DATA\b|ANALYZE\b|OPTIMIZE\b|REPAIR\b|FLUSH\b|RESET\b|SET\s+(?:(?:SESSION|LOCAL)\s+)?(?:@@(?:SESSION\.|LOCAL\.)?)?AUTOCOMMIT\s*=\s*(?:1|ON|TRUE)\b)/i
+
+const MYSQL_AUTOCOMMIT_OFF_RE =
+  /^SET\s+(?:(?:SESSION|LOCAL)\s+)?(?:@@(?:SESSION\.|LOCAL\.)?)?AUTOCOMMIT\s*=\s*(?:0|OFF|FALSE)\b/i
+
+export function isMysqlImplicitCommitStatement(sql: string): boolean {
+  const clean = stripCommentsAndLiterals(sql, 'mysql', true).replace(/^[\s(]+/, '').trim()
+  if (!clean) return false
+  return MYSQL_IMPLICIT_COMMIT_RE.test(clean)
+}
+
+export function isMysqlAutoCommitOffStatement(sql: string): boolean {
+  const clean = stripCommentsAndLiterals(sql, 'mysql', true).replace(/^[\s(]+/, '').trim()
+  if (!clean) return false
+  return MYSQL_AUTOCOMMIT_OFF_RE.test(clean)
+}
+
 /**
- * Checks whether a SQL script or Redis command sequence can mutate state or schema,
+ * Checks whether a SQL script, Redis command sequence, or MongoDB command can mutate state or schema,
  * supporting read-only enforcement on connections flagged `readOnly: true`.
  */
-export function isMutatingStatement(sql: string, driver: DatabaseDriverType): boolean {
+export function isMutatingStatement(
+  sql: string,
+  driver: DatabaseDriverType | 'mongodb'
+): boolean {
   if (!sql || !sql.trim()) return false
+  if (driver === 'mongodb') {
+    return isMongoCommandMutating(sql)
+  }
   if (driver === 'redis') {
     return isRedisCommandMutating(sql)
+  }
+  if (driver === 'mssql') {
+    return isMssqlReadOnlyBlocked(sql)
+  }
+  if (driver === 'oracle') {
+    const chunks = splitOracleStatements(sql)
+    if (chunks.length === 0) {
+      return isSingleSqlStatementMutating(sql, driver)
+    }
+    return chunks.some(
+      (chunk) => chunk.isPlSql || isSingleSqlStatementMutating(chunk.text, driver)
+    )
   }
   const statements = splitSqlStatements(sql, driver)
   if (statements.length === 0) {
@@ -791,10 +1519,6 @@ export function rewriteCockroachViewBodyWithMeta(
       if (token.kind === 'word' && (token.upper === 'LATERAL' || token.upper === 'ONLY')) {
         continue
       }
-      if (token.kind === 'punct' && token.text === '(') {
-        frame.expectRelation = false
-        continue
-      }
       if (token.kind !== 'word' && token.kind !== 'quoted') {
         frame.expectRelation = false
         continue
@@ -894,7 +1618,6 @@ export function rewriteCockroachViewBodyWithMeta(
   let result = ''
   let cursor = 0
   for (const span of spans) {
-    if (span.start < cursor) continue
     result += body.slice(cursor, span.start)
     cursor = span.end
   }

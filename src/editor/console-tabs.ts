@@ -2,8 +2,14 @@
 // Pure state manager for Phase 2: Multi-Tab SQL Console
 // Zero-DOM, zero-dependency, manages independent SQL docs, cursors, and multi-result sets
 
-import type { ColumnInfo, QueryResult } from '../protocol.js'
+import type { AiExplainAnalysisResult, AiFixQueryResult, ColumnInfo, QueryResult } from '../protocol.js'
 import type { GridRuntimeSnapshot } from './grid.js'
+
+export interface SqlFixTargetRange {
+  from: number
+  to: number
+  originalSlice: string
+}
 
 export interface ResultBannerState {
   kind: 'success' | 'error'
@@ -13,6 +19,8 @@ export interface ResultBannerState {
   showBackToTable?: boolean
   errorText?: string
   isExplain?: boolean
+  failedSql?: string
+  fixTargetRange?: SqlFixTargetRange | null
 }
 
 export interface EditableSqlTargetMeta {
@@ -41,6 +49,12 @@ export interface ResultSetTabRuntimeState {
   gridSubbarTitle: string
   gridPageInfo: string
   emptyMessage: string
+  explainTargetRange?: { from: number; to: number; originalSlice: string } | null
+  explainAnalysis?: AiExplainAnalysisResult | null
+  explainAnalysisError?: string | null
+  explainAnalysisCollapsed?: boolean
+  aiFixResult?: AiFixQueryResult | null
+  aiFixError?: string | null
 }
 
 export interface SqlConsoleTabState {

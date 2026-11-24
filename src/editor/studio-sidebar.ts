@@ -45,11 +45,33 @@ export function formatQualifiedSqlTable(item: SchemaObject, driver: DatabaseDriv
     driver !== 'sqlite' &&
     driver !== 'libsql' &&
     driver !== 'd1' &&
-    driver !== 'redis'
+    driver !== 'redis' &&
+    driver !== 'mongodb'
   ) {
     return `${quoteIdentForDialect(item.schema, driver)}.${quotedName}`
   }
   return quotedName
+}
+
+export function buildSelectPreviewSql(item: SchemaObject, driver: DatabaseDriverType): string {
+  if (driver === 'mongodb') {
+    return `db.getCollection(${JSON.stringify(item.name)}).find({}).limit(100);`
+  }
+  const tableRef = formatQualifiedSqlTable(item, driver)
+  if (driver === 'mssql') {
+    return `SELECT TOP 100 *\nFROM ${tableRef};`
+  }
+  if (driver === 'oracle') {
+    return `SELECT *\nFROM ${tableRef}\nFETCH FIRST 100 ROWS ONLY;`
+  }
+  return `SELECT *\nFROM ${tableRef} LIMIT 100;`
+}
+
+function buildMongoSampleValue(type: string): unknown {
+  if (/INT|NUMBER|DECIMAL|NUMERIC|DOUBLE|FLOAT|LONG/i.test(type)) return 0
+  if (/BOOL/i.test(type)) return false
+  if (/DATE|TIME/i.test(type)) return ''
+  return ''
 }
 
 export function buildSqlTemplateForObject(
@@ -59,6 +81,22 @@ export function buildSqlTemplateForObject(
   columns: TableDetails['columns'],
   primaryKey: string[]
 ): string {
+  if (driver === 'mongodb') {
+    const colCall = `db.getCollection(${JSON.stringify(item.name)})`
+    if (kind === 'select') {
+      return `${colCall}.find({}).limit(100);`
+    }
+    const sampleDoc: Record<string, unknown> = {}
+    const writableCols = columns.filter((c) => c.name !== '_id' && !c.isAutoIncrement)
+    for (const c of writableCols.length > 0 ? writableCols : [{ name: 'name', type: 'String' }]) {
+      sampleDoc[c.name] = buildMongoSampleValue(c.type)
+    }
+    if (kind === 'insert') {
+      return `${colCall}.insertOne(${JSON.stringify(sampleDoc, null, 2)});`
+    }
+    return `${colCall}.updateOne({ _id: "" }, { $set: ${JSON.stringify(sampleDoc, null, 2)} });`
+  }
+
   const tableRef = formatQualifiedSqlTable(item, driver)
   const colNames = columns.map((c) => c.name)
 
@@ -67,6 +105,12 @@ export function buildSqlTemplateForObject(
       colNames.length > 0
         ? colNames.map((name) => quoteIdentForDialect(name, driver)).join(', ')
         : '*'
+    if (driver === 'mssql') {
+      return `SELECT TOP 100 ${colList}\nFROM ${tableRef};`
+    }
+    if (driver === 'oracle') {
+      return `SELECT ${colList}\nFROM ${tableRef}\nFETCH FIRST 100 ROWS ONLY;`
+    }
     return `SELECT ${colList}\nFROM ${tableRef}\nLIMIT 100;`
   }
 
@@ -204,6 +248,7 @@ export function createSidebarContextMenu(opts: SidebarContextMenuCallbacks): HTM
   }
 
   const isRedis = driver === 'redis'
+  const isMongo = driver === 'mongodb'
 
   if (NON_TABULAR_KINDS.includes(item.kind)) {
     addItem('View DDL', () => onSelectReadOnlyObject(item))
@@ -229,8 +274,7 @@ export function createSidebarContextMenu(opts: SidebarContextMenuCallbacks): HTM
       onUpdateStatus(`Copied "${item.name}" to clipboard`)
     })
     addItem('Copy SELECT *', () => {
-      const tableRef = formatQualifiedSqlTable(item, driver)
-      const selectSql = `SELECT * FROM ${tableRef} LIMIT 100;`
+      const selectSql = buildSelectPreviewSql(item, driver)
       copyTextFallback(selectSql)
       onUpdateStatus(`Copied "${selectSql}" to clipboard`)
     })
@@ -243,34 +287,35 @@ export function createSidebarContextMenu(opts: SidebarContextMenuCallbacks): HTM
       onSwitchMode('split')
     }
   })
-  addItem('Count Rows', () => onCountRows(item), { disabled: isRedis })
+  addItem(isMongo ? 'Count Docs' : 'Count Rows', () => onCountRows(item), { disabled: isRedis })
   addSep()
-  addItem('Generate SELECT', () => onGenerateSql(item, 'select'))
-  addItem('Generate INSERT', () => onGenerateSql(item, 'insert'))
-  addItem('Generate UPDATE', () => onGenerateSql(item, 'update'))
+  addItem(isMongo ? 'Generate Find' : 'Generate SELECT', () => onGenerateSql(item, 'select'))
+  addItem(isMongo ? 'Generate Insert' : 'Generate INSERT', () => onGenerateSql(item, 'insert'))
+  addItem(isMongo ? 'Generate Update' : 'Generate UPDATE', () => onGenerateSql(item, 'update'))
   addSep()
-  addItem('Inspect Schema & DDL', () => {
+  addItem(isMongo ? 'Inspect Schema & Indexes' : 'Inspect Schema & DDL', () => {
     onSelectSidebarObject(item)
     onSwitchMode('inspector')
   })
   if (item.kind === 'table') {
-    addItem('Edit Table Structure', () => {
-      onSelectSidebarObject(item)
-      onSwitchMode('inspector')
-    })
+    if (!isRedis && !isMongo) {
+      addItem('Edit Table Structure', () => {
+        onSelectSidebarObject(item)
+        onSwitchMode('inspector')
+      })
+    }
     if (!isRedis) {
       addItem('Import CSV / JSON...', () => onOpenImportModal(item), { disabled: isReadOnly })
     }
   }
-  addItem('Copy Table Name', () => {
+  addItem(isMongo ? 'Copy Collection Name' : 'Copy Table Name', () => {
     copyTextFallback(item.name)
     onUpdateStatus(`Copied "${item.name}" to clipboard`)
   })
   addItem(
-    'Copy SELECT *',
+    isMongo ? 'Copy Find Query' : 'Copy SELECT *',
     () => {
-      const tableRef = formatQualifiedSqlTable(item, driver)
-      const selectSql = `SELECT * FROM ${tableRef} LIMIT 100;`
+      const selectSql = buildSelectPreviewSql(item, driver)
       copyTextFallback(selectSql)
       onUpdateStatus(`Copied "${selectSql}" to clipboard`)
     },
@@ -280,13 +325,17 @@ export function createSidebarContextMenu(opts: SidebarContextMenuCallbacks): HTM
   if (!isRedis) {
     addSep()
     if (item.kind === 'table') {
-      addItem('Truncate Table...', () => onOpenDangerModal('truncate', item), {
-        danger: true,
-        disabled: isReadOnly,
-      })
+      addItem(
+        isMongo ? 'Truncate Collection...' : 'Truncate Table...',
+        () => onOpenDangerModal('truncate', item),
+        {
+          danger: true,
+          disabled: isReadOnly,
+        }
+      )
     }
     addItem(
-      item.kind === 'view' ? 'Drop View...' : 'Drop Table...',
+      isMongo ? 'Drop Collection...' : item.kind === 'view' ? 'Drop View...' : 'Drop Table...',
       () => onOpenDangerModal('drop', item),
       { danger: true, disabled: isReadOnly }
     )
@@ -698,6 +747,18 @@ export const SCHEMA_OBJECT_GROUPS: ReadonlyArray<{
   { kind: 'type', label: 'Types', badge: 'TYPE' },
 ]
 
+export function getSidebarObjectGroupLabel(
+  kind: SchemaObjectKind,
+  driver?: DatabaseDriverType
+): string {
+  if (kind === 'table') {
+    if (driver === 'mongodb') return 'Collections'
+    if (driver === 'redis') return 'Keyspaces'
+    return 'Tables'
+  }
+  return SCHEMA_OBJECT_GROUPS.find((g) => g.kind === kind)?.label ?? kind
+}
+
 export function renderStudioSidebarList(
   opts: RenderSidebarObjectsOptions,
   filtered: SchemaObject[]
@@ -758,7 +819,7 @@ export function renderStudioSidebarList(
       const ctaBtn = document.createElement('button')
       ctaBtn.type = 'button'
       ctaBtn.className = 'datanoa-btn datanoa-btn-primary datanoa-btn-sm'
-      ctaBtn.textContent = '+ New Table'
+      ctaBtn.textContent = activeConnection.driver === 'mongodb' ? '+ New Collection' : '+ New Table'
       ctaBtn.addEventListener('click', onOpenCreateTableModal)
       ctaWrap.appendChild(ctaBtn)
       sidebarListEl.appendChild(ctaWrap)
@@ -786,7 +847,7 @@ export function renderStudioSidebarList(
 
     const labelSpan = document.createElement('span')
     labelSpan.className = 'datanoa-sidebar-group-label'
-    labelSpan.textContent = group.label
+    labelSpan.textContent = getSidebarObjectGroupLabel(group.kind, activeConnection?.driver)
 
     const countSpan = document.createElement('span')
     countSpan.className = 'datanoa-sidebar-group-count'

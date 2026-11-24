@@ -768,24 +768,67 @@ export const EDITOR_GRID_STYLE = `
     display: flex;
     flex-direction: column;
     flex-shrink: 0;
-    max-height: 200px;
-    overflow-y: auto;
+    height: 220px;
+    min-height: 140px;
+    max-height: 75%;
+    overflow: hidden;
+  }
+
+  .datanoa-value-inspector-resizer {
+    position: relative;
+    height: 8px;
+    flex-shrink: 0;
+    cursor: row-resize;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    touch-action: none;
+    user-select: none;
+  }
+
+  .datanoa-value-inspector-resizer::before {
+    content: '';
+    width: 36px;
+    height: 2px;
+    border-radius: 2px;
+    background: var(--border-strong);
+    transform-origin: center;
+    transition: background-color 140ms ease, transform 140ms ease;
+  }
+
+  .datanoa-value-inspector-resizer:hover::before,
+  .datanoa-value-inspector-resizer:focus-visible::before,
+  .datanoa-value-inspector-resizer.resizing::before {
+    background: var(--accent-ring);
+    transform: scaleX(1.35);
+  }
+
+  .datanoa-value-inspector-resizer:focus-visible {
+    outline: 1px solid var(--accent-ring);
+    outline-offset: -1px;
   }
 
   .datanoa-value-inspector-body {
+    flex: 1 1 auto;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 8px;
     padding: 8px 12px;
     min-height: 0;
-    overflow-y: auto;
+    overflow: hidden;
+  }
+
+  .datanoa-value-inspector-body .datanoa-json-status {
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
   }
 
   .datanoa-value-textarea {
     width: 100%;
-    min-height: 78px;
-    max-height: 130px;
-    padding: 7px 9px;
+    flex: 1 1 auto;
+    min-height: 80px;
+    height: 100%;
+    padding: 8px;
     border-radius: 4px;
     border: 1px solid var(--input-border);
     background: var(--input-bg);
@@ -793,7 +836,7 @@ export const EDITOR_GRID_STYLE = `
     font-family: var(--mono-font);
     font-size: 12px;
     line-height: 1.45;
-    resize: vertical;
+    resize: none;
     user-select: text;
   }
 
