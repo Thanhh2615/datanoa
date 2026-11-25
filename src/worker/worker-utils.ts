@@ -14,6 +14,7 @@ import {
   type SavedQueryEntry,
 } from '../protocol'
 import type { IDatabaseSession } from '../drivers'
+import { copyFailedStatementMeta } from '../drivers/common/driver'
 import { getCanonicalByodStarterCode } from '../drivers/common/byod-templates'
 import { scrubUrlCredentials, SUPPORTED_DRIVERS } from '../drivers/common/connection-uri'
 import { detectRecognizableSqlCredential } from '../drivers/common/sql-credentials'
@@ -662,7 +663,7 @@ export function scrubAndEnhanceWorkerError(err: unknown): unknown {
     if (rawCode !== undefined) {
       ;(sanitized as Error & { code?: unknown }).code = rawCode
     }
-    return sanitized
+    return copyFailedStatementMeta(err, sanitized)
   }
   if (err !== null && typeof err === 'object' && 'message' in err) {
     const obj = err as Record<string, unknown>

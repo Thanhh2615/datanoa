@@ -18,7 +18,11 @@ import type {
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
-import { DatabaseDriverError, runDriverConnectionTest } from '../common/driver'
+import {
+  DatabaseDriverError,
+  attachFailedStatementMeta,
+  runDriverConnectionTest,
+} from '../common/driver'
 import * as net from 'node:net'
 import * as tls from 'node:tls'
 import type { DriverTlsOptions } from '../common/tls-and-tunnel'
@@ -1061,6 +1065,7 @@ export class MysqlSession implements IDatabaseSession {
       let shouldDestroy = false
       let txEndedInRun = false
       let lastServerStatus: number | undefined
+      let currentExecIndex = -1
       try {
         let totalAffectedRows = 0
         let lastSelect: Omit<QueryResult, 'executionTimeMs'> | null = null
@@ -1094,6 +1099,7 @@ export class MysqlSession implements IDatabaseSession {
             txEndedInRun = false
           }
 
+          currentExecIndex = execIndex
           const [rows, fields] = await conn.query({ sql: stmtSql, rowsAsArray: true })
           const serverStatus = extractServerStatus(rows)
           if (serverStatus !== undefined) {
@@ -1205,6 +1211,15 @@ export class MysqlSession implements IDatabaseSession {
           if (this.txConn === conn) {
             this.clearPinnedTxConn()
           }
+        }
+        if (
+          currentExecIndex >= 0 &&
+          !activeEntry.cancelled &&
+          !this.isClosed &&
+          (err instanceof Error || execList.length > 1) &&
+          !(err instanceof DatabaseDriverError && (err.code === 'cancelled' || err.code === 'SESSION_CLOSED'))
+        ) {
+          throw attachFailedStatementMeta(err, currentExecIndex, execList.length)
         }
         throw err
       } finally {

@@ -23,7 +23,7 @@ import {
   MAX_QUERY_ROWS_CEILING,
   SAVED_QUERIES_STORAGE_KEY,
 } from '../shared-constants'
-import type { IDatabaseSession } from '../drivers/common/driver'
+import { extractFailedStatementMeta, type IDatabaseSession } from '../drivers/common/driver'
 import {
   hasMssqlSemicolonlessTxControl,
   isMssqlReadOnlyBlocked,
@@ -765,6 +765,7 @@ export function registerQueryAndTxHandlers({
       if (!executionStarted) {
         throw scrubThrownError(err)
       }
+      const executionTimeMs = Date.now() - startedAt
       const errorMessage = formatActionableWorkerErrorMessage(
         err instanceof Error ? err.message : String(err),
         err
@@ -776,12 +777,57 @@ export function registerQueryAndTxHandlers({
         connectionName: profile.name,
         driver: profile.driver,
         sql: trimmed,
-        durationMs: Date.now() - startedAt,
+        durationMs: executionTimeMs,
         rowCount: 0,
         isError: true,
         errorMessage,
       })
-      throw scrubThrownError(err)
+      const scrubbed = scrubThrownError(err)
+      if (input.structuredError === true) {
+        const stmtMeta = extractFailedStatementMeta(scrubbed) ?? extractFailedStatementMeta(err)
+        const rawCode =
+          scrubbed && typeof scrubbed === 'object' && 'code' in scrubbed
+            ? (scrubbed as { code?: unknown }).code
+            : err && typeof err === 'object' && 'code' in err
+              ? (err as { code?: unknown }).code
+              : undefined
+        const codeStr =
+          typeof rawCode === 'string' && rawCode.trim().length > 0 ? rawCode.trim() : undefined
+        const normalizedCode = codeStr ? codeStr.toLowerCase() : ''
+        const isNonStructuredCode =
+          normalizedCode === 'cancelled' ||
+          normalizedCode === 'timeout' ||
+          normalizedCode === 'forbidden' ||
+          normalizedCode === 'not_permitted' ||
+          normalizedCode === 'invalid_params' ||
+          normalizedCode === 'session_closed'
+        if (stmtMeta && !isNonStructuredCode) {
+          const scrubbedMessage =
+            scrubbed instanceof Error
+              ? scrubbed.message
+              : scrubbed && typeof scrubbed === 'object' && 'message' in scrubbed
+                ? String((scrubbed as { message?: unknown }).message ?? errorMessage)
+                : errorMessage
+          return {
+            isSelect: false,
+            columns: [],
+            rows: [],
+            rowCount: 0,
+            affectedRows: 0,
+            executionTimeMs,
+            truncated: false,
+            executionError: {
+              message: scrubbedMessage,
+              ...(codeStr !== undefined ? { code: codeStr } : {}),
+              failedStatementIndex: stmtMeta.failedStatementIndex,
+              ...(stmtMeta.statementCount !== undefined
+                ? { statementCount: stmtMeta.statementCount }
+                : {}),
+            },
+          }
+        }
+      }
+      throw scrubbed
     }
   })
 

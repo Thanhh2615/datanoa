@@ -1,7 +1,7 @@
 /**
  * build/bundle-drivers.mjs
- * Bundles pg, mysql2, mongodb, mssql, oracledb, and @codemirror/* into standalone vendor modules.
- * Enforces Orca's 1 MiB per-file limit and CSP rules (zero eval / new Function / escape runs).
+ * Bundles iconv-lite, pg, mysql2, mongodb, mssql, oracledb, @codemirror/*, and node-sql-parser into standalone vendor modules.
+ * Enforces Orca's 1 MiB per-file limit and CSP rules (zero eval / Function / escape runs).
  */
 import esbuild from 'esbuild'
 import fs from 'node:fs'
@@ -39,6 +39,8 @@ const PINNED_VENDOR_VERSIONS = {
   '@codemirror/state': '6.7.6',
   '@codemirror/view': '6.43.15',
   '@lezer/highlight': '1.2.5',
+  'node-sql-parser': '5.4.0',
+  'big-integer': '1.6.52',
 }
 
 function assertInstalledVersion(pkgName, expectedVersion = PINNED_VENDOR_VERSIONS[pkgName]) {
@@ -378,6 +380,13 @@ function validateBundle(filePath, name, { rejectEscapedRuns = false } = {}) {
   if (newFunctionMatch) {
     throw new Error(
       `[FAIL] ${name} contains prohibited 'new Function(' call (${newFunctionMatch.length} occurrences)!`
+    )
+  }
+
+  const bareFunctionMatch = content.match(/(?<![.\w$])Function\s*\(/g)
+  if (bareFunctionMatch) {
+    throw new Error(
+      `[FAIL] ${name} contains prohibited bare 'Function(' call (${bareFunctionMatch.length} occurrences)!`
     )
   }
 
@@ -1264,6 +1273,76 @@ export default _default
   fs.writeFileSync(path.join(vendorDir, 'oracledb.d.ts'), dtsContent.trim() + '\n', 'utf8')
 }
 
+async function buildSqlParserBundle({ filename, dtsFilename, code, exportedClasses }) {
+  const outfile = path.join(vendorDir, filename)
+  await esbuild.build({
+    stdin: { contents: code, resolveDir: projectRoot, loader: 'js' },
+    bundle: true,
+    platform: 'node',
+    format: 'esm',
+    target: ['node22', 'es2022'],
+    outfile,
+    minify: true,
+    charset: 'utf8',
+    treeShaking: true,
+    legalComments: 'none',
+  })
+  validateBundle(outfile, `vendor/${filename}`, { rejectEscapedRuns: true })
+
+  const classDecls = exportedClasses
+    .map((cls) => `export declare class ${cls} implements SqlParserInstance {\n  astify(sql: string): unknown\n}`)
+    .join('\n\n')
+  const dts = `export interface SqlParserLocationPoint {
+  offset: number
+  line: number
+  column: number
+}
+
+export interface SqlParserLocation {
+  start: SqlParserLocationPoint
+  end: SqlParserLocationPoint
+}
+
+export interface SqlParserInstance {
+  astify(sql: string): unknown
+}
+
+${classDecls}
+`
+  fs.writeFileSync(path.join(vendorDir, dtsFilename), dts, 'utf8')
+}
+
+async function bundleSqlParsers() {
+  assertInstalledVersion('node-sql-parser')
+  assertInstalledVersion('big-integer')
+
+  await buildSqlParserBundle({
+    filename: 'sql-parser-pg-sqlite.js',
+    dtsFilename: 'sql-parser-pg-sqlite.d.ts',
+    code: `
+import pg from 'node-sql-parser/build/postgresql';
+import sqlite from 'node-sql-parser/build/sqlite';
+
+export const PostgresParser = pg.Parser;
+export const SqliteParser = sqlite.Parser;
+`,
+    exportedClasses: ['PostgresParser', 'SqliteParser'],
+  })
+
+  await buildSqlParserBundle({
+    filename: 'sql-parser-mysql-mssql.js',
+    dtsFilename: 'sql-parser-mysql-mssql.d.ts',
+    code: `
+import mysql from 'node-sql-parser/build/mysql';
+import tsql from 'node-sql-parser/build/transactsql';
+
+export const MysqlParser = mysql.Parser;
+export const MssqlParser = tsql.Parser;
+`,
+    exportedClasses: ['MysqlParser', 'MssqlParser'],
+  })
+}
+
 async function main() {
   console.log('[bundle-drivers] Starting vendor drivers bundling...')
   const startTime = Date.now()
@@ -1276,6 +1355,7 @@ async function main() {
     await bundleMSSQL()
     await bundleOracleDB()
     await bundleCodeMirror()
+    await bundleSqlParsers()
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2)
     console.log(`[bundle-drivers] All vendor bundles built successfully in ${elapsed}s!`)

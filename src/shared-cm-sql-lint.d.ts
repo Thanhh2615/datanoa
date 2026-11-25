@@ -4,6 +4,7 @@ import type { SqlDiagnostic, SqlDiagnosticRange } from './shared-sql-diagnostics
 export interface DbSqlErrorPayload {
   errorMessage: string
   targetRange?: SqlDiagnosticRange | null
+  dialect?: string
 }
 
 export interface SqlDiagnosticsState {

@@ -18,7 +18,11 @@ import type {
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
-import { DatabaseDriverError, runDriverConnectionTest } from '../common/driver'
+import {
+  DatabaseDriverError,
+  attachFailedStatementMeta,
+  runDriverConnectionTest,
+} from '../common/driver'
 import {
   assembleTableBrowseResult,
   buildBatchStatements,
@@ -55,7 +59,12 @@ interface WorkerResponseMessage {
   id?: string
   ok: boolean
   data?: unknown
-  error?: { message?: string; code?: string }
+  error?: {
+    message?: string
+    code?: string
+    failedStatementIndex?: number
+    statementCount?: number
+  }
   txState?: TransactionState
 }
 
@@ -134,6 +143,12 @@ export class SqliteSession implements IDatabaseSession {
             res.error?.code || 'SQLITE_ERROR',
             'sqlite'
           )
+          if (
+            typeof res.error?.failedStatementIndex === 'number' &&
+            typeof res.error?.statementCount === 'number'
+          ) {
+            attachFailedStatementMeta(err, res.error.failedStatementIndex, res.error.statementCount)
+          }
           pending.reject(err)
         }
       }

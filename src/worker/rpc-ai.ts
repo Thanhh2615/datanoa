@@ -3,12 +3,10 @@ import type { OrcaWorkerApi } from 'orca/worker'
 import {
   sanitizeJsonPayload,
   type AiExplainAnalysisResult,
-  type AiExplainLanguage,
   type AiFixQueryResult,
-  type AiMetricKind,
-  type AiProviderFormat,
+  type AiInlineEdit,
+  type AiRole,
   type AiStatusSnapshot,
-  type AiStatusState,
   type DatabaseDriverType,
   type QueryHistoryEntry,
 } from '../protocol'
@@ -26,22 +24,22 @@ import {
   bumpMetric,
   completeChat,
   completeSql,
+  completeSqlStatementEdit,
   completeSqlWithMeta,
   emptyStats,
   explainFailure,
   hasSensitiveContent,
   hostOf,
+  isChatIncompatibleBaseModel,
   isExpectedSqlBenchAnswer,
+  isFimOnlyModel,
   isLoopbackHost,
   isStatsStore,
   listModels,
   median,
   parseFormat,
-  presetFor,
   recordMetricLatency,
   resolveTrailingTypoToken,
-  sameAddress,
-  sanitizeAiBaseUrlForDisplay,
   summarizeModelStats,
   validateAiBaseUrl,
   type AiProviderConfig,
@@ -50,19 +48,43 @@ import {
   type FetchPostLike,
 } from './ai-client'
 import {
+  AiConfigStore,
+  buildDualStatusSnapshot,
+  isRoleKeyMissing,
+  isRoleReady,
+  parseAiRole,
+  type AiRoleRuntimeHealth,
+  type ResolvedAiRoleConfig,
+  type ResolvedDualAiConfig,
+} from './ai-config-store'
+import {
   MAX_FIX_QUERY_SCHEMA_CHARS,
   WorkerSchemaMetadataCache,
   buildExplainAnalysisPrompt,
   buildFixQueryPrompt,
   buildPrunedSchemaBlock,
   buildSqlCompletionContext,
+  buildSqlStatementEditContext,
+  collectPartialTableMatches,
+  countFixQueryStatements,
   extractReferencedMongoCollections,
   extractReferencedTables,
+  extractTrailingPartialTableName,
   parseExplainAnalysis,
   parseFixQueryResult,
+  type HistoryBudgetOptions,
+  type SchemaContextBudget,
   type WorkerSchemaSnapshot,
 } from './ai-sql-context'
+import { isolateActiveSqlStatement } from '../shared-sql-core.js'
 import type { SessionManager } from './session-manager'
+import {
+  computeFilteredStatementEdits,
+  decideCompletionTier,
+  extractActiveStatementWindow,
+  extractRewriteTagContent,
+  shadowHealStatementForSchema,
+} from './ai-nep'
 import {
   QUERY_HISTORY_STORAGE_KEY,
   createHostError,
@@ -70,39 +92,43 @@ import {
   type WorkerRegisterHandler,
 } from './worker-utils'
 
-const AI_SECRET_KEY = 'ai_api_key'
-const AI_KEY_ADDRESS_STORAGE = 'datanoa.ai.keyAddress'
 const AI_USAGE_KEY = 'datanoa.ai.usage'
 const AI_STATS_KEY = 'datanoa.ai.stats'
+
+const SAFE_MIDLINE_SUFFIX_BOUNDARY_RE =
+  /^(?:$|[\r\n]|[\s]*[)\]},;'"`]|[\s]*(?:FROM|WHERE|JOIN|INNER|LEFT|RIGHT|FULL|CROSS|NATURAL|ON|USING|AND|OR|GROUP|ORDER|HAVING|LIMIT|OFFSET|UNION|INTERSECT|EXCEPT|THEN|ELSE|END|AS|SET|VALUES|INTO|RETURNING)\b)/i
+
+function isLoopbackBaseUrl(baseUrl: string): boolean {
+  return isLoopbackHost(hostOf(baseUrl))
+}
+
+function isMidLineBeforeExistingExpression(suffix: string): boolean {
+  const nl = suffix.indexOf('\n')
+  const sameLine = nl === -1 ? suffix : suffix.slice(0, nl)
+  if (!sameLine.trim()) return false
+  return !SAFE_MIDLINE_SUFFIX_BOUNDARY_RE.test(sameLine)
+}
 
 const CACHE_SIZE = 64
 const USAGE_SAMPLES = 9
 const USAGE_MODELS = 40
 const SUGGESTION_IDS_KEPT = 200
-const MAX_INLINE_TOKENS = 1024
-const DEFAULT_EXPLAIN_MAX_TOKENS = 2048
-const MIN_EXPLAIN_MAX_TOKENS = 256
-const MAX_EXPLAIN_MAX_TOKENS = 8192
 const ERROR_TEXT_CHARS = 160
 const LOG_REPEAT_MS = 60_000
 const AUTO_ERROR_COOLDOWN_THRESHOLD = 2
 const AUTO_ERROR_COOLDOWN_MS = 8_000
-
-const EXPLAIN_LANGUAGES: readonly AiExplainLanguage[] = [
-  'auto',
-  'vi',
-  'en',
-  'ja',
-  'zh',
-  'ko',
-  'es',
-  'fr',
-  'de',
-  'pt',
-]
-
-function parseExplainLanguage(val: unknown): AiExplainLanguage {
-  return EXPLAIN_LANGUAGES.find((l) => l === val) ?? 'auto'
+const COMPLETE_ENRICH_TIMEOUT_MS = 400
+const MAX_COMPLETE_ENRICH_REFS = 4
+const ENRICH_MISS_TTL_MS = 30_000
+const MAX_ENRICH_MISS_ENTRIES = 128
+const LOCAL_SCHEMA_BUDGET: SchemaContextBudget = {
+  maxChars: 6000,
+  compactTier3WhenReferenced: true,
+  maxTier3Chars: 1280,
+}
+const LOCAL_HISTORY_BUDGET: Readonly<HistoryBudgetOptions> = {
+  maxItems: 2,
+  maxChars: 360,
 }
 
 type UsageMap = Record<string, number[]>
@@ -117,12 +143,24 @@ function isUsageMap(value: unknown): value is UsageMap {
 
 const modelKey = (baseUrl: string, model: string): string => `${hostOf(baseUrl)}|${model}`
 
-interface ResolvedAiConfig {
-  enabled: boolean
-  explainLanguage: AiExplainLanguage
-  explainMaxTokens: number
-  provider: AiProviderConfig
-  validProvider: boolean
+function normalizeStreamPartial(raw: string): string {
+  if (!raw) return ''
+  let text = raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/gi, '')
+  const completionOpen = /<COMPLETION>/i.exec(text)
+  if (completionOpen) {
+    text = text.slice(completionOpen.index + completionOpen[0].length)
+  }
+  const completionClose = /<\/COMPLETION>/i.exec(text)
+  if (completionClose) {
+    text = text.slice(0, completionClose.index)
+  }
+  const fenceOpen = /^\s*```[^\n]*\r?\n([\s\S]*)$/.exec(text)
+  if (fenceOpen) {
+    text = fenceOpen[1]
+  }
+  return text
 }
 
 function buildExactCacheKey(scopeKey: string, prefix: string, suffix: string): string {
@@ -145,12 +183,16 @@ interface CompletionCacheEntry {
   rawSuffix: string
   suggestion: string
   replaceChars: number
+  edits?: AiInlineEdit[]
+  mode?: 'complete' | 'edit'
 }
 
 interface CompletionResultPayload {
   suggestion: string
   id: number
   replaceChars?: number
+  edits?: AiInlineEdit[]
+  mode?: 'complete' | 'edit'
 }
 
 function collectKnownIdentifiers(
@@ -219,15 +261,63 @@ export function registerAiHandlers({
     promise: Promise<CompletionResultPayload>
     controller: AbortController
     waiters: number
+    scopeKey: string
+    rawPrefix: string
+    rawSuffix: string
+    partialText: string
+    mode: 'complete' | 'edit'
   }
   const inflightByPanel = new Map<string, AbortController>()
+  const activeFlightByPanel = new Map<string, CompletionFlight>()
   const inFlightByPanelAndKey = new Map<string, CompletionFlight>()
   const inflightExplainByPanel = new Map<string, AbortController>()
   const inflightFixByPanel = new Map<string, AbortController>()
   const suggestionModels = new Map<number, string>()
   const reasoningModels = new Set<string>()
   const effortUnsupportedModels = new Set<string>()
+  const temperatureUnsupportedModels = new Set<string>()
+  const enrichMissCache = new Map<string, { at: number; revision: number }>()
   let lastSuggestionId = 0
+
+  function buildEnrichMissKey(
+    connId: string,
+    dialect: DatabaseDriverType,
+    refName: string,
+    activeSchema?: string
+  ): string {
+    const parts = dialect !== 'mongodb' ? refName.split('.') : [refName]
+    const schema = (
+      parts.length > 1
+        ? parts[0]
+        : dialect !== 'mongodb' && activeSchema
+          ? activeSchema
+          : ''
+    )
+      .trim()
+      .toLowerCase()
+    const table = (parts.length > 1 ? parts[1] : parts[0]).trim().toLowerCase()
+    return `${connId}\0${dialect}\0${schema}\0${table}`
+  }
+
+  function isFreshEnrichMiss(key: string, revision: number, now: number): boolean {
+    const entry = enrichMissCache.get(key)
+    if (entry === undefined) return false
+    if (entry.revision !== revision || now < entry.at || now - entry.at >= ENRICH_MISS_TTL_MS) {
+      enrichMissCache.delete(key)
+      return false
+    }
+    return true
+  }
+
+  function recordEnrichMiss(key: string, revision: number, now: number): void {
+    enrichMissCache.delete(key)
+    enrichMissCache.set(key, { at: now, revision })
+    while (enrichMissCache.size > MAX_ENRICH_MISS_ENTRIES) {
+      const oldest = enrichMissCache.keys().next().value
+      if (oldest === undefined) break
+      enrichMissCache.delete(oldest)
+    }
+  }
 
   function rememberBoundedKey(set: Set<string>, key: string): void {
     set.delete(key)
@@ -247,6 +337,10 @@ export function registerAiHandlers({
       markEffortUnsupported: () => rememberBoundedKey(effortUnsupportedModels, key),
       onReasoningDetected: () => rememberBoundedKey(reasoningModels, key),
       onEffortRejected: () => rememberBoundedKey(effortUnsupportedModels, key),
+      skipTemperature: temperatureUnsupportedModels.has(key),
+      isTemperatureUnsupported: () => temperatureUnsupportedModels.has(key),
+      markTemperatureUnsupported: () => rememberBoundedKey(temperatureUnsupportedModels, key),
+      onTemperatureRejected: () => rememberBoundedKey(temperatureUnsupportedModels, key),
     }
   }
 
@@ -265,15 +359,20 @@ export function registerAiHandlers({
     rawPrefix: string,
     rawSuffix: string,
     exactKey: string
-  ): { suggestion: string; replaceChars: number } | null {
+  ): { suggestion: string; replaceChars: number; edits?: AiInlineEdit[]; mode?: 'complete' | 'edit' } | null {
     const exact = completionCache.get(exactKey)
     if (exact) {
       rememberCompletion(exact)
-      return { suggestion: exact.suggestion, replaceChars: exact.replaceChars }
+      return {
+        suggestion: exact.suggestion,
+        replaceChars: exact.replaceChars,
+        ...(exact.edits ? { edits: exact.edits } : {}),
+        ...(exact.mode ? { mode: exact.mode } : {}),
+      }
     }
     let best: CompletionCacheEntry | null = null
     for (const entry of completionCache.values()) {
-      if (entry.replaceChars > 0) continue
+      if (entry.replaceChars > 0 || (entry.edits && entry.edits.length > 0)) continue
       if (entry.scopeKey !== scopeKey || entry.rawSuffix !== rawSuffix) continue
       if (!rawPrefix.startsWith(entry.rawPrefix)) continue
       if (!best || entry.rawPrefix.length > best.rawPrefix.length) best = entry
@@ -287,7 +386,7 @@ export function registerAiHandlers({
     let backspace: CompletionCacheEntry | null = null
     let backspaceTail = ''
     for (const entry of completionCache.values()) {
-      if (entry.replaceChars > 0) continue
+      if (entry.replaceChars > 0 || (entry.edits && entry.edits.length > 0)) continue
       if (entry.scopeKey !== scopeKey || entry.rawSuffix !== rawSuffix) continue
       if (!entry.rawPrefix.startsWith(rawPrefix)) continue
       const deletedTail = entry.rawPrefix.slice(rawPrefix.length)
@@ -327,7 +426,7 @@ export function registerAiHandlers({
     }
     const settled = flight.promise.finally(() => leave(false))
     if (!signal) return settled
-    let onAbort: () => void = () => {}
+    let onAbort: (() => void) | undefined
     const aborted = new Promise<CompletionResultPayload>((resolve) => {
       onAbort = () => {
         leave(true)
@@ -336,19 +435,48 @@ export function registerAiHandlers({
       signal.addEventListener('abort', onAbort, { once: true })
     })
     const raced = Promise.race([settled, aborted])
-    void raced.then(
-      () => signal.removeEventListener('abort', onAbort),
-      () => signal.removeEventListener('abort', onAbort)
-    )
+    const detachAbort = () => {
+      if (onAbort) signal.removeEventListener('abort', onAbort)
+    }
+    void raced.then(detachAbort, detachAbort)
     return raced
   }
 
-  const runtimeStats = {
-    suggested: 0,
-    lastMs: null as number | null,
-    lastError: null as string | null,
-    lastSlow: false,
+  const configStore = new AiConfigStore({ orca, sessionManager })
+  const roleRuntime: Record<AiRole, AiRoleRuntimeHealth> = {
+    autocomplete: { lastMs: null, lastError: null, lastSlow: false },
+    explain: { lastMs: null, lastError: null, lastSlow: false },
   }
+  let settingsChangeSeq = 0
+  const pendingRoleHealthSeq: Record<AiRole, number> = { autocomplete: 0, explain: 0 }
+  const reconciledRoleSeq: Record<AiRole, number> = { autocomplete: 0, explain: 0 }
+  const lastRoleHealthSig: Record<AiRole, string | null> = { autocomplete: null, explain: null }
+  let lastExplainUsingSharedKey = false
+
+  function roleHealthSignature(roleCfg: ResolvedAiRoleConfig): string {
+    const keyDigest = roleCfg.provider.apiKey
+      ? createHash('sha256').update(roleCfg.provider.apiKey).digest('hex')
+      : ''
+    return JSON.stringify([
+      roleCfg.enabled,
+      roleCfg.validProvider,
+      roleCfg.provider.format,
+      roleCfg.provider.baseUrl,
+      roleCfg.provider.model,
+      roleCfg.hasKey,
+      keyDigest,
+    ])
+  }
+
+  function clearRoleRuntimeHealth(role: AiRole): void {
+    roleRuntime[role].lastError = null
+    roleRuntime[role].lastSlow = false
+    lastRoleHealthSig[role] = null
+  }
+  let suggestedCount = 0
+  let latestLastMs: number | null = null
+  let lastKnownSync = true
+  let lastAutoIsFimOnly = false
   let consecutiveCompleteErrors = 0
   let autoCooldownUntil = 0
   let autoCooldownModelKey = ''
@@ -382,99 +510,73 @@ export function registerAiHandlers({
     orca.log(`[AI] ${safe}`)
   }
 
-  async function savedKeyFor(baseUrl: string): Promise<string> {
-    await pinReady
-    const [key, pinned] = await Promise.all([
-      orca.secrets.get(AI_SECRET_KEY).then((v) => v ?? ''),
-      orca.storage.get(AI_KEY_ADDRESS_STORAGE),
+  function roleProviderSignature(roleCfg: ResolvedAiRoleConfig): string {
+    const keyDigest = roleCfg.provider.apiKey
+      ? createHash('sha256').update(roleCfg.provider.apiKey).digest('hex')
+      : ''
+    return JSON.stringify([
+      roleCfg.validProvider,
+      roleCfg.provider.format,
+      roleCfg.provider.baseUrl,
+      roleCfg.provider.model,
+      roleCfg.hasKey,
+      keyDigest,
     ])
-    if (!key || typeof pinned !== 'string' || !pinned.trim() || !sameAddress(pinned, baseUrl)) {
-      return ''
-    }
-    return key
   }
 
-  async function readConfig(): Promise<ResolvedAiConfig> {
-    const settings = await orca.settings.get()
-    const enabled = settings.aiEnabled === true
-    const format = parseFormat(settings.aiFormat)
-    const rawUrl = settings.aiBaseUrl !== undefined ? String(settings.aiBaseUrl) : 'https://api.openai.com/v1'
-    const baseUrl = rawUrl.trim()
-    const rawModel = settings.aiModel !== undefined ? String(settings.aiModel) : 'gpt-4o-mini'
-    const model = rawModel.trim()
-    const maxTokensRaw = Number(settings.aiMaxTokens)
-    const maxTokens =
-      Number.isFinite(maxTokensRaw) && maxTokensRaw > 0
-        ? Math.min(MAX_INLINE_TOKENS, Math.max(16, Math.floor(maxTokensRaw)))
-        : 96
-    const explainTokensRaw = Number(settings.aiExplainMaxTokens)
-    const explainMaxTokens =
-      Number.isFinite(explainTokensRaw) && explainTokensRaw > 0
-        ? Math.min(MAX_EXPLAIN_MAX_TOKENS, Math.max(MIN_EXPLAIN_MAX_TOKENS, Math.floor(explainTokensRaw)))
-        : DEFAULT_EXPLAIN_MAX_TOKENS
-    const explainLanguage = parseExplainLanguage(settings.aiExplainLanguage)
-    const urlCheck = validateAiBaseUrl(baseUrl)
-    const canonicalBaseUrl = urlCheck.ok ? urlCheck.url : baseUrl
-    let validProvider = urlCheck.ok && model.length > 0
-    let apiKey = validProvider ? await savedKeyFor(canonicalBaseUrl) : ''
-    if (apiKey && !validateAiBaseUrl(canonicalBaseUrl, { hasApiKey: true }).ok) {
-      apiKey = ''
-      validProvider = false
+  async function readConfig(): Promise<ResolvedDualAiConfig> {
+    const snapChangeSeq = settingsChangeSeq
+    const seqBeforeRead = {
+      autocomplete: pendingRoleHealthSeq.autocomplete,
+      explain: pendingRoleHealthSeq.explain,
     }
-    return {
-      enabled,
-      explainLanguage,
-      explainMaxTokens,
-      validProvider,
-      provider: { format, baseUrl: canonicalBaseUrl, model, apiKey, maxTokens },
-    }
-  }
-
-  function isKeyMissing(cfg: ResolvedAiConfig): boolean {
-    return (
-      presetFor(cfg.provider.format, cfg.provider.baseUrl).keyKind === 'required' &&
-      !cfg.provider.apiKey
+    const cfg = await configStore.readConfig()
+    lastKnownSync = cfg.sync
+    lastExplainUsingSharedKey = cfg.explain.usingSharedKey
+    lastAutoIsFimOnly = isFimOnlyModel(
+      cfg.autocomplete.provider.format,
+      cfg.autocomplete.provider.model
     )
+    if (snapChangeSeq === settingsChangeSeq) {
+      const changedRoles: Record<AiRole, boolean> = { autocomplete: false, explain: false }
+      for (const role of ['autocomplete', 'explain'] as const) {
+        const sig = roleHealthSignature(cfg[role])
+        if (seqBeforeRead[role] > reconciledRoleSeq[role]) {
+          reconciledRoleSeq[role] = seqBeforeRead[role]
+          if (lastRoleHealthSig[role] !== null && sig !== lastRoleHealthSig[role]) {
+            changedRoles[role] = true
+            roleRuntime[role].lastError = null
+            roleRuntime[role].lastSlow = false
+          }
+        }
+        lastRoleHealthSig[role] = sig
+      }
+      if (
+        cfg.sync &&
+        cfg.autocomplete.enabled &&
+        cfg.explain.enabled &&
+        roleProviderSignature(cfg.autocomplete) === roleProviderSignature(cfg.explain)
+      ) {
+        if (changedRoles.explain && !changedRoles.autocomplete && roleRuntime.autocomplete.lastError) {
+          roleRuntime.explain.lastError = roleRuntime.autocomplete.lastError
+          roleRuntime.explain.lastSlow = roleRuntime.autocomplete.lastSlow
+        } else if (changedRoles.autocomplete && !changedRoles.explain && roleRuntime.explain.lastError) {
+          roleRuntime.autocomplete.lastError = roleRuntime.explain.lastError
+          roleRuntime.autocomplete.lastSlow = roleRuntime.explain.lastSlow
+        }
+      }
+    }
+    return cfg
   }
 
-  function stateOf(cfg: ResolvedAiConfig): AiStatusState {
-    if (!cfg.enabled) return 'off'
-    if (!cfg.validProvider || isKeyMissing(cfg)) return 'setup'
-    if (runtimeStats.lastSlow) return 'slow'
-    return runtimeStats.lastError ? 'error' : 'on'
-  }
-
-  function destinationOf(cfg: ResolvedAiConfig): 'none' | 'local' | 'remote' {
-    if (!cfg.enabled || !cfg.validProvider || isKeyMissing(cfg)) return 'none'
-    return isLoopbackHost(hostOf(cfg.provider.baseUrl)) ? 'local' : 'remote'
-  }
-
-  async function buildStatusSnapshot(known?: ResolvedAiConfig): Promise<AiStatusSnapshot> {
+  async function buildStatusSnapshot(known?: ResolvedDualAiConfig): Promise<AiStatusSnapshot> {
     const cfg = known ?? (await readConfig())
-    const displayBaseUrl = sanitizeAiBaseUrlForDisplay(cfg.provider.baseUrl)
-    const hasKey = Boolean(
-      cfg.validProvider
-        ? cfg.provider.apiKey
-        : validateAiBaseUrl(cfg.provider.baseUrl, { hasApiKey: true }).ok
-          ? await savedKeyFor(cfg.provider.baseUrl)
-          : ''
-    )
-    return {
-      enabled: cfg.enabled,
-      state: stateOf(cfg),
-      lastMs: runtimeStats.lastMs,
-      suggested: runtimeStats.suggested,
-      reason: runtimeStats.lastError,
-      format: cfg.provider.format,
-      baseUrl: displayBaseUrl,
-      host: hostOf(displayBaseUrl),
-      model: cfg.provider.model,
-      maxTokens: cfg.provider.maxTokens,
-      explainMaxTokens: cfg.explainMaxTokens,
-      explainLanguage: cfg.explainLanguage,
-      hasKey,
-      destination: destinationOf(cfg),
-    }
+    return buildDualStatusSnapshot(cfg, {
+      autocomplete: roleRuntime.autocomplete,
+      explain: roleRuntime.explain,
+      suggested: suggestedCount,
+      latestLastMs,
+    })
   }
 
   async function refreshStatus(): Promise<void> {
@@ -519,15 +621,6 @@ export function registerAiHandlers({
     return lastSuggestionId
   }
 
-  async function keyForListing(format: AiProviderFormat, url: string, typed: string): Promise<string> {
-    if (presetFor(format, url).keyKind === 'none') return ''
-    if (typed) return typed
-    const settings = await orca.settings.get()
-    const savedFormat = parseFormat(settings.aiFormat)
-    const savedUrl = String(settings.aiBaseUrl ?? '')
-    return savedFormat === format && sameAddress(savedUrl, url) ? await savedKeyFor(url) : ''
-  }
-
   async function getHistoryEntries(): Promise<QueryHistoryEntry[]> {
     if (historyCache) return historyCache
     try {
@@ -551,68 +644,98 @@ export function registerAiHandlers({
     }
   }
 
+  function buildTestExplainChatRequest() {
+    return {
+      system: 'You are a SQL assistant. Reply with one concise sentence.',
+      user: 'Briefly explain: SELECT id, name FROM users WHERE id = 1;',
+      maxTokens: 64,
+    }
+  }
+
   registerHandler('ai.status.get', async () => await buildStatusSnapshot())
 
   registerHandler('ai.key.set', async (input) => {
-    const trimmed = typeof input?.key === 'string' ? input.key.trim() : ''
-    if (trimmed) {
-      await sessionManager.assertSecureSecretStorage()
-      const baseUrl =
-        input?.baseUrl !== undefined
-          ? String(input.baseUrl).trim()
-          : String((await orca.settings.get('aiBaseUrl')) ?? '').trim()
-      const checked = validateAiBaseUrl(baseUrl, { hasApiKey: true })
-      if (!checked.ok) {
-        throw createHostError('invalid_params', checked.error)
+    const res = await configStore.setKey(input)
+    if (res.role === 'autocomplete') {
+      completionCache.clear()
+      resetCompleteErrorCooldown()
+      clearRoleRuntimeHealth('autocomplete')
+      if (lastKnownSync || lastExplainUsingSharedKey) {
+        clearRoleRuntimeHealth('explain')
       }
-      await orca.secrets.set(AI_SECRET_KEY, trimmed)
-      await orca.storage.set(AI_KEY_ADDRESS_STORAGE, checked.url)
     } else {
-      await orca.secrets.delete(AI_SECRET_KEY)
-      await orca.storage.delete(AI_KEY_ADDRESS_STORAGE)
+      if (lastAutoIsFimOnly && !lastKnownSync) {
+        completionCache.clear()
+      }
+      clearRoleRuntimeHealth('explain')
+      if (lastKnownSync) {
+        completionCache.clear()
+        resetCompleteErrorCooldown()
+        clearRoleRuntimeHealth('autocomplete')
+      }
     }
-    completionCache.clear()
-    resetCompleteErrorCooldown()
-    runtimeStats.lastError = null
-    runtimeStats.lastSlow = false
     void refreshStatus()
-    return { hasKey: Boolean(trimmed) }
+    return input?.role !== undefined ? { hasKey: res.hasKey, role: res.role } : { hasKey: res.hasKey }
   })
 
-  registerHandler('ai.provider.test', async () => {
+  registerHandler('ai.provider.test', async (input) => {
+    const role = parseAiRole(input?.role)
     const cfg = await readConfig()
-    if (!cfg.validProvider) {
-      return { ok: false, message: 'Set a valid http(s) Base URL and model name.', ms: null }
+    const roleCfg = role === 'explain' ? cfg.explain : cfg.autocomplete
+    const runtime = roleRuntime[role]
+    if (!roleCfg.validProvider) {
+      return { ok: false, message: 'Set a valid http(s) Base URL and model name.', ms: null, role }
     }
-    if (isKeyMissing(cfg)) {
-      return { ok: false, message: 'Paste an API key for this provider first.', ms: null }
+    if (isRoleKeyMissing(roleCfg)) {
+      return { ok: false, message: 'Paste an API key for this provider first.', ms: null, role }
+    }
+    if (role === 'explain' && isChatIncompatibleBaseModel(roleCfg.provider.model)) {
+      return {
+        ok: false,
+        message: `Model "${roleCfg.provider.model}" is a Fill-in-the-Middle (FIM) autocomplete model and cannot run chat-based EXPLAIN analysis or SQL fixes. Turn off Sync both and select a chat/instruct model for Explain & Fix.`,
+        ms: null,
+        role,
+      }
     }
     const started = Date.now()
     try {
-      await completeSql(
-        cfg.provider,
-        buildTestCompletionRequest(),
-        AbortSignal.timeout(AI_TEST_TIMEOUT_MS),
-        fetchPost,
-        adaptiveOptsFor(modelKey(cfg.provider.baseUrl, cfg.provider.model))
-      )
+      if (role === 'explain') {
+        const chatReq = buildTestExplainChatRequest()
+        await completeChat(
+          roleCfg.provider,
+          chatReq.system,
+          chatReq.user,
+          chatReq.maxTokens,
+          AbortSignal.timeout(AI_TEST_TIMEOUT_MS),
+          fetchPost,
+          'sqlite'
+        )
+      } else {
+        await completeSql(
+          roleCfg.provider,
+          buildTestCompletionRequest(),
+          AbortSignal.timeout(AI_TEST_TIMEOUT_MS),
+          fetchPost,
+          adaptiveOptsFor(modelKey(roleCfg.provider.baseUrl, roleCfg.provider.model))
+        )
+        resetCompleteErrorCooldown()
+      }
       const ms = Date.now() - started
-      resetCompleteErrorCooldown()
-      runtimeStats.lastError = null
-      runtimeStats.lastSlow = false
+      runtime.lastError = null
+      runtime.lastSlow = false
       void refreshStatus()
-      return { ok: true, message: '', ms }
+      return { ok: true, message: '', ms, role }
     } catch (err) {
       const msg = explainFailure(
         err,
-        hostOf(cfg.provider.baseUrl),
+        hostOf(roleCfg.provider.baseUrl),
         AI_TEST_TIMEOUT_MS,
-        cfg.provider.format
+        roleCfg.provider.format
       )
-      runtimeStats.lastError = scrubCredentialsInText(msg).slice(0, ERROR_TEXT_CHARS)
-      runtimeStats.lastSlow = false
+      runtime.lastError = scrubCredentialsInText(msg).slice(0, ERROR_TEXT_CHARS)
+      runtime.lastSlow = false
       void refreshStatus()
-      return { ok: false, message: msg, ms: null }
+      return { ok: false, message: msg, ms: null, role }
     }
   })
 
@@ -624,7 +747,12 @@ export function registerAiHandlers({
     }
     const url = baseCheck.url
     const format = parseFormat(input?.format)
-    const apiKey = await keyForListing(format, url, typeof input?.key === 'string' ? input.key.trim() : '')
+    const apiKey = await configStore.keyForListing(
+      format,
+      url,
+      typeof input?.key === 'string' ? input.key.trim() : '',
+      input?.role
+    )
     if (apiKey) {
       const keyCheck = validateAiBaseUrl(url, { hasApiKey: true })
       if (!keyCheck.ok) {
@@ -655,7 +783,12 @@ export function registerAiHandlers({
     }
     const url = baseCheck.url
     const format = parseFormat(input?.format)
-    const apiKey = await keyForListing(format, url, typeof input?.key === 'string' ? input.key.trim() : '')
+    const apiKey = await configStore.keyForListing(
+      format,
+      url,
+      typeof input?.key === 'string' ? input.key.trim() : '',
+      input?.role
+    )
     if (apiKey) {
       const keyCheck = validateAiBaseUrl(url, { hasApiKey: true })
       if (!keyCheck.ok) {
@@ -716,7 +849,8 @@ export function registerAiHandlers({
 
   registerHandler('ai.stats.get', async () => {
     const cfg = await readConfig()
-    const model = cfg.validProvider ? modelKey(cfg.provider.baseUrl, cfg.provider.model) : ''
+    const auto = cfg.autocomplete
+    const model = auto.validProvider ? modelKey(auto.provider.baseUrl, auto.provider.model) : ''
     await statsQueue
     const stored = await orca.storage.get(AI_STATS_KEY)
     const store = isStatsStore(stored) ? stored : emptyStats(Date.now())
@@ -735,32 +869,80 @@ export function registerAiHandlers({
       return empty
     }
     const cfg = await readConfig()
-    if (!cfg.enabled || !cfg.validProvider || isKeyMissing(cfg)) {
+    const auto = cfg.autocomplete
+    if (!isRoleReady(auto)) {
       return empty
     }
 
     const dialect: DatabaseDriverType = input.dialect || 'sqlite'
-    if (hasSensitiveContent(input.prefix, input.suffix, '', dialect)) {
-      return empty
-    }
     const boundedPrefix = input.prefix.slice(-AI_RPC_MAX_PREFIX_CHARS)
     const boundedSuffix = input.suffix.slice(0, AI_RPC_MAX_SUFFIX_CHARS)
     const connId = typeof input.connectionId === 'string' ? input.connectionId : ''
     const activeSchema = typeof input.activeSchema === 'string' ? input.activeSchema : ''
     const activeTable = typeof input.activeTable === 'string' ? input.activeTable : ''
-    const mKey = modelKey(cfg.provider.baseUrl, cfg.provider.model)
-    const scopeKey = `${cfg.provider.baseUrl}|${cfg.provider.model}|${connId}|${dialect}|${activeSchema}|${activeTable}`
-    const exactCacheKey = buildExactCacheKey(scopeKey, boundedPrefix, boundedSuffix)
-    const cached = lookupCompletion(scopeKey, boundedPrefix, boundedSuffix, exactCacheKey)
+    const requestedMode: 'auto' | 'complete' | 'edit' =
+      input.mode === 'edit' ? 'edit' : input.mode === 'complete' ? 'complete' : 'auto'
+    const isManual = input.manual === true
+
+    const isolated = isolateActiveSqlStatement(boundedPrefix, boundedSuffix, dialect)
+    if (hasSensitiveContent(isolated.stmtPrefix, isolated.stmtSuffix, '', dialect)) {
+      return empty
+    }
+    const activeWindow = extractActiveStatementWindow(boundedPrefix, boundedSuffix, dialect, {
+      allowPrecedingOnFreshLine: requestedMode === 'edit',
+    })
+    if (activeWindow && hasSensitiveContent(activeWindow.text, '', '', dialect)) {
+      return empty
+    }
+
+    const targetingPrecedingErrored = Boolean(
+      activeWindow && isolated.isFreshStatementAfterSemicolon && requestedMode === 'edit'
+    )
+    const cachePrefixKey =
+      targetingPrecedingErrored && activeWindow
+        ? `${activeWindow.text}@${activeWindow.cursorOffsetInSpan}`
+        : isolated.stmtPrefix
+    const cacheSuffixKey = targetingPrecedingErrored ? '' : isolated.stmtSuffix
+
+    const autoFimOnly = isFimOnlyModel(auto.provider.format, auto.provider.model)
+    const crossesLocalToRemote =
+      isLoopbackBaseUrl(auto.provider.baseUrl) && !isLoopbackBaseUrl(cfg.explain.provider.baseUrl)
+    const canRouteEditToExplain =
+      !cfg.sync &&
+      autoFimOnly &&
+      isRoleReady(cfg.explain) &&
+      !isFimOnlyModel(cfg.explain.provider.format, cfg.explain.provider.model) &&
+      (!crossesLocalToRemote || isManual)
+    const editScopeTag = canRouteEditToExplain
+      ? `|edit:${cfg.explain.provider.baseUrl}|${cfg.explain.provider.model}`
+      : autoFimOnly
+        ? '|fim-only'
+        : ''
+
+    const mKey = modelKey(auto.provider.baseUrl, auto.provider.model)
+    const scopeKey = `${auto.provider.baseUrl}|${auto.provider.model}${editScopeTag}|${connId}|${dialect}|${activeSchema}|${activeTable}|${requestedMode}`
+    const exactCacheKey = buildExactCacheKey(scopeKey, cachePrefixKey, cacheSuffixKey)
+    const cached = lookupCompletion(scopeKey, cachePrefixKey, cacheSuffixKey, exactCacheKey)
     if (cached !== null) {
+      if (
+        !isManual &&
+        cached.mode !== 'edit' &&
+        !(cached.edits && cached.edits.length > 0) &&
+        dialect !== 'redis' &&
+        dialect !== 'mongodb' &&
+        isMidLineBeforeExistingExpression(isolated.stmtSuffix)
+      ) {
+        return empty
+      }
       return {
         suggestion: cached.suggestion,
         id: rememberSuggestion(mKey),
         ...(cached.replaceChars > 0 ? { replaceChars: cached.replaceChars } : {}),
+        ...(cached.edits && cached.edits.length > 0 ? { edits: cached.edits } : {}),
+        ...(cached.mode ? { mode: cached.mode } : {}),
       }
     }
 
-    const isManual = input.manual === true
     if (!isManual && autoCooldownModelKey === mKey && Date.now() < autoCooldownUntil) {
       return empty
     }
@@ -768,6 +950,53 @@ export function registerAiHandlers({
     if (ctx?.signal?.aborted) {
       return empty
     }
+    const snapshot = connId ? schemaCache.getSnapshot(connId) : null
+    const shadowHeal = activeWindow
+      ? shadowHealStatementForSchema(activeWindow, dialect, snapshot, input.schemaMap, activeSchema || undefined)
+      : null
+    let resolvedTier = decideCompletionTier({
+      dialect,
+      prefix: targetingPrecedingErrored && activeWindow ? activeWindow.text : isolated.stmtPrefix,
+      stmt: activeWindow,
+      heal: shadowHeal,
+      requestedMode,
+      manual: isManual,
+    })
+
+    let editProvider: AiProviderConfig = auto.provider
+    let editRoutedToExplain = false
+    if (resolvedTier === 'edit' && autoFimOnly) {
+      if (canRouteEditToExplain) {
+        editProvider = cfg.explain.provider
+        editRoutedToExplain = true
+      } else {
+        resolvedTier = 'complete'
+      }
+    }
+
+    if ((isolated.cursorAfterSemicolon || targetingPrecedingErrored) && resolvedTier === 'complete') {
+      return empty
+    }
+    const prevCh = isolated.stmtPrefix.slice(-1)
+    const nextCh = isolated.stmtSuffix.slice(0, 1)
+    if (
+      resolvedTier === 'complete' &&
+      !isManual &&
+      /[A-Za-z0-9_]/.test(prevCh) &&
+      /[A-Za-z0-9_]/.test(nextCh)
+    ) {
+      return empty
+    }
+    if (
+      resolvedTier === 'complete' &&
+      !isManual &&
+      dialect !== 'redis' &&
+      dialect !== 'mongodb' &&
+      isMidLineBeforeExistingExpression(isolated.stmtSuffix)
+    ) {
+      return empty
+    }
+
     const panelId = ctx?.panel?.id || 'default'
     const flightKey = `${panelId}::${exactCacheKey}`
     const existingFlight = inFlightByPanelAndKey.get(flightKey)
@@ -775,85 +1004,244 @@ export function registerAiHandlers({
       return await joinFlight(existingFlight, ctx?.signal)
     }
 
+    const activeFlight = activeFlightByPanel.get(panelId)
+    if (
+      activeFlight &&
+      !activeFlight.controller.signal.aborted &&
+      activeFlight.mode === 'complete' &&
+      resolvedTier === 'complete' &&
+      activeFlight.scopeKey === scopeKey &&
+      activeFlight.rawSuffix === cacheSuffixKey &&
+      cachePrefixKey.startsWith(activeFlight.rawPrefix)
+    ) {
+      const delta = cachePrefixKey.slice(activeFlight.rawPrefix.length)
+      const partial = normalizeStreamPartial(activeFlight.partialText)
+      const canReuse =
+        delta.length > 0 &&
+        ((partial && partial.startsWith(delta)) ||
+          (!partial && delta.length <= 3 && !delta.includes('\n')))
+      if (canReuse) {
+        const reused = await joinFlight(activeFlight, ctx?.signal)
+        if (ctx?.signal?.aborted) {
+          return empty
+        }
+        if (
+          reused.suggestion &&
+          !(reused.replaceChars && reused.replaceChars > 0) &&
+          !(reused.edits && reused.edits.length > 0) &&
+          reused.suggestion.startsWith(delta)
+        ) {
+          const remainderText = reused.suggestion.slice(delta.length)
+          if (remainderText) {
+            return { suggestion: remainderText, id: rememberSuggestion(mKey) }
+          }
+        }
+      }
+    }
+
     inflightByPanel.get(panelId)?.abort()
     const controller = new AbortController()
     inflightByPanel.set(panelId, controller)
+    let flightRef: CompletionFlight | null = null
+
+    const activeProvider = resolvedTier === 'edit' ? editProvider : auto.provider
+    const activeModelKey = modelKey(activeProvider.baseUrl, activeProvider.model)
+    const activeHealthRole: AiRole =
+      resolvedTier === 'edit' && editRoutedToExplain ? 'explain' : 'autocomplete'
 
     const promise = (async (): Promise<CompletionResultPayload> => {
       const started = Date.now()
       try {
+        const uncachedRefs = collectUncachedRefsForComplete(
+          connId,
+          dialect,
+          isolated.isFreshStatementAfterSemicolon ? '' : isolated.text,
+          isolated.stmtPrefix,
+          snapshot,
+          input.schemaMap,
+          activeSchema || undefined,
+          shadowHeal?.healedTables
+        )
+        if (uncachedRefs.length > 0) {
+          await enrichTableDetailsBounded(
+            connId,
+            dialect,
+            uncachedRefs,
+            activeSchema || undefined,
+            COMPLETE_ENRICH_TIMEOUT_MS
+          )
+        }
+        const enrichedSnapshot = connId ? schemaCache.getSnapshot(connId) : snapshot
         const historyEntries = await getHistoryEntries()
-        const snapshot = connId ? schemaCache.getSnapshot(connId) : null
         const knownIdentifiers =
           dialect === 'redis' || dialect === 'mongodb'
             ? undefined
-            : collectKnownIdentifiers(snapshot, input.schemaMap)
-        const typo = resolveTrailingTypoToken(boundedPrefix, dialect, knownIdentifiers)
-        const sqlCtx = buildSqlCompletionContext({
-          connectionId: connId || undefined,
-          dialect,
-          prefix: typo ? typo.healedPrefix : boundedPrefix,
-          suffix: boundedSuffix,
-          activeSchema: activeSchema || undefined,
-          activeTable: activeTable || undefined,
-          snapshot,
-          schemaMap: input.schemaMap,
-          historyEntries,
-        })
-
+            : collectKnownIdentifiers(enrichedSnapshot, input.schemaMap)
         const signals = [controller.signal, AbortSignal.timeout(AI_COMPLETE_TIMEOUT_MS)]
-        const completed = await completeSqlWithMeta(
-          cfg.provider,
-          {
+
+        let suggestion = ''
+        let replaceChars = 0
+        let edits: AiInlineEdit[] | undefined
+        let outMode: 'complete' | 'edit' | undefined
+
+        const isLocalProvider =
+          activeProvider.format === 'ollama' || isLoopbackHost(hostOf(activeProvider.baseUrl))
+        const localBudgets = isLocalProvider
+          ? { schemaBudget: LOCAL_SCHEMA_BUDGET, historyBudget: LOCAL_HISTORY_BUDGET }
+          : {}
+
+        if (resolvedTier === 'edit' && activeWindow && shadowHeal) {
+          const editCtx = buildSqlStatementEditContext({
+            connectionId: connId || undefined,
             dialect,
-            system: sqlCtx.system,
-            user: sqlCtx.user,
-            prefix: boundedPrefix,
-            suffix: boundedSuffix,
-            fimPrefix: sqlCtx.fimPrefix,
-            fimSuffix: sqlCtx.fimSuffix,
-            multiline: sqlCtx.multiline,
-            knownIdentifiers,
-          },
-          AbortSignal.any(signals),
-          fetchPost,
-          adaptiveOptsFor(mKey)
-        )
-        const { suggestion, replaceChars } = completed
+            statementBeforeCursor: activeWindow.text.slice(0, activeWindow.relCursor),
+            statementAfterCursor: activeWindow.text.slice(activeWindow.relCursor),
+            activeSchema: activeSchema || undefined,
+            activeTable: activeTable || undefined,
+            snapshot: enrichedSnapshot,
+            schemaMap: input.schemaMap,
+            historyEntries,
+            fuzzyTables: shadowHeal.healedTables,
+            cursorAfterSemicolon: activeWindow.cursorAfterSemicolon,
+            ...localBudgets,
+          })
+          const editRes = await completeSqlStatementEdit(
+            editProvider,
+            {
+              dialect,
+              system: editCtx.system,
+              user: editCtx.user,
+              statement: activeWindow.text,
+            },
+            AbortSignal.any(signals),
+            fetchPost,
+            adaptiveOptsFor(activeModelKey)
+          )
+          const rewritten = extractRewriteTagContent(editRes.raw, activeWindow.text, editRes.finishReason)
+          const filtered = rewritten
+            ? computeFilteredStatementEdits({
+                stmt: activeWindow,
+                rewrittenSql: rewritten,
+                dialect,
+                heal: shadowHeal,
+                prefixLength: boundedPrefix.length,
+                suffixLength: boundedSuffix.length,
+              })
+            : []
+          if (filtered.length === 1) {
+            const single = filtered[0]
+            if (single && single.fromOffset === 0 && single.toOffset === 0 && single.insert.length > 0) {
+              suggestion = single.insert
+              outMode = 'complete'
+            } else if (single && single.fromOffset < 0 && single.toOffset === 0 && single.insert.length > 0) {
+              suggestion = single.insert
+              replaceChars = -single.fromOffset
+              outMode = 'edit'
+            } else if (single) {
+              edits = filtered
+              outMode = 'edit'
+            }
+          } else if (filtered.length > 1) {
+            const cursorHunk = filtered.find((e) => e.fromOffset === 0 && e.toOffset === 0)
+            suggestion = cursorHunk ? cursorHunk.insert : ''
+            edits = filtered
+            outMode = 'edit'
+          }
+        } else {
+          const typo = resolveTrailingTypoToken(isolated.stmtPrefix, dialect, knownIdentifiers)
+          const sqlCtx = buildSqlCompletionContext({
+            connectionId: connId || undefined,
+            dialect,
+            prefix: typo ? typo.healedPrefix : isolated.stmtPrefix,
+            suffix: isolated.stmtSuffix,
+            fullPrefix: boundedPrefix,
+            activeSchema: activeSchema || undefined,
+            activeTable: activeTable || undefined,
+            snapshot: enrichedSnapshot,
+            schemaMap: input.schemaMap,
+            historyEntries,
+            fuzzyTables: shadowHeal?.healedTables,
+            skipFimDdl: auto.provider.format !== 'ollama',
+            ...localBudgets,
+          })
+          const adaptiveOpts = {
+            ...adaptiveOptsFor(mKey),
+            onStreamDelta: (accumulatedText: string) => {
+              if (flightRef) {
+                flightRef.partialText = accumulatedText
+              }
+            },
+          }
+          const completed = await completeSqlWithMeta(
+            auto.provider,
+            {
+              dialect,
+              system: sqlCtx.system,
+              user: sqlCtx.user,
+              prefix: isolated.stmtPrefix,
+              suffix: isolated.stmtSuffix,
+              fimPrefix: sqlCtx.fimPrefix,
+              fimSuffix: sqlCtx.fimSuffix,
+              fimSchemaDdl: sqlCtx.fimSchemaDdl,
+              fimHistorySql: sqlCtx.fimHistorySql,
+              fimPriorSql: sqlCtx.priorTabSql,
+              multiline: sqlCtx.multiline,
+              knownIdentifiers,
+            },
+            AbortSignal.any(signals),
+            fetchPost,
+            adaptiveOpts
+          )
+          suggestion = completed.suggestion
+          replaceChars = completed.replaceChars
+          outMode = completed.replaceChars > 0 ? 'edit' : 'complete'
+        }
 
         const elapsed = Date.now() - started
         resetCompleteErrorCooldown()
-        runtimeStats.lastMs = elapsed
-        runtimeStats.lastError = null
-        runtimeStats.lastSlow = false
-        void recordUsage(cfg.provider.baseUrl, cfg.provider.model, elapsed).catch(() => undefined)
-        if (!suggestion) {
+        roleRuntime[activeHealthRole].lastMs = elapsed
+        roleRuntime[activeHealthRole].lastError = null
+        roleRuntime[activeHealthRole].lastSlow = false
+        if (activeHealthRole === 'explain') {
+          roleRuntime.autocomplete.lastMs = elapsed
+          roleRuntime.autocomplete.lastError = null
+          roleRuntime.autocomplete.lastSlow = false
+        }
+        latestLastMs = elapsed
+        void recordUsage(activeProvider.baseUrl, activeProvider.model, elapsed).catch(() => undefined)
+        if (!suggestion && (!edits || edits.length === 0)) {
           void refreshStatus()
           return empty
         }
 
-        runtimeStats.suggested += 1
+        suggestedCount += 1
         updateStats((store) => recordMetricLatency(store, mKey, elapsed))
         void refreshStatus()
 
         rememberCompletion({
           exactKey: exactCacheKey,
           scopeKey,
-          rawPrefix: boundedPrefix,
-          rawSuffix: boundedSuffix,
+          rawPrefix: cachePrefixKey,
+          rawSuffix: cacheSuffixKey,
           suggestion,
           replaceChars,
+          ...(edits ? { edits } : {}),
+          ...(outMode ? { mode: outMode } : {}),
         })
         return {
           suggestion,
           id: rememberSuggestion(mKey),
           ...(replaceChars > 0 ? { replaceChars } : {}),
+          ...(edits ? { edits } : {}),
+          ...(outMode ? { mode: outMode } : {}),
         }
       } catch (err) {
         if (err instanceof Error && err.name === 'TimeoutError') {
           noteCompleteError(mKey)
-          runtimeStats.lastSlow = true
-          void recordUsage(cfg.provider.baseUrl, cfg.provider.model, AI_COMPLETE_TIMEOUT_MS).catch(() => undefined)
+          roleRuntime[activeHealthRole].lastSlow = true
+          void recordUsage(activeProvider.baseUrl, activeProvider.model, AI_COMPLETE_TIMEOUT_MS).catch(
+            () => undefined
+          )
           updateStats((store) => recordMetricLatency(store, mKey, AI_COMPLETE_TIMEOUT_MS))
           void refreshStatus()
         } else if (controller.signal.aborted) {
@@ -862,24 +1250,41 @@ export function registerAiHandlers({
           noteCompleteError(mKey)
           const msg = explainFailure(
             err,
-            hostOf(cfg.provider.baseUrl),
+            hostOf(activeProvider.baseUrl),
             AI_COMPLETE_TIMEOUT_MS,
-            cfg.provider.format
+            activeProvider.format
           )
           logFailure(msg)
-          runtimeStats.lastError = scrubCredentialsInText(msg).slice(0, ERROR_TEXT_CHARS)
-          runtimeStats.lastSlow = false
+          roleRuntime[activeHealthRole].lastError = scrubCredentialsInText(msg).slice(
+            0,
+            ERROR_TEXT_CHARS
+          )
+          roleRuntime[activeHealthRole].lastSlow = false
           void refreshStatus()
         }
         return empty
       }
     })()
 
-    const flight: CompletionFlight = { promise, controller, waiters: 0 }
+    const flight: CompletionFlight = {
+      promise,
+      controller,
+      waiters: 0,
+      scopeKey,
+      rawPrefix: cachePrefixKey,
+      rawSuffix: cacheSuffixKey,
+      partialText: '',
+      mode: resolvedTier,
+    }
+    flightRef = flight
+    activeFlightByPanel.set(panelId, flight)
     inFlightByPanelAndKey.set(flightKey, flight)
     const cleanup = () => {
       if (inFlightByPanelAndKey.get(flightKey) === flight) {
         inFlightByPanelAndKey.delete(flightKey)
+      }
+      if (activeFlightByPanel.get(panelId) === flight) {
+        activeFlightByPanel.delete(panelId)
       }
       if (inflightByPanel.get(panelId) === controller) {
         inflightByPanel.delete(panelId)
@@ -888,6 +1293,108 @@ export function registerAiHandlers({
     void promise.then(cleanup, cleanup)
     return await joinFlight(flight, ctx?.signal)
   })
+
+  function collectUncachedRefsForComplete(
+    connId: string,
+    dialect: DatabaseDriverType,
+    statementText: string,
+    partialPrefix: string,
+    snapshot: WorkerSchemaSnapshot | null,
+    schemaMap: Record<string, string[]> | undefined,
+    activeSchema?: string,
+    fuzzyTables?: readonly string[]
+  ): string[] {
+    if (!connId || dialect === 'redis' || !statementText) return []
+    const referenced =
+      dialect === 'mongodb'
+        ? extractReferencedMongoCollections(statementText)
+        : extractReferencedTables(statementText, dialect)
+    const partial = extractTrailingPartialTableName(partialPrefix, dialect)
+    const partialMatches = partial
+      ? collectPartialTableMatches(snapshot, schemaMap, partial, activeSchema)
+      : []
+
+    const knownTabular = new Set<string>()
+    if (snapshot && snapshot.objects.length > 0) {
+      for (const obj of snapshot.objects) {
+        if (
+          obj.kind &&
+          obj.kind !== 'table' &&
+          obj.kind !== 'view' &&
+          obj.kind !== 'materialized_view'
+        ) {
+          continue
+        }
+        const bare = obj.name.toLowerCase()
+        knownTabular.add(bare)
+        if (obj.schema) {
+          knownTabular.add(`${obj.schema.toLowerCase()}.${bare}`)
+        }
+      }
+    }
+
+    const candidates = [...partialMatches, ...(fuzzyTables ?? []), ...referenced]
+    const seen = new Set<string>()
+    const missing: string[] = []
+    const now = Date.now()
+    const connRevision = schemaCache.getConnectionRevision(connId)
+    for (const rawName of candidates) {
+      if (missing.length >= MAX_COMPLETE_ENRICH_REFS) break
+      const lower = rawName.toLowerCase()
+      if (seen.has(lower)) continue
+      seen.add(lower)
+      const bare =
+        dialect !== 'mongodb' && lower.includes('.') ? lower.split('.').pop() || lower : lower
+      const qualified =
+        dialect !== 'mongodb' && activeSchema && !lower.includes('.')
+          ? `${activeSchema.toLowerCase()}.${lower}`
+          : ''
+      if (
+        snapshot?.details.has(lower) ||
+        snapshot?.details.has(bare) ||
+        (qualified && snapshot?.details.has(qualified))
+      ) {
+        continue
+      }
+      if (isFreshEnrichMiss(buildEnrichMissKey(connId, dialect, rawName, activeSchema), connRevision, now)) {
+        continue
+      }
+      if (knownTabular.size > 0 && !knownTabular.has(lower) && !knownTabular.has(bare)) {
+        continue
+      }
+      if (
+        knownTabular.size === 0 &&
+        partial &&
+        lower === partial.partial.toLowerCase() &&
+        partialMatches.length === 0
+      ) {
+        continue
+      }
+      missing.push(rawName)
+    }
+    return missing
+  }
+
+  async function enrichTableDetailsBounded(
+    connId: string,
+    dialect: DatabaseDriverType,
+    refs: readonly string[],
+    activeSchema: string | undefined,
+    timeoutMs: number
+  ): Promise<void> {
+    if (!connId || dialect === 'redis' || refs.length === 0) return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        enrichTableDetailsForRefs(connId, dialect, refs.slice(0, MAX_COMPLETE_ENRICH_REFS), activeSchema),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, timeoutMs)
+        }),
+      ])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }
 
   async function enrichTableDetailsForRefs(
     connId: string,
@@ -924,8 +1431,21 @@ export function registerAiHandlers({
                 ? activeSchema
                 : undefined
           const table = parts.length > 1 ? parts[1] : parts[0]
-          const det = await session.getTableDetails(table, schema)
-          if (det) schemaCache.setTableDetails(connId, det)
+          const missKey = buildEnrichMissKey(connId, dialect, refName, activeSchema)
+          const startRevision = schemaCache.getConnectionRevision(connId)
+          try {
+            const det = await session.getTableDetails(table, schema)
+            if (det) {
+              enrichMissCache.delete(missKey)
+              schemaCache.setTableDetails(connId, det)
+            } else if (schemaCache.getConnectionRevision(connId) === startRevision) {
+              recordEnrichMiss(missKey, startRevision, Date.now())
+            }
+          } catch {
+            if (schemaCache.getConnectionRevision(connId) === startRevision) {
+              recordEnrichMiss(missKey, startRevision, Date.now())
+            }
+          }
         })
       )
     } catch {
@@ -938,11 +1458,32 @@ export function registerAiHandlers({
       throw createHostError('invalid_params', 'SQL string is required for EXPLAIN analysis.')
     }
     const cfg = await readConfig()
-    if (!cfg.enabled) {
-      throw createHostError('not_permitted', 'Enable AI SQL Assistant in AI settings first.')
+    const explainCfg = cfg.explain
+    if (!explainCfg.enabled) {
+      throw createHostError(
+        'not_permitted',
+        'Enable AI SQL Assistant (Explain & Fix) in AI settings first.'
+      )
     }
-    if (!cfg.validProvider || isKeyMissing(cfg)) {
-      throw createHostError('invalid_params', 'Configure an AI provider, model, and API key first.')
+    if (!explainCfg.validProvider || isRoleKeyMissing(explainCfg)) {
+      throw createHostError(
+        'invalid_params',
+        'Configure an AI provider, model, and API key for Explain & Fix in AI settings first.'
+      )
+    }
+    if (isChatIncompatibleBaseModel(explainCfg.provider.model)) {
+      throw createHostError(
+        'invalid_params',
+        `Model "${explainCfg.provider.model}" is a Fill-in-the-Middle (FIM) autocomplete model and cannot run chat-based EXPLAIN analysis or SQL fixes. Open AI Settings → Explain & Fix (turn off Sync both) and select a chat/instruct model.`
+      )
+    }
+
+    const dialect: DatabaseDriverType = input.dialect || 'sqlite'
+    if (hasSensitiveContent(input.sql, '', '', dialect)) {
+      throw createHostError(
+        'invalid_params',
+        'Query appears to contain sensitive credentials/secrets and was not sent to AI.'
+      )
     }
 
     const panelId = ctx?.panel?.id || 'default'
@@ -951,7 +1492,6 @@ export function registerAiHandlers({
     inflightExplainByPanel.set(panelId, controller)
 
     const connId = typeof input.connectionId === 'string' ? input.connectionId : ''
-    const dialect: DatabaseDriverType = input.dialect || 'sqlite'
 
     try {
       const refs =
@@ -977,7 +1517,7 @@ export function registerAiHandlers({
 
       const started = Date.now()
       const raw = await completeChat(
-        cfg.provider,
+        explainCfg.provider,
         system,
         user,
         cfg.explainMaxTokens,
@@ -985,15 +1525,30 @@ export function registerAiHandlers({
         fetchPost,
         dialect
       )
-      return parseExplainAnalysis(raw, resolvedLanguage.label, Date.now() - started)
+      const durationMs = Date.now() - started
+      const parsed = parseExplainAnalysis(raw, resolvedLanguage.label, durationMs)
+      roleRuntime.explain.lastMs = durationMs
+      roleRuntime.explain.lastError = null
+      roleRuntime.explain.lastSlow = false
+      latestLastMs = durationMs
+      void recordUsage(explainCfg.provider.baseUrl, explainCfg.provider.model, durationMs).catch(
+        () => undefined
+      )
+      void refreshStatus()
+      return parsed
     } catch (err) {
       if (controller.signal.aborted || ctx?.signal?.aborted) {
         throw createHostError('cancelled', 'EXPLAIN analysis cancelled.')
       }
-      throw createHostError(
-        'action_failed',
-        explainFailure(err, hostOf(cfg.provider.baseUrl), AI_EXPLAIN_TIMEOUT_MS, cfg.provider.format)
+      const msg = explainFailure(
+        err,
+        hostOf(explainCfg.provider.baseUrl),
+        AI_EXPLAIN_TIMEOUT_MS,
+        explainCfg.provider.format
       )
+      const safeMsg = scrubCredentialsInText(msg)
+      logFailure(safeMsg)
+      throw createHostError('action_failed', safeMsg)
     } finally {
       if (inflightExplainByPanel.get(panelId) === controller) {
         inflightExplainByPanel.delete(panelId)
@@ -1012,11 +1567,24 @@ export function registerAiHandlers({
     }
 
     const cfg = await readConfig()
-    if (!cfg.enabled) {
-      throw createHostError('not_permitted', 'Enable AI SQL Assistant in AI settings first.')
+    const explainCfg = cfg.explain
+    if (!explainCfg.enabled) {
+      throw createHostError(
+        'not_permitted',
+        'Enable AI SQL Assistant (Explain & Fix) in AI settings first.'
+      )
     }
-    if (!cfg.validProvider || isKeyMissing(cfg)) {
-      throw createHostError('invalid_params', 'Configure an AI provider, model, and API key first.')
+    if (!explainCfg.validProvider || isRoleKeyMissing(explainCfg)) {
+      throw createHostError(
+        'invalid_params',
+        'Configure an AI provider, model, and API key for Explain & Fix in AI settings first.'
+      )
+    }
+    if (isChatIncompatibleBaseModel(explainCfg.provider.model)) {
+      throw createHostError(
+        'invalid_params',
+        `Model "${explainCfg.provider.model}" is a Fill-in-the-Middle (FIM) autocomplete model and cannot run chat-based EXPLAIN analysis or SQL fixes. Open AI Settings → Explain & Fix (turn off Sync both) and select a chat/instruct model.`
+      )
     }
 
     const dialect: DatabaseDriverType = input.dialect || 'sqlite'
@@ -1066,6 +1634,7 @@ export function registerAiHandlers({
               MAX_FIX_QUERY_SCHEMA_CHARS
             )
 
+      const statementCount = countFixQueryStatements(input.sql, dialect)
       const safeErrorMessage = scrubCredentialsInText(rawErrorMessage)
       const { system, user, resolvedLanguage } = buildFixQueryPrompt({
         dialect,
@@ -1074,6 +1643,7 @@ export function registerAiHandlers({
         schemaBlock,
         language: input.language ?? cfg.explainLanguage,
         uiLocale: input.uiLocale,
+        statementCount,
       })
 
       const signals = [controller.signal, AbortSignal.timeout(AI_EXPLAIN_TIMEOUT_MS)]
@@ -1082,7 +1652,7 @@ export function registerAiHandlers({
       const started = Date.now()
       const maxTokens = Math.max(2048, Math.min(cfg.explainMaxTokens, 8192))
       const raw = await completeChat(
-        cfg.provider,
+        explainCfg.provider,
         system,
         user,
         maxTokens,
@@ -1092,16 +1662,21 @@ export function registerAiHandlers({
       )
       const durationMs = Date.now() - started
       const result = parseFixQueryResult(raw, {
-        model: cfg.provider.model,
+        model: explainCfg.provider.model,
         durationMs,
         language: resolvedLanguage.label,
       })
 
-      resetCompleteErrorCooldown()
-      runtimeStats.lastMs = durationMs
-      runtimeStats.lastError = null
-      runtimeStats.lastSlow = false
-      void recordUsage(cfg.provider.baseUrl, cfg.provider.model, durationMs).catch(() => undefined)
+      if (cfg.sync) {
+        resetCompleteErrorCooldown()
+      }
+      roleRuntime.explain.lastMs = durationMs
+      roleRuntime.explain.lastError = null
+      roleRuntime.explain.lastSlow = false
+      latestLastMs = durationMs
+      void recordUsage(explainCfg.provider.baseUrl, explainCfg.provider.model, durationMs).catch(
+        () => undefined
+      )
       void refreshStatus()
 
       return sanitizeJsonPayload(result)
@@ -1111,9 +1686,9 @@ export function registerAiHandlers({
       }
       const msg = explainFailure(
         err,
-        hostOf(cfg.provider.baseUrl),
+        hostOf(explainCfg.provider.baseUrl),
         AI_EXPLAIN_TIMEOUT_MS,
-        cfg.provider.format
+        explainCfg.provider.format
       )
       const safeMsg = scrubCredentialsInText(msg)
       logFailure(safeMsg)
@@ -1125,34 +1700,38 @@ export function registerAiHandlers({
     }
   })
 
-  async function pinExistingKey(): Promise<void> {
-    try {
-      const pinned = await orca.storage.get(AI_KEY_ADDRESS_STORAGE)
-      if ((await orca.secrets.get(AI_SECRET_KEY)) && (pinned === null || pinned === '')) {
-        const url = String((await orca.settings.get('aiBaseUrl')) ?? 'https://api.openai.com/v1').trim()
-        const checked = validateAiBaseUrl(url, { hasApiKey: true })
-        if (checked.ok) {
-          await orca.storage.set(AI_KEY_ADDRESS_STORAGE, checked.url)
-        }
-      }
-    } catch {
-      // Ignore startup pinning failure in minimal mocks
-    }
-  }
-
   const settingsSub = orca.settings.onDidChange((change) => {
-    if (!change?.key || change.key.startsWith('ai')) {
-      if (change?.key !== 'aiExplainLanguage' && change?.key !== 'aiExplainMaxTokens') {
+    const key = change?.key
+    if (key === 'aiExplainEnabled' || key === 'aiSync') {
+      void configStore.markDualRoleMigrated()
+    }
+    if (!key || key.startsWith('ai')) {
+      const isExplainOnlyParam = key === 'aiExplainLanguage' || key === 'aiExplainMaxTokens'
+      const isExplainProviderKey =
+        key === 'aiExplainEnabled' ||
+        key === 'aiExplainFormat' ||
+        key === 'aiExplainBaseUrl' ||
+        key === 'aiExplainModel'
+      const isAutocompleteOrSyncKey = !key || (!isExplainOnlyParam && !isExplainProviderKey)
+
+      if (isAutocompleteOrSyncKey) {
         completionCache.clear()
+        resetCompleteErrorCooldown()
+        settingsChangeSeq += 1
+        pendingRoleHealthSeq.autocomplete = settingsChangeSeq
+        if (!key || key === 'aiSync' || lastKnownSync) {
+          pendingRoleHealthSeq.explain = settingsChangeSeq
+        }
+      } else if (isExplainProviderKey) {
+        if (lastAutoIsFimOnly && !lastKnownSync) {
+          completionCache.clear()
+        }
+        settingsChangeSeq += 1
+        pendingRoleHealthSeq.explain = settingsChangeSeq
       }
-      resetCompleteErrorCooldown()
-      runtimeStats.lastError = null
-      runtimeStats.lastSlow = false
       void refreshStatus()
     }
   })
-
-  const pinReady = pinExistingKey()
 
   return {
     invalidateHistoryCache: () => {
@@ -1164,11 +1743,14 @@ export function registerAiHandlers({
       for (const ctrl of inflightExplainByPanel.values()) ctrl.abort()
       for (const ctrl of inflightFixByPanel.values()) ctrl.abort()
       inflightByPanel.clear()
+      activeFlightByPanel.clear()
       inFlightByPanelAndKey.clear()
       inflightExplainByPanel.clear()
       inflightFixByPanel.clear()
       reasoningModels.clear()
       effortUnsupportedModels.clear()
+      temperatureUnsupportedModels.clear()
+      enrichMissCache.clear()
     },
   }
 }

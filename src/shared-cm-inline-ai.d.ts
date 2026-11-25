@@ -1,11 +1,19 @@
 import type { EditorState, EditorView, Extension, StateEffect, StateField } from '../vendor/codemirror.js'
-import type { AiMetricKind } from './protocol.js'
+import type { AiInlineEdit, AiMetricKind } from './protocol.js'
+
+export interface GhostEditHunk {
+  from: number
+  to: number
+  insert: string
+}
 
 export interface GhostSuggestionState {
   offset: number
   text: string
   id: number
   replaceChars?: number
+  edits?: GhostEditHunk[]
+  mode?: 'complete' | 'edit'
 }
 
 export interface TrackedTextModel {
@@ -32,19 +40,31 @@ export class Pacer {
 }
 
 export function remainder(
-  offered: { offset: number; text: string; replaceChars?: number } | null | undefined,
+  offered: { offset: number; text: string; replaceChars?: number; edits?: GhostEditHunk[] } | null | undefined,
   cursorOffset: number,
   typed: string
 ): string | null
 
-export function shouldSkipInlineTrigger(prefix: string, suffix: string): boolean
+export function shouldSkipInlineTrigger(prefix: string, suffix: string, dialect?: string): boolean
+
+export function resolveDocEdits(
+  rawEdits: readonly AiInlineEdit[] | undefined | null,
+  cursorOffset: number,
+  docLength: number
+): GhostEditHunk[] | null
+
+export function computePostApplyCursor(
+  edits: readonly GhostEditHunk[],
+  originalOffset: number,
+  newDocLength: number
+): number
 
 export const AI_MAX_IPC_PREFIX_CHARS: 8000
 export const AI_MAX_IPC_SUFFIX_CHARS: 4000
 
 export function trackAcceptance(
   model: TrackedTextModel,
-  accepted: { startOffset: number; text: string },
+  accepted: { startOffset?: number; text?: string; ranges?: Array<{ startOffset: number; text: string }> },
   report: (verdict: 'kept' | 'undone') => void,
   schedule?: (cb: () => void, ms: number) => unknown,
   unschedule?: (handle: unknown) => void
@@ -66,13 +86,21 @@ export function acceptGhostLine(view: EditorView): boolean
 
 export interface CmInlineAiOptions {
   isEnabled: () => boolean
+  getDialect?: () => string
   requestCompletion: (input: {
     prefix: string
     suffix: string
     offset: number
     signal: AbortSignal
     manual?: boolean
-  }) => Promise<{ suggestion: string; id: number; replaceChars?: number } | null>
+    mode?: 'auto' | 'complete' | 'edit'
+  }) => Promise<{
+    suggestion: string
+    id: number
+    replaceChars?: number
+    edits?: AiInlineEdit[]
+    mode?: 'complete' | 'edit'
+  } | null>
   onMetric?: (id: number, kind: AiMetricKind) => void
 }
 

@@ -68,6 +68,7 @@ export const EDITOR_BASE_STYLE = `
     --cm-type: #6fe0d0;
     --cm-comment: #8c8c8c;
     --cm-operator: #d4d4d4;
+    --cm-ident: #7dd3fc;
     --warn-fg: #1a1204;
     --warn-tint: color-mix(in srgb, var(--warn) 14%, transparent);
     --warn-border: color-mix(in srgb, var(--warn) 42%, transparent);
@@ -150,6 +151,7 @@ export const EDITOR_BASE_STYLE = `
     --cm-type: #0f766e;
     --cm-comment: #64748b;
     --cm-operator: #334155;
+    --cm-ident: #0284c7;
     --warn-fg: #ffffff;
     --warn-tint: color-mix(in srgb, var(--warn) 10%, transparent);
     --warn-border: color-mix(in srgb, var(--warn) 32%, transparent);
@@ -912,18 +914,16 @@ export const EDITOR_BASE_STYLE = `
   }
 
   .datanoa-caution-strip.prod {
-    background: color-mix(in srgb, var(--danger) 11%, var(--bg));
-    color: color-mix(in srgb, var(--danger) 74%, var(--text));
+    background: color-mix(in srgb, var(--warn) 10%, var(--bg));
+    border-bottom-color: color-mix(in srgb, var(--warn) 36%, var(--border));
+    color: var(--warn);
   }
 
   html.light .datanoa-caution-strip,
-  body.light .datanoa-caution-strip {
-    color: color-mix(in srgb, var(--warn) 78%, var(--text));
-  }
-
+  body.light .datanoa-caution-strip,
   html.light .datanoa-caution-strip.prod,
   body.light .datanoa-caution-strip.prod {
-    color: color-mix(in srgb, var(--danger) 76%, var(--text));
+    color: color-mix(in srgb, var(--warn) 78%, var(--text));
   }
 
   .datanoa-caution-strip-text {
@@ -2204,6 +2204,18 @@ export const EDITOR_BASE_STYLE = `
   }
 
   .datanoa-status-actions .datanoa-status-ai-btn {
+    height: 20px;
+    padding: 0 8px;
+    gap: 6px;
+    border-radius: 6px;
+    background: var(--bg);
+    border-color: var(--border);
+    color: var(--text);
+  }
+
+  .datanoa-status-actions .datanoa-status-ai-btn:hover:not(:disabled) {
+    background: var(--btn-hover-bg);
+    border-color: var(--btn-hover-border);
     color: var(--text);
   }
 
@@ -2435,6 +2447,23 @@ export const EDITOR_BASE_STYLE = `
     text-decoration-color: rgba(220, 38, 38, 0.78);
   }
 
+  .cm-ai-diff-insert {
+    color: rgba(74, 222, 128, 0.92);
+    background: rgba(34, 197, 94, 0.14);
+    border-radius: 3px;
+    padding: 0 2px;
+    margin-left: 2px;
+    white-space: pre;
+    pointer-events: none;
+    user-select: none;
+  }
+
+  html.light .cm-ai-diff-insert,
+  body.light .cm-ai-diff-insert {
+    color: #15803d;
+    background: rgba(22, 163, 74, 0.12);
+  }
+
   .cm-sql-diag-error {
     text-decoration-line: underline;
     text-decoration-style: wavy;
@@ -2474,10 +2503,10 @@ export const EDITOR_BASE_STYLE = `
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 5px;
-    height: 26px;
-    padding: 0 10px;
-    border-radius: 5px;
+    gap: 6px;
+    height: 28px;
+    padding: 0 12px;
+    border-radius: 6px;
     border: 1px solid var(--btn-border);
     background: var(--btn-bg);
     color: var(--text);
@@ -2486,6 +2515,7 @@ export const EDITOR_BASE_STYLE = `
     font-weight: 500;
     cursor: pointer;
     white-space: nowrap;
+    transition: color 150ms cubic-bezier(0.22, 1, 0.36, 1), background-color 150ms cubic-bezier(0.22, 1, 0.36, 1), border-color 150ms cubic-bezier(0.22, 1, 0.36, 1);
   }
 
   .datanoa-ai-btn:hover:not(:disabled) {
@@ -2531,17 +2561,27 @@ export const EDITOR_BASE_STYLE = `
   }
 
   .datanoa-ai-toolbar-btn {
-    font-variant-numeric: tabular-nums;
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: 6px;
+    height: 24px;
+    padding: 0 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    transition: color 150ms cubic-bezier(0.22, 1, 0.36, 1), background-color 150ms cubic-bezier(0.22, 1, 0.36, 1), border-color 150ms cubic-bezier(0.22, 1, 0.36, 1);
   }
 
-  .datanoa-ai-toolbar-btn .datanoa-ai-icon {
-    width: 12px;
-    height: 12px;
-    flex-shrink: 0;
-    display: block;
+  .datanoa-ai-toolbar-btn:hover:not(:disabled) {
+    background: var(--btn-hover-bg);
+    border-color: var(--btn-hover-border);
+    color: var(--text);
+  }
+
+  .datanoa-ai-toolbar-btn.tone-neutral {
     color: var(--muted);
   }
 
@@ -2552,10 +2592,76 @@ export const EDITOR_BASE_STYLE = `
     line-height: 1;
   }
 
-  .datanoa-ai-toolbar-btn.tone-neutral .datanoa-ai-icon { color: var(--muted); }
-  .datanoa-ai-toolbar-btn.tone-success .datanoa-ai-icon { color: var(--ok); }
-  .datanoa-ai-toolbar-btn.tone-warn .datanoa-ai-icon { color: var(--warn); }
-  .datanoa-ai-toolbar-btn.tone-danger .datanoa-ai-icon { color: var(--danger); }
+  .datanoa-ai-role-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  .datanoa-ai-role-item[data-state='off'] {
+    color: var(--muted);
+  }
+
+  .datanoa-ai-role-text {
+    display: inline-flex;
+    align-items: center;
+    line-height: 1;
+  }
+
+  .datanoa-ai-role-full {
+    display: inline;
+  }
+
+  .datanoa-ai-role-short {
+    display: none;
+  }
+
+  @media (max-width: 720px) {
+    .datanoa-ai-role-full {
+      display: none;
+    }
+    .datanoa-ai-role-short {
+      display: inline;
+    }
+  }
+
+  .datanoa-ai-role-sep {
+    color: var(--muted);
+    opacity: 0.6;
+    line-height: 1;
+  }
+
+  .datanoa-ai-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    display: inline-block;
+    box-sizing: border-box;
+  }
+
+  .datanoa-ai-dot.tone-success { background: var(--ok); }
+  .datanoa-ai-dot.tone-warn { background: var(--warn); }
+  .datanoa-ai-dot.tone-danger { background: var(--danger); }
+  .datanoa-ai-dot.tone-neutral {
+    background: transparent;
+    border: 1.5px solid var(--muted);
+  }
+
+  @keyframes datanoa-ai-dot-busy {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+
+  .datanoa-ai-toolbar-btn.is-ai-busy {
+    border-color: var(--border-strong);
+  }
+
+  .datanoa-ai-toolbar-btn.is-ai-busy .datanoa-ai-dot {
+    animation: datanoa-ai-dot-busy 1.2s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+  }
 
   .datanoa-ai-explain-panel {
     border-top: 1px solid var(--border);
@@ -2621,6 +2727,12 @@ export const EDITOR_BASE_STYLE = `
     min-height: 0;
   }
 
+  .datanoa-grid-area:has(~ .datanoa-ai-explain-panel:not([hidden])),
+  .datanoa-grid-area.has-explain-ai-panel {
+    flex-basis: 0;
+    min-height: 0;
+  }
+
   html.light .datanoa-ai-fix-panel,
   body.light .datanoa-ai-fix-panel {
     background: var(--surface);
@@ -2630,7 +2742,7 @@ export const EDITOR_BASE_STYLE = `
 
   .datanoa-ai-resizer {
     position: relative;
-    height: 10px;
+    height: 12px;
     flex-shrink: 0;
     display: flex;
     align-items: center;
@@ -2647,7 +2759,7 @@ export const EDITOR_BASE_STYLE = `
   }
 
   .datanoa-ai-resizer-grip {
-    width: 36px;
+    width: 40px;
     height: 3px;
     border-radius: 999px;
     background: var(--border-strong);
@@ -2676,11 +2788,11 @@ export const EDITOR_BASE_STYLE = `
     flex: 1 1 auto;
     min-height: 0;
     overflow-y: auto;
-    padding: 8px 12px;
+    padding: 12px;
     border-top: 1px solid var(--border);
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 12px;
   }
 
   .datanoa-ai-fix-footer {
@@ -2733,20 +2845,23 @@ export const EDITOR_BASE_STYLE = `
     height: 28px;
     padding: 0 8px;
     border: 1px solid var(--input-border);
-    border-radius: 4px;
+    border-radius: 6px;
     background: var(--input-bg);
     color: var(--text);
     font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    transition: border-color 150ms cubic-bezier(0.22, 1, 0.36, 1), background-color 150ms cubic-bezier(0.22, 1, 0.36, 1);
   }
 
   .datanoa-ai-pill {
     font-size: 11px;
     font-variant-numeric: tabular-nums;
     padding: 2px 8px;
-    border-radius: 999px;
+    border-radius: 6px;
     border: 1px solid var(--border);
     color: var(--muted);
     background: var(--card);
+    white-space: nowrap;
   }
 
   .datanoa-ai-dest-pill[data-destination='local'] {
@@ -2761,12 +2876,144 @@ export const EDITOR_BASE_STYLE = `
 
   .datanoa-ai-hint,
   .datanoa-ai-scope-note,
-  .datanoa-ai-loading,
   .datanoa-ai-item-detail {
     margin: 0;
-    font-size: 11.5px;
+    font-size: 12px;
     color: var(--muted);
     line-height: 1.45;
+  }
+  @keyframes datanoa-ai-robot-pulse {
+    0%, 100% {
+      opacity: 0.4;
+    }
+    45% {
+      opacity: 1;
+    }
+  }
+  @keyframes datanoa-ai-char-wave {
+    0%, 48%, 100% {
+      color: var(--muted);
+      opacity: 0.36;
+    }
+    10%, 34% {
+      color: color-mix(in srgb, var(--text) 72%, var(--info));
+      opacity: 0.88;
+    }
+    18%, 24% {
+      color: var(--text);
+      opacity: 1;
+    }
+  }
+  @keyframes datanoa-ai-progress-sweep {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(340%);
+    }
+  }
+  .datanoa-ai-loading-box {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 100%;
+    padding: 4px 0;
+  }
+  .datanoa-ai-loading-box.is-compact {
+    padding: 0;
+    gap: 0;
+  }
+  .datanoa-ai-loading-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 20px;
+  }
+  .datanoa-ai-loading {
+    margin: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--muted);
+    line-height: 16px;
+  }
+  .datanoa-ai-loading.is-compact { gap: 8px; }
+  .datanoa-ai-robot {
+    display: block;
+    width: 15px;
+    height: 15px;
+    color: var(--info);
+    flex-shrink: 0;
+  }
+  .datanoa-ai-robot-antenna {
+    animation: datanoa-ai-robot-pulse 1100ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+  }
+  .datanoa-ai-robot-eye {
+    animation: datanoa-ai-robot-pulse 1100ms cubic-bezier(0.22, 1, 0.36, 1) 180ms infinite;
+  }
+  .datanoa-ai-robot-eye:last-of-type { animation-delay: 340ms; }
+  .datanoa-ai-loading-text {
+    display: inline;
+  }
+  .datanoa-ai-loading-char {
+    display: inline;
+    color: var(--muted);
+    opacity: 0.36;
+    will-change: color, opacity;
+    animation: datanoa-ai-char-wave var(--datanoa-wave-duration, 1600ms) cubic-bezier(0.22, 1, 0.36, 1) var(--datanoa-char-delay, 0ms) infinite both;
+  }
+  .datanoa-ai-loading-elapsed {
+    flex-shrink: 0;
+    font-family: var(--mono-font);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+    line-height: 16px;
+  }
+  .datanoa-ai-progress-track {
+    position: relative;
+    width: 100%;
+    height: 2px;
+    border-radius: 999px;
+    background: var(--border);
+    overflow: hidden;
+  }
+  .datanoa-ai-progress-bar {
+    display: block;
+    width: 32%;
+    height: 100%;
+    border-radius: 999px;
+    background: var(--info);
+    animation: datanoa-ai-progress-sweep 1500ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+  }
+  .datanoa-ai-btn.is-loading {
+    opacity: 0.72;
+    cursor: progress;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .datanoa-ai-robot-antenna,
+    .datanoa-ai-robot-eye {
+      animation: none !important;
+      opacity: 1;
+    }
+    .datanoa-ai-progress-bar {
+      animation: none !important;
+      transform: none;
+      width: 36%;
+      opacity: 0.75;
+    }
+    .datanoa-ai-loading-char {
+      animation: none !important;
+      opacity: 1;
+    }
+    .datanoa-ai-toolbar-btn.is-ai-busy .datanoa-ai-dot {
+      animation: none !important;
+      opacity: 1;
+    }
   }
 
   .datanoa-ai-error-box {
@@ -2785,7 +3032,13 @@ export const EDITOR_BASE_STYLE = `
     white-space: pre-wrap;
   }
 
-  .datanoa-ai-explain-body,
+  .datanoa-ai-explain-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding-bottom: 4px;
+  }
+
   .datanoa-ai-list,
   .datanoa-ai-section {
     display: flex;
@@ -2801,9 +3054,12 @@ export const EDITOR_BASE_STYLE = `
 
   .datanoa-ai-summary {
     margin: 0;
+    max-width: 78ch;
     font-size: 12.5px;
     color: var(--text);
-    line-height: 1.5;
+    line-height: 1.55;
+    white-space: pre-line;
+    overflow-wrap: anywhere;
   }
 
   .datanoa-ai-item {
@@ -2836,7 +3092,7 @@ export const EDITOR_BASE_STYLE = `
 
   .datanoa-ai-sev.sev-high { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
   .datanoa-ai-sev.sev-medium { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
-  .datanoa-ai-item-title { font-size: 12px; color: var(--text); }
+  .datanoa-ai-item-title { font-size: 12px; font-weight: 600; color: var(--text); }
 
   .datanoa-ai-code {
     margin: 0;
@@ -2852,6 +3108,14 @@ export const EDITOR_BASE_STYLE = `
     white-space: pre-wrap;
     word-break: break-word;
   }
+  .datanoa-ai-code .datanoa-sql-kw { color: var(--cm-keyword); font-weight: 600; }
+  .datanoa-ai-code .datanoa-sql-str { color: var(--cm-string); }
+  .datanoa-ai-code .datanoa-sql-num { color: var(--cm-number); }
+  .datanoa-ai-code .datanoa-sql-fn { color: var(--cm-function); }
+  .datanoa-ai-code .datanoa-sql-type { color: var(--cm-type); }
+  .datanoa-ai-code .datanoa-sql-ident { color: var(--cm-ident); }
+  .datanoa-ai-code .datanoa-sql-cmt { color: var(--cm-comment); font-style: italic; }
+  .datanoa-ai-code .datanoa-sql-op { color: var(--cm-operator); }
 
   .datanoa-ai-caveats {
     margin: 0;
@@ -2863,16 +3127,34 @@ export const EDITOR_BASE_STYLE = `
     gap: 2px;
   }
 
+  .datanoa-ai-modal [hidden],
+  .datanoa-ai-btn[hidden],
+  .datanoa-ai-models-panel[hidden],
+  .datanoa-ai-inline-tip[hidden],
+  .datanoa-ai-inline-warn[hidden],
+  .datanoa-ai-stats-box[hidden],
+  .datanoa-ai-feedback[hidden],
+  .datanoa-ai-explain-panel[hidden],
+  .datanoa-ai-fix-panel[hidden] {
+    display: none !important;
+  }
+
   .datanoa-ai-modal {
     width: min(640px, 94vw);
     max-height: 92vh;
     background: var(--bg);
     color: var(--text);
     border: 1px solid var(--border-strong);
-    border-radius: 8px;
+    border-radius: 12px;
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.48);
+  }
+
+  html.light .datanoa-ai-modal,
+  body.light .datanoa-ai-modal {
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
   }
 
   .datanoa-ai-modal-head,
@@ -2886,45 +3168,262 @@ export const EDITOR_BASE_STYLE = `
   }
 
   .datanoa-ai-modal-head { border-bottom: 1px solid var(--border); }
-  .datanoa-ai-modal-actions { border-top: 1px solid var(--border); justify-content: flex-start; }
-  .datanoa-ai-modal-title-wrap { display: flex; align-items: center; gap: 8px; }
-  .datanoa-ai-modal-title { margin: 0; font-size: 13.5px; font-weight: 600; }
+  .datanoa-ai-modal-actions { border-top: 1px solid var(--border); justify-content: flex-start; flex-wrap: wrap; }
+  .datanoa-ai-modal-title-wrap { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .datanoa-ai-modal-title { margin: 0; font-size: 14px; font-weight: 600; line-height: 1.25; color: var(--text); }
   .datanoa-ai-spacer { flex: 1; }
 
   .datanoa-ai-modal-body {
-    padding: 12px 16px;
+    padding: 16px;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
     gap: 12px;
   }
 
+  .datanoa-ai-role-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .datanoa-ai-role-tabs {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+
+  .datanoa-ai-role-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 12px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--muted);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color 150ms cubic-bezier(0.22, 1, 0.36, 1), background-color 150ms cubic-bezier(0.22, 1, 0.36, 1), border-color 150ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .datanoa-ai-role-tab:hover:not([aria-selected='true']) {
+    color: var(--text);
+    background: var(--hover);
+  }
+
+  .datanoa-ai-role-tab[aria-selected='true'] {
+    background: var(--raised);
+    color: var(--text);
+    border-color: var(--border-strong);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  }
+
+  html.light .datanoa-ai-role-tab[aria-selected='true'],
+  body.light .datanoa-ai-role-tab[aria-selected='true'] {
+    background: var(--bg);
+    color: var(--text);
+    border-color: var(--border-strong);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+  }
+
+  .datanoa-ai-role-tabs.is-synced .datanoa-ai-role-tab {
+    color: var(--muted);
+    opacity: 0.78;
+  }
+
+  .datanoa-ai-role-tabs.is-synced .datanoa-ai-role-tab:hover {
+    opacity: 1;
+    color: var(--text);
+    background: var(--hover);
+  }
+
+  .datanoa-ai-role-tabs.is-synced .datanoa-ai-role-tab[aria-selected='true'] {
+    background: transparent;
+    border-color: transparent;
+    box-shadow: none;
+  }
+
+  .datanoa-ai-sync-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 32px;
+    padding: 0 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--muted);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color 150ms cubic-bezier(0.22, 1, 0.36, 1), background-color 150ms cubic-bezier(0.22, 1, 0.36, 1), border-color 150ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .datanoa-ai-sync-btn:hover {
+    color: var(--text);
+    background: var(--hover);
+    border-color: var(--border-strong);
+  }
+
+  .datanoa-ai-sync-btn[aria-pressed='true'] {
+    background: var(--raised);
+    color: var(--text);
+    border-color: var(--border-strong);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  }
+
+  html.light .datanoa-ai-sync-btn[aria-pressed='true'],
+  body.light .datanoa-ai-sync-btn[aria-pressed='true'] {
+    background: var(--bg);
+    color: var(--text);
+    border-color: var(--border-strong);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+  }
+
+  .datanoa-ai-sync-indicator {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    display: inline-block;
+    box-sizing: border-box;
+    background: transparent;
+    border: 1.5px solid var(--muted);
+    transition: background-color 150ms cubic-bezier(0.22, 1, 0.36, 1), border-color 150ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .datanoa-ai-sync-btn[aria-pressed='true'] .datanoa-ai-sync-indicator {
+    background: var(--ok);
+    border-color: var(--ok);
+  }
+
+  .datanoa-ai-sync-banner {
+    font-size: 12px;
+    line-height: 1.45;
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--muted);
+  }
+
+  .datanoa-ai-role-card {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+  }
+
+  .datanoa-ai-role-card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .datanoa-ai-sync-toggles {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+  }
+
   .datanoa-ai-toggle-row {
+    flex: 1 1 220px;
+    min-width: 0;
     display: flex;
     align-items: flex-start;
     gap: 8px;
     padding: 8px 12px;
     border: 1px solid var(--border);
     border-radius: 6px;
-    background: var(--surface);
+    background: var(--bg);
     cursor: pointer;
+    transition: border-color 150ms cubic-bezier(0.22, 1, 0.36, 1), background-color 150ms cubic-bezier(0.22, 1, 0.36, 1);
   }
 
-  .datanoa-ai-toggle-text { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
-  .datanoa-ai-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .datanoa-ai-toggle-row:hover {
+    border-color: var(--border-strong);
+  }
+
+  .datanoa-ai-toggle-row input[type='checkbox'] {
+    margin: 2px 0 0 0;
+    flex-shrink: 0;
+    accent-color: var(--primary);
+  }
+
+  .datanoa-ai-toggle-text { display: flex; flex-direction: column; gap: 2px; font-size: 12px; line-height: 1.4; }
+  .datanoa-ai-toggle-text strong { font-weight: 600; }
+  .datanoa-ai-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 8px; }
   .datanoa-ai-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
   .datanoa-ai-field-full { grid-column: 1 / -1; }
   .datanoa-ai-field .datanoa-ai-input { width: 100%; box-sizing: border-box; }
   .datanoa-ai-inline-row .datanoa-ai-input { flex: 1; min-width: 0; }
   .datanoa-ai-label { font-size: 11px; color: var(--muted); font-weight: 500; }
+
+  .datanoa-ai-inline-tip {
+    font-size: 12px;
+    line-height: 1.45;
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid color-mix(in srgb, var(--warn) 40%, var(--border));
+    background: color-mix(in srgb, var(--warn) 8%, var(--bg));
+    color: var(--warn);
+  }
+
+  .datanoa-ai-inline-tip-title {
+    color: var(--warn);
+    font-weight: 600;
+  }
+
+  .datanoa-ai-inline-tip code {
+    font-family: var(--mono-font, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 11px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border));
+    background: color-mix(in srgb, var(--warn) 12%, var(--bg));
+    color: var(--warn);
+  }
+
+  .datanoa-ai-inline-warn {
+    font-size: 12px;
+    line-height: 1.45;
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid color-mix(in srgb, var(--warn) 40%, var(--border));
+    background: color-mix(in srgb, var(--warn) 8%, var(--bg));
+    color: var(--warn);
+  }
+
   .datanoa-ai-models-panel {
     display: flex;
     flex-direction: column;
     gap: 8px;
-    padding: 8px;
+    padding: 8px 12px;
     border: 1px solid var(--border);
     border-radius: 6px;
-    background: var(--surface);
+    background: var(--bg);
   }
   .datanoa-ai-models-bar { display: flex; align-items: center; gap: 8px; }
   .datanoa-ai-model-search { flex: 1; min-width: 0; }
@@ -2940,10 +3439,11 @@ export const EDITOR_BASE_STYLE = `
     background: var(--btn-bg);
     color: var(--text);
     border-radius: 4px;
-    padding: 2px 8px;
+    padding: 4px 8px;
     font-size: 11px;
     font-variant-numeric: tabular-nums;
     cursor: pointer;
+    transition: color 150ms cubic-bezier(0.22, 1, 0.36, 1), background-color 150ms cubic-bezier(0.22, 1, 0.36, 1), border-color 150ms cubic-bezier(0.22, 1, 0.36, 1);
   }
   .datanoa-ai-chip:hover { background: var(--btn-hover-bg); border-color: var(--btn-hover-border); }
   .datanoa-ai-chip.is-selected {
@@ -2952,7 +3452,19 @@ export const EDITOR_BASE_STYLE = `
     font-weight: 600;
   }
 
-  .datanoa-ai-feedback { font-size: 11.5px; padding: 8px; border-radius: 4px; border: 1px solid var(--border); }
+  .datanoa-ai-feedback {
+    flex-shrink: 0;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+  }
+  .datanoa-ai-feedback.tone-loading {
+    color: var(--text);
+    border-color: var(--border-strong);
+    background: var(--raised);
+  }
   .datanoa-ai-feedback.tone-ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
   .datanoa-ai-feedback.tone-error { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); }
 
@@ -2964,10 +3476,29 @@ export const EDITOR_BASE_STYLE = `
     padding: 8px 12px;
     border: 1px solid var(--border);
     border-radius: 6px;
-    background: var(--surface);
+    background: var(--bg);
     font-size: 11px;
     font-variant-numeric: tabular-nums;
     color: var(--muted);
+  }
+
+  .datanoa-ai-toolbar-btn:focus-visible,
+  .datanoa-ai-role-tab:focus-visible,
+  .datanoa-ai-sync-btn:focus-visible,
+  .datanoa-ai-btn:focus-visible,
+  .datanoa-ai-chip:focus-visible,
+  .datanoa-ai-input:focus-visible,
+  .datanoa-ai-lang-select:focus-visible,
+  .datanoa-ai-toggle-row input:focus-visible {
+    outline: 1.5px solid var(--accent-ring);
+    outline-offset: 1px;
+  }
+
+  @media (max-width: 560px) {
+    .datanoa-ai-sync-toggles,
+    .datanoa-ai-form-grid {
+      grid-template-columns: 1fr;
+    }
   }
 `
 

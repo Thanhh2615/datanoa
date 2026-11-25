@@ -1,8 +1,8 @@
 # Third-Party Notices
 
-Datanoa incorporates or bundles the following open-source software components across its seven pre-bundled vendor modules (`vendor/iconv-lite.js`, `vendor/pg.js`, `vendor/mysql2.js`, `vendor/mongodb.js`, `vendor/mssql.js`, `vendor/oracledb.js`, and `vendor/codemirror.js`) and embedded font asset (`src/assets/geist-font.js`). Each component is subject to its own license terms reproduced below.
+Datanoa incorporates or bundles the following open-source software components across its nine pre-bundled vendor modules (`vendor/iconv-lite.js`, `vendor/pg.js`, `vendor/mysql2.js`, `vendor/mongodb.js`, `vendor/mssql.js`, `vendor/oracledb.js`, `vendor/codemirror.js`, `vendor/sql-parser-pg-sqlite.js`, and `vendor/sql-parser-mysql-mssql.js`) and embedded font asset (`src/assets/geist-font.js`). Each component is subject to its own license terms reproduced below.
 
-## Summary of Bundled Components (59 Components)
+## Summary of Bundled Components (61 Components)
 
 | Package | Version | Bundle | License | Copyright Holder |
 |---|---|---|---|---|
@@ -64,6 +64,8 @@ Datanoa incorporates or bundles the following open-source software components ac
 | `@marijn/find-cluster-break` | `1.0.4` | `vendor/codemirror.js` | MIT | Marijn Haverbeke |
 | `w3c-keyname` | `2.2.8` | `vendor/codemirror.js` | MIT | Marijn Haverbeke and others |
 | `crelt` | `1.0.7` | `vendor/codemirror.js` | MIT | Marijn Haverbeke |
+| `node-sql-parser` | `5.4.0` | `vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js` | Apache-2.0 | taozhi8833998 and contributors |
+| `big-integer` | `1.6.52` | `vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js` | Unlicense | Peter Olson |
 | Geist Variable Font (`src/assets/geist-font.js`) | Variable | `src/assets/geist-font.js` | SIL OFL-1.1 | Vercel Inc. (bundled via Orca Desktop) |
 
 ---
@@ -217,6 +219,8 @@ The following bundled packages are licensed under the Apache License, Version 2.
 - **`long@5.3.2`** (`vendor/mysql2.js`):
   `Copyright 2009 The Closure Library Authors`
   `Copyright 2020 Daniel Wirtz / The long.js Authors.`
+- **`node-sql-parser@5.4.0`** (`vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js`):
+  `taozhi8833998 <taozhi8833998@163.com> and contributors`
 
 ### Apache License, Version 2.0
 
@@ -655,3 +659,36 @@ INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
 DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DAMAGES.
+
+---
+
+## Unlicense (Public Domain) Components
+
+### `big-integer@1.6.52` (`vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js`)
+
+```text
+This is free and unencumbered software released into the public domain.
+
+Anyone is free to copy, modify, publish, use, compile, sell, or
+distribute this software, either in source code form or as a compiled
+binary, for any purpose, commercial or non-commercial, and by any
+means.
+
+In jurisdictions that recognize copyright laws, the author or authors
+of this software dedicate any and all copyright interest in the
+software to the public domain. We make this dedication for the benefit
+of the public at large and to the detriment of our heirs and
+successors. We intend this dedication to be an overt act of
+relinquishment in perpetuity of all present and future rights to this
+software under copyright law.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+For more information, please refer to <http://unlicense.org>
+```

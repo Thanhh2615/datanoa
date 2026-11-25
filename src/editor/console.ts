@@ -1094,6 +1094,16 @@ function buildEditorThemeExtension(isDark: boolean): Extension {
         textDecorationThickness: '1.4px',
         opacity: '0.58',
       },
+      '.cm-ai-diff-insert': {
+        color: isDark ? 'rgba(74, 222, 128, 0.92)' : '#15803d',
+        backgroundColor: isDark ? 'rgba(34, 197, 94, 0.14)' : 'rgba(22, 163, 74, 0.12)',
+        borderRadius: '3px',
+        padding: '0 2px',
+        marginLeft: '2px',
+        whiteSpace: 'pre',
+        pointerEvents: 'none',
+        userSelect: 'none',
+      },
       '.cm-sql-diag-error': {
         textDecorationLine: 'underline',
         textDecorationStyle: 'wavy',
@@ -1131,9 +1141,9 @@ export class SqlConsoleController {
   private readonly completionCompartment = new Compartment()
   private readonly typographyCompartment = new Compartment()
   private readonly themeModeCompartment = new Compartment()
-  private currentDialect: SqlDialectType = 'sqlite'
+  private currentDialect: SqlDialectType
   private currentSchema: Record<string, string[]> = {}
-  private currentDefaultTable?: string = undefined
+  private currentDefaultTable?: string
   private currentTypography: EditorTypography = {}
   private isDarkTheme = true
   private readonly onExecute?: (sql: string) => void
@@ -1233,7 +1243,9 @@ export class SqlConsoleController {
       docChangeListener,
       this.themeModeCompartment.of(buildEditorThemeExtension(this.isDarkTheme)),
       createCmSqlLintExtension({ getDialect: () => this.currentDialect }),
-      ...(this.aiInline ? [createCmInlineAiExtension(this.aiInline)] : []),
+      ...(this.aiInline
+        ? [createCmInlineAiExtension({ ...this.aiInline, getDialect: () => this.currentDialect })]
+        : []),
     ]
 
     const state = EditorState.create({
@@ -1391,9 +1403,13 @@ export class SqlConsoleController {
   /**
    * Replaces a targeted SQL range via a single undoable CodeMirror transaction.
    */
-  public replaceSqlRange(target: SqlReplaceTarget | null, nextSql: string): boolean {
+  public replaceSqlRange(
+    target: SqlReplaceTarget | null,
+    nextSql: string,
+    dialect?: SqlDialectType
+  ): boolean {
     if (!this.view) return false
-    return replaceEditorSqlRange(this.view, target, nextSql, this.currentDialect)
+    return replaceEditorSqlRange(this.view, target, nextSql, dialect ?? this.currentDialect)
   }
 
   /**
@@ -1440,7 +1456,8 @@ export class SqlConsoleController {
    */
   public setDbSyntaxError(
     errorMessage: string,
-    targetRange?: { from: number; to: number } | null
+    targetRange?: { from: number; to: number } | null,
+    dialect?: SqlDialectType
   ): void {
     if (!this.view) return
     const clean = String(errorMessage || '').trim()
@@ -1452,6 +1469,7 @@ export class SqlConsoleController {
       effects: setDbSqlErrorEffect.of({
         errorMessage: clean,
         targetRange: targetRange ?? null,
+        dialect: dialect ?? this.currentDialect,
       }),
     })
   }

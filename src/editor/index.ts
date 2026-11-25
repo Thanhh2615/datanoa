@@ -152,6 +152,7 @@ import {
   buildInitialResultTabStates,
   buildCombinedExplainResult,
   shouldShowQueryBannerForMode,
+  formatGridStatusMetrics,
   type StudioViewMode,
 } from './result-set-controller.js'
 import {
@@ -175,7 +176,8 @@ import {
   containsSensitiveSqlText,
   sanitizeSqlResultForStorage,
 } from '../shared-sql-safety.js'
-import { resolveSqlReplacementSpan } from '../shared-sql-core.js'
+import { remapSqlTargetRange, resolveSqlReplacementSpan } from '../shared-sql-core.js'
+import { resolveExecutionErrorFixTarget } from '../shared-sql-diagnostics.js'
 import {
   openStudioDangerSqlModal,
   type StudioDangerSqlModalContext,
@@ -237,6 +239,8 @@ import {
   type AiExplainAnalysisResult,
   type AiFixQueryResult,
   type AiMetricKind,
+  type AiRole,
+  type AiRoleStatus,
   type AiStatusSnapshot,
   type ColumnInfo,
   type ConnectionProfile,
@@ -258,6 +262,26 @@ import {
   type ExplainAiPanelState,
 } from '../shared-ai-ui.js'
 import { DEFAULT_RPC_TIMEOUT_MS } from '../shared-constants.js'
+
+function extractFailedStatementMetaFromError(err: unknown): {
+  failedStatementIndex: number | null
+  statementCount: number | null
+} {
+  if (!err || typeof err !== 'object') {
+    return { failedStatementIndex: null, statementCount: null }
+  }
+  const rawIdx =
+    'failedStatementIndex' in err
+      ? (err as { failedStatementIndex?: unknown }).failedStatementIndex
+      : undefined
+  const rawCount =
+    'statementCount' in err ? (err as { statementCount?: unknown }).statementCount : undefined
+  const failedStatementIndex =
+    typeof rawIdx === 'number' && Number.isInteger(rawIdx) && rawIdx >= 0 ? rawIdx : null
+  const statementCount =
+    typeof rawCount === 'number' && Number.isInteger(rawCount) && rawCount > 0 ? rawCount : null
+  return { failedStatementIndex, statementCount }
+}
 
 const BASE_EDITOR_TOKENS = `
   :root {
@@ -520,6 +544,7 @@ export class DatanoaStudioEditor {
     originTabId: string
     originResultSetIndex: number
     originConnectionId: string | null
+    executedConnectionId?: string | null
     originLastResult: QueryResult | null
   } | null = null
   private explainAiAbort: AbortController | null = null
@@ -566,6 +591,8 @@ export class DatanoaStudioEditor {
 
   private currentPage = 1
   private totalRows = 0
+  private currentColCount = 0
+  private currentMetricsTruncated = false
   private currentPageRowCount = 0
   private pageSize = 100
   private activeViewMode: StudioViewMode = 'split'
@@ -638,6 +665,7 @@ export class DatanoaStudioEditor {
   private colsPopoverOutsideCleanup: (() => void) | null = null
   private activeModalBackdrop: HTMLDivElement | null = null
   private activeModalKeyCleanup: (() => void) | null = null
+  private activeModalDismiss: (() => void) | null = null
   private lastInspectorLoadedKey = ''
 
   constructor() {
@@ -959,17 +987,29 @@ export class DatanoaStudioEditor {
       const rowCount = cachedRes.rowCount ?? (cachedRes.rows ? cachedRes.rows.length : 0)
       this.currentPage = 1
       this.totalRows = rowCount
+      this.currentColCount = cachedRes.isSelect ? (cachedRes.columns?.length ?? 0) : 0
+      this.currentMetricsTruncated = Boolean(cachedRes.isSelect && cachedRes.truncated)
       this.currentPageRowCount = cachedRes.rows ? cachedRes.rows.length : 0
       if (this.gridSubbarTitleEl) {
         this.gridSubbarTitleEl.textContent = cachedRes.isSelect
-          ? `SQL Result · ${cachedRes.columns?.length ?? 0} cols`
+          ? 'SQL Result'
           : `Executed · ${cachedRes.affectedRows ?? 0} affected`
       }
       if (this.gridPageInfoEl) {
         const rowLabel = `${rowCount} ${rowCount === 1 ? 'row' : 'rows'}`
         this.gridPageInfoEl.textContent = cachedRes.truncated ? `${rowLabel} (truncated)` : rowLabel
       }
-      this.updateStatus('Ready', `${rowCount} rows`)
+      this.updateStatus(
+        'Ready',
+        formatGridStatusMetrics(
+          cachedRes.isSelect ? rowCount : (cachedRes.affectedRows ?? 0),
+          this.currentColCount,
+          {
+            truncated: this.currentMetricsTruncated,
+            unit: cachedRes.isSelect ? 'row' : 'affected',
+          }
+        )
+      )
       hydratedGrid = true
     } else if (this.doesWarmPageCacheMatchCurrentQuery(warm) && warm.pageData) {
       const cachedPage = warm.pageData
@@ -978,6 +1018,8 @@ export class DatanoaStudioEditor {
       this.lastLoadedTableKey = `${targetConnId}:${this.activeSchema || ''}:${this.activeTable || ''}`
       this.currentPage = cachedPage.page || this.currentPage || 1
       this.totalRows = cachedPage.totalRows || 0
+      this.currentColCount = cachedPage.columns.length
+      this.currentMetricsTruncated = false
       this.currentPageRowCount = Array.isArray(cachedPage.rows) ? cachedPage.rows.length : 0
       const expectedPageRows = Math.min(
         Math.max(0, this.totalRows - (this.currentPage - 1) * this.pageSize),
@@ -1000,13 +1042,16 @@ export class DatanoaStudioEditor {
       const totalPages = Math.max(1, Math.ceil(this.totalRows / this.pageSize))
       if (this.gridSubbarTitleEl && this.activeTable) {
         this.gridSubbarTitleEl.textContent = readOnly
-          ? `${this.activeTable} · ${cachedPage.columns.length} cols · RO`
-          : `${this.activeTable} · ${cachedPage.columns.length} cols`
+          ? `${this.activeTable} · RO`
+          : this.activeTable
       }
       if (this.gridPageInfoEl) {
         this.gridPageInfoEl.textContent = `Page ${this.currentPage} / ${totalPages} (${this.totalRows} rows)`
       }
-      this.updateStatus(this.activeTable ? `Ready · ${this.activeTable}` : 'Ready', `${this.totalRows} rows`)
+      this.updateStatus(
+        this.activeTable ? `Ready · ${this.activeTable}` : 'Ready',
+        formatGridStatusMetrics(this.totalRows, this.currentColCount)
+      )
       hydratedGrid = true
     }
 
@@ -1714,16 +1759,25 @@ export class DatanoaStudioEditor {
           suffix,
           signal,
           manual,
+          mode,
         }: {
           prefix: string
           suffix: string
           offset: number
           signal: AbortSignal
           manual?: boolean
+          mode?: 'auto' | 'complete' | 'edit'
         }) => {
           const conn = this.getActiveConnection()
           if (!conn) return null
-          return await this.requestPlugin<{ suggestion: string; id: number; replaceChars?: number }>(
+          if (containsSensitiveSqlText(`${prefix}${suffix}`)) return null
+          return await this.requestPlugin<{
+            suggestion: string
+            id: number
+            replaceChars?: number
+            edits?: Array<{ fromOffset: number; toOffset: number; insert: string }>
+            mode?: 'complete' | 'edit'
+          }>(
             'ai.complete',
             {
               connectionId: conn.id,
@@ -1731,6 +1785,7 @@ export class DatanoaStudioEditor {
               prefix,
               suffix,
               ...(manual ? { manual: true } : {}),
+              ...(mode && mode !== 'auto' ? { mode } : {}),
               activeSchema: this.selectedSchema,
               activeTable: this.activeTable ?? undefined,
               schemaMap: this.schemaMap,
@@ -2846,10 +2901,11 @@ export class DatanoaStudioEditor {
       ((this.isShowingSqlResult && this.editableSqlTarget) ||
         (!this.isShowingSqlResult && this.activeTable))
     ) {
-      this.statusMetricsEl.textContent =
-        stagedCount > 0
-          ? `${this.totalRows} rows (+${stagedCount} staged)`
-          : `${this.totalRows} rows`
+      this.statusMetricsEl.textContent = formatGridStatusMetrics(
+        this.totalRows,
+        this.currentColCount,
+        { stagedCount, truncated: this.currentMetricsTruncated }
+      )
     }
   }
 
@@ -3205,16 +3261,29 @@ export class DatanoaStudioEditor {
         const rowCount = cachedRes.rowCount ?? (cachedRes.rows ? cachedRes.rows.length : 0)
         this.currentPage = 1
         this.totalRows = rowCount
+        this.currentColCount = cachedRes.isSelect ? (cachedRes.columns?.length ?? 0) : 0
+        this.currentMetricsTruncated = Boolean(cachedRes.isSelect && cachedRes.truncated)
         this.currentPageRowCount = cachedRes.rows ? cachedRes.rows.length : 0
         if (this.gridSubbarTitleEl) {
           this.gridSubbarTitleEl.textContent = cachedRes.isSelect
-            ? `SQL Result · ${cachedRes.columns?.length ?? 0} cols`
+            ? 'SQL Result'
             : `Executed · ${cachedRes.affectedRows ?? 0} affected`
         }
         if (this.gridPageInfoEl) {
           const rowLabel = `${rowCount} ${rowCount === 1 ? 'row' : 'rows'}`
           this.gridPageInfoEl.textContent = cachedRes.truncated ? `${rowLabel} (truncated)` : rowLabel
         }
+        this.updateStatus(
+          'Ready',
+          formatGridStatusMetrics(
+            cachedRes.isSelect ? rowCount : (cachedRes.affectedRows ?? 0),
+            this.currentColCount,
+            {
+              truncated: this.currentMetricsTruncated,
+              unit: cachedRes.isSelect ? 'row' : 'affected',
+            }
+          )
+        )
         this.consumePendingScrollState()
         hydratedFromWorkerCache = true
       } else if (
@@ -3232,6 +3301,8 @@ export class DatanoaStudioEditor {
         this.lastLoadedTableKey = `${connectionId}:${this.activeSchema || ''}:${this.activeTable || ''}`
         this.currentPage = cachedPage.page || this.currentPage || 1
         this.totalRows = cachedPage.totalRows || 0
+        this.currentColCount = cachedPage.columns.length
+        this.currentMetricsTruncated = false
         this.currentPageRowCount = Array.isArray(cachedPage.rows) ? cachedPage.rows.length : 0
         const expectedPageRows = Math.min(
           Math.max(0, this.totalRows - (this.currentPage - 1) * this.pageSize),
@@ -3254,15 +3325,21 @@ export class DatanoaStudioEditor {
         const totalPages = Math.max(1, Math.ceil(this.totalRows / this.pageSize))
         if (this.gridSubbarTitleEl && this.activeTable) {
           this.gridSubbarTitleEl.textContent = readOnly
-            ? `${this.activeTable} · ${cachedPage.columns.length} cols · RO`
-            : `${this.activeTable} · ${cachedPage.columns.length} cols`
+            ? `${this.activeTable} · RO`
+            : this.activeTable
         }
         if (this.gridPageInfoEl) {
           this.gridPageInfoEl.textContent = `Page ${this.currentPage} / ${totalPages} (${this.totalRows} rows)`
         }
+        this.updateStatus(
+          this.activeTable ? `Ready · ${this.activeTable}` : 'Ready',
+          formatGridStatusMetrics(this.totalRows, this.currentColCount)
+        )
         this.consumePendingScrollState()
         hydratedFromWorkerCache = true
       } else {
+        this.currentColCount = 0
+        this.currentMetricsTruncated = false
         this.dataGrid?.setEmptyMessage(
           connectionId ? 'Loading schema...' : 'Select a database connection to browse tables.'
         )
@@ -3281,6 +3358,10 @@ export class DatanoaStudioEditor {
         if (this.gridSubbarTitleEl) {
           this.gridSubbarTitleEl.textContent = 'Select a table'
         }
+        this.updateStatus(
+          connectionId ? 'Loading schema...' : 'Ready',
+          formatGridStatusMetrics(0, 0)
+        )
       }
       this.schemaInspector?.clear()
       this.updatePaginationButtons()
@@ -3816,7 +3897,7 @@ export class DatanoaStudioEditor {
     tableNames: string[],
     reqToken: number
   ): Promise<void> {
-    const targets = tableNames.slice(0, 50)
+    const targets = tableNames.slice(0, 100)
     const schemaMap: Record<string, string[]> = { ...this.schemaMap }
     const batchSize = 4
 
@@ -3827,7 +3908,9 @@ export class DatanoaStudioEditor {
       const chunk = targets.slice(i, i + batchSize)
       const results = await Promise.allSettled(
         chunk.map(async (t) => {
-          const obj = this.schemaObjects.find((o) => o.name === t)
+          const obj =
+            this.schemaObjects.find((o) => this.isTabularKind(o.kind) && o.name === t) ||
+            this.schemaObjects.find((o) => o.name === t)
           const details = await this.fetchTableDetailsDeduped(
             connectionId,
             t,
@@ -4001,10 +4084,12 @@ export class DatanoaStudioEditor {
         const rowCount = cachedRes.rowCount ?? (cachedRes.rows ? cachedRes.rows.length : 0)
         this.currentPage = 1
         this.totalRows = rowCount
+        this.currentColCount = cachedRes.isSelect ? (cachedRes.columns?.length ?? 0) : 0
+        this.currentMetricsTruncated = Boolean(cachedRes.isSelect && cachedRes.truncated)
         this.currentPageRowCount = cachedRes.rows ? cachedRes.rows.length : 0
         if (this.gridSubbarTitleEl) {
           this.gridSubbarTitleEl.textContent = cachedRes.isSelect
-            ? `SQL Result · ${cachedRes.columns?.length ?? 0} cols`
+            ? 'SQL Result'
             : `Executed · ${cachedRes.affectedRows ?? 0} affected`
         }
         if (this.gridPageInfoEl) {
@@ -4016,15 +4101,27 @@ export class DatanoaStudioEditor {
         this.updatePaginationButtons()
         this.updateExportDropdownOptions()
         this.consumePendingScrollState()
-        this.updateStatus('Restored SQL result', `${rowCount} rows`)
+        this.updateStatus(
+          'Restored SQL result',
+          formatGridStatusMetrics(
+            cachedRes.isSelect ? rowCount : (cachedRes.affectedRows ?? 0),
+            this.currentColCount,
+            {
+              truncated: this.currentMetricsTruncated,
+              unit: cachedRes.isSelect ? 'row' : 'affected',
+            }
+          )
+        )
         this.saveStudioDataCache()
-        void this.prefetchAutocompleteSchema(connectionId, tableNames, reqToken)
+        void this.prefetchAutocompleteSchema(connectionId, tabularNames, reqToken)
         return
       }
 
       if (this.schemaObjects.length === 0 || !this.activeTable) {
         this.pendingBootDataCache = null
         this.currentPageRowCount = 0
+        this.currentColCount = 0
+        this.currentMetricsTruncated = false
         this.dataGrid?.setEmptyMessage('No objects found in this connection.')
         this.dataGrid?.setData({
           columns: [],
@@ -4062,6 +4159,8 @@ export class DatanoaStudioEditor {
         this.lastPageData = cachedPage
         this.currentPage = cachedPage.page || initialPage
         this.totalRows = cachedPage.totalRows || 0
+        this.currentColCount = cachedPage.columns.length
+        this.currentMetricsTruncated = false
         this.currentPageRowCount = Array.isArray(cachedPage.rows) ? cachedPage.rows.length : 0
         this.currentCanEdit = Boolean(cachedPage.canEdit) && !readOnly
         this.dataGrid?.setContextMeta(
@@ -4074,12 +4173,16 @@ export class DatanoaStudioEditor {
         const totalPages = Math.max(1, Math.ceil(this.totalRows / this.pageSize))
         if (this.gridSubbarTitleEl) {
           this.gridSubbarTitleEl.textContent = readOnly
-            ? `${this.activeTable} · ${cachedPage.columns.length} cols · RO`
-            : `${this.activeTable} · ${cachedPage.columns.length} cols`
+            ? `${this.activeTable} · RO`
+            : this.activeTable
         }
         if (this.gridPageInfoEl) {
           this.gridPageInfoEl.textContent = `Page ${this.currentPage} / ${totalPages} (${this.totalRows} rows)`
         }
+        this.updateStatus(
+          this.activeTable ? `Ready · ${this.activeTable}` : 'Ready',
+          formatGridStatusMetrics(this.totalRows, this.currentColCount)
+        )
         this.updatePaginationButtons()
         this.consumePendingScrollState()
         await this.loadTableData(connectionId, this.activeTable, initialPage, undefined, true)
@@ -4089,7 +4192,7 @@ export class DatanoaStudioEditor {
         if (this.activeViewMode === 'inspector') {
           void this.loadActiveTableSchema()
         }
-        void this.prefetchAutocompleteSchema(connectionId, tableNames, reqToken)
+        void this.prefetchAutocompleteSchema(connectionId, tabularNames, reqToken)
         return
       }
       if (bootCache && bootCache.activeConnectionId === connectionId) {
@@ -4105,7 +4208,7 @@ export class DatanoaStudioEditor {
         void this.loadActiveTableSchema()
       }
 
-      void this.prefetchAutocompleteSchema(connectionId, tableNames, reqToken)
+      void this.prefetchAutocompleteSchema(connectionId, tabularNames, reqToken)
     } catch (err: unknown) {
       if (reqToken !== this.introspectToken || this.activeConnectionId !== connectionId) {
         return
@@ -4187,21 +4290,20 @@ export class DatanoaStudioEditor {
     this.renderAiFixPanel()
   }
 
-  private isAiInlineReady(): boolean {
-    return Boolean(
-      this.aiStatus?.enabled &&
-        this.aiStatus.state !== 'off' &&
-        this.aiStatus.state !== 'setup'
-    )
+  private getAiRoleStatus(role: AiRole): AiRoleStatus | AiStatusSnapshot | null {
+    const snap = this.aiStatus
+    if (!snap) return null
+    return snap.roles?.[role] ?? snap
   }
 
-  private isAiConfiguredAndEnabled(): boolean {
-    return Boolean(
-      this.aiStatus?.enabled &&
-        (this.aiStatus.state === 'on' ||
-          this.aiStatus.state === 'slow' ||
-          this.aiStatus.state === 'error')
-    )
+  private isAiInlineReady(): boolean {
+    const auto = this.getAiRoleStatus('autocomplete')
+    return Boolean(auto?.enabled && auto.state !== 'off' && auto.state !== 'setup')
+  }
+
+  private isExplainAiConfiguredAndEnabled(): boolean {
+    const exp = this.getAiRoleStatus('explain')
+    return Boolean(exp?.enabled && exp.state !== 'off' && exp.state !== 'setup')
   }
 
   private applyAiStatus(snapshot: AiStatusSnapshot | null): void {
@@ -4210,6 +4312,7 @@ export class DatanoaStudioEditor {
       const badge = renderAiStatusButtonContent(this.aiBtn, snapshot)
       this.aiBtn.className = `datanoa-btn datanoa-btn-sm datanoa-ai-toolbar-btn datanoa-status-ai-btn tone-${badge.tone}`
     }
+    this.syncAiBusyState()
     if (!this.isAiInlineReady()) {
       this.sqlConsole?.clearAiGhost()
     }
@@ -4230,11 +4333,12 @@ export class DatanoaStudioEditor {
     }
   }
 
-  private async openAiSettingsModal(): Promise<void> {
+  private async openAiSettingsModal(initialRole?: AiRole): Promise<void> {
     await openSharedAiConfigModal({
       rpc: (name, input, opts) => this.requestPlugin(name, input, opts),
       saveSettings: saveOrcaSettingsPatch,
       initialStatus: this.aiStatus,
+      ...(initialRole ? { initialRole } : {}),
       onStatusUpdated: (snapshot) => this.applyAiStatus(snapshot),
       mountModal: (modalEl, canClose, onDismiss) =>
         this.mountStudioModal(modalEl, canClose, onDismiss),
@@ -4242,7 +4346,13 @@ export class DatanoaStudioEditor {
     })
   }
 
+  private syncAiBusyState(): void {
+    const busy = this.aiFixState?.phase === 'loading' || this.explainAiLoadingTarget !== null
+    this.aiBtn?.classList.toggle('is-ai-busy', busy)
+  }
+
   private renderExplainAiForActiveTab(): void {
+    this.syncAiBusyState()
     if (!this.explainAiEl) return
     const wasHidden = this.explainAiEl.hidden
     const tab = this.consoleTabs?.getActiveTab()
@@ -4263,14 +4373,18 @@ export class DatanoaStudioEditor {
         rsState?.banner?.isExplain
     )
 
+    const explainRole = this.getAiRoleStatus('explain')
+    const explainReady = this.isExplainAiConfiguredAndEnabled()
+
     if (!isExplain || !tab || !rsState) {
+      this.gridAreaEl?.classList.remove('has-explain-ai-panel')
       if (!wasHidden) {
         renderSharedExplainAiPanel(
           this.explainAiEl,
           {
             phase: 'hidden',
-            aiEnabled: Boolean(this.aiStatus?.enabled),
-            aiReady: this.isAiConfiguredAndEnabled(),
+            aiEnabled: Boolean(explainRole?.enabled),
+            aiReady: explainReady,
             explainLanguage: this.aiStatus?.explainLanguage || 'auto',
           },
           {
@@ -4289,6 +4403,9 @@ export class DatanoaStudioEditor {
     }
 
     const originConnId = tab.executedConnectionId ?? this.activeConnectionId
+    const explainConn = tab.executedConnectionId
+      ? this.connections.find((c) => c.id === tab.executedConnectionId)
+      : this.getActiveConnection()
     const isLoading = Boolean(
       this.explainAiLoadingTarget &&
         this.explainAiLoadingTarget.tabId === tab.id &&
@@ -4300,16 +4417,18 @@ export class DatanoaStudioEditor {
       rsState.explainAnalysisError,
       rsState.explainAnalysis
     )
+    this.gridAreaEl?.classList.toggle('has-explain-ai-panel', !rsState.explainAnalysisCollapsed)
 
     renderSharedExplainAiPanel(
       this.explainAiEl,
       {
         phase,
-        aiEnabled: Boolean(this.aiStatus?.enabled),
-        aiReady: this.isAiConfiguredAndEnabled(),
+        aiEnabled: Boolean(explainRole?.enabled),
+        aiReady: explainReady,
         explainLanguage: this.aiStatus?.explainLanguage || 'auto',
-        destination: this.aiStatus?.destination,
-        host: this.aiStatus?.host,
+        dialect: explainConn?.driver || 'sqlite',
+        destination: explainRole?.destination,
+        host: explainRole?.host,
         result: rsState.explainAnalysis ?? null,
         error: rsState.explainAnalysisError ?? null,
         collapsed: Boolean(rsState.explainAnalysisCollapsed),
@@ -4319,7 +4438,7 @@ export class DatanoaStudioEditor {
           void this.runExplainAiAnalysis(tab.id, idx)
         },
         onConfigureAi: () => {
-          void this.openAiSettingsModal()
+          void this.openAiSettingsModal('explain')
         },
         onCancel: () => {
           this.explainAiSeq += 1
@@ -4337,6 +4456,7 @@ export class DatanoaStudioEditor {
           ) {
             return
           }
+          const latestRsState = this.consoleTabs.getResultTabState(idx, tab.id) ?? rsState
           const replaceFn:
             | ((
                 target: {
@@ -4344,16 +4464,24 @@ export class DatanoaStudioEditor {
                   to: number
                   originalSlice?: string
                   fallbackSql?: string
+                  statementIndex?: number
+                  totalStatements?: number
+                  preserveOtherStatements?: boolean
                 },
-                nextSql: string
+                nextSql: string,
+                dialect?: SqlDialectType
               ) => boolean)
             | undefined = sqlConsole.replaceSqlRange
           const target = {
-            ...(rsState.explainTargetRange ?? { from: -1, to: -1 }),
-            fallbackSql: rsState.statementSql,
+            ...(latestRsState.explainTargetRange ?? { from: -1, to: -1 }),
+            fallbackSql: latestRsState.statementSql,
+            preserveOtherStatements: true,
           }
+          const prevDoc = sqlConsole.getText()
+          const dialect = explainConn?.driver || this.getActiveConnection()?.driver || 'sqlite'
+          const expectedEdit = resolveSqlReplacementSpan(prevDoc, target, sql, dialect)
           if (typeof replaceFn === 'function') {
-            const replaced = replaceFn.call(sqlConsole, target, sql)
+            const replaced = replaceFn.call(sqlConsole, target, sql, dialect)
             if (!replaced) {
               this.updateStatus(
                 'Could not safely match target query in multi-statement script — use Copy SQL to apply manually'
@@ -4361,18 +4489,45 @@ export class DatanoaStudioEditor {
               return
             }
           } else {
-            const currentText = sqlConsole.getText()
-            const dialect = this.getActiveConnection()?.driver || 'sqlite'
-            const edit = resolveSqlReplacementSpan(currentText, target, sql, dialect)
-            if (!edit) {
+            if (!expectedEdit) {
               this.updateStatus(
                 'Could not safely match target query in multi-statement script — use Copy SQL to apply manually'
               )
               return
             }
             sqlConsole.setText(
-              `${currentText.slice(0, edit.from)}${edit.insert}${currentText.slice(edit.to)}`
+              `${prevDoc.slice(0, expectedEdit.from)}${expectedEdit.insert}${prevDoc.slice(expectedEdit.to)}`
             )
+          }
+          if (expectedEdit) {
+            this.remapTabResultTargetsAfterEdit(
+              tab.id,
+              expectedEdit.from,
+              expectedEdit.to,
+              expectedEdit.insert.length
+            )
+            if (!latestRsState.explainTargetRange) {
+              const postState = this.consoleTabs.getResultTabState(idx, tab.id) ?? latestRsState
+              const totalStmts =
+                dialect === 'redis'
+                  ? 1
+                  : Math.max(sets.length, splitSqlStatements(prevDoc, dialect).length)
+              this.consoleTabs.setResultTabState(
+                idx,
+                {
+                  ...postState,
+                  explainTargetRange: {
+                    from: -1,
+                    to: -1,
+                    originalSlice: prevDoc.slice(expectedEdit.from, expectedEdit.to),
+                    statementIndex: idx,
+                    totalStatements: totalStmts,
+                    preserveOtherStatements: true,
+                  },
+                },
+                tab.id
+              )
+            }
           }
           this.saveActiveConsoleTabState()
           const latestDoc = sqlConsole.getText()
@@ -4424,6 +4579,45 @@ export class DatanoaStudioEditor {
     const rsState = tab.resultStates?.[resultSetIndex]
     if (!rs || rs.isError || !rsState) return
 
+    if (!this.isExplainAiConfiguredAndEnabled()) {
+      this.explainAiSeq += 1
+      this.explainAiAbort?.abort()
+      this.explainAiAbort = null
+      this.explainAiLoadingTarget = null
+      this.consoleTabs.setResultTabState(
+        resultSetIndex,
+        {
+          ...rsState,
+          explainAnalysisError:
+            'Explain & Fix AI is not configured or disabled. Enable Explain & Fix in AI Settings to analyze query plans.',
+          explainAnalysisCollapsed: false,
+        },
+        tabId
+      )
+      this.renderExplainAiForActiveTab()
+      return
+    }
+
+    const sql = rsState.statementSql || rs.sql || tab.executedSql || ''
+    if (containsSensitiveSqlText(sql)) {
+      this.explainAiSeq += 1
+      this.explainAiAbort?.abort()
+      this.explainAiAbort = null
+      this.explainAiLoadingTarget = null
+      this.consoleTabs.setResultTabState(
+        resultSetIndex,
+        {
+          ...rsState,
+          explainAnalysisError:
+            'Query appears to contain sensitive credentials/secrets and was not sent to AI.',
+          explainAnalysisCollapsed: false,
+        },
+        tabId
+      )
+      this.renderExplainAiForActiveTab()
+      return
+    }
+
     this.explainAiAbort?.abort()
     const ac = new AbortController()
     this.explainAiAbort = ac
@@ -4436,7 +4630,6 @@ export class DatanoaStudioEditor {
     )
     this.renderExplainAiForActiveTab()
 
-    const sql = rsState.statementSql || rs.sql || tab.executedSql || ''
     const connId = tab.executedConnectionId || this.activeConnectionId
     const conn = tab.executedConnectionId
       ? this.connections.find((c) => c.id === tab.executedConnectionId)
@@ -4513,6 +4706,7 @@ export class DatanoaStudioEditor {
   }
 
   private renderAiFixPanel(): void {
+    this.syncAiBusyState()
     if (!this.aiFixEl) return
     const wasHidden = this.aiFixEl.hidden
     const current = this.aiFixState
@@ -4523,14 +4717,17 @@ export class DatanoaStudioEditor {
         this.activeResultBannerState?.kind === 'error'
     )
 
+    const explainRole = this.getAiRoleStatus('explain')
+    const explainReady = this.isExplainAiConfiguredAndEnabled()
+
     if (!visible || !current) {
       if (!wasHidden) {
         renderSharedAiFixPanel(
           this.aiFixEl,
           {
             phase: 'hidden',
-            aiEnabled: Boolean(this.aiStatus?.enabled),
-            aiReady: this.isAiConfiguredAndEnabled(),
+            aiEnabled: Boolean(explainRole?.enabled),
+            aiReady: explainReady,
           },
           {
             onReplaceQuery: () => {},
@@ -4548,14 +4745,21 @@ export class DatanoaStudioEditor {
       return
     }
 
+    const fixDialect =
+      this.connections.find(
+        (c) => c.id === (current.executedConnectionId ?? current.originConnectionId)
+      )?.driver ||
+      this.getActiveConnection()?.driver ||
+      'sqlite'
     renderSharedAiFixPanel(
       this.aiFixEl,
       {
         phase: current.phase,
-        aiEnabled: Boolean(this.aiStatus?.enabled),
-        aiReady: this.isAiConfiguredAndEnabled(),
-        destination: this.aiStatus?.destination,
-        host: this.aiStatus?.host,
+        aiEnabled: Boolean(explainRole?.enabled),
+        aiReady: explainReady,
+        dialect: fixDialect,
+        destination: explainRole?.destination,
+        host: explainRole?.host,
         result: current.result,
         error: current.error,
       },
@@ -4570,14 +4774,24 @@ export class DatanoaStudioEditor {
             return
           }
           const target = current.fixTargetRange
-            ? { ...current.fixTargetRange, fallbackSql: current.failedSql }
-            : { from: -1, to: -1, fallbackSql: current.failedSql }
-          const replaced = this.sqlConsole.replaceSqlRange(target, sql)
+            ? { ...current.fixTargetRange, fallbackSql: current.failedSql, preserveOtherStatements: true }
+            : { from: -1, to: -1, fallbackSql: current.failedSql, preserveOtherStatements: true }
+          const prevDoc = this.sqlConsole.getText()
+          const expectedEdit = resolveSqlReplacementSpan(prevDoc, target, sql, fixDialect)
+          const replaced = this.sqlConsole.replaceSqlRange(target, sql, fixDialect)
           if (!replaced) {
             this.updateStatus(
               'Could not safely match failed statement in multi-statement script — use Copy SQL to apply manually'
             )
             return
+          }
+          if (expectedEdit) {
+            this.remapTabResultTargetsAfterEdit(
+              current.originTabId,
+              expectedEdit.from,
+              expectedEdit.to,
+              expectedEdit.insert.length
+            )
           }
           const nextDoc = this.sqlConsole.getText()
           this.consoleTabs.updateActiveSql(nextDoc, this.sqlConsole.getCursorOffset())
@@ -4600,7 +4814,7 @@ export class DatanoaStudioEditor {
           this.clearAiFixPanel()
         },
         onConfigureAi: () => {
-          void this.openAiSettingsModal()
+          void this.openAiSettingsModal('explain')
         },
         resizeEdge: 'bottom',
         onResize: () => {
@@ -4627,7 +4841,7 @@ export class DatanoaStudioEditor {
     const originConnectionId = this.activeConnectionId
     const originLastResult = this.activeQueryResult
 
-    if (!this.isAiConfiguredAndEnabled()) {
+    if (!this.isExplainAiConfiguredAndEnabled()) {
       this.aiFixSeq += 1
       this.aiFixAbort?.abort()
       this.aiFixAbort = null
@@ -4635,13 +4849,42 @@ export class DatanoaStudioEditor {
         phase: 'error',
         result: null,
         error:
-          'AI SQL Assistant is not configured or disabled. Enable it in AI Settings to fix SQL errors.',
+          'Explain & Fix AI is not configured or disabled. Enable Explain & Fix in AI Settings to fix SQL errors.',
         failedSql,
         errorMessage,
         fixTargetRange,
         originTabId,
         originResultSetIndex,
         originConnectionId,
+        originLastResult,
+      }
+      this.renderAiFixPanel()
+      return
+    }
+
+    const activeTab = this.consoleTabs.getActiveTab()
+    const conn = activeTab?.executedConnectionId
+      ? (this.connections.find((c) => c.id === activeTab.executedConnectionId) ??
+        this.getActiveConnection())
+      : this.getActiveConnection()
+    const executedConnectionId = conn?.id ?? originConnectionId
+
+    if (containsSensitiveSqlText(failedSql) || containsSensitiveSqlText(errorMessage)) {
+      this.aiFixSeq += 1
+      this.aiFixAbort?.abort()
+      this.aiFixAbort = null
+      this.aiFixState = {
+        phase: 'error',
+        result: null,
+        error:
+          'Query or error message appears to contain sensitive credentials/secrets and was not sent to AI.',
+        failedSql,
+        errorMessage,
+        fixTargetRange,
+        originTabId,
+        originResultSetIndex,
+        originConnectionId,
+        executedConnectionId,
         originLastResult,
       }
       this.renderAiFixPanel()
@@ -4663,11 +4906,12 @@ export class DatanoaStudioEditor {
       originTabId,
       originResultSetIndex,
       originConnectionId,
+      executedConnectionId,
       originLastResult,
     }
     this.renderAiFixPanel()
 
-    const conn = this.getActiveConnection()
+    const isSameActiveConn = conn?.id === this.activeConnectionId
     const uiLocale =
       typeof window !== 'undefined'
         ? (window.orca as unknown as { locale?: string } | undefined)?.locale
@@ -4681,9 +4925,9 @@ export class DatanoaStudioEditor {
           dialect: conn?.driver || 'sqlite',
           sql: failedSql,
           errorMessage,
-          activeSchema: this.selectedSchema,
-          activeTable: this.activeTable ?? undefined,
-          schemaMap: this.schemaMap,
+          activeSchema: isSameActiveConn ? this.selectedSchema : undefined,
+          activeTable: isSameActiveConn ? (this.activeTable ?? undefined) : undefined,
+          schemaMap: isSameActiveConn ? this.schemaMap : {},
           language: this.aiStatus?.explainLanguage || 'auto',
           uiLocale,
         },
@@ -4710,6 +4954,7 @@ export class DatanoaStudioEditor {
         originTabId,
         originResultSetIndex,
         originConnectionId,
+        executedConnectionId,
         originLastResult,
       }
       if (originLastResult !== null) {
@@ -4766,31 +5011,125 @@ export class DatanoaStudioEditor {
     }
   }
 
+  private remapTabResultTargetsAfterEdit(
+    tabId: string,
+    editFrom: number,
+    editTo: number,
+    insertLen: number
+  ): void {
+    const tab = this.consoleTabs.getTabs().find((t) => t.id === tabId)
+    if (tab?.resultStates) {
+      for (const [idxStr, st] of Object.entries(tab.resultStates)) {
+        if (!st) continue
+        let changed = false
+        let nextBanner = st.banner
+        if (st.banner?.fixTargetRange) {
+          const remapped = remapSqlTargetRange(st.banner.fixTargetRange, editFrom, editTo, insertLen)
+          if (remapped !== st.banner.fixTargetRange) {
+            nextBanner = { ...st.banner, fixTargetRange: remapped }
+            changed = true
+          }
+        }
+        let nextExplainRange = st.explainTargetRange
+        if (st.explainTargetRange) {
+          const remapped = remapSqlTargetRange(st.explainTargetRange, editFrom, editTo, insertLen)
+          if (remapped !== st.explainTargetRange) {
+            nextExplainRange = remapped
+            changed = true
+          }
+        }
+        if (changed) {
+          this.consoleTabs.setResultTabState(
+            Number(idxStr),
+            {
+              ...st,
+              banner: nextBanner,
+              explainTargetRange: nextExplainRange,
+            },
+            tabId
+          )
+        }
+      }
+    }
+    if (tabId === this.consoleTabs.getActiveTabId() && this.activeResultBannerState?.fixTargetRange) {
+      this.activeResultBannerState = {
+        ...this.activeResultBannerState,
+        fixTargetRange: remapSqlTargetRange(
+          this.activeResultBannerState.fixTargetRange,
+          editFrom,
+          editTo,
+          insertLen
+        ),
+      }
+    }
+    if (this.aiFixState?.originTabId === tabId && this.aiFixState.fixTargetRange) {
+      this.aiFixState = {
+        ...this.aiFixState,
+        fixTargetRange: remapSqlTargetRange(
+          this.aiFixState.fixTargetRange,
+          editFrom,
+          editTo,
+          insertLen
+        ),
+      }
+    }
+  }
+
   private resolveResultStatementRange(
     targetSql: string,
     idx: number,
     totalSets: number,
     stmtSlices: Array<{ text: string; start: number; end: number }>,
-    execRange: SqlExecutionRange | null
+    execRange: SqlExecutionRange | null,
+    resultIndex?: number
   ): SqlFixTargetRange | null {
     if (!execRange) return null
+    const normStmt = (s: string): string => s.trim().replace(/;\s*$/, '').trim()
+    const targetNorm = normStmt(targetSql)
+    const hasValidResultIndex =
+      typeof resultIndex === 'number' &&
+      Number.isInteger(resultIndex) &&
+      resultIndex >= 0 &&
+      resultIndex < stmtSlices.length
+    const preferredIdx = hasValidResultIndex ? resultIndex : idx
+    const candidateSlice = stmtSlices[preferredIdx]
     const matchingSlice =
-      stmtSlices[idx] &&
-      (stmtSlices.length === totalSets || stmtSlices[idx].text.trim() === targetSql)
-        ? stmtSlices[idx]
+      candidateSlice &&
+      (stmtSlices.length === totalSets ||
+        normStmt(candidateSlice.text) === targetNorm ||
+        !targetNorm ||
+        (hasValidResultIndex && normStmt(execRange.sql) === targetNorm))
+        ? candidateSlice
         : null
     if (matchingSlice) {
       return {
         from: execRange.from + matchingSlice.start,
         to: execRange.from + matchingSlice.end,
         originalSlice: execRange.sql.slice(matchingSlice.start, matchingSlice.end),
+        statementIndex: preferredIdx,
+        totalStatements: stmtSlices.length,
+        preserveOtherStatements: stmtSlices.length > 1,
       }
     }
-    if (totalSets === 1 && stmtSlices.length <= 1) {
+    if (totalSets === 1 && stmtSlices.length === 1 && stmtSlices[0]) {
+      const onlySlice = stmtSlices[0]
+      return {
+        from: execRange.from + onlySlice.start,
+        to: execRange.from + onlySlice.end,
+        originalSlice: execRange.sql.slice(onlySlice.start, onlySlice.end),
+        statementIndex: 0,
+        totalStatements: 1,
+        preserveOtherStatements: true,
+      }
+    }
+    if (totalSets === 1 && stmtSlices.length === 0) {
       return {
         from: execRange.from,
         to: execRange.to,
         originalSlice: execRange.originalSlice,
+        statementIndex: 0,
+        totalStatements: 1,
+        preserveOtherStatements: true,
       }
     }
     return null
@@ -4805,19 +5144,57 @@ export class DatanoaStudioEditor {
   ): void {
     const sets = getEffectiveResultSets(res, overallSql)
     const stmtSlices =
-      execRange && driver !== 'redis' ? splitSqlStatements(execRange.sql, driver) : []
+      driver === 'redis'
+        ? []
+        : splitSqlStatements(execRange ? execRange.sql : overallSql, driver)
+    const execErrIdx =
+      typeof res.executionError?.failedStatementIndex === 'number' &&
+      Number.isInteger(res.executionError.failedStatementIndex) &&
+      res.executionError.failedStatementIndex >= 0
+        ? res.executionError.failedStatementIndex
+        : null
+    const execErrStmtCount =
+      typeof res.executionError?.statementCount === 'number' &&
+      Number.isInteger(res.executionError.statementCount) &&
+      res.executionError.statementCount > 0
+        ? res.executionError.statementCount
+        : null
     sets.forEach((rs, idx) => {
       const st = states[idx]
       if (!st?.banner || st.banner.kind !== 'error') return
-      const failedSql = (st.statementSql || rs.sql || overallSql).trim()
+      let failedSql = (st.statementSql || rs.sql || overallSql).trim()
       if (!failedSql) return
-      const fixTargetRange = this.resolveResultStatementRange(
-        failedSql,
-        idx,
-        sets.length,
-        stmtSlices,
-        execRange
-      )
+      const errMsg = rs.errorMessage || st.banner.errorText || st.banner.detail || ''
+      let fixTargetRange: SqlFixTargetRange | null
+      if (sets.length === 1 && stmtSlices.length > 1) {
+        const resolved = resolveExecutionErrorFixTarget(
+          execRange,
+          failedSql,
+          errMsg,
+          stmtSlices,
+          driver,
+          execErrIdx,
+          execErrStmtCount
+        )
+        failedSql = resolved.failedSql
+        fixTargetRange = resolved.fixTargetRange
+      } else {
+        fixTargetRange = this.resolveResultStatementRange(
+          failedSql,
+          idx,
+          sets.length,
+          stmtSlices,
+          execRange,
+          rs.index
+        )
+        if (
+          fixTargetRange &&
+          typeof fixTargetRange.statementIndex === 'number' &&
+          stmtSlices[fixTargetRange.statementIndex]
+        ) {
+          failedSql = stmtSlices[fixTargetRange.statementIndex].text.trim() || failedSql
+        }
+      }
       st.banner = {
         ...st.banner,
         failedSql,
@@ -4846,7 +5223,8 @@ export class DatanoaStudioEditor {
         idx,
         sets.length,
         stmtSlices,
-        execRange
+        execRange,
+        rs.index
       )
     })
   }
@@ -5177,10 +5555,12 @@ export class DatanoaStudioEditor {
       if (this.dmlPreviewEl) this.dmlPreviewEl.style.display = 'none'
 
       const totalPages = Math.max(1, Math.ceil(this.totalRows / this.pageSize))
+      this.currentColCount = pageData.columns.length
+      this.currentMetricsTruncated = false
       if (this.gridSubbarTitleEl) {
         this.gridSubbarTitleEl.textContent = readOnly
-          ? `${table} · ${pageData.columns.length} cols · RO`
-          : `${table} · ${pageData.columns.length} cols`
+          ? `${table} · RO`
+          : table
       }
       if (this.gridPageInfoEl) {
         this.gridPageInfoEl.textContent = `Page ${this.currentPage} / ${totalPages} (${this.totalRows} rows)`
@@ -5190,7 +5570,10 @@ export class DatanoaStudioEditor {
       this.updateExportDropdownOptions()
       this.saveStudioViewState(true)
       this.saveStudioDataCache()
-      this.updateStatus(`Loaded ${table}`, `${this.totalRows} rows`)
+      this.updateStatus(
+        `Loaded ${table}`,
+        formatGridStatusMetrics(this.totalRows, this.currentColCount)
+      )
 
       if (!cachedDetails) {
         void this.prefetchSingleTableForeignKeys(connectionId, table, targetSchema, loadToken)
@@ -5205,6 +5588,8 @@ export class DatanoaStudioEditor {
         return
       }
       this.isTableLoading = false
+      this.currentColCount = 0
+      this.currentMetricsTruncated = false
       const msg = err instanceof Error ? err.message : String(err)
       if (this.gridSubbarTitleEl) {
         this.gridSubbarTitleEl.textContent = `${table} · Error`
@@ -5225,7 +5610,7 @@ export class DatanoaStudioEditor {
         },
       })
       this.updatePaginationButtons()
-      this.updateStatus(`Error loading ${table}: ${msg}`)
+      this.updateStatus(`Error loading ${table}: ${msg}`, '0 rows')
     }
   }
 
@@ -5531,11 +5916,16 @@ export class DatanoaStudioEditor {
       isSelect: true,
     })
     this.updateStagedActionButtons(0)
+    this.currentColCount = 0
+    this.currentMetricsTruncated = false
     if (this.gridSubbarTitleEl) {
       this.gridSubbarTitleEl.textContent = 'SQL Result'
     }
     if (this.gridPageInfoEl) {
       this.gridPageInfoEl.textContent = '0 rows'
+    }
+    if (this.statusMetricsEl) {
+      this.statusMetricsEl.textContent = '0 rows'
     }
   }
 
@@ -5686,9 +6076,23 @@ export class DatanoaStudioEditor {
       this.currentPage = 1
       this.currentPageRowCount = existingState.gridSnapshot.model?.rows.length ?? rs.rows.length
       this.totalRows = rs.rowCount
+      this.currentColCount = rs.isError || !rs.isSelect
+        ? 0
+        : (existingState.gridSnapshot.model?.headers.length ?? rs.columns?.length ?? 0)
+      this.currentMetricsTruncated = Boolean(!rs.isError && rs.isSelect && rs.truncated)
       this.updatePaginationButtons()
       this.updateExportDropdownOptions()
       this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
+      if (this.statusMetricsEl && !this.editableSqlTarget) {
+        this.statusMetricsEl.textContent = formatGridStatusMetrics(
+          rs.isError ? 0 : rs.isSelect ? this.totalRows : (rs.affectedRows ?? 0),
+          this.currentColCount,
+          {
+            truncated: this.currentMetricsTruncated,
+            unit: !rs.isError && !rs.isSelect ? 'affected' : 'row',
+          }
+        )
+      }
       this.renderResultSetsBar()
       this.activeResultBannerState = existingState.banner ? { ...existingState.banner } : null
       this.syncQueryBannerForViewMode()
@@ -5712,6 +6116,12 @@ export class DatanoaStudioEditor {
       tab.executedConnectionId === this.activeConnectionId
     )
     const isExplain = Boolean(existingState?.banner?.isExplain)
+
+    this.currentPage = 1
+    this.currentPageRowCount = rs.isError ? 0 : rs.rows.length
+    this.totalRows = rs.isError ? 0 : rs.rowCount
+    this.currentColCount = rs.isError || !rs.isSelect ? 0 : (rs.columns?.length ?? 0)
+    this.currentMetricsTruncated = Boolean(!rs.isError && rs.isSelect && rs.truncated)
 
     if (rs.isError) {
       this.dataGrid?.setData({
@@ -5748,12 +6158,19 @@ export class DatanoaStudioEditor {
       this.gridPageInfoEl.textContent = existingState.gridPageInfo
     }
 
-    this.currentPage = 1
-    this.currentPageRowCount = rs.isError ? 0 : rs.rows.length
-    this.totalRows = rs.isError ? 0 : rs.rowCount
     this.updatePaginationButtons()
     this.updateExportDropdownOptions()
     this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
+    if (this.statusMetricsEl && !this.editableSqlTarget) {
+      this.statusMetricsEl.textContent = formatGridStatusMetrics(
+        rs.isError ? 0 : rs.isSelect ? this.totalRows : (rs.affectedRows ?? 0),
+        this.currentColCount,
+        {
+          truncated: this.currentMetricsTruncated,
+          unit: !rs.isError && !rs.isSelect ? 'affected' : 'row',
+        }
+      )
+    }
     this.renderResultSetsBar()
     this.activeResultBannerState = existingState?.banner ? { ...existingState.banner } : null
     this.syncQueryBannerForViewMode()
@@ -5939,6 +6356,7 @@ export class DatanoaStudioEditor {
         if (this.gridSubbarTitleEl) {
           this.gridSubbarTitleEl.textContent = nextSubbarTitle
         }
+        this.currentColCount = canonicalCols.length
         this.updateStagedActionButtons(this.dataGrid?.getStagedCount?.() ?? 0)
         if (rsState) {
           rsState.editableSqlTarget = { ...this.editableSqlTarget }
@@ -6033,9 +6451,15 @@ export class DatanoaStudioEditor {
     this.applyResultTabState(index, activeTab)
     const label = rs.isError
       ? 'Error'
-      : rs.isSelect
-        ? `${rs.rowCount} ${rs.rowCount === 1 ? 'row' : 'rows'}`
-        : `${rs.affectedRows ?? 0} affected`
+      : formatGridStatusMetrics(
+          rs.isSelect ? rs.rowCount : (rs.affectedRows ?? 0),
+          rs.isSelect ? (rs.columns?.length ?? 0) : 0,
+          {
+            stagedCount: this.editableSqlTarget ? (this.dataGrid?.getStagedCount?.() ?? 0) : 0,
+            truncated: Boolean(rs.isSelect && rs.truncated),
+            unit: rs.isSelect ? 'row' : 'affected',
+          }
+        )
     this.updateStatus(`Result ${index + 1} of ${sets.length}`, label)
   }
 
@@ -6198,6 +6622,69 @@ export class DatanoaStudioEditor {
       this.updateStatus(`Running ${elapsedText}...`)
     })
 
+    const handleQueryExecutionError = (
+      msg: string,
+      failedStatementIndex: number | null,
+      expectedStatementCount: number | null
+    ): void => {
+      this.consoleTabs?.setResultForTab?.(originTabId, null, 0, sqlText, targetConnId)
+      if (originTabId !== this.consoleTabs.getActiveTabId()) {
+        return
+      }
+      this.isShowingSqlResult = true
+      this.currentCanEdit = false
+      this.currentPageRowCount = 0
+      this.closeValueInspector()
+      const errSlices =
+        driver === 'redis'
+          ? []
+          : splitSqlStatements(execRange ? execRange.sql : sqlText, driver)
+      const { failedSql: errFailedSql, fixTargetRange: errFixRange } =
+        resolveExecutionErrorFixTarget(
+          execRange,
+          sqlText,
+          msg,
+          errSlices,
+          driver,
+          failedStatementIndex,
+          expectedStatementCount
+        )
+      this.showQueryBanner('error', 'SQL Execution Error', msg, {
+        showBackToTable: true,
+        failedSql: errFailedSql,
+        fixTargetRange: errFixRange,
+      })
+      this.sqlConsole?.setDbSyntaxError?.(msg, errFixRange, driver)
+      this.activeQueryResult = null
+      this.activeResultSetIndex = 0
+      this.hideResultSetsBar()
+      this.renderExplainAiForActiveTab()
+      this.dataGrid?.setEmptyMessage(`Query error: ${msg}`)
+      this.dataGrid?.setData({
+        columns: [],
+        rows: [],
+        rowCount: 0,
+        executionTimeMs: 0,
+        truncated: false,
+        isSelect: true,
+      })
+      this.updateStagedActionButtons(0)
+      this.updatePaginationButtons()
+      this.updateExportDropdownOptions()
+      if (this.gridSubbarTitleEl) {
+        this.gridSubbarTitleEl.textContent = 'SQL Error'
+      }
+      if (this.gridPageInfoEl) {
+        this.gridPageInfoEl.textContent = '0 rows'
+      }
+      this.currentColCount = 0
+      this.currentMetricsTruncated = false
+      this.updateStatus(`Query error: ${msg}`, '0 rows')
+      if (this.queryHistoryDrawer?.isOpen?.()) {
+        void this.queryHistoryDrawer.load()
+      }
+    }
+
     try {
       const startTime = performance.now()
       const res = await this.requestPlugin<QueryResult>(
@@ -6206,6 +6693,7 @@ export class DatanoaStudioEditor {
           connectionId: targetConnId,
           queryId,
           sql: sqlText,
+          structuredError: true,
         },
         { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
       )
@@ -6214,6 +6702,26 @@ export class DatanoaStudioEditor {
         viewSeq !== this.gridViewSeq ||
         this.activeConnectionId !== targetConnId
       ) {
+        return
+      }
+      if (res?.executionError) {
+        const execErrIdx =
+          typeof res.executionError.failedStatementIndex === 'number' &&
+          Number.isInteger(res.executionError.failedStatementIndex) &&
+          res.executionError.failedStatementIndex >= 0
+            ? res.executionError.failedStatementIndex
+            : null
+        const execErrCount =
+          typeof res.executionError.statementCount === 'number' &&
+          Number.isInteger(res.executionError.statementCount) &&
+          res.executionError.statementCount > 0
+            ? res.executionError.statementCount
+            : null
+        handleQueryExecutionError(
+          res.executionError.message || 'Query execution failed',
+          execErrIdx,
+          execErrCount
+        )
         return
       }
 
@@ -6281,21 +6789,35 @@ export class DatanoaStudioEditor {
         const errSet = sets[firstErrIdx]
         const errBanner = initialStates[firstErrIdx]?.banner
         const errMsg = errSet.errorMessage || errBanner?.errorText || errBanner?.detail || ''
-        this.sqlConsole?.setDbSyntaxError?.(errMsg, errBanner?.fixTargetRange ?? null)
+        this.sqlConsole?.setDbSyntaxError?.(errMsg, errBanner?.fixTargetRange ?? null, driver)
       } else {
         this.sqlConsole?.clearDbSyntaxError?.()
       }
       const activeRs = sets[this.activeResultSetIndex] || sets[0]
+      const isSelectSet = Boolean(activeRs ? activeRs.isSelect && !activeRs.isError : res.isSelect)
       const rowCount = activeRs
         ? activeRs.rowCount ?? activeRs.rows.length
         : (res.rowCount ?? res.rows.length)
-      const rowLabel = `${rowCount} ${rowCount === 1 ? 'row' : 'rows'}`
+      this.currentColCount = isSelectSet ? (activeRs?.columns?.length ?? res.columns?.length ?? 0) : 0
+      this.currentMetricsTruncated = Boolean(isSelectSet && (activeRs?.truncated ?? res.truncated))
       const activeDuration = activeRs?.executionTimeMs ?? durationMs
       this.updateStatus(
         sets.length > 1
           ? `Executed ${sets.length} statements in ${durationMs}ms`
           : `Query executed in ${activeDuration}ms`,
-        (activeRs?.truncated ?? res.truncated) ? `${rowLabel} (truncated)` : rowLabel
+        formatGridStatusMetrics(
+          activeRs?.isError
+            ? 0
+            : isSelectSet
+              ? rowCount
+              : (activeRs?.affectedRows ?? res.affectedRows ?? 0),
+          this.currentColCount,
+          {
+            stagedCount: this.editableSqlTarget ? (this.dataGrid?.getStagedCount?.() ?? 0) : 0,
+            truncated: this.currentMetricsTruncated,
+            unit: activeRs?.isError ? 'row' : isSelectSet ? 'row' : 'affected',
+          }
+        )
       )
       this.saveStudioViewState(true)
       this.saveStudioDataCache()
@@ -6313,49 +6835,9 @@ export class DatanoaStudioEditor {
       ) {
         return
       }
-      if (originTabId !== this.consoleTabs.getActiveTabId()) {
-        return
-      }
       const msg = err instanceof Error ? err.message : String(err)
-      this.isShowingSqlResult = true
-      this.currentCanEdit = false
-      this.currentPageRowCount = 0
-      this.closeValueInspector()
-      const errFixRange = execRange
-        ? { from: execRange.from, to: execRange.to, originalSlice: execRange.originalSlice }
-        : null
-      this.showQueryBanner('error', 'SQL Execution Error', msg, {
-        showBackToTable: true,
-        failedSql: sqlText,
-        fixTargetRange: errFixRange,
-      })
-      this.sqlConsole?.setDbSyntaxError?.(msg, errFixRange)
-      this.activeQueryResult = null
-      this.activeResultSetIndex = 0
-      this.hideResultSetsBar()
-      this.renderExplainAiForActiveTab()
-      this.dataGrid?.setEmptyMessage(`Query error: ${msg}`)
-      this.dataGrid?.setData({
-        columns: [],
-        rows: [],
-        rowCount: 0,
-        executionTimeMs: 0,
-        truncated: false,
-        isSelect: true,
-      })
-      this.updateStagedActionButtons(0)
-      this.updatePaginationButtons()
-      this.updateExportDropdownOptions()
-      if (this.gridSubbarTitleEl) {
-        this.gridSubbarTitleEl.textContent = 'SQL Error'
-      }
-      if (this.gridPageInfoEl) {
-        this.gridPageInfoEl.textContent = '0 rows'
-      }
-      this.updateStatus(`Query error: ${msg}`, '0 rows')
-      if (this.queryHistoryDrawer.isOpen()) {
-        void this.queryHistoryDrawer.load()
-      }
+      const meta = extractFailedStatementMetaFromError(err)
+      handleQueryExecutionError(msg, meta.failedStatementIndex, meta.statementCount)
     } finally {
       stopTimer()
       this.cancelledQueryIds.delete(queryId)
@@ -6613,17 +7095,19 @@ export class DatanoaStudioEditor {
         const errSet = collectedSets[firstErrIdx]
         const errBanner = initialStates[firstErrIdx]?.banner
         const errMsg = errSet.errorMessage || errBanner?.errorText || errBanner?.detail || ''
-        this.sqlConsole?.setDbSyntaxError?.(errMsg, errBanner?.fixTargetRange ?? null)
+        this.sqlConsole?.setDbSyntaxError?.(errMsg, errBanner?.fixTargetRange ?? null, driver)
       } else {
         this.sqlConsole?.clearDbSyntaxError?.()
       }
       const firstSet = collectedSets[0]
       const errCount = collectedSets.filter((s) => s.isError).length
+      this.currentColCount = firstSet && !firstSet.isError ? (firstSet.columns?.length ?? 0) : 0
+      this.currentMetricsTruncated = false
       this.updateStatus(
         explainStmts.length > 1
           ? `EXPLAIN completed (${explainStmts.length} statements${errCount > 0 ? `, ${errCount} failed` : ''}) in ${totalMs}ms`
           : `EXPLAIN completed in ${firstSet?.executionTimeMs ?? totalMs}ms`,
-        `${firstSet?.rowCount ?? 0} ${(firstSet?.rowCount ?? 0) === 1 ? 'row' : 'rows'}`
+        formatGridStatusMetrics(firstSet?.rowCount ?? 0, this.currentColCount)
       )
       this.saveStudioViewState(true)
       this.saveStudioDataCache()
@@ -6635,6 +7119,7 @@ export class DatanoaStudioEditor {
       ) {
         return
       }
+      this.consoleTabs?.setResultForTab?.(originTabId, null, 0, sqlText, targetConnId)
       if (originTabId !== this.consoleTabs.getActiveTabId()) {
         return
       }
@@ -6642,16 +7127,28 @@ export class DatanoaStudioEditor {
       this.isShowingSqlResult = true
       this.currentCanEdit = false
       this.currentPageRowCount = 0
-      const errFixRange = execRange
-        ? { from: execRange.from, to: execRange.to, originalSlice: execRange.originalSlice }
-        : null
+      const errSlices =
+        driver === 'redis'
+          ? []
+          : splitSqlStatements(execRange ? execRange.sql : sqlText, driver)
+      const errMeta = extractFailedStatementMetaFromError(err)
+      const { failedSql: errFailedSql, fixTargetRange: errFixRange } =
+        resolveExecutionErrorFixTarget(
+          execRange,
+          sqlText,
+          msg,
+          errSlices,
+          driver,
+          errMeta.failedStatementIndex,
+          errMeta.statementCount
+        )
       this.showQueryBanner('error', 'EXPLAIN Error', msg, {
         showBackToTable: true,
         isExplain: true,
-        failedSql: sqlText,
+        failedSql: errFailedSql,
         fixTargetRange: errFixRange,
       })
-      this.sqlConsole?.setDbSyntaxError?.(msg, errFixRange)
+      this.sqlConsole?.setDbSyntaxError?.(msg, errFixRange, driver)
       this.activeQueryResult = null
       this.activeResultSetIndex = 0
       this.hideResultSetsBar()
@@ -6671,9 +7168,11 @@ export class DatanoaStudioEditor {
       if (this.gridPageInfoEl) {
         this.gridPageInfoEl.textContent = '0 rows'
       }
+      this.currentColCount = 0
+      this.currentMetricsTruncated = false
       this.updatePaginationButtons()
       this.updateExportDropdownOptions()
-      this.updateStatus(`EXPLAIN error: ${msg}`)
+      this.updateStatus(`EXPLAIN error: ${msg}`, '0 rows')
     } finally {
       stopTimer()
       this.cancelledQueryIds.delete(queryId)
@@ -6765,8 +7264,8 @@ export class DatanoaStudioEditor {
         currentCanEdit: false,
         gridSubbarTitle:
           nextResult.resultSets && nextResult.resultSets.length > 1
-            ? `Result ${resultIdx + 1} · ${updatedSet.columns.length} cols`
-            : `SQL Result · ${updatedSet.columns.length} cols`,
+            ? `Result ${resultIdx + 1}`
+            : 'SQL Result',
         gridPageInfo: `${updatedSet.rowCount} ${updatedSet.rowCount === 1 ? 'row' : 'rows'}${updatedSet.truncated ? ' (truncated)' : ''}`,
         emptyMessage: 'Query returned no rows.',
       }
@@ -7408,6 +7907,15 @@ export class DatanoaStudioEditor {
       this.activeModalBackdrop.remove()
       this.activeModalBackdrop = null
     }
+    const dismiss = this.activeModalDismiss
+    this.activeModalDismiss = null
+    if (dismiss) {
+      try {
+        dismiss()
+      } catch {
+        // Ignore modal dismiss cleanup errors
+      }
+    }
   }
 
   private static modalTitleSeq = 0
@@ -7417,9 +7925,24 @@ export class DatanoaStudioEditor {
     canClose: () => boolean = () => true,
     onDismiss?: () => void
   ): HTMLDivElement | null {
+    if (this.isDestroyed) {
+      try {
+        onDismiss?.()
+      } catch {
+        // Ignore modal dismiss cleanup errors
+      }
+      return null
+    }
     this.closeActiveModal()
     closeActiveStudioCollapsibleDropdown()
-    if (typeof document === 'undefined' || !document.body) return null
+    if (typeof document === 'undefined' || !document.body) {
+      try {
+        onDismiss?.()
+      } catch {
+        // Ignore modal dismiss cleanup errors
+      }
+      return null
+    }
     const backdrop = document.createElement('div')
     backdrop.className = 'datanoa-modal-backdrop'
     backdrop.setAttribute('role', 'dialog')
@@ -7439,10 +7962,10 @@ export class DatanoaStudioEditor {
       backdrop.setAttribute('aria-label', modalEl.getAttribute('aria-label') || 'Dialog')
     }
     backdrop.appendChild(modalEl)
+    this.activeModalDismiss = onDismiss ?? null
     backdrop.addEventListener('click', (e) => {
       if (e.target === backdrop && canClose()) {
         this.closeActiveModal()
-        onDismiss?.()
       }
     })
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
@@ -7453,7 +7976,6 @@ export class DatanoaStudioEditor {
           ev.stopPropagation()
           if (canClose()) {
             this.closeActiveModal()
-            onDismiss?.()
           }
         }
       }
@@ -7751,12 +8273,16 @@ export class DatanoaStudioEditor {
   }
 
   private openDriverManagerModal(onCloseReturn?: () => void): void {
+    const returnIfAlive = onCloseReturn
+      ? () => {
+          if (!this.isDestroyed) onCloseReturn()
+        }
+      : undefined
     openStudioDriverManagerModal({
       mountModal: (modalEl, canClose) =>
-        this.mountStudioModal(modalEl, canClose, onCloseReturn),
+        this.mountStudioModal(modalEl, canClose, returnIfAlive),
       closeModal: () => {
         this.closeActiveModal()
-        onCloseReturn?.()
       },
       requestPlugin: <T = unknown>(
         method: string,
@@ -8053,6 +8579,44 @@ export class DatanoaStudioEditor {
     this.explainAiAbort?.abort()
     this.explainAiAbort = null
     this.explainAiLoadingTarget = null
+    if (this.explainAiEl) {
+      renderSharedExplainAiPanel(
+        this.explainAiEl,
+        {
+          phase: 'hidden',
+          aiEnabled: false,
+          aiReady: false,
+          explainLanguage: this.aiStatus?.explainLanguage || 'auto',
+        },
+        {
+          onAnalyze: () => {},
+          onConfigureAi: () => {},
+          onCancel: () => {},
+          onApplySql: () => {},
+          onOpenNewTab: () => {},
+          onCopyText: () => {},
+          onToggleCollapsed: () => {},
+        }
+      )
+    }
+    if (this.aiFixEl) {
+      renderSharedAiFixPanel(
+        this.aiFixEl,
+        {
+          phase: 'hidden',
+          aiEnabled: false,
+          aiReady: false,
+        },
+        {
+          onReplaceQuery: () => {},
+          onCopySql: () => {},
+          onRetry: () => {},
+          onCancel: () => {},
+          onDismiss: () => {},
+          onConfigureAi: () => {},
+        }
+      )
+    }
     this.cancelClientSearchDebounce()
     this.introspectToken++
     this.gridViewSeq++

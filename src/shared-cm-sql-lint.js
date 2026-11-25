@@ -91,6 +91,15 @@ function getCursorTokenBoundaryKey(doc, offset) {
   return `gap:${line.from + gapStart}:${line.from + gapEnd}:${atDocEnd}`
 }
 
+const sqlLintDialectField = StateField.define({
+  create() {
+    return () => ''
+  },
+  update(value) {
+    return value
+  },
+})
+
 export const sqlDiagnosticsField = StateField.define({
   create() {
     return { staticDiags: [], dbDiag: null }
@@ -134,10 +143,18 @@ export const sqlDiagnosticsField = StateField.define({
         if (!payload || typeof payload.errorMessage !== 'string' || !payload.errorMessage.trim()) {
           dbDiag = null
         } else {
+          const dialectGetter = tr.state.field(sqlLintDialectField, false)
+          const resolvedDialect =
+            typeof payload.dialect === 'string' && payload.dialect.trim()
+              ? payload.dialect
+              : typeof dialectGetter === 'function'
+                ? dialectGetter() || ''
+                : ''
           dbDiag = extractDbSyntaxErrorDiagnostic(
             tr.newDoc.toString(),
             payload.errorMessage,
-            payload.targetRange ?? null
+            payload.targetRange ?? null,
+            resolvedDialect
           )
         }
         changed = true
@@ -360,5 +377,11 @@ export function createCmSqlLintExtension(options = {}) {
     }
   )
 
-  return [sqlDiagnosticsField, diagnosticDecorations, lintPlugin, createSqlDiagHoverTooltip()]
+  return [
+    sqlLintDialectField.init(() => getDialect),
+    sqlDiagnosticsField,
+    diagnosticDecorations,
+    lintPlugin,
+    createSqlDiagHoverTooltip(),
+  ]
 }

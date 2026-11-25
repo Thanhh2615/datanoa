@@ -54,7 +54,6 @@ import {
 } from './panel-explorer.js'
 import { createPanelSqlController } from './panel-sql.js'
 import {
-  formatAiStatusBadge,
   openSharedAiConfigModal,
   saveOrcaSettingsPatch,
 } from '../shared-ai-ui.js'
@@ -1016,7 +1015,7 @@ const sqlCtrl = createPanelSqlController({
   savePanelDataCache: () => savePanelDataCache(),
   onFormatSql: () => formatSqlInEditor(),
   getAiStatus: () => state.aiStatus,
-  openAiSettingsModal: () => openAiSettingsModal(),
+  openAiSettingsModal: (initialRole) => openAiSettingsModal(initialRole),
   onRefreshAiStatus: () => hydrateAiStatus(),
 })
 const {
@@ -1566,7 +1565,7 @@ async function prefetchPanelAutocompleteSchema(connectionId) {
   )
   const missing = objs
     .filter((o) => !state.tableDetails[makeTableKey(connectionId, o.name, o.schema)])
-    .slice(0, 30)
+    .slice(0, 60)
   if (missing.length === 0) return
 
   let cursor = 0
@@ -2061,6 +2060,7 @@ function selectTableAndOpen(connectionId, tableName, schemaName, switchToData, o
     state.activeSchema !== schemaName
   if (state.activeConnectionId !== connectionId) {
     state.activeConnectionId = connectionId
+    sqlCtrl.clearAiGhost?.()
     sqlCtrl.clearAiFixPanel?.()
     sqlCtrl.clearDbSyntaxError?.()
     void persistActiveConnectionId(connectionId)
@@ -2091,6 +2091,7 @@ function selectTableAndOpen(connectionId, tableName, schemaName, switchToData, o
   $('clearFilterBtn').hidden = !state.whereClause
 
   if (!options.preserveSqlEditor) {
+    sqlCtrl.clearAiGhost?.()
     sqlCtrl.clearAiFixPanel?.()
     sqlCtrl.clearDbSyntaxError?.()
     const activeConn = getActiveConn()
@@ -4325,6 +4326,8 @@ window.addEventListener('pagehide', () => {
   }
   dataGridSel?.destroy?.()
   sqlGridSel?.destroy?.()
+  aiSettingsModalOpenSeq += 1
+  closeExistingAiSettingsBackdrops()
   destroySqlEditor()
   while (orcaDisposables.length > 0) {
     const d = orcaDisposables.pop()
@@ -4337,13 +4340,6 @@ window.addEventListener('pagehide', () => {
 
 function applyAiStatus(snapshot) {
   state.aiStatus = snapshot || null
-  const btn = $('sqlAiBtn')
-  if (btn) {
-    const badge = formatAiStatusBadge(state.aiStatus)
-    btn.textContent = badge.label
-    btn.title = badge.title
-    btn.className = `btn btn-ghost btn-sm datanoa-ai-toolbar-btn tone-${badge.tone}`
-  }
   sqlCtrl?.onAiStatusChanged?.()
 }
 
@@ -4356,12 +4352,61 @@ async function hydrateAiStatus() {
   }
 }
 
-async function openAiSettingsModal() {
+let aiSettingsModalOpenSeq = 0
+
+function closeExistingAiSettingsBackdrops() {
+  if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') {
+    return
+  }
+  for (const existing of document.querySelectorAll('.datanoa-ai-backdrop')) {
+    if (typeof existing._closeAiModal === 'function') {
+      try {
+        existing._closeAiModal()
+      } catch {
+        // Ignore modal teardown errors
+      }
+    }
+    if (existing.parentNode) {
+      existing.parentNode.removeChild(existing)
+    }
+  }
+}
+
+async function openAiSettingsModal(initialRole) {
+  const openSeq = ++aiSettingsModalOpenSeq
+  closeExistingAiSettingsBackdrops()
   await openSharedAiConfigModal({
     rpc,
     saveSettings: saveOrcaSettingsPatch,
     initialStatus: state.aiStatus,
+    ...(initialRole ? { initialRole } : {}),
     onStatusUpdated: (snapshot) => applyAiStatus(snapshot),
+    mountModal: (card, _canClose, onDismiss) => {
+      if (openSeq !== aiSettingsModalOpenSeq) {
+        onDismiss?.()
+        return null
+      }
+      closeExistingAiSettingsBackdrops()
+      const backdrop = document.createElement('div')
+      backdrop.className = 'modal-backdrop datanoa-ai-backdrop'
+      const closeBackdrop = () => {
+        onDismiss?.()
+        if (backdrop.parentNode) {
+          backdrop.parentNode.removeChild(backdrop)
+        }
+      }
+      backdrop._closeAiModal = closeBackdrop
+      backdrop.addEventListener('click', (e) => {
+        if (e.target === backdrop) closeBackdrop()
+      })
+      backdrop.appendChild(card)
+      document.body.appendChild(backdrop)
+      card.focus()
+      return backdrop
+    },
+    closeModal: () => {
+      closeExistingAiSettingsBackdrops()
+    },
   })
 }
 

@@ -307,6 +307,15 @@ function scanStatements(
   return statements
 }
 
+const ORACLE_IDENTIFIED_BY_NON_SECRET_WORDS: ReadonlySet<string> = new Set([
+  'RANDOM',
+  'PASSWORD',
+  'NULL',
+  'EXTERNALLY',
+  'GLOBALLY',
+  'VALUES',
+])
+
 function isStringCredentialToken(token: SqlToken | undefined, allowDoubleQuoted: boolean): boolean {
   if (!token) return false
   if (token.kind === 'string') {
@@ -337,7 +346,9 @@ function hasAccountAuthLiteral(tokens: SqlToken[]): boolean {
   const isAccountTarget =
     isCreateOrAlter &&
     tokens[accountTargetIdx]?.kind === 'word' &&
-    (tokens[accountTargetIdx].upper === 'USER' || tokens[accountTargetIdx].upper === 'ROLE')
+    (tokens[accountTargetIdx].upper === 'USER' ||
+      tokens[accountTargetIdx].upper === 'ROLE' ||
+      tokens[accountTargetIdx].upper === 'LOGIN')
 
   const isSetPassword =
     first.upper === 'SET' && tokens[1]?.kind === 'word' && tokens[1].upper === 'PASSWORD'
@@ -373,9 +384,21 @@ function hasAccountAuthLiteral(tokens: SqlToken[]): boolean {
     const tok = tokens[i]
     if (tok.kind !== 'word') continue
 
-    // PostgreSQL / CockroachDB: CREATE/ALTER USER|ROLE ... [ENCRYPTED|UNENCRYPTED] PASSWORD '<literal>'
-    if (isAccountTarget && tok.upper === 'PASSWORD') {
-      const next = tokens[i + 1]
+    // PostgreSQL / CockroachDB / MSSQL:
+    // CREATE/ALTER USER|ROLE|LOGIN ... [ENCRYPTED|UNENCRYPTED] PASSWORD [=] [N]'<literal>'
+    if (isAccountTarget && (tok.upper === 'PASSWORD' || tok.upper === 'OLD_PASSWORD')) {
+      let valIdx = i + 1
+      if (tokens[valIdx]?.kind === 'symbol' && tokens[valIdx].raw === '=') {
+        valIdx += 1
+      }
+      if (
+        tokens[valIdx]?.kind === 'word' &&
+        tokens[valIdx].upper === 'N' &&
+        tokens[valIdx + 1]?.kind === 'string'
+      ) {
+        valIdx += 1
+      }
+      const next = tokens[valIdx]
       if (next && next.kind === 'word' && next.upper === 'NULL') {
         continue
       }
@@ -384,22 +407,34 @@ function hasAccountAuthLiteral(tokens: SqlToken[]): boolean {
       }
     }
 
-    // MySQL / MariaDB / ClickHouse: IDENTIFIED [WITH <plugin>] BY '<literal>'
+    // MySQL / MariaDB / ClickHouse / Oracle:
+    // IDENTIFIED [WITH <plugin>] BY '<literal>' | "<literal>" | <unquoted_oracle_pw>
     if (tok.upper === 'IDENTIFIED') {
       let cursor = i + 1
       if (tokens[cursor]?.kind === 'word' && tokens[cursor].upper === 'WITH') {
         cursor += 2
       }
       if (tokens[cursor]?.kind === 'word' && tokens[cursor].upper === 'BY') {
-        const secretTok = tokens[cursor + 1]
+        let valIdx = cursor + 1
+        if (
+          tokens[valIdx]?.kind === 'word' &&
+          tokens[valIdx].upper === 'N' &&
+          tokens[valIdx + 1]?.kind === 'string'
+        ) {
+          valIdx += 1
+        }
+        const secretTok = tokens[valIdx]
         if (
           secretTok &&
           secretTok.kind === 'word' &&
-          (secretTok.upper === 'RANDOM' || secretTok.upper === 'PASSWORD')
+          ORACLE_IDENTIFIED_BY_NON_SECRET_WORDS.has(secretTok.upper)
         ) {
           continue
         }
         if (isStringCredentialToken(secretTok, true)) {
+          return true
+        }
+        if (secretTok && secretTok.kind === 'word' && isNonEmptyRealCredential(secretTok.value)) {
           return true
         }
       }

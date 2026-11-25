@@ -21,6 +21,7 @@ import type {
 } from '../common/driver'
 import {
   DatabaseDriverError,
+  attachFailedStatementMeta,
   buildCombinedAbortSignal,
   createUnsupportedTransactionError,
   createUnsupportedTransactionState,
@@ -1048,7 +1049,23 @@ export class LibsqlSession implements IDatabaseSession {
       }
 
       if (stmts.length <= 1) {
-        const res = await this.executeSingle(trimmed, [], controller.signal)
+        let res: HranaExecuteResult
+        try {
+          res = await this.executeSingle(trimmed, [], controller.signal)
+        } catch (singleErr: unknown) {
+          if (
+            !active.cancelled &&
+            !(
+              singleErr instanceof DatabaseDriverError &&
+              (singleErr.code === 'cancelled' ||
+                singleErr.code === 'SESSION_CLOSED' ||
+                singleErr.code === 'TIMEOUT')
+            )
+          ) {
+            throw attachFailedStatementMeta(singleErr, 0, 1)
+          }
+          throw singleErr
+        }
         const parsed = parseHranaStatementResult(res, trimmed, maxRows)
         if (parsed.isSelect) {
           lastSelect = parsed.result
@@ -1117,10 +1134,14 @@ export class LibsqlSession implements IDatabaseSession {
         for (let i = 0; i < stmts.length; i++) {
           const stepErr = stepErrors[i]
           if (stepErr) {
-            throw new DatabaseDriverError(
-              formatHranaErrorMessage(stepErr.message, 'LibSQL statement execution failed'),
-              stepErr.code || 'LIBSQL_ERROR',
-              'libsql'
+            throw attachFailedStatementMeta(
+              new DatabaseDriverError(
+                formatHranaErrorMessage(stepErr.message, 'LibSQL statement execution failed'),
+                stepErr.code || 'LIBSQL_ERROR',
+                'libsql'
+              ),
+              i,
+              stmts.length
             )
           }
         }

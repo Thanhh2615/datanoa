@@ -3,7 +3,7 @@
   "manifestVersion": 2,
   "id": "datanoa",
   "name": "Datanoa Studio",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "license": "MIT",
   "author": {
     "name": "Thanhh2615",
@@ -14,7 +14,7 @@
   "icon": "assets/icon.png",
   "cover": {
     "path": "images/cover.webp",
-    "alt": "Datanoa Studio v1.2.1 database client and SQL studio for Orca with multi-tab SQL editor, AI SQL Assistant, data grid, and schema explorer"
+    "alt": "Datanoa Studio v1.2.2 database client and SQL studio for Orca with multi-tab SQL editor, AI SQL Assistant, data grid, and schema explorer"
   },
   "screenshots": [
     {
@@ -48,7 +48,7 @@
       "theme": "dark"
     }
   ],
-  "description": "Database client and SQL studio for Orca with an opt-in AI SQL Assistant (inline ghost completion, real-time SQL syntax diagnostics, Fix with AI, and EXPLAIN plan analyzer). Browse schemas, edit and import data, design tables, and run SQL, MQL, or Redis queries over SSH and TLS across 12 built-in engines (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, LibSQL/Turso, Cloudflare D1, MSSQL, Oracle, MongoDB) plus 7 local BYOD drivers.",
+  "description": "Database client and SQL studio for Orca with real-time SQL syntax diagnostics and an opt-in dual-role AI SQL Assistant (inline ghost completion, inline statement edits, Fix with AI, and EXPLAIN plan analyzer). Browse schemas, edit and import data, design tables, and run SQL, MQL, or Redis queries over SSH and TLS across 12 built-in engines (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, LibSQL/Turso, Cloudflare D1, MSSQL, Oracle, MongoDB) plus 7 local BYOD drivers.",
   "engines": {
     "orca": ">=1.4.248"
   },
@@ -113,8 +113,8 @@
       },
       {
         "key": "aiEnabled",
-        "title": "AI SQL Assistant",
-        "description": "Enable AI inline SQL autocomplete (ghost text) and EXPLAIN plan analysis. When off, only local schema and keyword completion runs.",
+        "title": "AI Inline SQL Autocomplete",
+        "description": "Enable AI inline SQL autocomplete (ghost text) and inline statement edits (Alt+\\). When off, only local schema and keyword completion runs.",
         "type": "boolean",
         "default": false
       },
@@ -133,14 +133,14 @@
           "OpenAI-compatible (/chat/completions)",
           "Anthropic-compatible (/v1/messages)",
           "Ollama (/api/generate FIM & /api/chat)",
-          "Mistral / Codestral (/v1/fim/completions)"
+          "Mistral / Codestral (/v1/fim/completions for inline)"
         ],
         "default": "openai"
       },
       {
         "key": "aiBaseUrl",
         "title": "AI Base URL",
-        "description": "Root URL of your chosen AI provider.",
+        "description": "Root URL of your chosen AI provider for inline autocomplete (and EXPLAIN & Fix when Sync AI Provider Across Tasks is enabled).",
         "type": "string",
         "default": "https://api.openai.com/v1",
         "placeholder": "http://localhost:11434/v1"
@@ -148,7 +148,7 @@
       {
         "key": "aiModel",
         "title": "AI Model",
-        "description": "Fast model for inline SQL completion and EXPLAIN analysis.",
+        "description": "Fast model for inline SQL autocomplete (and EXPLAIN & Fix when Sync AI Provider Across Tasks is enabled).",
         "type": "string",
         "default": "gpt-4o-mini"
       },
@@ -163,8 +163,8 @@
       },
       {
         "key": "aiExplainMaxTokens",
-        "title": "AI EXPLAIN Max Tokens",
-        "description": "Maximum tokens for AI EXPLAIN analysis responses (higher values prevent truncation in Vietnamese/CJK).",
+        "title": "AI EXPLAIN & Fix Max Tokens",
+        "description": "Maximum tokens for AI EXPLAIN analysis and Fix with AI responses (higher values prevent truncation in Vietnamese/CJK).",
         "type": "integer",
         "default": 2048,
         "minimum": 256,
@@ -172,8 +172,8 @@
       },
       {
         "key": "aiExplainLanguage",
-        "title": "EXPLAIN Analysis Language",
-        "description": "Language used by AI when explaining execution plans and bottlenecks. SQL and DDL stay in standard SQL.",
+        "title": "EXPLAIN & Fix Response Language",
+        "description": "Language used by AI for EXPLAIN execution plan analysis and Fix with AI explanations. SQL and DDL stay in standard SQL.",
         "type": "string",
         "enum": [
           "auto",
@@ -200,6 +200,54 @@
           "Português (Portuguese)"
         ],
         "default": "auto"
+      },
+      {
+        "key": "aiSync",
+        "title": "Sync AI Provider Across Tasks",
+        "description": "Share one AI provider, base URL, model, and API key across both Inline Autocomplete and EXPLAIN & Fix. Disable to configure each task independently.",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "aiExplainEnabled",
+        "title": "AI EXPLAIN & Fix Assistant",
+        "description": "Enable AI execution plan analysis (EXPLAIN) and Fix with AI error repair.",
+        "type": "boolean",
+        "default": false
+      },
+      {
+        "key": "aiExplainFormat",
+        "title": "AI EXPLAIN & Fix Provider Format",
+        "description": "API protocol used for EXPLAIN analysis and Fix with AI when Sync AI Provider Across Tasks is disabled.",
+        "type": "string",
+        "enum": [
+          "openai",
+          "anthropic",
+          "ollama",
+          "mistral-fim"
+        ],
+        "enumLabels": [
+          "OpenAI-compatible (/chat/completions)",
+          "Anthropic-compatible (/v1/messages)",
+          "Ollama (/api/chat)",
+          "Mistral (/v1/chat/completions)"
+        ],
+        "default": "openai"
+      },
+      {
+        "key": "aiExplainBaseUrl",
+        "title": "AI EXPLAIN & Fix Base URL",
+        "description": "Root URL of the AI provider used for EXPLAIN analysis and Fix with AI when not synced.",
+        "type": "string",
+        "default": "https://api.openai.com/v1",
+        "placeholder": "https://api.openai.com/v1"
+      },
+      {
+        "key": "aiExplainModel",
+        "title": "AI EXPLAIN & Fix Model",
+        "description": "Instruction or chat model used for EXPLAIN analysis and Fix with AI when not synced.",
+        "type": "string",
+        "default": "gpt-4o-mini"
       }
     ]
   },

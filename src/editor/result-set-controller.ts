@@ -7,6 +7,35 @@ import type { ResultBannerState, ResultSetTabRuntimeState } from './console-tabs
 
 export type StudioViewMode = 'split' | 'grid' | 'sql' | 'inspector'
 
+const toNonNegInt = (raw: unknown): number => {
+  const num = Number(raw)
+  return Number.isFinite(num) && num > 0 ? Math.floor(num) : 0
+}
+
+/**
+ * Formats bottom status-bar row and column metrics consistently across table browse and SQL results.
+ */
+export function formatGridStatusMetrics(
+  rowCount: number,
+  colCount: number,
+  opts?: {
+    stagedCount?: number
+    truncated?: boolean
+    unit?: 'row' | 'affected'
+  }
+): string {
+  const rows = toNonNegInt(rowCount)
+  const cols = toNonNegInt(colCount)
+  const staged = toNonNegInt(opts?.stagedCount)
+  if (opts?.unit === 'affected') {
+    return `${rows} affected`
+  }
+  const rowLabel = `${rows} ${rows === 1 ? 'row' : 'rows'}`
+  const base = opts?.truncated ? `${rowLabel} (truncated)` : rowLabel
+  const withCols = cols > 0 ? `${base} · ${cols} ${cols === 1 ? 'col' : 'cols'}` : base
+  return staged > 0 ? `${withCols} (+${staged} staged)` : withCols
+}
+
 /**
  * Collapses whitespace and truncates SQL for compact status/banner previews.
  */
@@ -160,8 +189,8 @@ export function buildInitialResultTabStates(
             ? `Result ${idx + 1} · ${rs.affectedRows ?? 0} affected`
             : `Executed · ${rs.affectedRows ?? 0} affected`
           : sets.length > 1
-            ? `Result ${idx + 1} · ${rs.columns?.length ?? 0} cols`
-            : `SQL Result · ${rs.columns?.length ?? 0} cols`
+            ? `Result ${idx + 1}`
+            : 'SQL Result'
 
     out[idx] = {
       resultSetIndex: idx,

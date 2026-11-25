@@ -43,7 +43,7 @@ cd datanoa
 # 2. Install dependencies
 npm install
 
-# 3. Bundle vendor drivers (iconv-lite, pg, mysql2, mongodb, mssql, oracledb, CodeMirror 6) into vendor/ (< 1 MiB & CSP audit)
+# 3. Bundle vendor drivers & parsers (iconv-lite, pg, mysql2, mongodb, mssql, oracledb, CodeMirror 6, node-sql-parser) into vendor/ (< 1 MiB & CSP audit)
 npm run build
 
 # 4. Run the full verification pipeline (build + size + typecheck + validate + check)
@@ -57,7 +57,7 @@ orca plugin dev load .
 ```
 
 > **Note on "Install plugin -> Local folder" in Orca Desktop:**
-> All runtime dependencies (`vendor/iconv-lite.js`, `vendor/pg.js`, `vendor/mysql2.js`, `vendor/mongodb.js`, `vendor/mssql.js`, `vendor/oracledb.js`, `vendor/codemirror.js`) are pre-bundled into `vendor/` (`~2.70 MB` total; total packaged workspace payload `<= 25,000,000` bytes). However, Orca Desktop's **Local folder** installer scans the entire folder on disk (including untracked directories) against a 50 MiB / file-count limit. Before installing from a local checkout via **Install plugin -> Local folder** (or inspecting with `orca plugin inspect .`), remove dev-only directories (`rm -rf node_modules .serena .orca .datanoa .vite`) or use `orca plugin dev load .`.
+> All runtime dependencies (`vendor/iconv-lite.js`, `vendor/pg.js`, `vendor/mysql2.js`, `vendor/mongodb.js`, `vendor/mssql.js`, `vendor/oracledb.js`, `vendor/codemirror.js`, `vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js`) are pre-bundled into `vendor/` (`~3.76 MB` total; total packaged workspace payload `<= 25,000,000` bytes). However, Orca Desktop's **Local folder** installer scans the entire folder on disk (including untracked directories) against a 50 MiB / file-count limit. Before installing from a local checkout via **Install plugin -> Local folder** (or inspecting with `orca plugin inspect .`), remove dev-only directories (`rm -rf node_modules .serena .orca .datanoa .vite`) or use `orca plugin dev load .`.
 
 ---
 
@@ -72,18 +72,20 @@ datanoa/
 │   └── check-package-size.mjs            # Package payload & vendor size budget guard
 ├── images/                               # 960x600 cover & 1280x800/1600x1000 (16:10) screenshots
 ├── vendor/
-│   ├── iconv-lite.js                     # Shared ESM iconv-lite bundle (used by mysql2 & mssql)
-│   ├── pg.js / pg.d.ts                   # Bundled node-postgres + pg-cursor
-│   ├── mysql2.js / mysql2.d.ts           # Bundled mysql2 (with IP-SAN TLS identity patch)
-│   ├── mongodb.js / mongodb.d.ts         # Bundled official MongoDB driver + BSON/EJSON
-│   ├── mssql.js / mssql.d.ts             # Bundled mssql + tedious (node:stream & Azure stubs)
-│   ├── oracledb.js / oracledb.d.ts       # Bundled OracleDB Thin Mode driver
-│   └── codemirror.js / codemirror.d.ts   # Bundled CodeMirror 6 SQL editor & Lezer highlight
+│   ├── iconv-lite.js                         # Shared ESM iconv-lite bundle (used by mysql2 & mssql)
+│   ├── pg.js / pg.d.ts                       # Bundled node-postgres + pg-cursor
+│   ├── mysql2.js / mysql2.d.ts               # Bundled mysql2 (with IP-SAN TLS identity patch)
+│   ├── mongodb.js / mongodb.d.ts             # Bundled official MongoDB driver + BSON/EJSON
+│   ├── mssql.js / mssql.d.ts                 # Bundled mssql + tedious (node:stream & Azure stubs)
+│   ├── oracledb.js / oracledb.d.ts           # Bundled OracleDB Thin Mode driver
+│   ├── codemirror.js / codemirror.d.ts       # Bundled CodeMirror 6 SQL editor & Lezer highlight
+│   ├── sql-parser-pg-sqlite.js / .d.ts       # Bundled node-sql-parser (PostgreSQL & SQLite AST grammar)
+│   └── sql-parser-mysql-mssql.js / .d.ts     # Bundled node-sql-parser (MySQL & T-SQL AST grammar)
 ├── src/
 │   ├── protocol.ts                       # Canonical IPC contracts & payload sanitizer
-│   ├── shared-ai-ui.js                   # Shared AI config modal, language selector & EXPLAIN panel UI
+│   ├── shared-ai-ui.js                   # Shared dual-role AI modal, Fix with AI & resizable EXPLAIN panel UI
 │   ├── shared-ai-ui.d.ts                 # TypeScript declaration for shared-ai-ui.js
-│   ├── shared-cm-inline-ai.js            # Shared CodeMirror 6 ghost text, Pacer & telemetry extension
+│   ├── shared-cm-inline-ai.js            # Shared CodeMirror 6 ghost text, multi-hunk statement diffs (Alt+\), Pacer & telemetry extension
 │   ├── shared-cm-inline-ai.d.ts          # TypeScript declaration for shared-cm-inline-ai.js
 │   ├── shared-cm-sql-lint.js             # Shared CodeMirror 6 SQL syntax diagnostics & live DB error lint extension
 │   ├── shared-cm-sql-lint.d.ts           # TypeScript declaration for shared-cm-sql-lint.js
@@ -96,9 +98,9 @@ datanoa/
 │   ├── shared-file-picker.d.ts           # TypeScript declaration for shared-file-picker.js
 │   ├── shared-grid-paste.js              # Shared delimited clipboard, lossless BIGINT JSON formatter, paste planner & error sanitizer
 │   ├── shared-grid-paste.d.ts            # TypeScript declaration for shared-grid-paste.js
-│   ├── shared-sql-core.js                # Shared SQL lexer, splitter, formatter, DDL guard & type/default validators
+│   ├── shared-sql-core.js                # Shared SQL lexer, splitter, active statement isolation, target range remapping, formatter, DDL guard & validators
 │   ├── shared-sql-core.d.ts              # TypeScript declaration for shared-sql-core.js
-│   ├── shared-sql-diagnostics.js         # Shared zero-dependency multi-dialect SQL syntax diagnostic engine
+│   ├── shared-sql-diagnostics.js         # Shared zero-dependency multi-dialect SQL syntax diagnostic engine & multi-statement DB error targeting
 │   ├── shared-sql-diagnostics.d.ts       # TypeScript declaration for shared-sql-diagnostics.js
 │   ├── shared-sql-safety.js              # Shared dangerous SQL analyzer, URI secret masker, storage scrubbers & Redis credential detector
 │   ├── shared-sql-safety.d.ts            # TypeScript declaration for shared-sql-safety.js
@@ -196,9 +198,12 @@ datanoa/
 │       ├── index.ts                      # Trusted Worker entry
 │       ├── tx-ownership.ts               # Serialized cross-panel transaction ownership lock controller
 │       ├── worker-utils.ts               # Sanitization, serialized queues, IPC cap & backup
-│       ├── ai-client.ts                  # Multi-provider AI HTTP client, URL guard, secret blocklist & telemetry
-│       ├── ai-sql-context.ts             # 3-tier schema pruning, history masking & EXPLAIN prompt/parser
-│       ├── rpc-ai.ts                     # AI completion, EXPLAIN analysis, keyring & stats RPCs
+│       ├── ai-client.ts                  # Multi-provider AI HTTP client (FIM, chat & statement edits), URL guard, secret blocklist & telemetry
+│       ├── ai-config-store.ts            # Dual-role AI settings resolver, per-role host-pinned keyring & v1.2.1 migration
+│       ├── ai-nep.ts                     # Mini-NEP statement windowing, shadow healing, token diff & edit filtering
+│       ├── ai-sql-context.ts             # 3-tier schema pruning, history masking, EXPLAIN & Fix prompt/parsers
+│       ├── sql-grammar.ts                # Bundled node-sql-parser AST grammar validation for PG/CockroachDB, MySQL/MariaDB, SQLite/LibSQL/D1 & MSSQL
+│       ├── rpc-ai.ts                     # Dual-role AI completion, statement edits, EXPLAIN/Fix, keyring & stats RPCs
 │       ├── rpc-connections.ts            # Connection, workspace discovery & local driver RPCs
 │       ├── rpc-data-schema.ts            # Schema introspection & data browse/mutation RPCs
 │       ├── rpc-query-tx.ts               # Query execution, cancellation, history & transactions

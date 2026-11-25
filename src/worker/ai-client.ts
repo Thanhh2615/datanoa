@@ -6,15 +6,9 @@ import type {
 } from '../protocol'
 import { detectRecognizableSqlCredential } from '../drivers/common/sql-credentials'
 import { isSensitiveUriParamKey, scrubSensitiveText } from '../shared-sql-safety.js'
+import { doesInsertionIntroduceGrammarError } from './sql-grammar'
 
-export type AiDialect = DatabaseDriverType | 'mssql' | 'oracle' | 'mongodb'
-
-function toLegacySqlDriver(dialect?: AiDialect): DatabaseDriverType | undefined {
-  if (!dialect || dialect === 'mssql' || dialect === 'oracle' || dialect === 'mongodb') {
-    return undefined
-  }
-  return dialect
-}
+export type AiDialect = DatabaseDriverType
 
 export const AI_COMPLETE_TIMEOUT_MS = 15_000
 export const AI_EXPLAIN_TIMEOUT_MS = 60_000
@@ -38,8 +32,11 @@ export const AI_MAX_MODELS_BODY_BYTES = 2 * 1024 * 1024
 export const AI_EVENT_KINDS = ['shown', 'accepted', 'partial', 'kept', 'undone', 'stale'] as const
 
 const FORMATS: readonly AiProviderFormat[] = ['openai', 'anthropic', 'ollama', 'mistral-fim']
-const FIM_TEMPERATURE = 0.2
-const ECHO_MAX_LINES = 5
+const FIM_TEMPERATURE = 0.01
+const OLLAMA_NUM_CTX = 4096
+const OLLAMA_MAX_ADAPTIVE_NUM_CTX = 16384
+const OLLAMA_KEEP_ALIVE = '30m'
+const ECHO_MAX_LINES = 24
 const ECHO_MIN_CHARS = 3
 const OVERLAP_PROBE_CHARS = 30
 const OVERLAP_MIN_PROBE_CHARS = 8
@@ -48,6 +45,8 @@ const STATS_MODELS_KEPT = 40
 const RECOMMENDED_COUNT = 3
 const AI_CHAT_RETRY_DELAY_MS = 750
 const TRANSIENT_GATEWAY_STATUSES: ReadonlySet<number> = new Set([502, 503, 504])
+export const CHAT_INLINE_TEMPERATURE = 0.01
+const MAX_HOSTED_STOP_SEQUENCES = 4
 
 export interface AiProviderConfig {
   format: AiProviderFormat
@@ -78,6 +77,25 @@ export const AI_PRESETS: readonly AiPreset[] = [
 
 export function parseFormat(value: unknown): AiProviderFormat {
   return FORMATS.find((f) => f === value) ?? 'openai'
+}
+
+const FIM_ONLY_MODEL_RE =
+  /(?:^|[:/_-])(base|fim)(?:$|[:_-])|(?:^|\/)(?:mellum|starcoder|sweep-next-edit)|-base$/i
+
+export function isChatIncompatibleBaseModel(model: string): boolean {
+  const trimmed = typeof model === 'string' ? model.trim() : ''
+  if (!trimmed) return false
+  return FIM_ONLY_MODEL_RE.test(trimmed)
+}
+
+export function isFimOnlyModel(format: AiProviderFormat, model: string): boolean {
+  if (format === 'mistral-fim') return true
+  return isChatIncompatibleBaseModel(model)
+}
+
+export function isQwenCoderModel(model: string): boolean {
+  const trimmed = typeof model === 'string' ? model.trim() : ''
+  return /qwen.*coder/i.test(trimmed)
 }
 
 export function sameAddress(a: string, b: string): boolean {
@@ -127,6 +145,30 @@ const postJson = (url: string, headers: Record<string, string>, body: object): B
 
 const bearer = (apiKey: string): Record<string, string> => (apiKey ? { authorization: `Bearer ${apiKey}` } : {})
 
+function resolveOllamaChatNumCtx(
+  system: string,
+  user: string,
+  maxTokens: number,
+  extraBody?: Record<string, unknown>
+): number {
+  if (extraBody && 'num_ctx' in extraBody) {
+    const raw = extraBody.num_ctx
+    if (typeof raw === 'number' || (typeof raw === 'string' && raw.trim() !== '')) {
+      const explicit = Math.trunc(Number(raw))
+      if (Number.isFinite(explicit) && explicit > 0) {
+        return explicit
+      }
+    }
+  }
+  const safeMaxTokens = Number.isFinite(maxTokens) && maxTokens > 0 ? Math.trunc(maxTokens) : 0
+  const estimatedTokens =
+    Math.ceil((system.length + user.length) / 3) + safeMaxTokens + 256
+  if (estimatedTokens <= OLLAMA_NUM_CTX) {
+    return OLLAMA_NUM_CTX
+  }
+  return Math.min(OLLAMA_MAX_ADAPTIVE_NUM_CTX, Math.ceil(estimatedTokens / 1024) * 1024)
+}
+
 /** Builds a chat completion request across all 4 formats (used for chat inline completion and EXPLAIN analysis). */
 export function buildChatRequest(
   provider: AiProviderConfig,
@@ -154,14 +196,30 @@ export function buildChatRequest(
     )
   }
   if (provider.format === 'ollama') {
+    const options: Record<string, unknown> = {
+      num_ctx: resolveOllamaChatNumCtx(system, user, maxTokens, extraBody),
+      num_predict: maxTokens,
+    }
+    if (
+      extraBody &&
+      'temperature' in extraBody &&
+      typeof extraBody.temperature === 'number' &&
+      Number.isFinite(extraBody.temperature)
+    ) {
+      options.temperature = extraBody.temperature
+    }
+    if (extraBody && 'stop' in extraBody && Array.isArray(extraBody.stop)) {
+      options.stop = extraBody.stop
+    }
     return postJson(joinUrl(withoutV1(provider.baseUrl), '/api/chat'), bearer(provider.apiKey), {
       model: provider.model,
       stream,
+      keep_alive: OLLAMA_KEEP_ALIVE,
       messages: [
         { role: 'system', content: system },
         { role: 'user', content: user },
       ],
-      options: { num_predict: maxTokens },
+      options,
     })
   }
   const chatRoot = provider.format === 'mistral-fim' ? withV1(provider.baseUrl) : provider.baseUrl
@@ -185,6 +243,9 @@ export interface AiCompletionRequest {
   suffix: string
   fimPrefix?: string
   fimSuffix?: string
+  fimSchemaDdl?: string
+  fimHistorySql?: string
+  fimPriorSql?: string
   multiline?: boolean
   knownIdentifiers?: Iterable<string>
 }
@@ -209,6 +270,53 @@ export interface SqlCompletionResult {
 
 export type CompleteSqlParams = AiCompletionRequest
 
+const MODEL_FIM_STOP_RULES: readonly { pattern: RegExp; stops: readonly string[] }[] = [
+  {
+    pattern: /qwen/i,
+    stops: [
+      '<|endoftext|>',
+      '<|fim_prefix|>',
+      '<|fim_middle|>',
+      '<|fim_suffix|>',
+      '<|fim_pad|>',
+      '<|file_sep|>',
+      '<|repo_name|>',
+      '<|im_start|>',
+      '<|im_end|>',
+    ],
+  },
+  {
+    pattern: /codestral/i,
+    stops: ['[PREFIX]', '[SUFFIX]'],
+  },
+  {
+    pattern: /deepseek/i,
+    stops: ['<｜fim▁begin｜>', '<｜fim▁hole｜>', '<｜fim▁end｜>', '<｜end▁of▁sentence｜>'],
+  },
+  {
+    pattern: /codegemma/i,
+    stops: ['<|fim_prefix|>', '<|fim_suffix|>', '<|fim_middle|>', '<|file_separator|>', '<end_of_turn>'],
+  },
+  {
+    pattern: /codellama|code-llama/i,
+    stops: ['<PRE>', '<SUF>', '<MID>', '<EOT>'],
+  },
+  {
+    pattern: /starcoder|star-coder|stable-?code|granite|seed/i,
+    stops: ['<fim_prefix>', '<fim_suffix>', '<fim_middle>', '<file_sep>', '<|endoftext|>'],
+  },
+]
+
+export function getModelFimStopTokens(model: string): string[] {
+  const name = model || ''
+  for (const rule of MODEL_FIM_STOP_RULES) {
+    if (rule.pattern.test(name)) {
+      return [...rule.stops]
+    }
+  }
+  return []
+}
+
 export function buildCompletionRequest(
   provider: AiProviderConfig,
   req: AiCompletionRequest,
@@ -218,6 +326,7 @@ export function buildCompletionRequest(
 ): BuiltPostRequest {
   const prefix = (req.fimPrefix ?? req.prefix).slice(-AI_PREFIX_CHARS)
   const suffix = (req.fimSuffix ?? req.suffix).slice(0, AI_SUFFIX_CHARS)
+  const effectiveSuffix = suffix || '\n'
   const stopList =
     stop ??
     (Array.isArray(extraBody?.stop)
@@ -225,12 +334,44 @@ export function buildCompletionRequest(
       : undefined)
   const hasStop = stopList !== undefined && stopList.length > 0
   if (provider.format === 'ollama') {
+    const schemaDdl = typeof req.fimSchemaDdl === 'string' ? req.fimSchemaDdl.trim() : ''
+    const historySql = typeof req.fimHistorySql === 'string' ? req.fimHistorySql.trim() : ''
+    const priorTabSql = typeof req.fimPriorSql === 'string' ? req.fimPriorSql.trim() : ''
+    if (isQwenCoderModel(provider.model) && (schemaDdl.length > 0 || historySql.length > 0)) {
+      const rawPrefix = req.prefix.slice(-AI_PREFIX_CHARS)
+      const repoName = req.dialect || 'sql'
+      const schemaBlock = schemaDdl ? `<|file_sep|>schema.sql\n${schemaDdl}\n` : ''
+      const historyBlock = historySql ? `<|file_sep|>history.sql\n${historySql}\n` : ''
+      const recentBlock = priorTabSql ? `<|file_sep|>recent.sql\n${priorTabSql}\n` : ''
+      const rawPrompt =
+        `<|repo_name|>${repoName}\n` +
+        schemaBlock +
+        historyBlock +
+        recentBlock +
+        `<|file_sep|>query.sql\n` +
+        `<|fim_prefix|>${rawPrefix}<|fim_suffix|>${effectiveSuffix}<|fim_middle|>`
+      return postJson(joinUrl(withoutV1(provider.baseUrl), '/api/generate'), bearer(provider.apiKey), {
+        model: provider.model,
+        prompt: rawPrompt,
+        raw: true,
+        stream,
+        keep_alive: OLLAMA_KEEP_ALIVE,
+        options: {
+          num_ctx: OLLAMA_NUM_CTX,
+          num_predict: provider.maxTokens,
+          temperature: FIM_TEMPERATURE,
+          ...(hasStop ? { stop: stopList } : {}),
+        },
+      })
+    }
     return postJson(joinUrl(withoutV1(provider.baseUrl), '/api/generate'), bearer(provider.apiKey), {
       model: provider.model,
       prompt: prefix,
-      suffix,
+      suffix: effectiveSuffix,
       stream,
+      keep_alive: OLLAMA_KEEP_ALIVE,
       options: {
+        num_ctx: OLLAMA_NUM_CTX,
         num_predict: provider.maxTokens,
         temperature: FIM_TEMPERATURE,
         ...(hasStop ? { stop: stopList } : {}),
@@ -241,11 +382,11 @@ export function buildCompletionRequest(
     return postJson(joinUrl(withV1(provider.baseUrl), '/fim/completions'), bearer(provider.apiKey), {
       model: provider.model,
       prompt: prefix,
-      suffix,
+      suffix: effectiveSuffix,
       max_tokens: provider.maxTokens,
       temperature: FIM_TEMPERATURE,
       stream,
-      ...(hasStop ? { stop: stopList } : {}),
+      ...(hasStop ? { stop: stopList.slice(0, MAX_HOSTED_STOP_SEQUENCES) } : {}),
     })
   }
   const extra: Record<string, unknown> = { ...(extraBody ?? {}) }
@@ -314,7 +455,13 @@ const SECRET_RULES: readonly { kind: string; pattern: RegExp }[] = [
 ]
 
 const ASSIGNED_SECRET_RE =
-  /(?:pass(?:word|wd)?|secret|api[_-]?key|access[_-]?key|auth[_-]?token|private[_-]?key|token)["']?\s*[:=]\s*["']([^"'\s]{16,})["']/gi
+  /(?:pass(?:word|wd)?|(?<![a-zA-Z])pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token|private[_-]?key|token)["']?\s*[:=]\s*["']([^"'\s]{16,})["']/gi
+
+const SHORT_PWD_ASSIGN_RE =
+  /(?<![a-zA-Z])pwd["']?\s*[:=]\s*["']([^"'\s]{6,})["']/gi
+
+const MONGO_USER_AUTH_CALL_RE =
+  /\b(?:changeUserPassword|auth)\s*\(\s*["'][^"']+["']\s*,\s*["']([^"'\s]{4,})["']/gi
 
 const AUTH_HEADER_SECRET_RE =
   /\bAuthorization\s*[:=]\s*(?:Bearer|Basic)[ \t]+([^\s,;'"`}\])<>]+)/gi
@@ -390,7 +537,18 @@ function scanTextForSecret(text: string, dialect?: AiDialect): string | null {
       return 'secret assigned in code'
     }
   }
-  const sqlCred = detectRecognizableSqlCredential(text, toLegacySqlDriver(dialect))
+  for (const match of text.matchAll(SHORT_PWD_ASSIGN_RE)) {
+    const val = match[1]
+    if (!PLACEHOLDER_RE.test(val) && !val.startsWith('/') && !/^[A-Za-z]:\\/.test(val)) {
+      return 'secret assigned in code'
+    }
+  }
+  for (const match of text.matchAll(MONGO_USER_AUTH_CALL_RE)) {
+    if (!PLACEHOLDER_RE.test(match[1])) {
+      return 'sql-auth-literal'
+    }
+  }
+  const sqlCred = detectRecognizableSqlCredential(text, dialect)
   if (sqlCred) return sqlCred
   return null
 }
@@ -534,20 +692,89 @@ function leadingNonBlankLines(text: string, max: number): string[] {
   return out
 }
 
+function findLineBoundarySuffixMatch(text: string, needle: string): number {
+  let i = text.indexOf('\n')
+  while (i !== -1) {
+    let ws = i + 1
+    while (ws < text.length && (text[ws] === ' ' || text[ws] === '\t')) ws += 1
+    if (text.startsWith(needle, ws)) {
+      let after = ws + needle.length
+      while (after < text.length && (text[after] === ' ' || text[after] === '\t')) after += 1
+      if (after === text.length || text[after] === '\r' || text[after] === '\n') {
+        return text[i - 1] === '\r' ? i - 1 : i
+      }
+    }
+    i = text.indexOf('\n', i + 1)
+  }
+  return -1
+}
+
+function findInlineSuffixChopOutsideQuotes(text: string, needle: string): number {
+  let inQuote: "'" | '"' | '`' | null = null
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (inQuote) {
+      if (ch === '\\' && inQuote !== '`') {
+        i += 1
+        continue
+      }
+      if (ch === inQuote) {
+        if (text[i + 1] === inQuote) {
+          i += 1
+          continue
+        }
+        inQuote = null
+      }
+      continue
+    }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      inQuote = ch
+      continue
+    }
+    if (i > 0 && /[\s,;(\[]/.test(text[i - 1]) && text.startsWith(needle, i)) {
+      return i
+    }
+  }
+  return -1
+}
+
 export function dropDuplicatedFromSuffix(text: string, suffix: string): string {
   const textLines = leadingNonBlankLines(text, 3)
   const suffixLines = leadingNonBlankLines(suffix, 3)
   const count = Math.min(3, textLines.length, suffixLines.length)
-  if (count >= 1) {
+  if (count === 1) {
+    const normA = textLines[0].replace(/[ \t]+/g, ' ').trim().toLowerCase()
+    const normB = suffixLines[0].replace(/[ \t]+/g, ' ').trim().toLowerCase()
+    if (normA && normA === normB) return ''
+  } else if (count >= 2) {
     const a = textLines.slice(0, count).join('\n').trim()
     const b = suffixLines.slice(0, count).join('\n').trim()
     const threshold = Math.max(1, 0.05 * a.length, 0.05 * b.length)
     if (lineDistance(a, b) <= threshold) return ''
   }
   const firstSuffixLine = suffixLines[0]?.trim()
-  if (firstSuffixLine && firstSuffixLine.length >= 2 && /\w/.test(firstSuffixLine)) {
-    const at = text.indexOf(firstSuffixLine)
-    if (at > 0) return text.slice(0, at).trimEnd()
+  if (firstSuffixLine && /\w/.test(firstSuffixLine)) {
+    const lineAt = findLineBoundarySuffixMatch(text, firstSuffixLine)
+    if (lineAt > 0) {
+      return text.slice(0, lineAt).trimEnd()
+    }
+    if (firstSuffixLine.length >= 6) {
+      const inlineAt = findInlineSuffixChopOutsideQuotes(text, firstSuffixLine)
+      if (inlineAt > 0) {
+        const before = text.slice(0, inlineAt)
+        const trimmed = before.trimEnd()
+        if (
+          trimmed.length > 0 &&
+          /[ \t]+$/.test(before) &&
+          suffix.length > 0 &&
+          !/^\s/.test(suffix) &&
+          /^[A-Za-z0-9_]/.test(suffix)
+        ) {
+          return `${trimmed} `
+        }
+        return trimmed
+      }
+    }
   }
   return text
 }
@@ -560,24 +787,77 @@ export function trimMultiLineInSingleLineMode(
   if (multiline) return text
   const lines = text.split('\n')
   if (lines.length <= 1) return text
+  const firstIdx = lines.findIndex((l) => l.trim().length > 0)
+  const rawFirst = firstIdx === -1 ? lines[0] : lines[firstIdx]
   const suffixLine = suffix.slice(0, suffix.indexOf('\n') === -1 ? suffix.length : suffix.indexOf('\n')).trimEnd()
-  const firstLine = lines[0].trimEnd()
-  if (suffixLine && firstLine.endsWith(suffixLine)) {
-    return firstLine.slice(0, firstLine.length - suffixLine.length)
+  const firstTrimmedEnd = rawFirst.trimEnd()
+  if (suffixLine && firstTrimmedEnd.endsWith(suffixLine)) {
+    return firstTrimmedEnd.slice(0, firstTrimmedEnd.length - suffixLine.length)
   }
-  return firstLine
+  if (
+    firstTrimmedEnd.length > 0 &&
+    /[ \t]+$/.test(rawFirst) &&
+    suffix.length > 0 &&
+    !/^\s/.test(suffix) &&
+    /^[A-Za-z0-9_]/.test(suffix)
+  ) {
+    return `${firstTrimmedEnd} `
+  }
+  return firstTrimmedEnd
 }
 
-function extractUnfencedSuggestion(raw: string): string {
-  const stripped = stripSpecialCompletionTokens(raw)
+function extractCompletionTagContent(raw: string): string {
+  const openMatch = /<COMPLETION>/i.exec(raw)
+  if (openMatch) {
+    const afterOpen = raw.slice(openMatch.index + openMatch[0].length)
+    const closeIdx = afterOpen.search(/<\/COMPLETION>/i)
+    return closeIdx === -1 ? afterOpen : afterOpen.slice(0, closeIdx)
+  }
+  const closeIdx = raw.search(/<\/COMPLETION>/i)
+  return closeIdx === -1 ? raw : raw.slice(0, closeIdx)
+}
+
+function unwrapSingleBacktickInline(text: string, prefix: string, dialect?: AiDialect): string {
+  const trimmed = text.trim()
+  if (!trimmed || trimmed.includes('\n') || trimmed.includes('\r')) return text
+  const state = scanSqlBoundaryState(prefix, dialect)
+  if (state.inQuote === '`' || state.inQuote === "'") return text
+  const closed = /^`([^`\r\n]+)`$/.exec(trimmed)
+  if (closed) {
+    const inner = closed[1]
+    if (dialect !== 'mysql' || /[\s*(),;=]/.test(inner) || prefix.toLowerCase().endsWith(inner.slice(0, 2).toLowerCase())) {
+      return inner
+    }
+    return text
+  }
+  if (dialect !== 'mysql' && trimmed.startsWith('`') && !trimmed.slice(1).includes('`')) {
+    const afterTick = trimmed.slice(1)
+    if (/^[A-Za-z_*(]/.test(afterTick)) {
+      return afterTick
+    }
+  }
+  return text
+}
+
+function extractUnfencedSuggestion(raw: string, prefix = '', dialect?: AiDialect): string {
+  const withoutThink = raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/gi, '')
+  const tagExtracted = extractCompletionTagContent(withoutThink)
+  const stripped = stripSpecialCompletionTokens(tagExtracted)
   let text = stripped
-  if (stripped !== raw) {
+  if (stripped !== tagExtracted) {
     text = text.replace(/^\r?\n+/, '')
+  } else if (/<COMPLETION>/i.test(withoutThink)) {
+    text = text.replace(/^(?:\r?\n)+/, '')
   }
   const fenced = /^\s*```[^\n]*\n([\s\S]*?)\n?```[\s\S]*$/.exec(text)
   if (fenced) return fenced[1]
+  const preambleFenced = /^[A-Za-z][^\n`]{0,60}:\s*\r?\n```[^\n]*\n([\s\S]*?)\n?```[\s\S]*$/.exec(text)
+  if (preambleFenced) return preambleFenced[1]
   const unclosed = /^\s*```[^\n]*\n([\s\S]*)$/.exec(text)
-  return unclosed ? unclosed[1] : text
+  if (unclosed) return unclosed[1]
+  return unwrapSingleBacktickInline(text, prefix, dialect)
 }
 
 function stripTrailingCaretPipe(
@@ -601,7 +881,7 @@ function stripTrailingCaretPipe(
 
 export function cleanSuggestion(raw: string, prefix = '', dialect?: AiDialect): string {
   const hadTrailingMarker = TRAILING_SPECIAL_MARKER_RE.test(raw)
-  return stripTrailingCaretPipe(extractUnfencedSuggestion(raw), prefix, dialect, hadTrailingMarker)
+  return stripTrailingCaretPipe(extractUnfencedSuggestion(raw, prefix, dialect), prefix, dialect, hadTrailingMarker)
 }
 
 const STANDALONE_SQL_CLAUSE_KEYWORDS: ReadonlySet<string> = new Set([
@@ -788,7 +1068,7 @@ const POST_TABLE_CLAUSE_KEYWORDS: ReadonlySet<string> = new Set([
   'VALUES',
 ])
 
-const VALID_SQL_WORDS: ReadonlySet<string> = new Set([
+export const VALID_SQL_WORDS: ReadonlySet<string> = new Set([
   ...SQL_KEYWORDS,
   ...STATEMENT_STARTER_KEYWORDS,
   'ADD',
@@ -939,6 +1219,14 @@ const VALID_SQL_WORDS: ReadonlySet<string> = new Set([
   'MONEY',
   'BIT',
   'VARBINARY',
+  'STRFTIME',
+  'UNNEST',
+  'GENERATE_SERIES',
+  'IFNULL',
+  'DATE_TRUNC',
+  'TO_CHAR',
+  'GROUP_CONCAT',
+  'JSON_EXTRACT',
   'BINARY',
 ])
 
@@ -1049,7 +1337,7 @@ function scanSqlBoundaryState(prefix: string, dialect?: AiDialect): SqlBoundaryS
   return { inQuote: null, inComment: state === 'line_comment' || state === 'block_comment' }
 }
 
-function damerauLevenshtein(a: string, b: string): number {
+export function damerauLevenshtein(a: string, b: string): number {
   const m = a.length
   const n = b.length
   if (Math.abs(m - n) > 2) return Math.abs(m - n)
@@ -1124,7 +1412,7 @@ function isAtSqlStatementStart(before: string, dialect?: AiDialect): boolean {
   return stripped.trim().length === 0
 }
 
-function formatCorrectedKeyword(keywordUpper: string, rawWord: string): string {
+export function formatCorrectedKeyword(keywordUpper: string, rawWord: string): string {
   return /^[a-z_][a-z0-9_]*$/.test(rawWord) ? keywordUpper.toLowerCase() : keywordUpper
 }
 
@@ -1240,6 +1528,35 @@ export function resolveTrailingTypoToken(
   }
 }
 
+function detectQuotedLeadingSpaceReplacement(
+  prefix: string,
+  suggestion: string,
+  quoteChar: string,
+  knownIdentifiers?: Iterable<string>
+): LeadingTokenReplacement | null {
+  if (quoteChar !== '"' && quoteChar !== '`') return null
+  const quoteRe = quoteChar === '"' ? /"([A-Za-z0-9_$]+)([ \t]+)$/ : /`([A-Za-z0-9_$]+)([ \t]+)$/
+  const openMatch = quoteRe.exec(prefix)
+  if (!openMatch) return null
+
+  const partial = openMatch[1]
+  const spaces = openMatch[2]
+  const trimmedSuggestion = suggestion.replace(/^[ \t]+/, '')
+  const strippedQuote = trimmedSuggestion.startsWith(quoteChar) ? trimmedSuggestion.slice(1) : trimmedSuggestion
+  const headMatch = /^([A-Za-z_][A-Za-z0-9_$]*)/.exec(strippedQuote)
+  if (!headMatch) return null
+
+  const partialLower = partial.toLowerCase()
+  const nextLower = headMatch[1].toLowerCase()
+  if (!matchesKnownIdentifier(nextLower, knownIdentifiers)) return null
+
+  const isPrefixOrSingleTypo =
+    nextLower.startsWith(partialLower) || (partialLower.length >= 2 && damerauLevenshtein(partialLower, nextLower) <= 1)
+  if (!isPrefixOrSingleTypo) return null
+
+  return { suggestion: strippedQuote, replaceChars: partial.length + spaces.length }
+}
+
 export function detectLeadingTokenReplacement(
   prefix: string,
   suggestion: string,
@@ -1249,7 +1566,10 @@ export function detectLeadingTokenReplacement(
   if (!prefix || !suggestion) return null
   if (dialect === 'redis' || dialect === 'mongodb') return null
   const boundary = scanSqlBoundaryState(prefix, dialect)
-  if (boundary.inQuote !== null || boundary.inComment) return null
+  if (boundary.inComment) return null
+  if (boundary.inQuote !== null) {
+    return detectQuotedLeadingSpaceReplacement(prefix, suggestion, boundary.inQuote, knownIdentifiers)
+  }
 
   const tailMatch = /([A-Za-z0-9_]+)$/.exec(prefix)
   if (!tailMatch) return null
@@ -1300,37 +1620,138 @@ export function detectLeadingTokenReplacement(
   return null
 }
 
+function normalizeLeftCompletionBoundary(
+  out: string,
+  prefix: string,
+  startState: { inQuote: string | null; inComment: boolean },
+  knownIdentifiers?: Iterable<string>
+): string {
+  if (/^\s/.test(out) || startState.inComment) return out
+
+  if (startState.inQuote !== null) {
+    if (startState.inQuote !== '"' && startState.inQuote !== '`') return out
+    const clauseHead = /^([A-Za-z_][A-Za-z0-9_]*)(?=$|[\s;])/.exec(out.trimStart())?.[1]
+    const isGluedClauseInQuote =
+      Boolean(clauseHead) &&
+      STANDALONE_SQL_CLAUSE_KEYWORDS.has((clauseHead ?? '').toUpperCase()) &&
+      !out.includes(startState.inQuote)
+    return isGluedClauseInQuote ? '' : out
+  }
+
+  const lastChar = prefix[prefix.length - 1]
+  if ((lastChar === '"' || lastChar === '`' || lastChar === "'" || lastChar === ']' || lastChar === ')') && /^[A-Za-z_]/.test(out)) {
+    return ` ${out}`
+  }
+
+  const tailWord = /([A-Za-z0-9_]+)$/.exec(prefix)?.[1]
+  if (!tailWord || tailWord.endsWith('_')) return out
+  const firstWord = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(out)?.[1]
+  if (!firstWord) return out
+
+  const isGluedStandaloneClause =
+    STANDALONE_SQL_CLAUSE_KEYWORDS.has(firstWord.toUpperCase()) &&
+    !SQL_KEYWORDS.has((tailWord + firstWord).toUpperCase()) &&
+    !(/[a-z]$/.test(tailWord) && /^[A-Z][a-z]+$/.test(firstWord)) &&
+    !(/[a-z]$/.test(tailWord) && SHORT_LOWER_WORD_ENDINGS.has(firstWord))
+  if (!isGluedStandaloneClause) return out
+
+  const beforeTailIdx = prefix.length - tailWord.length
+  const prevBeforeTail = beforeTailIdx > 0 ? prefix[beforeTailIdx - 1] : ''
+  const isStandaloneNumeric = /^\d+$/.test(tailWord) && (!prevBeforeTail || !/[A-Za-z0-9_.]/.test(prevBeforeTail))
+  return isStandaloneNumeric || matchesKnownIdentifier(tailWord.toLowerCase(), knownIdentifiers) ? ` ${out}` : ''
+}
+
+function normalizeRightCompletionBoundary(
+  out: string,
+  prefix: string,
+  dialect: AiDialect | undefined,
+  suffix: string
+): string {
+  if (!out || !suffix || /\s$/.test(out) || /^\s/.test(suffix)) return out
+  const endState = scanSqlBoundaryState(`${prefix}${out}`, dialect)
+  if (endState.inQuote !== null || endState.inComment || !/^[A-Za-z]/.test(suffix)) return out
+
+  const lastOut = out[out.length - 1]
+  if (out.endsWith(',')) return `${out} `
+  if (lastOut === '.' || lastOut === '_' || !/[A-Za-z0-9_)'"`\]]$/.test(lastOut)) return out
+
+  const sufWord = /^([A-Za-z][A-Za-z0-9_]*)/.exec(suffix)?.[1] ?? ''
+  const outTailWord = /([A-Za-z0-9_]+)$/.exec(out)?.[1] ?? ''
+  const needsRightSpace =
+    VALID_SQL_WORDS.has(sufWord.toUpperCase()) ||
+    /[)'"`\]]$/.test(lastOut) ||
+    /^\d+$/.test(outTailWord) ||
+    STANDALONE_SQL_CLAUSE_KEYWORDS.has(outTailWord.toUpperCase())
+  return needsRightSpace ? `${out} ` : out
+}
+
 export function normalizeCompletionBoundary(
   suggestion: string,
   prefix: string,
-  dialect?: AiDialect
+  dialect?: AiDialect,
+  knownIdentifiers?: Iterable<string>,
+  suffix = ''
 ): string {
-  if (!suggestion || !prefix || /^\s/.test(suggestion)) return suggestion
+  if (!suggestion || !prefix) return suggestion
   if (dialect === 'redis' || dialect === 'mongodb') return suggestion
-  const state = scanSqlBoundaryState(prefix, dialect)
-  if (state.inQuote !== null || state.inComment) return suggestion
+  const startState = scanSqlBoundaryState(prefix, dialect)
+  let out =
+    prefix.endsWith('\n') &&
+    suggestion.startsWith('\n') &&
+    !suggestion.startsWith('\n\n') &&
+    startState.inQuote === null &&
+    !startState.inComment
+      ? suggestion.slice(1)
+      : suggestion
+  if (!out) return ''
 
-  const lastChar = prefix[prefix.length - 1]
-  if (
-    (lastChar === '"' || lastChar === '`' || lastChar === "'" || lastChar === ']' || lastChar === ')') &&
-    /^[A-Za-z_]/.test(suggestion)
-  ) {
-    return ` ${suggestion}`
+  out = normalizeLeftCompletionBoundary(out, prefix, startState, knownIdentifiers)
+  if (!out) return ''
+  return normalizeRightCompletionBoundary(out, prefix, dialect, suffix)
+}
+
+function matchIndentNormalizedMultiLineEcho(suggestion: string, tailLines: string[]): string | null {
+  const joined = tailLines.join('\n')
+  if (tailLines.length < 2 || joined.trim().length < ECHO_MIN_CHARS) return null
+  const sugLines: Array<{ start: number; endWithoutCr: number }> = []
+  let lineStart = 0
+  while (lineStart <= suggestion.length && sugLines.length < tailLines.length) {
+    const nl = suggestion.indexOf('\n', lineStart)
+    const end = nl === -1 ? suggestion.length : nl
+    const endWithoutCr = end > lineStart && suggestion[end - 1] === '\r' ? end - 1 : end
+    sugLines.push({ start: lineStart, endWithoutCr })
+    if (nl === -1) break
+    lineStart = nl + 1
+  }
+  if (sugLines.length < tailLines.length) return null
+
+  for (let i = 0; i < tailLines.length - 1; i += 1) {
+    const sugLineNorm = suggestion.slice(sugLines[i].start, sugLines[i].endWithoutCr).trim().toLowerCase()
+    const tailLineNorm = tailLines[i].trim().toLowerCase()
+    if (sugLineNorm !== tailLineNorm) return null
   }
 
-  const tailMatch = /([A-Za-z0-9_]+)$/.exec(prefix)
-  if (!tailMatch) return suggestion
-  const tailWord = tailMatch[1]
-  if (tailWord.endsWith('_')) return suggestion
+  const last = tailLines.length - 1
+  const tailLastTrimStart = tailLines[last].replace(/^[ \t]+/, '')
+  const sugLastRaw = suggestion.slice(sugLines[last].start, sugLines[last].endWithoutCr)
+  const sugLastLeadingWsLen = (/^[ \t]*/.exec(sugLastRaw)?.[0] ?? '').length
+  const sugLastAfterWs = sugLastRaw.slice(sugLastLeadingWsLen)
+  if (
+    sugLastAfterWs.length < tailLastTrimStart.length ||
+    sugLastAfterWs.slice(0, tailLastTrimStart.length).toLowerCase() !== tailLastTrimStart.toLowerCase()
+  ) {
+    return null
+  }
 
-  const headMatch = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(suggestion)
-  if (!headMatch) return suggestion
-  const firstWord = headMatch[1]
-  if (!STANDALONE_SQL_CLAUSE_KEYWORDS.has(firstWord.toUpperCase())) return suggestion
-  if (SQL_KEYWORDS.has((tailWord + firstWord).toUpperCase())) return suggestion
-  if (/[a-z]$/.test(tailWord) && /^[A-Z][a-z]+$/.test(firstWord)) return suggestion
-  if (/[a-z]$/.test(tailWord) && SHORT_LOWER_WORD_ENDINGS.has(firstWord)) return suggestion
-  return ''
+  const cutOffset = sugLines[last].start + sugLastLeadingWsLen + tailLastTrimStart.length
+  const rest = suggestion.slice(cutOffset)
+  const tailWord = /([A-Za-z_][A-Za-z0-9_]*)$/.exec(tailLastTrimStart)?.[1]
+  const restWord = /^([A-Za-z0-9_]+)/.exec(rest)?.[1]
+  if (tailWord && restWord) {
+    const matchedTail = suggestion.slice(cutOffset - tailWord.length, cutOffset)
+    return matchKeywordTailCasing(matchedTail, restWord, matchedTail + restWord) + rest.slice(restWord.length)
+  }
+  return rest
 }
 
 function matchKeywordTailCasing(
@@ -1344,27 +1765,65 @@ function matchKeywordTailCasing(
   return remainderWord
 }
 
-export function trimPrefixEcho(suggestion: string, prefix: string): string {
+export function trimPrefixEcho(
+  suggestion: string,
+  prefix: string,
+  dialect?: AiDialect,
+  knownIdentifiers?: Iterable<string>
+): string {
   if (!suggestion || !prefix) return suggestion
+  const state = scanSqlBoundaryState(prefix, dialect)
+  const leadingSpacesMatch = /^([ \t]+)/.exec(suggestion)
+  const leadingSpaces = leadingSpacesMatch?.[1] ?? ''
+  const suggestionTrimmedStart = leadingSpaces ? suggestion.slice(leadingSpaces.length) : suggestion
+
   const lines = prefix.split('\n')
   for (let count = Math.min(lines.length, ECHO_MAX_LINES); count >= 1; count -= 1) {
     const tail = lines.slice(-count).join('\n')
     if (tail.trim().length < ECHO_MIN_CHARS) continue
-    if (suggestion.startsWith(tail)) {
-      return suggestion.slice(tail.length)
-    }
-    if (
-      suggestion.length >= tail.length &&
-      suggestion.slice(0, tail.length).toLowerCase() === tail.toLowerCase()
-    ) {
-      const rest = suggestion.slice(tail.length)
-      const tailWord = /([A-Za-z_][A-Za-z0-9_]*)$/.exec(tail)?.[1]
-      const restWord = /^([A-Za-z0-9_]+)/.exec(rest)?.[1]
-      if (tailWord && restWord) {
-        const fullWord = suggestion.slice(tail.length - tailWord.length, tail.length + restWord.length)
-        return matchKeywordTailCasing(tailWord, restWord, fullWord) + rest.slice(restWord.length)
+    const candidate =
+      suggestion.startsWith(tail) ||
+      (suggestion.length >= tail.length &&
+        suggestion.slice(0, tail.length).toLowerCase() === tail.toLowerCase())
+        ? suggestion
+        : leadingSpaces &&
+            !suggestionTrimmedStart.startsWith('\n') &&
+            (suggestionTrimmedStart.startsWith(tail) ||
+              (suggestionTrimmedStart.length >= tail.length &&
+                suggestionTrimmedStart.slice(0, tail.length).toLowerCase() === tail.toLowerCase()))
+          ? suggestionTrimmedStart
+          : null
+    if (!candidate) {
+      if (count >= 2) {
+        const indentEcho = matchIndentNormalizedMultiLineEcho(suggestion, lines.slice(-count))
+        if (indentEcho !== null) return indentEcho
       }
-      return rest
+      continue
+    }
+    if (candidate.startsWith(tail)) {
+      return candidate.slice(tail.length)
+    }
+    const rest = candidate.slice(tail.length)
+    const tailWord = /([A-Za-z_][A-Za-z0-9_]*)$/.exec(tail)?.[1]
+    const restWord = /^([A-Za-z0-9_]+)/.exec(rest)?.[1]
+    if (tailWord && restWord) {
+      const fullWord = candidate.slice(tail.length - tailWord.length, tail.length + restWord.length)
+      return matchKeywordTailCasing(tailWord, restWord, fullWord) + rest.slice(restWord.length)
+    }
+    return rest
+  }
+
+  if (state.inQuote === '"' || state.inQuote === '`') {
+    const q = state.inQuote
+    const openMatch = q === '"' ? /"([A-Za-z0-9_$]+)$/.exec(prefix) : /`([A-Za-z0-9_$]+)$/.exec(prefix)
+    if (openMatch) {
+      const quotedPartial = openMatch[0]
+      if (
+        suggestionTrimmedStart.length > quotedPartial.length &&
+        suggestionTrimmedStart.slice(0, quotedPartial.length).toLowerCase() === quotedPartial.toLowerCase()
+      ) {
+        return suggestionTrimmedStart.slice(quotedPartial.length)
+      }
     }
   }
 
@@ -1373,12 +1832,13 @@ export function trimPrefixEcho(suggestion: string, prefix: string): string {
     quotedTail &&
     quotedTail.length >= ECHO_MIN_CHARS &&
     suggestion.startsWith(quotedTail) &&
-    scanSqlBoundaryState(prefix).inQuote === null
+    state.inQuote === null
   ) {
     return suggestion.slice(quotedTail.length)
   }
 
-  const tailWord = /([A-Za-z_][A-Za-z0-9_]*)$/.exec(prefix)?.[1]
+  const tailWordMatch = /([A-Za-z_][A-Za-z0-9_]*)$/.exec(prefix)
+  const tailWord = tailWordMatch?.[1]
   const headMatch = /^([ \t]*)([A-Za-z_][A-Za-z0-9_]*)/.exec(suggestion)
   const leadingWs = headMatch?.[1] ?? ''
   const headWord = headMatch?.[2]
@@ -1386,14 +1846,30 @@ export function trimPrefixEcho(suggestion: string, prefix: string): string {
     tailWord &&
     headWord &&
     headWord.length >= tailWord.length &&
-    (leadingWs.length === 0 || scanSqlBoundaryState(prefix).inQuote === null)
+    (leadingWs.length === 0 || state.inQuote === null)
   ) {
     const headPrefix = headWord.slice(0, tailWord.length)
+    const beforeTailWord = prefix.slice(0, prefix.length - tailWord.length)
     const isLongMatch =
       tailWord.length >= ECHO_MIN_CHARS && headPrefix.toLowerCase() === tailWord.toLowerCase()
     const isShortKeywordMatch =
       tailWord.length === 2 && headPrefix === tailWord && SQL_KEYWORDS.has(headWord.toUpperCase())
-    if (isLongMatch || isShortKeywordMatch) {
+    const isShortIdentEcho =
+      tailWord.length === 2 &&
+      headWord.length > 2 &&
+      headPrefix.toLowerCase() === tailWord.toLowerCase() &&
+      (matchesKnownIdentifier(headWord.toLowerCase(), knownIdentifiers) ||
+        state.inQuote === '"' ||
+        state.inQuote === '`' ||
+        AFTER_OBJECT_KEYWORD_RE.test(beforeTailWord) ||
+        /\.\s*$/.test(beforeTailWord))
+    const isSingleCharQuotedIdentEcho =
+      tailWord.length === 1 &&
+      headWord.length > 1 &&
+      (state.inQuote === '"' || state.inQuote === '`') &&
+      headPrefix.toLowerCase() === tailWord.toLowerCase() &&
+      matchesKnownIdentifier(headWord.toLowerCase(), knownIdentifiers)
+    if (isLongMatch || isShortKeywordMatch || isShortIdentEcho || isSingleCharQuotedIdentEcho) {
       const wordRest = headWord.slice(tailWord.length)
       return (
         matchKeywordTailCasing(tailWord, wordRest, headWord) +
@@ -1401,7 +1877,628 @@ export function trimPrefixEcho(suggestion: string, prefix: string): string {
       )
     }
   }
+
+  if (
+    (prefix.endsWith(' ') || prefix.endsWith('\t')) &&
+    suggestion.startsWith(' ') &&
+    !/^\s*\n/.test(suggestion) &&
+    state.inQuote === null &&
+    !state.inComment
+  ) {
+    return suggestion.replace(/^ +/, '')
+  }
   return suggestion
+}
+
+interface ScannedSqlLiteral {
+  kind: 'string' | 'number'
+  value: string
+  raw: string
+  start: number
+  end: number
+}
+
+interface TopLevelSqlKeyword {
+  keyword: string
+  start: number
+  end: number
+  parenDepth: number
+  caseDepth: number
+}
+
+interface WherePredicateSegment {
+  cutAt: number
+  text: string
+  connector: 'none' | 'and' | 'or'
+}
+
+const WHERE_CLAUSE_TERMINATORS: ReadonlySet<string> = new Set([
+  'GROUP',
+  'ORDER',
+  'HAVING',
+  'LIMIT',
+  'OFFSET',
+  'UNION',
+  'INTERSECT',
+  'EXCEPT',
+  'RETURNING',
+  'FETCH',
+  'FOR',
+  'WINDOW',
+  'QUALIFY',
+  'SETTINGS',
+  'FORMAT',
+])
+
+const PLACEHOLDER_LITERAL_WORDS: ReadonlySet<string> = new Set([
+  'test',
+  'example',
+  'sample',
+  'dummy',
+  'foo',
+  'bar',
+  'baz',
+  'qux',
+  'abc',
+  'abcd',
+  'xyz',
+  'xxx',
+  'placeholder',
+  'value',
+  'something',
+  'unknown',
+  'user',
+  'user1',
+  'admin',
+  'john',
+  'jane',
+  'doe',
+  'john doe',
+  'password',
+  'secret',
+])
+
+function isSqlIdentChar(ch: string | undefined): boolean {
+  return Boolean(ch && /[A-Za-z0-9_$]/.test(ch))
+}
+
+function skipCommentOrQuotedSpan(sql: string, i: number, dialect?: AiDialect): number | null {
+  const ch = sql[i]
+  const next = sql[i + 1]
+  if (ch === '-' && next === '-') {
+    const nl = sql.indexOf('\n', i + 2)
+    return nl === -1 ? sql.length : nl + 1
+  }
+  if (ch === '#' && dialect !== 'mssql' && dialect !== 'oracle') {
+    const nl = sql.indexOf('\n', i + 1)
+    return nl === -1 ? sql.length : nl + 1
+  }
+  if (ch === '/' && next === '*') {
+    const close = sql.indexOf('*/', i + 2)
+    return close === -1 ? sql.length : close + 2
+  }
+  if (ch === '"' || ch === '`') {
+    const allowBackslash = ch !== '`' && dialect !== 'mssql' && dialect !== 'oracle'
+    let j = i + 1
+    while (j < sql.length) {
+      const c = sql[j]
+      if (allowBackslash && c === '\\' && j + 1 < sql.length) {
+        j += 2
+        continue
+      }
+      if (c === ch) {
+        if (sql[j + 1] === ch) {
+          j += 2
+          continue
+        }
+        return j + 1
+      }
+      j += 1
+    }
+    return sql.length
+  }
+  if (dialect === 'mssql' && ch === '[') {
+    const close = sql.indexOf(']', i + 1)
+    return close === -1 ? sql.length : close + 1
+  }
+  return null
+}
+
+function scanSingleQuotedLiteral(
+  sql: string,
+  start: number,
+  dialect?: AiDialect
+): { lit: ScannedSqlLiteral; nextIndex: number } {
+  const allowBackslash = dialect !== 'mssql' && dialect !== 'oracle'
+  let value = ''
+  let j = start + 1
+  while (j < sql.length) {
+    const c = sql[j]
+    if (allowBackslash && c === '\\' && j + 1 < sql.length) {
+      value += sql[j + 1]
+      j += 2
+      continue
+    }
+    if (c === "'") {
+      if (sql[j + 1] === "'") {
+        value += "'"
+        j += 2
+        continue
+      }
+      j += 1
+      break
+    }
+    value += c
+    j += 1
+  }
+  return {
+    lit: { kind: 'string', value, raw: sql.slice(start, j), start, end: j },
+    nextIndex: j,
+  }
+}
+
+function scanSqlLiterals(sql: string, dialect?: AiDialect): ScannedSqlLiteral[] {
+  const literals: ScannedSqlLiteral[] = []
+  let i = 0
+  while (i < sql.length) {
+    const skipped = skipCommentOrQuotedSpan(sql, i, dialect)
+    if (skipped !== null) {
+      i = skipped
+      continue
+    }
+    const ch = sql[i]
+    if (ch === "'") {
+      const scanned = scanSingleQuotedLiteral(sql, i, dialect)
+      literals.push(scanned.lit)
+      i = scanned.nextIndex
+      continue
+    }
+    const prev = i > 0 ? sql[i - 1] : ''
+    const isNegative = ch === '-' && /[0-9]/.test(sql[i + 1] ?? '') && (i === 0 || /[\s(=<>!,+*/]/.test(prev))
+    const isDigitStart = /[0-9]/.test(ch) && !isSqlIdentChar(prev) && prev !== '.'
+    if (isNegative || isDigitStart) {
+      let j = isNegative ? i + 1 : i
+      while (j < sql.length && /[0-9]/.test(sql[j])) j += 1
+      if (sql[j] === '.' && /[0-9]/.test(sql[j + 1] ?? '')) {
+        j += 1
+        while (j < sql.length && /[0-9]/.test(sql[j])) j += 1
+      }
+      if (!/[A-Za-z_$]/.test(sql[j] ?? '')) {
+        const raw = sql.slice(i, j)
+        literals.push({ kind: 'number', value: raw, raw, start: i, end: j })
+        i = j
+        continue
+      }
+    }
+    i += 1
+  }
+  return literals
+}
+
+function scanTopLevelSqlTokens(
+  sql: string,
+  startOffset: number,
+  endOffset: number,
+  dialect?: AiDialect
+): { keywords: TopLevelSqlKeyword[]; semicolons: number[]; firstTerminatorAt: number | null } {
+  const keywords: TopLevelSqlKeyword[] = []
+  const semicolons: number[] = []
+  let firstTerminatorAt: number | null = null
+  let parenDepth = 0
+  let caseDepth = 0
+  let i = startOffset
+  while (i < endOffset) {
+    const skipped = skipCommentOrQuotedSpan(sql, i, dialect)
+    if (skipped !== null) {
+      i = Math.min(skipped, endOffset)
+      continue
+    }
+    const ch = sql[i]
+    if (ch === "'") {
+      i = Math.min(scanSingleQuotedLiteral(sql, i, dialect).nextIndex, endOffset)
+      continue
+    }
+    if (ch === '(') {
+      parenDepth += 1
+      i += 1
+      continue
+    }
+    if (ch === ')') {
+      if (parenDepth > 0) parenDepth -= 1
+      i += 1
+      continue
+    }
+    if (ch === ';' && parenDepth === 0) {
+      semicolons.push(i)
+      if (firstTerminatorAt === null) firstTerminatorAt = i
+      i += 1
+      continue
+    }
+    if (/[A-Za-z_]/.test(ch)) {
+      const prev = i > 0 ? sql[i - 1] : ''
+      let j = i + 1
+      while (j < endOffset && isSqlIdentChar(sql[j])) j += 1
+      if (!isSqlIdentChar(prev) && prev !== '.') {
+        const upper = sql.slice(i, j).toUpperCase()
+        if (parenDepth === 0) {
+          if (upper === 'CASE') {
+            caseDepth += 1
+          } else if (upper === 'END') {
+            if (caseDepth > 0) caseDepth -= 1
+          } else {
+            keywords.push({ keyword: upper, start: i, end: j, parenDepth, caseDepth })
+            if (firstTerminatorAt === null && caseDepth === 0 && WHERE_CLAUSE_TERMINATORS.has(upper)) {
+              firstTerminatorAt = i
+            }
+          }
+        }
+      }
+      i = j
+      continue
+    }
+    i += 1
+  }
+  return { keywords, semicolons, firstTerminatorAt }
+}
+
+function isFabricatedPlaceholderLiteral(lit: ScannedSqlLiteral, modelIntroducedWhere: boolean): boolean {
+  const v = lit.value.trim().toLowerCase()
+  if (!v) return false
+  if (lit.kind === 'number' || /^-?\d+(?:\.\d+)?$/.test(v)) {
+    const digits = v.replace(/[-.]/g, '')
+    if (digits.length >= 4) return true
+    if (/^(?:123|234|345|456|567|678|789|321|000|111|222|999)$/.test(digits)) return true
+    return modelIntroducedWhere && lit.kind === 'string' && /^\d+$/.test(v)
+  }
+  if (/^\d{4}-\d{2}-\d{2}/.test(v)) return true
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-/.test(v)) return true
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) return true
+  const stripped = v.replace(/^[%_]+|[%_]+$/g, '')
+  return PLACEHOLDER_LITERAL_WORDS.has(stripped)
+}
+
+function prefixHasActiveWhereClause(prefix: string, dialect?: AiDialect): boolean {
+  const scanned = scanTopLevelSqlTokens(prefix, 0, prefix.length, dialect)
+  const afterSemi = scanned.semicolons.length > 0 ? scanned.semicolons[scanned.semicolons.length - 1] + 1 : 0
+  let active = false
+  for (const kw of scanned.keywords) {
+    if (kw.start < afterSemi || kw.caseDepth > 0) continue
+    if (kw.keyword === 'WHERE') active = true
+    else if (WHERE_CLAUSE_TERMINATORS.has(kw.keyword)) active = false
+  }
+  return active
+}
+
+function prefixEndsWithComparisonOp(prefix: string): boolean {
+  const trimmed = prefix.trimEnd()
+  if (!trimmed) return false
+  if (/(?:!=|<>|<=|>=|=|<|>)$/.test(trimmed)) return true
+  if (/\b(?:NOT\s+)?I?LIKE$/i.test(trimmed)) return true
+  if (/\b(?:NOT\s+)?IN\s*\(\s*$/i.test(trimmed)) return true
+  return /\b(?:NOT\s+)?IN\s*\([^)]*,\s*$/i.test(trimmed)
+}
+
+function splitTopLevelWherePredicates(
+  sql: string,
+  startOffset: number,
+  endOffset: number,
+  dialect?: AiDialect
+): WherePredicateSegment[] {
+  const { keywords } = scanTopLevelSqlTokens(sql, startOffset, endOffset, dialect)
+  const segments: WherePredicateSegment[] = []
+  let segStart = startOffset
+  let cutAt = startOffset
+  let connector: 'none' | 'and' | 'or' = 'none'
+  let pendingBetween = false
+
+  for (const kw of keywords) {
+    if (kw.caseDepth > 0) continue
+    if (kw.keyword === 'BETWEEN') {
+      pendingBetween = true
+      continue
+    }
+    if (kw.keyword === 'AND') {
+      if (pendingBetween) {
+        pendingBetween = false
+        continue
+      }
+      segments.push({ cutAt, text: sql.slice(segStart, kw.start), connector })
+      cutAt = kw.start
+      segStart = kw.end
+      connector = 'and'
+      continue
+    }
+    if (kw.keyword === 'OR') {
+      pendingBetween = false
+      segments.push({ cutAt, text: sql.slice(segStart, kw.start), connector })
+      cutAt = kw.start
+      segStart = kw.end
+      connector = 'or'
+    }
+  }
+  segments.push({ cutAt, text: sql.slice(segStart, endOffset), connector })
+  return segments
+}
+
+export function trimFabricatedFilterLiterals(
+  suggestion: string,
+  prefix: string,
+  suffix: string,
+  groundedSources: readonly string[],
+  dialect?: AiDialect
+): string {
+  if (!suggestion || dialect === 'redis' || dialect === 'mongodb') return suggestion
+
+  const groundedValues = new Set<string>()
+  for (const src of [prefix, suffix, ...groundedSources]) {
+    if (!src) continue
+    for (const lit of scanSqlLiterals(src, dialect)) {
+      const key = lit.value.trim().toLowerCase()
+      if (key) groundedValues.add(key)
+    }
+  }
+
+  const findUngrounded = (text: string): ScannedSqlLiteral[] =>
+    scanSqlLiterals(text, dialect).filter((lit) => {
+      const key = lit.value.trim().toLowerCase()
+      return Boolean(key) && !groundedValues.has(key)
+    })
+
+  const fullScan = scanTopLevelSqlTokens(suggestion, 0, suggestion.length, dialect)
+  if (!prefixHasActiveWhereClause(prefix, dialect)) {
+    const whereKw = fullScan.keywords.find((kw) => kw.caseDepth === 0 && kw.keyword === 'WHERE')
+    if (!whereKw) return suggestion
+    const bodyStart = whereKw.end
+    const postWhereScan = scanTopLevelSqlTokens(suggestion, bodyStart, suggestion.length, dialect)
+    const whereZoneEnd = postWhereScan.firstTerminatorAt ?? suggestion.length
+    const hasPrecedingClause = suggestion.slice(0, whereKw.start).trim().length > 0
+    const segments = splitTopLevelWherePredicates(suggestion, bodyStart, whereZoneEnd, dialect)
+    for (let i = 0; i < segments.length; i += 1) {
+      const seg = segments[i]
+      const ungrounded = findUngrounded(seg.text)
+      if (ungrounded.length === 0) continue
+      const hasFabricatedLiteral = ungrounded.some(
+        (lit) =>
+          isFabricatedPlaceholderLiteral(lit, true) ||
+          (hasPrecedingClause && lit.kind === 'string')
+      )
+      if (hasFabricatedLiteral) {
+        const cutIdx = i === 0 ? whereKw.start : seg.cutAt
+        return suggestion.slice(0, cutIdx).trimEnd()
+      }
+    }
+    return suggestion
+  }
+
+  const whereZoneEnd = fullScan.firstTerminatorAt ?? suggestion.length
+  const segments = splitTopLevelWherePredicates(suggestion, 0, whereZoneEnd, dialect)
+  if (prefixEndsWithComparisonOp(prefix) && segments.length > 0) {
+    const ungroundedLead = findUngrounded(segments[0].text)
+    if (ungroundedLead.some((lit) => isFabricatedPlaceholderLiteral(lit, false))) {
+      return ''
+    }
+  }
+  for (let i = 0; i < segments.length; i += 1) {
+    const seg = segments[i]
+    const ungrounded = findUngrounded(seg.text)
+    if (ungrounded.length === 0) continue
+    if (seg.connector !== 'none') {
+      const hasFabricated = ungrounded.some(
+        (lit) => lit.kind === 'string' || isFabricatedPlaceholderLiteral(lit, false)
+      )
+      if (hasFabricated) {
+        return suggestion.slice(0, seg.cutAt).trimEnd()
+      }
+      continue
+    }
+    if (ungrounded.some((lit) => isFabricatedPlaceholderLiteral(lit, false))) {
+      return ''
+    }
+  }
+  return suggestion
+}
+
+export function skipRewrittenSuffix(suggestion: string, suffix: string): string {
+  const compLine = suggestion.split(/\r?\n/).find((line) => line.trim().length > 0) ?? ''
+  const comp = compLine.trimStart()
+  const nlSuf = suffix.indexOf('\n')
+  const after = (nlSuf === -1 ? suffix : suffix.slice(0, nlSuf)).trimStart()
+  if (!comp || !after) return suggestion
+  const compLower = comp.toLowerCase()
+  const afterLower = after.toLowerCase()
+  if (compLower === afterLower) return ''
+  let shared = 0
+  while (shared < compLower.length && shared < afterLower.length && compLower[shared] === afterLower[shared]) {
+    shared += 1
+  }
+  const sharedSignificant = after.slice(0, shared).replace(/\s/g, '').length
+  const afterSignificant = after.replace(/\s/g, '').length
+  const isCommaListItem = comp.trimEnd().endsWith(',')
+  if (!isCommaListItem && sharedSignificant >= 6 && shared / Math.min(compLower.length, afterLower.length) >= 0.75) {
+    return ''
+  }
+  if (!isCommaListItem && compLower.startsWith(afterLower) && afterSignificant >= 4) {
+    return ''
+  }
+  return suggestion
+}
+
+function hasUnmatchedTrailingCloser(suggestion: string, closer: ')' | ']' | '}', dialect?: AiDialect): boolean {
+  const opener = closer === ')' ? '(' : closer === ']' ? '[' : '{'
+  if (closer === ']' && dialect === 'mssql') return false
+  let depth = 0
+  let inQuote: string | null = null
+  for (let i = 0; i < suggestion.length; i += 1) {
+    const ch = suggestion[i]
+    if (inQuote) {
+      if (ch === '\\' && inQuote !== '`') {
+        i += 1
+      } else if (ch === inQuote) {
+        inQuote = null
+      }
+      continue
+    }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      inQuote = ch
+    } else if (ch === opener) {
+      depth += 1
+    } else if (ch === closer) {
+      depth -= 1
+    }
+  }
+  return depth < 0
+}
+
+export function trimSingleLineSuffixOverlap(
+  suggestion: string,
+  suffix: string,
+  prefix = '',
+  dialect?: AiDialect
+): string {
+  if (!suggestion || !suffix) return suggestion
+  const nl = suffix.indexOf('\n')
+  const suffixLine = nl === -1 ? suffix : suffix.slice(0, nl)
+  if (!suffixLine) return suggestion
+  const maxLen = Math.min(suggestion.length, suffixLine.length)
+  for (let len = maxLen; len >= 2; len -= 1) {
+    if (suggestion.endsWith(suffixLine.slice(0, len))) {
+      return suggestion.slice(0, suggestion.length - len)
+    }
+  }
+  const firstSuf = suffixLine[0]
+  if (suggestion.endsWith(firstSuf)) {
+    if (firstSuf === '"' || firstSuf === "'" || firstSuf === '`') {
+      if (scanSqlBoundaryState(`${prefix}${suggestion}`, dialect).inQuote === null) {
+        return suggestion.slice(0, -1)
+      }
+    } else if (firstSuf === ')' || firstSuf === ']' || firstSuf === '}') {
+      if (hasUnmatchedTrailingCloser(suggestion, firstSuf, dialect)) {
+        return suggestion.slice(0, -1)
+      }
+    }
+  }
+  return suggestion
+}
+
+export function matchCompletionBrackets(
+  suggestion: string,
+  prefix: string,
+  dialect?: AiDialect,
+  suffix = ''
+): string {
+  if (!suggestion || dialect === 'redis') return suggestion
+  const skipSquare = dialect === 'mssql'
+  const prefixOpen = { '(': 0, '[': 0, '{': 0 }
+
+  const scanText = (
+    text: string,
+    mode: 'prefix' | 'suffix' | 'suggestion',
+    stack: Array<')' | ']' | '}'>,
+    initState = { inQuote: null as string | null, inLineComment: false, inBlockComment: false }
+  ): {
+    out: string
+    inQuote: string | null
+    inLineComment: boolean
+    inBlockComment: boolean
+    suffixUnmatched: { '(': number; '[': number; '{': number }
+  } => {
+    let { inQuote, inLineComment, inBlockComment } = initState
+    const localSuffixOpen = { '(': 0, '[': 0, '{': 0 }
+    const suffixUnmatched = { '(': 0, '[': 0, '{': 0 }
+    for (let i = 0; i < text.length; i += 1) {
+      const ch = text[i]
+      const next = text[i + 1]
+      if (inLineComment) {
+        if (ch === '\n') inLineComment = false
+        continue
+      }
+      if (inBlockComment) {
+        if (ch === '*' && next === '/') {
+          inBlockComment = false
+          i += 1
+        }
+        continue
+      }
+      if (inQuote) {
+        if (ch === '\\' && inQuote !== '`' && dialect !== 'mssql' && dialect !== 'oracle') {
+          i += 1
+          continue
+        }
+        if (ch === inQuote) {
+          if (next === inQuote) {
+            i += 1
+            continue
+          }
+          inQuote = null
+        }
+        continue
+      }
+      if (ch === '-' && next === '-') {
+        inLineComment = true
+        i += 1
+        continue
+      }
+      if (ch === '#' && dialect !== 'mssql' && dialect !== 'oracle') {
+        inLineComment = true
+        continue
+      }
+      if (ch === '/' && next === '*') {
+        inBlockComment = true
+        i += 1
+        continue
+      }
+      if (ch === "'" || ch === '"' || ch === '`') {
+        inQuote = ch
+        continue
+      }
+      if (ch === '(' || (ch === '[' && !skipSquare) || ch === '{') {
+        if (mode === 'prefix') {
+          prefixOpen[ch] += 1
+        } else if (mode === 'suffix') {
+          localSuffixOpen[ch] += 1
+        } else {
+          stack.push(ch === '(' ? ')' : ch === '[' ? ']' : '}')
+        }
+      } else if (ch === ')' || (ch === ']' && !skipSquare) || ch === '}') {
+        const openKey = ch === ')' ? '(' : ch === ']' ? '[' : '{'
+        if (mode === 'prefix') {
+          if (prefixOpen[openKey] > 0) prefixOpen[openKey] -= 1
+        } else if (mode === 'suffix') {
+          if (localSuffixOpen[openKey] > 0) localSuffixOpen[openKey] -= 1
+          else suffixUnmatched[openKey] += 1
+        } else {
+          if (stack.length > 0 && stack[stack.length - 1] === ch) {
+            stack.pop()
+          } else if (prefixOpen[openKey] > 0) {
+            prefixOpen[openKey] -= 1
+          } else {
+            return {
+              out: text.slice(0, i).trimEnd(),
+              inQuote,
+              inLineComment,
+              inBlockComment,
+              suffixUnmatched,
+            }
+          }
+        }
+      }
+    }
+    return { out: text, inQuote, inLineComment, inBlockComment, suffixUnmatched }
+  }
+
+  const prefixRes = scanText(prefix, 'prefix', [])
+  if (suffix && prefixRes.inQuote === null && !prefixRes.inLineComment && !prefixRes.inBlockComment) {
+    const sufRes = scanText(suffix, 'suffix', [])
+    prefixOpen['('] = Math.max(0, prefixOpen['('] - sufRes.suffixUnmatched['('])
+    prefixOpen['['] = Math.max(0, prefixOpen['['] - sufRes.suffixUnmatched['['])
+    prefixOpen['{'] = Math.max(0, prefixOpen['{'] - sufRes.suffixUnmatched['{'])
+  }
+  const stack: Array<')' | ']' | '}'> = []
+  return scanText(suggestion, 'suggestion', stack, {
+    inQuote: prefixRes.inQuote,
+    inLineComment: prefixRes.inLineComment,
+    inBlockComment: prefixRes.inBlockComment,
+  }).out
 }
 
 export function trimSuffixOverlap(suggestion: string, suffix: string): string {
@@ -1519,6 +2616,11 @@ export interface AiCompleteAdaptiveOptions {
   markEffortUnsupported?: (model: string) => void
   onReasoningDetected?: () => void
   onEffortRejected?: () => void
+  skipTemperature?: boolean
+  isTemperatureUnsupported?: (model: string) => boolean
+  markTemperatureUnsupported?: (model: string) => void
+  onTemperatureRejected?: () => void
+  onStreamDelta?: (accumulatedText: string) => void
 }
 
 export function isReasoningExhausted(format: AiProviderFormat, json: unknown): boolean {
@@ -1584,51 +2686,156 @@ function parseStreamLine(format: AiProviderFormat, rawLine: string): StreamDelta
   }
 }
 
-function statementEnded(text: string, multiline: boolean): boolean {
-  if (!multiline && text.includes('\n')) return true
-  if (text.includes('\n\n')) return true
-  const lines = text.split('\n')
-  const nonEmpty = collectNonEmptyIndices(lines)
-  if (nonEmpty.length >= 3 && findTrailingLineCycleKeepEnd(lines, nonEmpty) !== null) {
-    return true
+function stripLeadingWrapperPrefix(text: string): string {
+  let out = text
+  out = out.replace(/^(?:\s|<COMPLETION>)+/i, '')
+  const fenceStart = /^```[^\n]*\r?\n/.exec(out)
+  if (fenceStart) {
+    out = out.slice(fenceStart[0].length)
   }
-  let inSingle = false
-  let inDouble = false
-  let lastSemicolon = -1
+  return out
+}
+
+function suffixOverlapStopIndex(text: string, suffix: string): number {
+  const probe = suffix.trimStart().slice(0, 20)
+  if (probe.replace(/\s/g, '').length < 12) return -1
+  return text.indexOf(probe)
+}
+
+function findBlankLineAfterContent(text: string): number {
+  const content = stripLeadingWrapperPrefix(text)
+  const match = /\r?\n[ \t]*\r?\n/.exec(content)
+  if (!match) return -1
+  if (content.slice(0, match.index).trim().length === 0) return -1
+  return (text.length - content.length) + match.index
+}
+
+interface StreamBoundaryContext {
+  dialect?: AiDialect
+  initialQuote?: "'" | '"' | '`' | null
+}
+
+function findFirstUnquotedSemicolon(
+  text: string,
+  initialQuote: "'" | '"' | '`' | null = null
+): number {
+  let inSingle = initialQuote === "'"
+  let inDouble = initialQuote === '"'
+  let inBacktick = initialQuote === '`'
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]
     if (inSingle) {
-      if (ch === "'") {
-        if (text[i + 1] === "'") i++
+      if (ch === '\\' && i + 1 < text.length) {
+        i += 1
+      } else if (ch === "'") {
+        if (text[i + 1] === "'") i += 1
         else inSingle = false
       }
       continue
     }
     if (inDouble) {
       if (ch === '"') {
-        if (text[i + 1] === '"') i++
+        if (text[i + 1] === '"') i += 1
         else inDouble = false
+      }
+      continue
+    }
+    if (inBacktick) {
+      if (ch === '`') {
+        if (text[i + 1] === '`') i += 1
+        else inBacktick = false
       }
       continue
     }
     if (ch === "'") inSingle = true
     else if (ch === '"') inDouble = true
-    else if (ch === ';') lastSemicolon = i
+    else if (ch === '`') inBacktick = true
+    else if (ch === ';') return i
   }
-  return lastSemicolon >= 0 && text.slice(lastSemicolon + 1).trim() === ''
+  return -1
 }
 
-function applyBoundary(text: string, multiline: boolean): { text: string; done: boolean } {
-  if (!statementEnded(text, multiline)) return { text, done: false }
-  let out = text
+function statementEnded(
+  text: string,
+  multiline: boolean,
+  suffix = '',
+  boundaryCtx?: StreamBoundaryContext
+): boolean {
+  if (/<\/COMPLETION>/i.test(text)) return true
+  if (suffixOverlapStopIndex(text, suffix) > 0) return true
   if (!multiline) {
-    const newline = out.indexOf('\n')
-    if (newline !== -1) out = out.slice(0, newline)
+    const content = stripLeadingWrapperPrefix(text)
+    if (content.includes('\n')) return true
+    if (text.trimStart().startsWith('```') && !content && text.includes('\n')) {
+      return false
+    }
+  }
+  if (findBlankLineAfterContent(text) >= 0) return true
+  const lines = text.split('\n')
+  const nonEmpty = collectNonEmptyIndices(lines)
+  if (nonEmpty.length >= 3 && findTrailingLineCycleKeepEnd(lines, nonEmpty) !== null) {
+    return true
+  }
+  if (boundaryCtx?.dialect === 'redis') return false
+  return findFirstUnquotedSemicolon(text, boundaryCtx?.initialQuote ?? null) >= 0
+}
+
+function applyBoundary(
+  text: string,
+  multiline: boolean,
+  suffix = '',
+  boundaryCtx?: StreamBoundaryContext
+): { text: string; done: boolean } {
+  if (!statementEnded(text, multiline, suffix, boundaryCtx)) return { text, done: false }
+  let out = text
+  const closeIdx = out.search(/<\/COMPLETION>/i)
+  if (closeIdx !== -1) {
+    out = out.slice(0, closeIdx)
+  }
+  const suffixOverlapAt = suffixOverlapStopIndex(out, suffix)
+  if (suffixOverlapAt > 0) {
+    out = out.slice(0, suffixOverlapAt)
+  }
+  if (boundaryCtx?.dialect !== 'redis') {
+    const firstSemi = findFirstUnquotedSemicolon(out, boundaryCtx?.initialQuote ?? null)
+    if (firstSemi >= 0) {
+      out = out.slice(0, firstSemi + 1)
+    }
+  }
+  if (!multiline) {
+    const trimmed = out.trimStart()
+    const hasOpenFence = trimmed.startsWith('```')
+    const hasOpenTag = /^<COMPLETION>/i.test(trimmed)
+    if (hasOpenFence || hasOpenTag) {
+      const content = stripLeadingWrapperPrefix(out)
+      const contentNl = content.indexOf('\n')
+      if (contentNl !== -1) {
+        const prefixLen = out.length - content.length
+        out = out.slice(0, prefixLen + contentNl)
+      }
+    } else {
+      const leadingEmptyMatch = /^(?:[ \t]*\r?\n)+/.exec(out)
+      if (leadingEmptyMatch) {
+        out = out.slice(leadingEmptyMatch[0].length)
+      }
+      const newline = out.indexOf('\n')
+      if (newline !== -1) out = out.slice(0, newline)
+    }
   } else {
-    const blankBreak = out.indexOf('\n\n')
+    const blankBreak = findBlankLineAfterContent(out)
     if (blankBreak !== -1) out = out.slice(0, blankBreak)
   }
-  return { text: out.trimEnd(), done: true }
+  const trimmedOut = out.trimEnd()
+  if (
+    trimmedOut.length > 0 &&
+    /[ \t]+$/.test(out) &&
+    !/\r?\n$/.test(out) &&
+    suffix.length > 0 &&
+    /^[A-Za-z0-9_'"`(]/.test(suffix)
+  ) {
+    return { text: `${trimmedOut} `, done: true }
+  }
+  return { text: trimmedOut, done: true }
 }
 
 export class AiResponseTooLargeError extends Error {
@@ -1670,12 +2877,20 @@ async function readBodyAll(
   return text
 }
 
+function isTimeoutAbortReason(reason: unknown): boolean {
+  return reason instanceof Error && reason.name === 'TimeoutError'
+}
+
 async function readStreamBody(
   format: AiProviderFormat,
   body: ReadableStream<Uint8Array>,
   multiline: boolean,
   onEarlyStop?: () => void,
-  maxBytes = AI_MAX_COMPLETION_BODY_BYTES
+  maxBytes = AI_MAX_COMPLETION_BODY_BYTES,
+  suffix = '',
+  signal?: AbortSignal,
+  onDelta?: (accumulatedText: string) => void,
+  boundaryCtx?: StreamBoundaryContext
 ): Promise<string> {
   const reader = body.getReader()
   const decoder = new TextDecoder()
@@ -1684,7 +2899,16 @@ async function readStreamBody(
   let totalBytes = 0
   try {
     for (;;) {
-      const { done, value } = await reader.read()
+      let chunk: ReadableStreamReadResult<Uint8Array>
+      try {
+        chunk = await reader.read()
+      } catch (err) {
+        if (text.trim().length > 0 && (isTimeoutAbortReason(err) || isTimeoutAbortReason(signal?.reason))) {
+          return applyBoundary(text, multiline, suffix, boundaryCtx).text
+        }
+        throw err
+      }
+      const { done, value } = chunk
       if (done) break
       totalBytes += value.byteLength
       if (totalBytes > maxBytes) {
@@ -1701,11 +2925,12 @@ async function readStreamBody(
         if (parsed.done) {
           await reader.cancel().catch(() => undefined)
           onEarlyStop?.()
-          return applyBoundary(text, multiline).text
+          return applyBoundary(text, multiline, suffix, boundaryCtx).text
         }
         if (parsed.delta) {
           text += parsed.delta
-          const boundary = applyBoundary(text, multiline)
+          onDelta?.(text)
+          const boundary = applyBoundary(text, multiline, suffix, boundaryCtx)
           if (boundary.done) {
             await reader.cancel().catch(() => undefined)
             onEarlyStop?.()
@@ -1716,7 +2941,10 @@ async function readStreamBody(
       }
     }
     const tail = parseStreamLine(format, buffer)
-    if (!tail.done && tail.delta) text += tail.delta
+    if (!tail.done && tail.delta) {
+      text += tail.delta
+      onDelta?.(text)
+    }
   } finally {
     try {
       reader.releaseLock()
@@ -1724,20 +2952,26 @@ async function readStreamBody(
       // reader already released/cancelled
     }
   }
-  return applyBoundary(text, multiline).text
+  return applyBoundary(text, multiline, suffix, boundaryCtx).text
 }
 
-function parseStreamText(format: AiProviderFormat, raw: string, multiline: boolean): string {
+function parseStreamText(
+  format: AiProviderFormat,
+  raw: string,
+  multiline: boolean,
+  suffix = '',
+  boundaryCtx?: StreamBoundaryContext
+): string {
   let text = ''
   for (const line of raw.split(/\r?\n/)) {
     const parsed = parseStreamLine(format, line)
     if (parsed.done) break
     if (parsed.delta) {
       text += parsed.delta
-      if (applyBoundary(text, multiline).done) break
+      if (applyBoundary(text, multiline, suffix, boundaryCtx).done) break
     }
   }
-  return applyBoundary(text, multiline).text
+  return applyBoundary(text, multiline, suffix, boundaryCtx).text
 }
 
 async function readChatStreamBody(
@@ -1877,7 +3111,11 @@ async function readCompletionResult(
   format: AiProviderFormat,
   response: Awaited<ReturnType<FetchPostLike>>,
   multiline: boolean,
-  onEarlyStop?: () => void
+  onEarlyStop?: () => void,
+  suffix = '',
+  signal?: AbortSignal,
+  onDelta?: (accumulatedText: string) => void,
+  boundaryCtx?: StreamBoundaryContext
 ): Promise<SqlFetchResult> {
   const rawLength = response.headers?.get('content-length')
   if (rawLength !== null && rawLength !== undefined && rawLength.trim() !== '') {
@@ -1897,7 +3135,11 @@ async function readCompletionResult(
         response.body,
         multiline,
         onEarlyStop,
-        AI_MAX_COMPLETION_BODY_BYTES
+        AI_MAX_COMPLETION_BODY_BYTES,
+        suffix,
+        signal,
+        onDelta,
+        boundaryCtx
       ),
     }
   }
@@ -1913,7 +3155,7 @@ async function readCompletionResult(
       // fall through to stream parsing
     }
   }
-  return { text: parseStreamText(format, raw, multiline) }
+  return { text: parseStreamText(format, raw, multiline, suffix, boundaryCtx) }
 }
 
 function resultText(format: AiProviderFormat, result: SqlFetchResult): string {
@@ -1958,7 +3200,7 @@ export async function completeSqlWithMeta(
     hasSensitiveContent(
       req.prefix,
       req.suffix,
-      `${req.user}\n${req.fimPrefix ?? ''}\n${req.fimSuffix ?? ''}`,
+      `${req.user}\n${req.fimPrefix ?? ''}\n${req.fimSuffix ?? ''}\n${req.fimSchemaDdl ?? ''}\n${req.fimHistorySql ?? ''}\n${req.fimPriorSql ?? ''}`,
       req.dialect
     )
   ) {
@@ -1967,29 +3209,53 @@ export async function completeSqlWithMeta(
 
   const typo = resolveTrailingTypoToken(req.prefix, req.dialect, req.knownIdentifiers)
   const effectiveReq = typo ? buildHealedCompletionRequest(req, typo) : req
+  const boundaryCtx: StreamBoundaryContext = {
+    dialect: effectiveReq.dialect,
+    initialQuote:
+      effectiveReq.dialect === 'redis'
+        ? null
+        : scanSqlBoundaryState(effectiveReq.prefix, effectiveReq.dialect).inQuote,
+  }
 
   const multiline = effectiveReq.multiline !== false
   const baseTokens = multiline ? provider.maxTokens : Math.min(provider.maxTokens, 48)
-  const stop = !multiline ? ['\n', ';', '```'] : ['\n\n', '```']
+  const baseStops = ['</COMPLETION>']
+  const fimStops = getModelFimStopTokens(provider.model)
+  const stop =
+    provider.format === 'ollama' || provider.format === 'mistral-fim'
+      ? Array.from(new Set([...fimStops, ...(multiline ? ['\n\n', '```'] : ['\n', '```'])]))
+      : baseStops
   let effortDisabled = false
+  let temperatureDisabled = false
   const isEffortAllowed = (): boolean =>
     provider.format === 'openai' &&
     !effortDisabled &&
     !adaptiveOpts?.skipEffort &&
     !(adaptiveOpts?.isEffortUnsupported?.(provider.model) ?? false)
+  const isTemperatureAllowed = (): boolean =>
+    (provider.format === 'openai' || provider.format === 'anthropic') &&
+    !temperatureDisabled &&
+    !adaptiveOpts?.skipTemperature &&
+    !(adaptiveOpts?.isTemperatureUnsupported?.(provider.model) ?? false)
   const stopAllowed = true
 
   const attempt = async (
     tokens: number,
     withEffort: boolean,
+    withTemperature: boolean,
     withStop: boolean
   ): Promise<SqlFetchResult> => {
-    const extra =
-      provider.format === 'openai' && withEffort ? { reasoning_effort: 'none' } : undefined
+    const extra: Record<string, unknown> = {}
+    if (provider.format === 'openai' && withEffort) {
+      extra.reasoning_effort = 'none'
+    }
+    if ((provider.format === 'openai' || provider.format === 'anthropic') && withTemperature) {
+      extra.temperature = CHAT_INLINE_TEMPERATURE
+    }
     const { url, init } = buildCompletionRequest(
       { ...provider, maxTokens: tokens },
       effectiveReq,
-      extra,
+      Object.keys(extra).length > 0 ? extra : undefined,
       true,
       withStop ? stop : undefined
     )
@@ -2009,8 +3275,15 @@ export async function completeSqlWithMeta(
       if (!response.ok) {
         throw new ProviderHttpError(response.status)
       }
-      return await readCompletionResult(provider.format, response, multiline, () =>
-        streamAbortController.abort()
+      return await readCompletionResult(
+        provider.format,
+        response,
+        multiline,
+        () => streamAbortController.abort(),
+        effectiveReq.suffix,
+        signal,
+        adaptiveOpts?.onStreamDelta,
+        boundaryCtx
       )
     } finally {
       signal.removeEventListener('abort', onCallerAbort)
@@ -2022,11 +3295,12 @@ export async function completeSqlWithMeta(
     allowStop: boolean
   ): Promise<SqlFetchResult> => {
     const allowEffort = isEffortAllowed()
+    const allowTemperature = isTemperatureAllowed()
     try {
-      return await attempt(tokens, allowEffort, allowStop)
+      return await attempt(tokens, allowEffort, allowTemperature, allowStop)
     } catch (err) {
       if (
-        (allowEffort || allowStop) &&
+        (allowEffort || allowTemperature || allowStop) &&
         err instanceof ProviderHttpError &&
         (err.status === 400 || err.status === 422)
       ) {
@@ -2038,7 +3312,15 @@ export async function completeSqlWithMeta(
           adaptiveOpts?.markEffortUnsupported?.(provider.model)
           adaptiveOpts?.onEffortRejected?.()
         }
-        return await attempt(tokens, false, false)
+        if (allowTemperature) {
+          temperatureDisabled = true
+          if (adaptiveOpts && !Object.isFrozen(adaptiveOpts)) {
+            adaptiveOpts.skipTemperature = true
+          }
+          adaptiveOpts?.markTemperatureUnsupported?.(provider.model)
+          adaptiveOpts?.onTemperatureRejected?.()
+        }
+        return await attempt(tokens, false, false, false)
       }
       throw err
     }
@@ -2064,33 +3346,73 @@ export async function completeSqlWithMeta(
   const raw = resultText(provider.format, result)
   if (looksInjected(raw)) return empty
   const hadTrailingMarker = TRAILING_SPECIAL_MARKER_RE.test(raw)
-  const cleaned = extractUnfencedSuggestion(raw)
+  const unfenced = extractUnfencedSuggestion(raw, effectiveReq.prefix, effectiveReq.dialect)
+  const cleaned =
+    effectiveReq.dialect !== 'redis'
+      ? (() => {
+          const semiAt = findFirstUnquotedSemicolon(unfenced, boundaryCtx.initialQuote ?? null)
+          return semiAt >= 0 ? unfenced.slice(0, semiAt + 1) : unfenced
+        })()
+      : unfenced
   const deduped = dropDuplicatedFromSuffix(
     removeRepetitiveBlocks(removeRepetitiveLines(cleaned)),
     req.suffix
   )
   const singleLine = trimMultiLineInSingleLineMode(deduped, effectiveReq.suffix, multiline)
-  const echoed = trimPrefixEcho(singleLine, effectiveReq.prefix)
+  const echoed = trimPrefixEcho(
+    singleLine,
+    effectiveReq.prefix,
+    effectiveReq.dialect,
+    effectiveReq.knownIdentifiers
+  )
   const withoutCaret = stripTrailingCaretPipe(
     echoed,
     effectiveReq.prefix,
     effectiveReq.dialect,
     hadTrailingMarker
   )
-  const overlapped = trimSuffixOverlap(withoutCaret, effectiveReq.suffix)
+  const bracketed = matchCompletionBrackets(
+    withoutCaret,
+    effectiveReq.prefix,
+    effectiveReq.dialect,
+    effectiveReq.suffix
+  )
+  const notRewritten = skipRewrittenSuffix(bracketed, effectiveReq.suffix)
+  const overlapped = trimSingleLineSuffixOverlap(
+    trimSuffixOverlap(notRewritten, effectiveReq.suffix),
+    effectiveReq.suffix,
+    effectiveReq.prefix,
+    effectiveReq.dialect
+  )
+  const groundedSources: string[] = []
+  if (effectiveReq.fimHistorySql) groundedSources.push(effectiveReq.fimHistorySql)
+  if (effectiveReq.fimPriorSql) groundedSources.push(effectiveReq.fimPriorSql)
+  const grounded = trimFabricatedFilterLiterals(
+    overlapped,
+    effectiveReq.prefix,
+    effectiveReq.suffix,
+    groundedSources,
+    effectiveReq.dialect
+  )
   if (typo) {
-    if (overlapped && isProseExplanation(overlapped)) return empty
+    if (grounded && isProseExplanation(grounded)) return empty
     let fullSuggestion: string
     if (typo.trailingSpaces.length > 0) {
-      const cont = normalizeCompletionBoundary(overlapped, typo.healedPrefix, effectiveReq.dialect)
+      const cont = normalizeCompletionBoundary(
+        grounded,
+        typo.healedPrefix,
+        effectiveReq.dialect,
+        effectiveReq.knownIdentifiers,
+        effectiveReq.suffix
+      )
       fullSuggestion = cont.trim() ? `${typo.correctedWord} ${cont.trimStart()}` : `${typo.correctedWord} `
-    } else if (overlapped) {
+    } else if (grounded) {
       const needsSeparator =
-        /^[A-Za-z0-9_]/.test(overlapped) ||
-        (VALID_SQL_WORDS.has(typo.correctedWord.toUpperCase()) && /^[*'"`[]/.test(overlapped))
+        /^[A-Za-z0-9_]/.test(grounded) ||
+        (VALID_SQL_WORDS.has(typo.correctedWord.toUpperCase()) && /^[*'"`[]/.test(grounded))
       fullSuggestion = needsSeparator
-        ? `${typo.correctedWord} ${overlapped}`
-        : `${typo.correctedWord}${overlapped}`
+        ? `${typo.correctedWord} ${grounded}`
+        : `${typo.correctedWord}${grounded}`
     } else {
       fullSuggestion = typo.correctedWord
     }
@@ -2100,15 +3422,28 @@ export async function completeSqlWithMeta(
   }
   const replacement = detectLeadingTokenReplacement(
     req.prefix,
-    overlapped,
+    grounded,
     req.dialect,
     req.knownIdentifiers
   )
   if (replacement) {
     return isProseExplanation(replacement.suggestion) ? empty : replacement
   }
-  const final = normalizeCompletionBoundary(overlapped, req.prefix, req.dialect)
-  return isProseExplanation(final) ? empty : { suggestion: final, replaceChars: 0 }
+  const final = normalizeCompletionBoundary(
+    grounded,
+    req.prefix,
+    req.dialect,
+    req.knownIdentifiers,
+    req.suffix
+  )
+  if (!final || isProseExplanation(final)) return empty
+  if (
+    (provider.format === 'ollama' || provider.format === 'mistral-fim') &&
+    doesInsertionIntroduceGrammarError(req.prefix, final, req.suffix, req.dialect)
+  ) {
+    return empty
+  }
+  return { suggestion: final, replaceChars: 0 }
 }
 
 export async function completeSql(
@@ -2120,6 +3455,357 @@ export async function completeSql(
 ): Promise<string> {
   const res = await completeSqlWithMeta(provider, req, signal, fetchImpl, adaptiveOpts)
   return res.replaceChars > 0 ? '' : res.suggestion
+}
+
+export interface StatementEditCompletionRequest {
+  dialect?: AiDialect
+  system: string
+  user: string
+  statement: string
+}
+
+export interface StatementEditCompletionResult {
+  raw: string
+  finishReason: string | null
+}
+
+interface ParsedEditStreamMeta {
+  delta: string
+  done: boolean
+  finishReason: string | null
+  sawReasoning: boolean
+}
+
+function parseStatementEditStreamLine(format: AiProviderFormat, rawLine: string): ParsedEditStreamMeta {
+  let line = rawLine.trim()
+  if (!line) return { delta: '', done: false, finishReason: null, sawReasoning: false }
+  if (line.startsWith('data:')) line = line.slice(5).trim()
+  if (!line) return { delta: '', done: false, finishReason: null, sawReasoning: false }
+  if (line === '[DONE]') return { delta: '', done: true, finishReason: null, sawReasoning: false }
+  if (!line.startsWith('{')) return { delta: '', done: false, finishReason: null, sawReasoning: false }
+  try {
+    const obj: unknown = JSON.parse(line)
+    const delta = extractStreamDelta(format, obj)
+    let finishReason: string | null = null
+    let sawReasoning = false
+    let done = false
+    if (isRecord(obj)) {
+      if (format === 'ollama') {
+        if (typeof obj.done_reason === 'string' && obj.done_reason) finishReason = obj.done_reason
+        if (obj.done === true) done = true
+        const msg = isRecord(obj.message) ? obj.message : null
+        if (typeof msg?.thinking === 'string' && msg.thinking.trim().length > 0) sawReasoning = true
+      } else if (format === 'anthropic') {
+        const d = isRecord(obj.delta) ? obj.delta : null
+        if (typeof d?.stop_reason === 'string' && d.stop_reason) finishReason = d.stop_reason
+        if (obj.type === 'message_stop') done = true
+      } else {
+        const choices = Array.isArray(obj.choices) ? obj.choices : []
+        const first = choices[0]
+        if (isRecord(first)) {
+          if (typeof first.finish_reason === 'string' && first.finish_reason) {
+            finishReason = first.finish_reason
+          }
+          const d = isRecord(first.delta) ? first.delta : null
+          if (
+            d &&
+            ((typeof d.reasoning_content === 'string' && d.reasoning_content.trim().length > 0) ||
+              (typeof d.reasoning === 'string' && d.reasoning.trim().length > 0))
+          ) {
+            sawReasoning = true
+          }
+        }
+      }
+    }
+    return { delta, done, finishReason, sawReasoning }
+  } catch {
+    return { delta: '', done: false, finishReason: null, sawReasoning: false }
+  }
+}
+
+function extractFinishReasonFromJson(format: AiProviderFormat, json: unknown): string | null {
+  if (!isRecord(json)) return null
+  if (format === 'ollama') return typeof json.done_reason === 'string' ? json.done_reason : null
+  if (format === 'anthropic') return typeof json.stop_reason === 'string' ? json.stop_reason : null
+  const choices = Array.isArray(json.choices) ? json.choices : []
+  const first = choices[0]
+  return isRecord(first) && typeof first.finish_reason === 'string' ? first.finish_reason : null
+}
+
+function shouldStopEditStreamText(text: string): boolean {
+  if (/<\/REWRITE>/i.test(text)) return true
+  const withoutOpen = text.replace(/<REWRITE>/i, '')
+  const openFence = /^\s*```[^\n]*\r?\n/.exec(withoutOpen)
+  if (openFence) {
+    const rest = withoutOpen.slice(openFence[0].length)
+    return /\r?\n?```/.test(rest)
+  }
+  return false
+}
+
+async function readStatementEditStreamBody(
+  format: AiProviderFormat,
+  body: ReadableStream<Uint8Array>,
+  onEarlyStop?: () => void,
+  maxBytes = AI_MAX_COMPLETION_BODY_BYTES
+): Promise<{ text: string; finishReason: string | null; sawReasoning: boolean }> {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let text = ''
+  let totalBytes = 0
+  let finishReason: string | null = null
+  let sawReasoning = false
+  try {
+    for (;;) {
+      // Do NOT swallow TimeoutError on partial statement edits (incomplete <REWRITE> risks truncating SQL)
+      const { done, value } = await reader.read()
+      if (done) break
+      totalBytes += value.byteLength
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => undefined)
+        onEarlyStop?.()
+        throw new AiResponseTooLargeError(maxBytes)
+      }
+      buffer += decoder.decode(value, { stream: true })
+      let newline = buffer.indexOf('\n')
+      while (newline !== -1) {
+        const line = buffer.slice(0, newline)
+        buffer = buffer.slice(newline + 1)
+        const parsed = parseStatementEditStreamLine(format, line)
+        if (parsed.finishReason) finishReason = parsed.finishReason
+        if (parsed.sawReasoning) sawReasoning = true
+        if (parsed.delta) {
+          text += parsed.delta
+          if (shouldStopEditStreamText(text)) {
+            await reader.cancel().catch(() => undefined)
+            onEarlyStop?.()
+            return { text, finishReason, sawReasoning }
+          }
+        }
+        if (parsed.done) {
+          await reader.cancel().catch(() => undefined)
+          onEarlyStop?.()
+          return { text, finishReason, sawReasoning }
+        }
+        newline = buffer.indexOf('\n')
+      }
+    }
+    buffer += decoder.decode()
+    if (buffer.trim()) {
+      const tail = parseStatementEditStreamLine(format, buffer)
+      if (tail.finishReason) finishReason = tail.finishReason
+      if (tail.sawReasoning) sawReasoning = true
+      if (tail.delta) text += tail.delta
+    }
+  } finally {
+    try {
+      reader.releaseLock()
+    } catch {
+      // reader already released/cancelled
+    }
+  }
+  return { text, finishReason, sawReasoning }
+}
+
+/** Requests a statement-level `<REWRITE>` completion for Mini-NEP Tier 2 using dynamic token budget and timeout safety. */
+export async function completeSqlStatementEdit(
+  provider: AiProviderConfig,
+  req: StatementEditCompletionRequest,
+  signal: AbortSignal,
+  fetchImpl: FetchPostLike = fetch as unknown as FetchPostLike,
+  adaptiveOpts?: AiCompleteAdaptiveOptions
+): Promise<StatementEditCompletionResult> {
+  const empty: StatementEditCompletionResult = { raw: '', finishReason: null }
+  if (hasSensitiveContent(req.statement, '', `${req.user}\n${req.statement}`, req.dialect)) {
+    return empty
+  }
+
+  const estimatedStmtTokens = Math.ceil(req.statement.length / 3.2)
+  const nepMaxTokens = Math.min(
+    2048,
+    Math.max(provider.maxTokens, estimatedStmtTokens + Math.max(provider.maxTokens, 96) + 32)
+  )
+  const editStops = ['</REWRITE>']
+
+  let effortDisabled = false
+  let temperatureDisabled = false
+  const isEffortAllowed = (): boolean =>
+    provider.format === 'openai' &&
+    !effortDisabled &&
+    !adaptiveOpts?.skipEffort &&
+    !(adaptiveOpts?.isEffortUnsupported?.(provider.model) ?? false)
+  const isTemperatureAllowed = (): boolean =>
+    !temperatureDisabled &&
+    !adaptiveOpts?.skipTemperature &&
+    !(adaptiveOpts?.isTemperatureUnsupported?.(provider.model) ?? false)
+
+  const attempt = async (
+    tokens: number,
+    withEffort: boolean,
+    withTemperature: boolean,
+    withStop: boolean
+  ): Promise<{ raw: string; finishReason: string | null; sawReasoning: boolean; json?: unknown }> => {
+    const extra: Record<string, unknown> = {}
+    if (provider.format === 'openai' && withEffort) {
+      extra.reasoning_effort = 'none'
+    }
+    if (withTemperature) {
+      extra.temperature = CHAT_INLINE_TEMPERATURE
+    }
+    if (withStop) {
+      if (provider.format === 'anthropic') {
+        extra.stop_sequences = editStops
+      } else {
+        extra.stop = editStops
+      }
+    }
+    const { url, init } = buildChatRequest(
+      provider,
+      req.system,
+      req.user,
+      tokens,
+      Object.keys(extra).length > 0 ? extra : undefined,
+      true
+    )
+    const streamAbortController = new AbortController()
+    const onCallerAbort = () => streamAbortController.abort(signal.reason)
+    if (signal.aborted) {
+      streamAbortController.abort(signal.reason)
+    } else {
+      signal.addEventListener('abort', onCallerAbort, { once: true })
+    }
+    try {
+      const response = await fetchImpl(url, {
+        ...init,
+        redirect: 'error',
+        signal: streamAbortController.signal,
+      })
+      if (!response.ok) {
+        throw new ProviderHttpError(response.status)
+      }
+      const rawLength = response.headers?.get('content-length')
+      if (rawLength !== null && rawLength !== undefined && rawLength.trim() !== '') {
+        const declared = Number(rawLength)
+        if (Number.isFinite(declared) && declared > AI_MAX_COMPLETION_BODY_BYTES) {
+          await response.body?.cancel().catch(() => undefined)
+          streamAbortController.abort()
+          throw new AiResponseTooLargeError(AI_MAX_COMPLETION_BODY_BYTES)
+        }
+      }
+      const contentType = (response.headers?.get('content-type') ?? '').toLowerCase()
+      if (/text\/event-stream|x-ndjson/.test(contentType) && response.body) {
+        const streamed = await readStatementEditStreamBody(
+          provider.format,
+          response.body,
+          () => streamAbortController.abort(),
+          AI_MAX_COMPLETION_BODY_BYTES
+        )
+        return {
+          raw: streamed.text,
+          finishReason: streamed.finishReason,
+          sawReasoning: streamed.sawReasoning,
+        }
+      }
+      if (!response.body) {
+        const json = await readJsonBounded(response, AI_MAX_COMPLETION_BODY_BYTES)
+        return {
+          raw: extractChatText(provider.format, json),
+          finishReason: extractFinishReasonFromJson(provider.format, json),
+          sawReasoning: false,
+          json,
+        }
+      }
+      const bodyText = await readBodyAll(response.body, AI_MAX_COMPLETION_BODY_BYTES)
+      const trimmed = bodyText.trimStart()
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        try {
+          const json: unknown = JSON.parse(bodyText)
+          return {
+            raw: extractChatText(provider.format, json),
+            finishReason: extractFinishReasonFromJson(provider.format, json),
+            sawReasoning: false,
+            json,
+          }
+        } catch {
+          // fall through to SSE text parsing
+        }
+      }
+      let parsedText = ''
+      let parsedFinish: string | null = null
+      let parsedReasoning = false
+      for (const line of bodyText.split(/\r?\n/)) {
+        const parsed = parseStatementEditStreamLine(provider.format, line)
+        if (parsed.finishReason) parsedFinish = parsed.finishReason
+        if (parsed.sawReasoning) parsedReasoning = true
+        if (parsed.delta) {
+          parsedText += parsed.delta
+          if (shouldStopEditStreamText(parsedText)) break
+        }
+        if (parsed.done) break
+      }
+      return { raw: parsedText, finishReason: parsedFinish, sawReasoning: parsedReasoning }
+    } finally {
+      signal.removeEventListener('abort', onCallerAbort)
+    }
+  }
+
+  const runWithFallback = async (
+    tokens: number,
+    allowStop: boolean
+  ): Promise<{ raw: string; finishReason: string | null; sawReasoning: boolean; json?: unknown }> => {
+    const allowEffort = isEffortAllowed()
+    const allowTemperature = isTemperatureAllowed()
+    try {
+      return await attempt(tokens, allowEffort, allowTemperature, allowStop)
+    } catch (err) {
+      if (
+        (allowEffort || allowTemperature || allowStop) &&
+        err instanceof ProviderHttpError &&
+        (err.status === 400 || err.status === 422)
+      ) {
+        if (allowEffort) {
+          effortDisabled = true
+          if (adaptiveOpts && !Object.isFrozen(adaptiveOpts)) adaptiveOpts.skipEffort = true
+          adaptiveOpts?.markEffortUnsupported?.(provider.model)
+          adaptiveOpts?.onEffortRejected?.()
+        }
+        if (allowTemperature) {
+          temperatureDisabled = true
+          if (adaptiveOpts && !Object.isFrozen(adaptiveOpts)) adaptiveOpts.skipTemperature = true
+          adaptiveOpts?.markTemperatureUnsupported?.(provider.model)
+          adaptiveOpts?.onTemperatureRejected?.()
+        }
+        return await attempt(tokens, false, false, false)
+      }
+      throw err
+    }
+  }
+
+  const bumpedTokens = Math.min(2048, Math.max(nepMaxTokens, 512))
+  const canAdapt = provider.format === 'openai' || provider.format === 'mistral-fim'
+  let res =
+    canAdapt && adaptiveOpts?.reasoning
+      ? await runWithFallback(bumpedTokens, true)
+      : await runWithFallback(nepMaxTokens, true)
+
+  const exhausted =
+    (res.json !== undefined && isReasoningExhausted(provider.format, res.json)) ||
+    (res.sawReasoning && !res.raw.trim() && (res.finishReason === 'length' || res.finishReason === 'max_tokens'))
+
+  if (canAdapt && !adaptiveOpts?.reasoning && exhausted) {
+    adaptiveOpts?.onReasoningDetected?.()
+    res = await runWithFallback(bumpedTokens, true)
+  }
+
+  const exhaustedAfter =
+    (res.json !== undefined && isReasoningExhausted(provider.format, res.json)) ||
+    (res.sawReasoning && !res.raw.trim() && (res.finishReason === 'length' || res.finishReason === 'max_tokens'))
+  if (canAdapt && exhaustedAfter) {
+    throw new ReasoningExhaustedError()
+  }
+
+  return { raw: res.raw, finishReason: res.finishReason }
 }
 
 export async function completeChat(
@@ -2302,26 +3988,117 @@ export function median(samples: readonly number[]): number {
   return sorted.length % 2 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2)
 }
 
-const IPV4_OCTET_RE = /^(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/
+const STRICT_IPV4_OCTET_RE = /^(?:0|[1-9]\d{0,2})$/
+const IPV6_HEXTET_RE = /^[0-9a-f]{1,4}$/i
 const LOCALHOST_NAME_RE =
   /^(?:localhost|[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.localhost)$/i
 
+function parseStrictIpv4Octets(host: string): [number, number, number, number] | null {
+  const parts = host.split('.')
+  if (parts.length !== 4) return null
+  const out: number[] = []
+  for (const p of parts) {
+    if (!STRICT_IPV4_OCTET_RE.test(p)) return null
+    const n = Number(p)
+    if (n > 255) return null
+    out.push(n)
+  }
+  return [out[0], out[1], out[2], out[3]]
+}
+
+function parseIpv6GroupSlice(groups: readonly string[]): number[] | null {
+  const out: number[] = []
+  for (let i = 0; i < groups.length; i += 1) {
+    const g = groups[i]
+    if (!g) return null
+    if (g.includes('.')) {
+      if (i !== groups.length - 1) return null
+      const v4 = parseStrictIpv4Octets(g)
+      if (!v4) return null
+      out.push((v4[0] << 8) | v4[1], (v4[2] << 8) | v4[3])
+    } else {
+      if (!IPV6_HEXTET_RE.test(g)) return null
+      out.push(Number.parseInt(g, 16))
+    }
+  }
+  return out
+}
+
+function parseIpv6Hextets(rawIpv6: string): number[] | null {
+  if (!rawIpv6 || rawIpv6.includes('%')) return null
+  const doubleColonParts = rawIpv6.split('::')
+  if (doubleColonParts.length > 2) return null
+  if (doubleColonParts.length === 1) {
+    const groups = rawIpv6.split(':')
+    const hextets = parseIpv6GroupSlice(groups)
+    return hextets && hextets.length === 8 ? hextets : null
+  }
+  const [leftRaw, rightRaw] = doubleColonParts
+  const leftGroups = leftRaw ? leftRaw.split(':') : []
+  const rightGroups = rightRaw ? rightRaw.split(':') : []
+  const left = parseIpv6GroupSlice(leftGroups)
+  const right = parseIpv6GroupSlice(rightGroups)
+  if (!left || !right) return null
+  if (leftGroups.some((g) => g.includes('.'))) return null
+  const zeros = 8 - (left.length + right.length)
+  if (zeros < 1) return null
+  return [...left, ...new Array<number>(zeros).fill(0), ...right]
+}
+
+function isIpv6Loopback(rawIpv6: string): boolean {
+  const h = parseIpv6Hextets(rawIpv6)
+  if (!h) return false
+  if (h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0 && h[6] === 0 && h[7] === 1) {
+    return true
+  }
+  if (
+    h[0] === 0 &&
+    h[1] === 0 &&
+    h[2] === 0 &&
+    h[3] === 0 &&
+    h[4] === 0 &&
+    h[5] === 0xffff &&
+    ((h[6] >> 8) & 0xff) === 127
+  ) {
+    return true
+  }
+  return false
+}
+
 export function isLoopbackHost(host: string): boolean {
-  const trimmed = host.trim()
-  if (!trimmed) return false
-  if (trimmed === '::1' || trimmed === '[::1]') return true
+  const trimmed = typeof host === 'string' ? host.trim() : ''
+  if (!trimmed || /[\s/?#@%]/.test(trimmed)) return false
+
+  let bare = trimmed
+  let expectIpv6 = false
   if (trimmed.startsWith('[')) {
     const closeIdx = trimmed.indexOf(']')
-    if (closeIdx < 0) return false
-    const inside = trimmed.slice(1, closeIdx)
+    if (closeIdx <= 1) return false
     const rest = trimmed.slice(closeIdx + 1)
     if (rest && !/^:\d+$/.test(rest)) return false
-    return inside === '::1'
+    bare = trimmed.slice(1, closeIdx)
+    if (bare.includes('[') || bare.includes(']')) return false
+    expectIpv6 = true
+  } else {
+    if (trimmed.includes('[') || trimmed.includes(']')) return false
+    const firstColon = trimmed.indexOf(':')
+    if (firstColon !== -1) {
+      const lastColon = trimmed.lastIndexOf(':')
+      if (firstColon === lastColon) {
+        if (!/^\d+$/.test(trimmed.slice(firstColon + 1))) return false
+        bare = trimmed.slice(0, firstColon)
+      } else {
+        expectIpv6 = true
+      }
+    }
   }
-  const name = trimmed.replace(/:\d+$/, '')
-  if (LOCALHOST_NAME_RE.test(name)) return true
-  const parts = name.split('.')
-  return parts.length === 4 && parts[0] === '127' && parts.every((p) => IPV4_OCTET_RE.test(p))
+
+  if (expectIpv6 || bare.includes(':')) {
+    return isIpv6Loopback(bare)
+  }
+  if (LOCALHOST_NAME_RE.test(bare)) return true
+  const v4 = parseStrictIpv4Octets(bare)
+  return v4 !== null && v4[0] === 127
 }
 
 export function validateAiBaseUrl(

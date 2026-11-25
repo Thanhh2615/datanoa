@@ -417,11 +417,13 @@ workerPort.on('message', (msg: WorkerRequest) => {
         truncated: boolean
       } | null = null
 
+      let currentExecIndex = -1
       try {
         for (let execIndex = 0; execIndex < execList.length; execIndex++) {
           const rawSql = execList[execIndex]
           const trimmedStmt = rawSql.trim()
           if (!trimmedStmt) continue
+          currentExecIndex = execIndex
           const stmtStart = performance.now()
           const normalizedStmt = stripLeadingSqlComments(trimmedStmt)
           const isStandaloneBegin = /^(?:BEGIN|START\s+TRANSACTION)\b/i.test(normalizedStmt)
@@ -552,10 +554,16 @@ workerPort.on('message', (msg: WorkerRequest) => {
             // Ignore pragma restore errors
           }
         }
+        const errInfo = extractSqliteErrorInfo(queryErr)
         workerPort.postMessage({
           id: msg.id,
           ok: false,
-          error: extractSqliteErrorInfo(queryErr),
+          error: {
+            ...errInfo,
+            ...(currentExecIndex >= 0
+              ? { failedStatementIndex: currentExecIndex, statementCount: execList.length }
+              : {}),
+          },
           txState: getTransactionStatePayload(),
         })
         return

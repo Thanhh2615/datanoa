@@ -6,6 +6,28 @@ export interface SqlStatementSlice {
   end: number
 }
 
+export interface IsolatedAiSqlStatement {
+  text: string
+  stmtPrefix: string
+  stmtSuffix: string
+  spanStart: number
+  spanEnd: number
+  relCursor: number
+  cursorOffsetInSpan: number
+  lineCount: number
+  hasPrecedingStatements: boolean
+  terminatedBySemicolon: boolean
+  semiEnd: number
+  cursorAfterSemicolon: boolean
+  isFreshStatementAfterSemicolon: boolean
+  precedingErroredSlice: {
+    text: string
+    spanStart: number
+    spanEnd: number
+    semiEnd: number
+  } | null
+}
+
 export declare function usesBackslashAndHash(dialect?: DatabaseDriverType): boolean
 export declare function supportsNestedBlockComments(dialect?: DatabaseDriverType): boolean
 export declare function supportsDollarQuoting(dialect?: DatabaseDriverType): boolean
@@ -51,6 +73,11 @@ export declare function findStatementAtOffset(
   offset: number,
   dialect?: DatabaseDriverType
 ): string
+export declare function isolateActiveSqlStatement(
+  prefix: string,
+  suffix: string,
+  dialect?: DatabaseDriverType
+): IsolatedAiSqlStatement
 
 export type SqlExecutionMode = 'caret' | 'all' | 'explain'
 
@@ -73,6 +100,9 @@ export interface SqlReplaceTarget {
   to: number
   originalSlice?: string
   fallbackSql?: string
+  statementIndex?: number
+  totalStatements?: number
+  preserveOtherStatements?: boolean
 }
 
 export interface SqlReplacementEdit {
@@ -94,6 +124,13 @@ export declare function resolveSqlReplacementSpan(
   nextSql: string,
   dialect?: DatabaseDriverType
 ): SqlReplacementEdit | null
+
+export declare function remapSqlTargetRange<T extends { from: number; to: number } | null | undefined>(
+  target: T,
+  editFrom: number,
+  editTo: number,
+  insertLen: number
+): T
 export declare function stripLeadingSqlComments(
   sql: string,
   dialect?: DatabaseDriverType

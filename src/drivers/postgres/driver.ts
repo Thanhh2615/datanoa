@@ -23,7 +23,11 @@ import type {
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
-import { DatabaseDriverError, runDriverConnectionTest } from '../common/driver'
+import {
+  DatabaseDriverError,
+  attachFailedStatementMeta,
+  runDriverConnectionTest,
+} from '../common/driver'
 import type { DriverTlsOptions } from '../common/tls-and-tunnel'
 import { buildDefaultTlsOptions, resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
 import {
@@ -1275,6 +1279,7 @@ export class PostgresSession implements IDatabaseSession {
       this.activeQueries.set(queryId, activeEntry)
 
       let shouldDestroyClient = false
+      let currentExecIndex = -1
       try {
         let totalAffectedRows = 0
         let lastSelect: Omit<QueryResult, 'executionTimeMs'> | null = null
@@ -1286,6 +1291,7 @@ export class PostgresSession implements IDatabaseSession {
             shouldDestroyClient = true
             throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', this.driverType)
           }
+          currentExecIndex = execIndex
           const trimmedStmt = stmtSql.trim()
           const stmtStart = performance.now()
           const normalizedStmt = stripLeadingSqlComments(trimmedStmt, this.driverType).trim()
@@ -1423,6 +1429,15 @@ export class PostgresSession implements IDatabaseSession {
           this.txAborted = true
         } else if (!isPinned) {
           shouldDestroyClient = true
+        }
+        if (
+          currentExecIndex >= 0 &&
+          !activeEntry.cancelled &&
+          !this.isClosed &&
+          (err instanceof Error || execList.length > 1) &&
+          !(err instanceof DatabaseDriverError && (err.code === 'cancelled' || err.code === 'SESSION_CLOSED'))
+        ) {
+          throw attachFailedStatementMeta(err, currentExecIndex, execList.length)
         }
         throw err
       } finally {

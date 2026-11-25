@@ -494,6 +494,16 @@ function buildEditorTheme(typography, isLightTheme) {
         textDecorationThickness: '1.4px',
         opacity: '0.58',
       },
+      '.cm-ai-diff-insert': {
+        color: isLightTheme ? '#15803d' : 'rgba(74, 222, 128, 0.92)',
+        backgroundColor: isLightTheme ? 'rgba(22, 163, 74, 0.12)' : 'rgba(34, 197, 94, 0.14)',
+        borderRadius: '3px',
+        padding: '0 2px',
+        marginLeft: '2px',
+        whiteSpace: 'pre',
+        pointerEvents: 'none',
+        userSelect: 'none',
+      },
       '.cm-sql-diag-error': {
         textDecorationLine: 'underline',
         textDecorationStyle: 'wavy',
@@ -651,7 +661,9 @@ export function createPanelCodeMirrorEditor(options) {
       themeCompartment.of(buildEditorTheme(currentTypography, currentIsLight)),
       placeholderCompartment.of(currentPlaceholder ? placeholder(currentPlaceholder) : []),
       createCmSqlLintExtension({ getDialect: () => currentDialect }),
-      ...(options?.aiInline ? [createCmInlineAiExtension(options.aiInline)] : []),
+      ...(options?.aiInline
+        ? [createCmInlineAiExtension({ ...options.aiInline, getDialect: () => currentDialect })]
+        : []),
       runKeymap,
       keymap.of([
         ...completionKeymap,
@@ -703,8 +715,8 @@ export function createPanelCodeMirrorEditor(options) {
     getExecutionRange(mode = 'caret', driverOverride) {
       return extractPanelExecutionRange(view.state, mode, driverOverride || currentDialect)
     },
-    replaceSqlRange(target, nextSql) {
-      return replacePanelSqlRange(view, target, nextSql, currentDialect)
+    replaceSqlRange(target, nextSql, driverOverride) {
+      return replacePanelSqlRange(view, target, nextSql, driverOverride || currentDialect)
     },
     getCursorOffset() {
       return view.state.selection.main.head
@@ -767,7 +779,7 @@ export function createPanelCodeMirrorEditor(options) {
     clearAiGhost() {
       view.dispatch({ effects: clearGhostEffect.of(undefined) })
     },
-    setDbSyntaxError(errorMessage, targetRange) {
+    setDbSyntaxError(errorMessage, targetRange, driverOverride) {
       const clean = String(errorMessage || '').trim()
       if (!clean) {
         view.dispatch({ effects: clearDbSqlErrorEffect.of(undefined) })
@@ -777,6 +789,7 @@ export function createPanelCodeMirrorEditor(options) {
         effects: setDbSqlErrorEffect.of({
           errorMessage: clean,
           targetRange: targetRange ?? null,
+          dialect: driverOverride || currentDialect,
         }),
       })
     },

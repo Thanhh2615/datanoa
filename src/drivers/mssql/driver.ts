@@ -20,7 +20,13 @@ import type {
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
-import { DatabaseDriverError, runDriverConnectionTest } from '../common/driver'
+import {
+  DatabaseDriverError,
+  areChunksAlignedWithSqlSlices,
+  attachFailedStatementMeta,
+  copyFailedStatementMeta,
+  runDriverConnectionTest,
+} from '../common/driver'
 import type { DriverTlsOptions } from '../common/tls-and-tunnel'
 import { resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
 import {
@@ -137,7 +143,10 @@ function scrubMssqlError(err: unknown): unknown {
       try {
         err.message = clean
       } catch {
-        return new DatabaseDriverError(clean, extractMssqlErrorCode(err) || 'MSSQL_ERROR', 'mssql', err)
+        return copyFailedStatementMeta(
+          err,
+          new DatabaseDriverError(clean, extractMssqlErrorCode(err) || 'MSSQL_ERROR', 'mssql', err)
+        )
       }
     }
   }
@@ -849,6 +858,7 @@ export class MssqlSession implements IDatabaseSession {
     }
     const batches = splitMssqlBatches(sql)
     const execBatches = batches.length > 0 ? batches : [sql]
+    const chunksAligned = areChunksAlignedWithSqlSlices(sql, 'mssql', execBatches)
     if (this.profile.readOnly && execBatches.some((b) => isMssqlReadOnlyBlocked(b))) {
       this.assertWritable()
     }
@@ -876,7 +886,8 @@ export class MssqlSession implements IDatabaseSession {
       this.activeQueries.set(queryId, activeEntry)
 
       try {
-        for (const batchSql of execBatches) {
+        for (let batchIndex = 0; batchIndex < execBatches.length; batchIndex++) {
+          const batchSql = execBatches[batchIndex]
           if (activeEntry.cancelled || this.isClosed) {
             throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'mssql')
           }
@@ -959,7 +970,11 @@ export class MssqlSession implements IDatabaseSession {
             if (activeEntry.cancelled || extractMssqlErrorCode(err) === 'ECANCEL') {
               throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'mssql', err)
             }
-            throw scrubMssqlError(err)
+            const scrubbed = scrubMssqlError(err)
+            if (chunksAligned && (execBatches.length > 1 || scrubbed instanceof Error)) {
+              throw attachFailedStatementMeta(scrubbed, batchIndex, execBatches.length)
+            }
+            throw scrubbed
           }
 
           if (activeEntry.cancelled || this.isClosed) {

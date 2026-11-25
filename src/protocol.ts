@@ -200,6 +200,13 @@ export interface QueryResultSet {
   sourceTable?: QueryResultSourceTable
 }
 
+export interface QueryExecutionError {
+  message: string
+  code?: string
+  failedStatementIndex?: number
+  statementCount?: number
+}
+
 export interface QueryResult {
   columns: { name: string; type: string }[]
   rows: unknown[][]
@@ -210,6 +217,7 @@ export interface QueryResult {
   isSelect: boolean
   sourceTable?: QueryResultSourceTable
   resultSets?: QueryResultSet[]
+  executionError?: QueryExecutionError
 }
 
 export interface TableBrowseResult {
@@ -278,6 +286,12 @@ export const SAVED_CONNECTIONS_STORAGE_KEY = 'datanoa.savedConnections'
 
 /** Storage key for active connection */
 export const ACTIVE_CONNECTION_STORAGE_KEY = 'datanoa.activeConnectionId'
+
+export interface AiInlineEdit {
+  fromOffset: number
+  toOffset: number
+  insert: string
+}
 
 interface DatanoaPluginRequests {
   'connections.list': {
@@ -368,6 +382,7 @@ interface DatanoaPluginRequests {
       queryId: string
       sql: string
       maxRows?: number
+      structuredError?: boolean
     }
     output: QueryResult
   }
@@ -577,19 +592,19 @@ interface DatanoaPluginRequests {
     output: AiStatusSnapshot
   }
   'ai.key.set': {
-    input: { key: string; baseUrl?: string }
-    output: { hasKey: boolean }
+    input: { key: string; baseUrl?: string; role?: AiRole }
+    output: { hasKey: boolean; role?: AiRole }
   }
   'ai.provider.test': {
-    input?: Record<string, never>
-    output: { ok: boolean; message: string; ms: number | null }
+    input: { role?: AiRole } | undefined
+    output: { ok: boolean; message: string; ms: number | null; role?: AiRole }
   }
   'ai.models.list': {
-    input: { format: AiProviderFormat; baseUrl: string; key: string }
+    input: { format: AiProviderFormat; baseUrl: string; key: string; role?: AiRole }
     output: { ok: boolean; models: string[]; message: string }
   }
   'ai.models.bench': {
-    input: { format: AiProviderFormat; baseUrl: string; key: string; models: string[] }
+    input: { format: AiProviderFormat; baseUrl: string; key: string; models: string[]; role?: AiRole }
     output: { results: { model: string; ok: boolean; ms: number | null }[]; message: string }
   }
   'ai.models.usage': {
@@ -618,8 +633,15 @@ interface DatanoaPluginRequests {
       activeTable?: string
       schemaMap?: Record<string, string[]>
       manual?: boolean
+      mode?: 'auto' | 'complete' | 'edit'
     }
-    output: { suggestion: string; id: number; replaceChars?: number }
+    output: {
+      suggestion: string
+      id: number
+      replaceChars?: number
+      edits?: AiInlineEdit[]
+      mode?: 'complete' | 'edit'
+    }
   }
   'ai.explainAnalyze': {
     input: {
@@ -676,6 +698,21 @@ export type AiExplainLanguage =
 
 export type AiMetricKind = 'shown' | 'accepted' | 'partial' | 'kept' | 'undone' | 'stale'
 
+export type AiRole = 'autocomplete' | 'explain'
+
+export interface AiRoleStatus {
+  enabled: boolean
+  state: AiStatusState
+  reason: string | null
+  format: AiProviderFormat
+  baseUrl: string
+  host: string
+  model: string
+  hasKey: boolean
+  usingSharedKey?: boolean
+  destination: 'none' | 'local' | 'remote'
+}
+
 export interface AiStatusSnapshot {
   enabled: boolean
   state: AiStatusState
@@ -691,6 +728,11 @@ export interface AiStatusSnapshot {
   explainLanguage: AiExplainLanguage
   hasKey: boolean
   destination: 'none' | 'local' | 'remote'
+  sync: boolean
+  roles: {
+    autocomplete: AiRoleStatus
+    explain: AiRoleStatus
+  }
 }
 
 export interface AiStatsSnapshot {
@@ -850,7 +892,17 @@ export function sanitizeJsonPayload<T>(value: T): T {
     const out: Record<string, unknown> = {}
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       if (v !== undefined && typeof v !== 'function' && typeof v !== 'symbol') {
-        out[k] = sanitizeJsonPayload(v)
+        const sanitized = sanitizeJsonPayload(v)
+        if (k === '__proto__') {
+          Object.defineProperty(out, k, {
+            value: sanitized,
+            enumerable: true,
+            writable: true,
+            configurable: true,
+          })
+        } else {
+          out[k] = sanitized
+        }
       }
     }
     return out as unknown as T

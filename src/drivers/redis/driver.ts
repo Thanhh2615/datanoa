@@ -20,6 +20,8 @@ import type {
 } from '../common/driver'
 import {
   DatabaseDriverError,
+  attachFailedStatementMeta,
+  copyFailedStatementMeta,
   createUnsupportedTransactionError,
   createUnsupportedTransactionState,
   runDriverConnectionTest,
@@ -44,7 +46,7 @@ function scrubRedisError(err: unknown): unknown {
           err && typeof err === 'object' && 'code' in err && typeof err.code === 'string'
             ? err.code
             : 'REDIS_ERROR'
-        return new DatabaseDriverError(clean, code, 'redis', err)
+        return copyFailedStatementMeta(err, new DatabaseDriverError(clean, code, 'redis', err))
       }
     }
   }
@@ -1516,6 +1518,7 @@ export class RedisSession implements IDatabaseSession {
 
       ;(async () => {
         let queryClient: RespSocketClient | null = null
+        let currentCmdIndex = -1
         try {
           // Dedicated per-query socket so cancelQuery never destroys sharedClient or disrupts concurrent ops
           queryClient = await this.openAuthenticatedClient()
@@ -1528,6 +1531,7 @@ export class RedisSession implements IDatabaseSession {
           if (parsedCommands.length === 1) {
             const cmdArgs = parsedCommands[0]
             const verb = (cmdArgs[0] || '').toUpperCase()
+            currentCmdIndex = 0
             const reply = await queryClient.sendCommand(cmdArgs)
             if (entry.cancelled) return
 
@@ -1628,8 +1632,10 @@ export class RedisSession implements IDatabaseSession {
 
           // Multi-line command batch
           const allRows: unknown[][] = []
-          for (const cmdArgs of parsedCommands) {
+          for (let cmdIndex = 0; cmdIndex < parsedCommands.length; cmdIndex++) {
+            const cmdArgs = parsedCommands[cmdIndex]
             if (entry.cancelled) return
+            currentCmdIndex = cmdIndex
             const reply = await queryClient.sendCommand(cmdArgs)
             if (entry.cancelled) return
             allRows.push([
@@ -1654,7 +1660,20 @@ export class RedisSession implements IDatabaseSession {
           })
         } catch (err) {
           if (!entry.cancelled) {
-            reject(scrubRedisError(err))
+            const scrubbed = scrubRedisError(err)
+            if (
+              currentCmdIndex >= 0 &&
+              !this.isClosed &&
+              (scrubbed instanceof Error || parsedCommands.length > 1) &&
+              !(
+                scrubbed instanceof DatabaseDriverError &&
+                (scrubbed.code === 'cancelled' || scrubbed.code === 'SESSION_CLOSED')
+              )
+            ) {
+              reject(attachFailedStatementMeta(scrubbed, currentCmdIndex, parsedCommands.length))
+            } else {
+              reject(scrubbed)
+            }
           }
         } finally {
           this.activeQueries.delete(queryId)

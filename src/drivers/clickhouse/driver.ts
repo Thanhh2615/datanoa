@@ -21,6 +21,7 @@ import type {
 } from '../common/driver'
 import {
   DatabaseDriverError,
+  attachFailedStatementMeta,
   buildCombinedAbortSignal,
   createUnsupportedTransactionError,
   createUnsupportedTransactionState,
@@ -1150,12 +1151,14 @@ export class ClickHouseSession implements IDatabaseSession {
       )
     }
 
+    let currentExecIndex = -1
     try {
       let totalAffectedRows = 0
       let lastSelect: Omit<QueryResult, 'executionTimeMs'> | null = null
       const collectedSets: QueryResultSet[] = []
 
       for (let i = 0; i < statementList.length; i++) {
+        currentExecIndex = i
         const stmtSql = statementList[i]
         const serverQueryId = statementList.length === 1 ? queryId : `${queryId}_${i + 1}`
         active.currentServerQueryId = serverQueryId
@@ -1263,6 +1266,16 @@ export class ClickHouseSession implements IDatabaseSession {
     } catch (err) {
       if (active.cancelled && !(err instanceof DatabaseDriverError && err.code === 'cancelled')) {
         throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'clickhouse', err)
+      }
+      if (
+        currentExecIndex >= 0 &&
+        !active.cancelled &&
+        !(
+          err instanceof DatabaseDriverError &&
+          (err.code === 'cancelled' || err.code === 'SESSION_CLOSED' || err.code === 'TIMEOUT')
+        )
+      ) {
+        throw attachFailedStatementMeta(err, currentExecIndex, statementList.length)
       }
       throw err
     } finally {

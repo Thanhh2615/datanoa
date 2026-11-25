@@ -565,7 +565,7 @@
 
       <!-- TAB 3: SQL / REDIS CONSOLE -->
       <section id="tabSql" class="tree-box" hidden>
-        <div id="sqlProdBanner" class="banner danger" hidden>
+        <div id="sqlProdBanner" class="banner warn" hidden>
           <span id="sqlProdBannerText" class="banner-text">PROD environment — double-check statements before running.</span>
           <button id="sqlProdBannerClose" class="btn btn-ghost btn-icon btn-sm banner-close-btn" type="button" aria-label="Dismiss">&times;</button>
         </div>
@@ -942,6 +942,9 @@
         <kbd>Ctrl+Enter</kbd><span>Execute SQL at Caret / Apply Cell</span>
         <kbd>Ctrl+Shift+Enter</kbd><span>Run All SQL Statements</span>
         <kbd>Shift+Alt+F</kbd><span>Format SQL Query</span>
+        <kbd>Tab / Ctrl+Right</kbd><span>Accept AI Inline Completion or Statement Diff / Next Word</span>
+        <kbd>Ctrl+Alt+Right / Cmd+Alt+Right</kbd><span>Accept Next Line of AI Inline Suggestion</span>
+        <kbd>Alt+\</kbd><span>Trigger AI Statement Edit (Fix &amp; Complete)</span>
         <kbd>Ctrl+C / Ctrl+V</kbd><span>Copy selected cells / Paste into cells or new rows</span>
         <kbd>Ctrl+Shift+V</kbd><span>Paste Clipboard as New Staged Row(s)</span>
         <kbd>Ctrl+F</kbd><span>Find &amp; Highlight in Data Page</span>

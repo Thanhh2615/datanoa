@@ -45,7 +45,13 @@ import type {
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
-import { DatabaseDriverError, runDriverConnectionTest } from '../common/driver'
+import {
+  DatabaseDriverError,
+  areChunksAlignedWithSqlSlices,
+  attachFailedStatementMeta,
+  copyFailedStatementMeta,
+  runDriverConnectionTest,
+} from '../common/driver'
 import { TableDetailsCache } from '../common/schema'
 import type { DriverTlsOptions } from '../common/tls-and-tunnel'
 import { resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
@@ -1758,9 +1764,15 @@ function scrubMongoError(
   if (err instanceof DatabaseDriverError) {
     const scrubbed = scrubMongoErrorMessage(err.message, fallback)
     if (scrubbed === err.message) return err
-    return new DatabaseDriverError(scrubbed, err.code, err.driver ?? 'mongodb', err.cause ?? err)
+    return copyFailedStatementMeta(
+      err,
+      new DatabaseDriverError(scrubbed, err.code, err.driver ?? 'mongodb', err.cause ?? err)
+    )
   }
-  return new DatabaseDriverError(scrubMongoErrorMessage(err, fallback), defaultCode, 'mongodb', err)
+  return copyFailedStatementMeta(
+    err,
+    new DatabaseDriverError(scrubMongoErrorMessage(err, fallback), defaultCode, 'mongodb', err)
+  )
 }
 
 function parseMongoProfileOptions(rawOptions: string | undefined): Record<string, unknown> {
@@ -4050,14 +4062,26 @@ export class MongoSession implements IDatabaseSession {
     this.assertOpen()
     const rawText = typeof rawQuery === 'string' ? rawQuery : ''
     let parsedStmts: ParsedMongoStatement[]
+    let parseIdx = -1
+    let rawStmtCount = 0
+    let chunksAligned = false
     try {
       const rawStmts = splitMongoScriptStatements(rawText)
       if (rawStmts.length === 0) {
         throw new DatabaseDriverError('MongoDB query cannot be empty', 'invalid_params', 'mongodb')
       }
-      parsedStmts = rawStmts.map((raw) => parseMongoStatement(raw))
+      rawStmtCount = rawStmts.length
+      chunksAligned = areChunksAlignedWithSqlSlices(rawText, 'mongodb', rawStmts)
+      parsedStmts = rawStmts.map((raw, idx) => {
+        parseIdx = idx
+        return parseMongoStatement(raw)
+      })
     } catch (err: unknown) {
-      throw scrubMongoError(err, 'Invalid MongoDB query', 'SYNTAX_ERROR')
+      const scrubbed = scrubMongoError(err, 'Invalid MongoDB query', 'SYNTAX_ERROR')
+      if (chunksAligned && parseIdx >= 0 && rawStmtCount > 0 && scrubbed.code !== 'invalid_params') {
+        throw attachFailedStatementMeta(scrubbed, parseIdx, rawStmtCount)
+      }
+      throw scrubbed
     }
 
     if (this.profile.readOnly) {
@@ -4089,6 +4113,7 @@ export class MongoSession implements IDatabaseSession {
     this.activeQueries.set(queryId, activeEntry)
     const startTime = performance.now()
 
+    let currentExecIdx = -1
     try {
       let currentDbName = this.dbName
       let totalAffectedRows = 0
@@ -4101,6 +4126,7 @@ export class MongoSession implements IDatabaseSession {
         if (activeEntry.cancelled || activeEntry.controller.signal.aborted || this.isClosed) {
           throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'mongodb')
         }
+        currentExecIdx = idx
         const stmt = parsedStmts[idx]
         const stmtStart = performance.now()
         const { result, nextDbName, mutates } = await this.executeSingleMongoStatement(
@@ -4174,7 +4200,17 @@ export class MongoSession implements IDatabaseSession {
       if (activeEntry.cancelled || activeEntry.controller.signal.aborted) {
         throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'mongodb', err)
       }
-      throw scrubMongoError(err, 'MongoDB query failed', 'QUERY_ERROR')
+      const scrubbed = scrubMongoError(err, 'MongoDB query failed', 'QUERY_ERROR')
+      if (
+        chunksAligned &&
+        currentExecIdx >= 0 &&
+        !this.isClosed &&
+        scrubbed.code !== 'cancelled' &&
+        scrubbed.code !== 'SESSION_CLOSED'
+      ) {
+        throw attachFailedStatementMeta(scrubbed, currentExecIdx, parsedStmts.length)
+      }
+      throw scrubbed
     } finally {
       this.activeQueries.delete(queryId)
     }

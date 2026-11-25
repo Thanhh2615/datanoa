@@ -1,6 +1,6 @@
 {
   "name": "datanoa",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Database client and SQL studio for Orca with opt-in AI SQL Assistant, SQL syntax diagnostics, and 7 local BYOD drivers — built-in SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, LibSQL/Turso, Cloudflare D1, SQL Server (MSSQL), Oracle, and MongoDB.",
   "private": true,
   "type": "module",
@@ -39,6 +39,7 @@
     "mongodb": "7.9.1",
     "mssql": "12.8.1",
     "mysql2": "3.24.6",
+    "node-sql-parser": "5.4.0",
     "oracledb": "26.0.0",
     "pg": "8.23.1",
     "pg-cursor": "2.22.1",

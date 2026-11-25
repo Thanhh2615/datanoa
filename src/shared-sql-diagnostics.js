@@ -1082,6 +1082,38 @@ function matchFusedClause(upperWord) {
   return null
 }
 
+const SEMICOLON_TRAILING_CLAUSE_TYPO_MAP = new Map([
+  ['WHRE', 'WHERE'],
+  ['WHER', 'WHERE'],
+  ['WEHRE', 'WHERE'],
+  ['WHREE', 'WHERE'],
+  ['WHEER', 'WHERE'],
+  ['WHEREE', 'WHERE'],
+  ['HAVNG', 'HAVING'],
+  ['HAVIG', 'HAVING'],
+  ['HVING', 'HAVING'],
+  ['HAIVNG', 'HAVING'],
+  ['HAVNIG', 'HAVING'],
+  ['HAVIGN', 'HAVING'],
+  ['LIMT', 'LIMIT'],
+  ['LMIT', 'LIMIT'],
+  ['LIMTI', 'LIMIT'],
+  ['LIIMT', 'LIMIT'],
+  ['OFSET', 'OFFSET'],
+  ['OFFST', 'OFFSET'],
+  ['OFFEST', 'OFFSET'],
+  ['OFFSTE', 'OFFSET'],
+  ['ODRER', 'ORDER'],
+  ['OREDR', 'ORDER'],
+  ['ORDRE', 'ORDER'],
+  ['GRUOP', 'GROUP'],
+  ['GROPU', 'GROUP'],
+])
+
+function matchSemicolonTrailingClauseTypo(upperWord) {
+  return SEMICOLON_TRAILING_CLAUSE_TYPO_MAP.get(upperWord) ?? null
+}
+
 function isActiveTypingPrefix(tok, cursorOffset) {
   if (cursorOffset === null || tok.type !== 'word') return false
   if (cursorOffset < tok.from || cursorOffset > tok.to) return false
@@ -1771,6 +1803,21 @@ function analyzeQueryBranch(branch, branchStarter, meta, diagnostics) {
         }
       }
 
+      // 6i. Dangling clause typo immediately before `;` (`SELECT * FROM accounts WHRE;`)
+      if (
+        !detectedMisspelledClause &&
+        hasSemicolon &&
+        !next &&
+        canStartPostBodyClause &&
+        isClauseBoundaryPredecessor(prev) &&
+        !(prev?.type === 'word' && prev.upper === 'AS')
+      ) {
+        const trailingTarget = matchSemicolonTrailingClauseTypo(tok.upper)
+        if (trailingTarget) {
+          detectedMisspelledClause = { clause: trailingTarget, suggestion: trailingTarget }
+        }
+      }
+
       if (detectedMisspelledClause) {
         diagnostics.push({
           from: tok.from,
@@ -2131,15 +2178,26 @@ function stripIdentifierQuotes(raw) {
   return raw
 }
 
+function stripErrorIdentQuotes(raw) {
+  if (raw.length < 2) return raw
+  const first = raw[0]
+  const last = raw[raw.length - 1]
+  if (first === "'" && last === "'") return raw.slice(1, -1).replace(/''/g, "'")
+  return stripIdentifierQuotes(raw)
+}
+
 function findTokenInRange(tokens, scopeText, tokenText, startBound, endBound) {
   if (!tokenText) return null
   const targetLower = tokenText.toLowerCase()
+  const bareToken = stripIdentifierQuotes(tokenText)
+  const bareTargetLower = bareToken.toLowerCase()
 
   // Pass 1: exact lexed token match (case-sensitive)
   for (const tok of tokens) {
     if (tok.from < startBound || tok.from >= endBound) continue
     if (tok.type === 'string') continue
-    if (tok.raw === tokenText || stripIdentifierQuotes(tok.raw) === tokenText) {
+    const bareRaw = stripIdentifierQuotes(tok.raw)
+    if (tok.raw === tokenText || bareRaw === tokenText || bareRaw === bareToken) {
       return { from: tok.from, to: tok.to }
     }
   }
@@ -2148,9 +2206,11 @@ function findTokenInRange(tokens, scopeText, tokenText, startBound, endBound) {
   for (const tok of tokens) {
     if (tok.from < startBound || tok.from >= endBound) continue
     if (tok.type === 'string') continue
+    const bareRawLower = stripIdentifierQuotes(tok.raw).toLowerCase()
     if (
       tok.raw.toLowerCase() === targetLower ||
-      stripIdentifierQuotes(tok.raw).toLowerCase() === targetLower
+      bareRawLower === targetLower ||
+      bareRawLower === bareTargetLower
     ) {
       return { from: tok.from, to: tok.to }
     }
@@ -2158,7 +2218,8 @@ function findTokenInRange(tokens, scopeText, tokenText, startBound, endBound) {
 
   // Pass 3: raw substring fallback for non-word tokens (e.g. partial string literal `'abc` or bracket `[x`)
   const isPureWord = /^[A-Za-z_][A-Za-z0-9_$]*$/.test(tokenText)
-  if (!isPureWord) {
+  const isQuotedPureWord = bareToken !== tokenText && /^[A-Za-z_][A-Za-z0-9_$]*$/.test(bareToken)
+  if (!isPureWord && !isQuotedPureWord) {
     const slice = scopeText.slice(startBound, endBound)
     const exactIdx = slice.indexOf(tokenText)
     if (exactIdx !== -1) {
@@ -2209,11 +2270,13 @@ function extractLeadingToken(snippet) {
   return m ? m[1] : ''
 }
 
-/**
- * Parses real DB engine syntax error messages (PostgreSQL, CockroachDB, SQLite,
- * LibSQL, MySQL, MariaDB, MSSQL, ClickHouse) into an exact document-absolute span.
- */
-export function extractDbSyntaxErrorDiagnostic(docText, errorMessage, targetRange = null) {
+function extractDbSyntaxErrorInternal(
+  docText,
+  errorMessage,
+  targetRange = null,
+  dialect = '',
+  strictLineBounds = false
+) {
   if (
     typeof docText !== 'string' ||
     docText.length === 0 ||
@@ -2236,7 +2299,8 @@ export function extractDbSyntaxErrorDiagnostic(docText, errorMessage, targetRang
   if (scopeText.length === 0) return null
 
   const cleanMessage = errorMessage.trim()
-  const { tokens } = lexSql(scopeText, '')
+  const normalizedDialect = typeof dialect === 'string' ? dialect.trim().toLowerCase() : ''
+  const { tokens } = lexSql(scopeText, normalizedDialect)
 
   const makeDiag = (localSpan) => {
     if (!localSpan) return null
@@ -2270,8 +2334,13 @@ export function extractDbSyntaxErrorDiagnostic(docText, errorMessage, targetRang
     if (
       chToken &&
       spanAtPos &&
-      scopeText.slice(spanAtPos.from, spanAtPos.to).toLowerCase() !== chToken.toLowerCase()
+      scopeText.slice(spanAtPos.from, spanAtPos.to).toLowerCase() !== chToken.toLowerCase() &&
+      stripIdentifierQuotes(scopeText.slice(spanAtPos.from, spanAtPos.to)).toLowerCase() !==
+        stripIdentifierQuotes(chToken).toLowerCase()
     ) {
+      if (strictLineBounds) {
+        return null
+      }
       const tokenSpan = findTokenInRange(tokens, scopeText, chToken, 0, scopeText.length)
       if (tokenSpan) return makeDiag(tokenSpan)
     }
@@ -2284,9 +2353,16 @@ export function extractDbSyntaxErrorDiagnostic(docText, errorMessage, targetRang
     const snippet = mysqlMatch[1]
     const lineNum = Number.parseInt(mysqlMatch[2], 10)
     const bounds = getLineBounds(scopeText, lineNum)
+    if (strictLineBounds && !bounds) {
+      return null
+    }
     if (snippet.length === 0) {
       const limit = bounds ? bounds.end : scopeText.length
-      return makeDiag(findLastTokenSpanBefore(tokens, limit))
+      const lastSpan = findLastTokenSpanBefore(tokens, limit)
+      if (strictLineBounds && bounds && lastSpan && lastSpan.from < bounds.start) {
+        return null
+      }
+      return makeDiag(lastSpan)
     }
     const trimmedLeading = snippet.length - snippet.trimStart().length
     const trimmedSnippet = snippet.trimStart()
@@ -2308,6 +2384,7 @@ export function extractDbSyntaxErrorDiagnostic(docText, errorMessage, targetRang
       if (bounds) {
         const onLine = findTokenInRange(tokens, scopeText, leadTok, bounds.start, bounds.end)
         if (onLine) return makeDiag(onLine)
+        if (strictLineBounds) return null
       }
       const anywhere = findTokenInRange(tokens, scopeText, leadTok, 0, scopeText.length)
       if (anywhere) return makeDiag(anywhere)
@@ -2316,7 +2393,7 @@ export function extractDbSyntaxErrorDiagnostic(docText, errorMessage, targetRang
   }
 
   // 3. PostgreSQL / CockroachDB: syntax error at or near "TOKEN" (with optional LINE N:)
-  const pgMatch = /syntax error at or near "([^"]+)"/i.exec(cleanMessage)
+  const pgMatch = /syntax error at or near "("(?:""|[^"])*"|[^"]+)"/i.exec(cleanMessage)
   if (pgMatch) {
     const token = pgMatch[1]
     const lineMatch = /\bLINE\s+(\d+)\s*:/i.exec(cleanMessage)
@@ -2326,13 +2403,16 @@ export function extractDbSyntaxErrorDiagnostic(docText, errorMessage, targetRang
       if (bounds) {
         const onLine = findTokenInRange(tokens, scopeText, token, bounds.start, bounds.end)
         if (onLine) return makeDiag(onLine)
+        if (strictLineBounds) return null
+      } else if (strictLineBounds) {
+        return null
       }
     }
     return makeDiag(findTokenInRange(tokens, scopeText, token, 0, scopeText.length))
   }
 
-  // 4. SQLite / LibSQL: near "TOKEN": syntax error
-  const sqliteMatch = /near "([^"]+)":\s*syntax error/i.exec(cleanMessage)
+  // 4. SQLite / LibSQL: near "TOKEN": syntax error (including double-quoted near ""ident"": syntax error)
+  const sqliteMatch = /near "(.+?)":\s*syntax error/i.exec(cleanMessage)
   if (sqliteMatch) {
     const token = sqliteMatch[1]
     return makeDiag(findTokenInRange(tokens, scopeText, token, 0, scopeText.length))
@@ -2349,10 +2429,618 @@ export function extractDbSyntaxErrorDiagnostic(docText, errorMessage, targetRang
       if (bounds) {
         const onLine = findTokenInRange(tokens, scopeText, token, bounds.start, bounds.end)
         if (onLine) return makeDiag(onLine)
+        if (strictLineBounds) return null
+      } else if (strictLineBounds) {
+        return null
       }
     }
     return makeDiag(findTokenInRange(tokens, scopeText, token, 0, scopeText.length))
   }
 
   return null
+}
+
+/**
+ * Parses real DB engine syntax error messages (PostgreSQL, CockroachDB, SQLite,
+ * LibSQL, MySQL, MariaDB, MSSQL, ClickHouse) into an exact document-absolute span.
+ */
+export function extractDbSyntaxErrorDiagnostic(
+  docText,
+  errorMessage,
+  targetRange = null,
+  dialect = ''
+) {
+  return extractDbSyntaxErrorInternal(docText, errorMessage, targetRange, dialect, false)
+}
+
+function findStatementIndexAtOffset(stmtSlices, offset) {
+  for (let i = 0; i < stmtSlices.length; i++) {
+    const s = stmtSlices[i]
+    if (offset >= s.start && offset <= s.end) {
+      return i
+    }
+  }
+  for (let i = stmtSlices.length - 1; i >= 0; i--) {
+    if (offset > stmtSlices[i].end) {
+      return i
+    }
+  }
+  return stmtSlices.length > 0 ? 0 : null
+}
+
+const ERROR_IDENT_SEG_SRC =
+  '(?:"(?:[^"]|"")+"|`(?:[^`]|``)+`|\\[(?:[^\\]]|\\]\\])+\\]|\'(?:[^\']|\'\')+\'|[A-Za-z_](?:[A-Za-z0-9_$]|-(?=[A-Za-z0-9_$]))*)'
+const ERROR_IDENT_PATH_SRC = `${ERROR_IDENT_SEG_SRC}(?:\\.${ERROR_IDENT_SEG_SRC})*`
+
+function unwrapSingleOuterSingleQuotes(text) {
+  const len = text.length
+  if (len < 2 || text[0] !== "'" || text[len - 1] !== "'") return text
+  for (let i = 1; i < len - 1; i++) {
+    if (text[i] === "'") {
+      if (i + 1 < len - 1 && text[i + 1] === "'") {
+        i++
+        continue
+      }
+      return text
+    }
+  }
+  return text.slice(1, -1).replace(/''/g, "'").trim()
+}
+
+function parseIdentifierPathParts(rawText) {
+  const cleaned = String(rawText || '')
+    .trim()
+    .replace(/[\s.,;:]+$/, '')
+    .trim()
+  if (!cleaned) return []
+
+  const working = unwrapSingleOuterSingleQuotes(cleaned)
+  if (!working) return []
+
+  const parts = []
+  let start = 0
+  let quote = ''
+  const len = working.length
+  for (let i = 0; i < len; i++) {
+    const ch = working[i]
+    if (quote) {
+      if (quote === '[') {
+        if (ch === ']') {
+          if (i + 1 < len && working[i + 1] === ']') {
+            i++
+            continue
+          }
+          quote = ''
+        }
+      } else if (ch === quote) {
+        if (i + 1 < len && working[i + 1] === quote) {
+          i++
+          continue
+        }
+        quote = ''
+      }
+      continue
+    }
+    if (ch === '"' || ch === '`' || ch === "'" || ch === '[') {
+      quote = ch
+      continue
+    }
+    if (ch === '.') {
+      const seg = stripErrorIdentQuotes(working.slice(start, i).trim()).trim().toLowerCase()
+      if (seg) parts.push(seg)
+      start = i + 1
+    }
+  }
+  const tailSeg = stripErrorIdentQuotes(working.slice(start).trim()).trim().toLowerCase()
+  if (tailSeg) parts.push(tailSeg)
+  return parts
+}
+
+function extractMissingIdentifierCandidates(errorMessage) {
+  const qualifiedPaths = []
+  const seenQualified = new Set()
+  const bareIdentifiers = []
+  const seenBare = new Set()
+  const unqualifiedTails = []
+  const pairs = []
+  const seenPairs = new Set()
+
+  const addPair = (relation, column) => {
+    const rel = String(relation || '').trim().toLowerCase()
+    const col = String(column || '').trim().toLowerCase()
+    if (!rel || !col) return
+    const key = `${rel}\0${col}`
+    if (seenPairs.has(key)) return
+    seenPairs.add(key)
+    pairs.push({ relation: rel, column: col })
+  }
+
+  const addParts = (parts, isColumnKind = false) => {
+    if (!parts || parts.length === 0) return
+    if (parts.length >= 2) {
+      const qKey = parts.join('\0')
+      if (!seenQualified.has(qKey)) {
+        seenQualified.add(qKey)
+        qualifiedPaths.push(parts)
+      }
+      const last = parts[parts.length - 1]
+      const prev = parts[parts.length - 2]
+      unqualifiedTails.push(last)
+      if (isColumnKind) {
+        addPair(prev, last)
+      }
+    } else if (!seenBare.has(parts[0])) {
+      seenBare.add(parts[0])
+      bareIdentifiers.push(parts[0])
+    }
+  }
+
+  const addPath = (rawPath, isColumnKind = false) => {
+    addParts(parseIdentifierPathParts(rawPath), isColumnKind)
+  }
+
+  let scrubbed = String(errorMessage || '')
+
+  // 1. PostgreSQL: column "X" of relation "Y" does not exist (mask span so "relation Y does not exist" isn't re-matched)
+  const pgColOfRelRe = new RegExp(
+    `column\\s+(${ERROR_IDENT_PATH_SRC})\\s+of\\s+relation\\s+(${ERROR_IDENT_PATH_SRC})\\s+(?:does not exist|doesn't exist|not found)`,
+    'gi'
+  )
+  scrubbed = scrubbed.replace(pgColOfRelRe, (full, colRaw, relRaw) => {
+    const colParts = parseIdentifierPathParts(colRaw)
+    const relParts = parseIdentifierPathParts(relRaw)
+    if (colParts.length > 0 && relParts.length > 0) {
+      addPair(relParts[relParts.length - 1], colParts[colParts.length - 1])
+      addParts(colParts, false)
+    }
+    return ' '.repeat(full.length)
+  })
+
+  // 2. SQLite INSERT/UPDATE: table X has no column named Y
+  if (/has no column named/i.test(scrubbed)) {
+    const sqliteNoColRe =
+      /table\s+([^\r\n]+?)\s+has no column named\s+([^\r\n;,()]+?)(?=\s*\(|\s+in\s+|\s+at\s+|$)/gim
+    scrubbed = scrubbed.replace(sqliteNoColRe, (full, tblRaw, colRaw) => {
+      const tblParts = parseIdentifierPathParts(tblRaw)
+      const colParts = parseIdentifierPathParts(colRaw)
+      if (tblParts.length > 0 && colParts.length > 0) {
+        addPair(tblParts[tblParts.length - 1], colParts[colParts.length - 1])
+        addParts(colParts, false)
+      }
+      return ' '.repeat(full.length)
+    })
+  }
+
+  // 3. SQLite / generic: no such table/column/...: <ident> (supports quoted schema."tbl", hyphens, spaces)
+  const noSuchRe =
+    /no such (table|column|function|index|view|trigger|module):\s*([^\r\n;,()]+?)(?=\s*\(|\s+in\s+|\s+at\s+|$)/gim
+  let m
+  while ((m = noSuchRe.exec(scrubbed)) !== null) {
+    addPath(m[2], String(m[1] || '').toLowerCase() === 'column')
+  }
+
+  // 4. PG / MySQL / ClickHouse / Oracle: relation/table/column/... <ident> does not exist / not found / is ambiguous
+  const doesNotExistRe = new RegExp(
+    `(table or view|relation|table|column|view|index|function|sequence|schema)\\s+(${ERROR_IDENT_PATH_SRC})\\s+(?:does not exist|doesn't exist|not found|is ambiguous)`,
+    'gi'
+  )
+  while ((m = doesNotExistRe.exec(scrubbed)) !== null) {
+    addPath(m[2], String(m[1] || '').toLowerCase() === 'column')
+  }
+
+  // 5. MySQL / ClickHouse: Unknown column/table/identifier + Missing columns
+  const unknownRe = new RegExp(
+    `Unknown\\s+(expression or function identifier|table expression identifier|expression identifier|identifier|column|table)\\s+(${ERROR_IDENT_PATH_SRC})`,
+    'gi'
+  )
+  while ((m = unknownRe.exec(scrubbed)) !== null) {
+    const kind = String(m[1] || '').toLowerCase()
+    addPath(m[2], kind === 'column' || kind.includes('identifier'))
+  }
+  const chMissingColsRe = /Missing columns:\s*'([^']+)'/gi
+  while ((m = chMissingColsRe.exec(scrubbed)) !== null) {
+    addPath(m[1], true)
+  }
+
+  // 6. MSSQL: Invalid object/column name 'X'
+  const mssqlInvalidRe = /Invalid\s+(object|column)\s+name\s+'([^']+)'/gi
+  while ((m = mssqlInvalidRe.exec(scrubbed)) !== null) {
+    addPath(m[2], String(m[1] || '').toLowerCase() === 'column')
+  }
+
+  // 7. Oracle: ORA-00904: <ident>: invalid identifier
+  const oraInvalidRe = new RegExp(
+    `ORA-00904:\\s*(${ERROR_IDENT_PATH_SRC})\\s*:\\s*invalid identifier`,
+    'gi'
+  )
+  while ((m = oraInvalidRe.exec(scrubbed)) !== null) {
+    addPath(m[1], true)
+  }
+
+  return {
+    qualifiedPaths,
+    bareIdentifiers,
+    tails: [...new Set(unqualifiedTails)],
+    pairs,
+  }
+}
+
+function sliceTokensHaveBareIdent(tokens, lowerIdent) {
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i]
+    if (tok.type === 'string' || tok.type === 'comment') continue
+    if (stripIdentifierQuotes(tok.raw).toLowerCase() === lowerIdent) {
+      return true
+    }
+  }
+  return false
+}
+
+function sliceTokensHaveQualifiedIdent(tokens, pathParts) {
+  const segs = Array.isArray(pathParts)
+    ? pathParts.filter(Boolean)
+    : String(pathParts || '').split('.').filter(Boolean)
+  if (segs.length === 0) return false
+  if (segs.length === 1) return sliceTokensHaveBareIdent(tokens, segs[0])
+  const neededLen = segs.length * 2 - 1
+  for (let i = 0; i <= tokens.length - neededLen; i++) {
+    let matched = true
+    for (let s = 0; s < segs.length; s++) {
+      const tok = tokens[i + s * 2]
+      if (!tok || tok.type === 'string' || tok.type === 'comment') {
+        matched = false
+        break
+      }
+      if (stripIdentifierQuotes(tok.raw).toLowerCase() !== segs[s]) {
+        matched = false
+        break
+      }
+      if (s < segs.length - 1) {
+        const dotTok = tokens[i + s * 2 + 1]
+        if (!dotTok || dotTok.type !== 'dot') {
+          matched = false
+          break
+        }
+      }
+    }
+    if (matched) return true
+  }
+  return false
+}
+
+function matchPgErrorLineSnippet(sliceText, lineNum, rawSnippet) {
+  const norm = (s) =>
+    String(s || '')
+      .trim()
+      .replace(/;\s*$/, '')
+      .replace(/\s+/g, ' ')
+      .toLowerCase()
+  const snippetClean = norm(rawSnippet).replace(/^\.\.\.\s*/, '').replace(/\s*\.\.\.$/, '')
+  if (!snippetClean) return false
+  const bounds = getLineBounds(sliceText, lineNum)
+  if (!bounds) return false
+  const lineNorm = norm(sliceText.slice(bounds.start, bounds.end))
+  return lineNorm.length > 0 && (lineNorm === snippetClean || lineNorm.includes(snippetClean))
+}
+
+/**
+ * Pinpoints the failing statement index inside a multi-statement SQL script from a DB error message.
+ * Returns null if the error cannot be attributed unambiguously to a specific statement.
+ */
+export function resolveFailedStatementInScript(
+  scriptText,
+  errorMessage,
+  stmtSlices,
+  dialect = 'sqlite'
+) {
+  if (typeof scriptText !== 'string' || !Array.isArray(stmtSlices) || stmtSlices.length === 0) {
+    return null
+  }
+  if (stmtSlices.length === 1) {
+    return 0
+  }
+
+  const msg = typeof errorMessage === 'string' ? errorMessage.trim() : ''
+  if (!msg) return null
+
+  const normalizedDialect = typeof dialect === 'string' ? dialect.trim().toLowerCase() : ''
+  const staticDiags = analyzeSqlDiagnostics(scriptText, { dialect: normalizedDialect })
+  const hasStaticErrorInSlice = (slice) =>
+    staticDiags.some(
+      (d) => d.severity === 'error' && d.from >= slice.start && d.from <= slice.end
+    )
+
+  const explicitLineMatch = /\b(?:at\s+line|line)\s+(\d+)\b/i.exec(msg)
+  const explicitPosMatch = /\bat\s+position\s+(\d+)\b/i.exec(msg)
+  const explicitLineNum = explicitLineMatch ? Number.parseInt(explicitLineMatch[1], 10) : null
+  const explicitPosNum = explicitPosMatch ? Number.parseInt(explicitPosMatch[1], 10) : null
+  const hasExplicitCoord =
+    (explicitLineNum !== null && Number.isFinite(explicitLineNum)) ||
+    (explicitPosNum !== null && Number.isFinite(explicitPosNum))
+  const wholeDiag = hasExplicitCoord
+    ? extractDbSyntaxErrorInternal(scriptText, msg, null, normalizedDialect, true)
+    : null
+  const wholeDiagIdx = wholeDiag ? findStatementIndexAtOffset(stmtSlices, wholeDiag.from) : null
+  const slice0Lines = stmtSlices[0].text.split('\n').length
+  const slice0Len = stmtSlices[0].text.length
+
+  // 1. DB syntax error matching — evaluate per statement slice first so statement-local
+  //    LINE 1: / at line 1 / at position N never falsely targets Query 1.
+  const perSliceSyntaxMatches = []
+  for (let i = 0; i < stmtSlices.length; i++) {
+    if (extractDbSyntaxErrorInternal(stmtSlices[i].text, msg, null, normalizedDialect, true)) {
+      perSliceSyntaxMatches.push(i)
+    }
+  }
+
+  if (perSliceSyntaxMatches.length === 1) {
+    const localIdx = perSliceSyntaxMatches[0]
+    const hasGlobalCoordConflict =
+      wholeDiagIdx !== null &&
+      wholeDiagIdx !== localIdx &&
+      ((explicitLineNum !== null && explicitLineNum > 1) ||
+        (explicitPosNum !== null && explicitPosNum > slice0Len + 1))
+    if (!hasGlobalCoordConflict) {
+      return localIdx
+    }
+    // Disambiguate script-global vs statement-local coordinate conflict using PG snippet or static diags
+    const pgLineSnippetConflict = /\bLINE\s+(\d+)\s*:\s*([^\r\n]+)/i.exec(msg)
+    if (pgLineSnippetConflict) {
+      const lineNum = Number.parseInt(pgLineSnippetConflict[1], 10)
+      const localSnipOk = matchPgErrorLineSnippet(
+        stmtSlices[localIdx].text,
+        lineNum,
+        pgLineSnippetConflict[2]
+      )
+      const globalSnipOk = matchPgErrorLineSnippet(scriptText, lineNum, pgLineSnippetConflict[2])
+      if (localSnipOk && !globalSnipOk) return localIdx
+      if (globalSnipOk && !localSnipOk) return wholeDiagIdx
+    }
+    const localHasStaticErr = hasStaticErrorInSlice(stmtSlices[localIdx])
+    const globalHasStaticErr = hasStaticErrorInSlice(stmtSlices[wholeDiagIdx])
+    if (localHasStaticErr && !globalHasStaticErr) return localIdx
+    if (globalHasStaticErr && !localHasStaticErr) return wholeDiagIdx
+    // Ambiguous between statement-local line N and script-global line N — fail closed!
+    return null
+  }
+  if (perSliceSyntaxMatches.length > 1) {
+    // Disambiguate PostgreSQL LINE N: <snippet> against each matching slice's line N
+    const pgLineSnippetMatch = /\bLINE\s+(\d+)\s*:\s*([^\r\n]+)/i.exec(msg)
+    if (pgLineSnippetMatch) {
+      const lineNum = Number.parseInt(pgLineSnippetMatch[1], 10)
+      const snippetMatches = perSliceSyntaxMatches.filter((idx) =>
+        matchPgErrorLineSnippet(stmtSlices[idx].text, lineNum, pgLineSnippetMatch[2])
+      )
+      if (snippetMatches.length === 1) {
+        return snippetMatches[0]
+      }
+    }
+    // Disambiguate using static SQL diagnostics (e.g., SELET in Query 2 when token "id" exists in both)
+    const erroredMatches = perSliceSyntaxMatches.filter((idx) =>
+      hasStaticErrorInSlice(stmtSlices[idx])
+    )
+    if (erroredMatches.length === 1) {
+      return erroredMatches[0]
+    }
+    // Ambiguous across multiple statements — fail closed rather than overwriting Query 1!
+    return null
+  }
+
+  // If per-slice strict syntax matching returned 0 hits (e.g. PG semicolon error where `;` was
+  // stripped from stmtSlices), still match PG `LINE N: <snippet>` across slices cleanly first.
+  const pgLineSnippetFallback = /\bLINE\s+(\d+)\s*:\s*([^\r\n]+)/i.exec(msg)
+  if (pgLineSnippetFallback) {
+    const lineNum = Number.parseInt(pgLineSnippetFallback[1], 10)
+    const snippetMatches = []
+    for (let i = 0; i < stmtSlices.length; i++) {
+      if (matchPgErrorLineSnippet(stmtSlices[i].text, lineNum, pgLineSnippetFallback[2])) {
+        snippetMatches.push(i)
+      }
+    }
+    if (snippetMatches.length === 1) {
+      return snippetMatches[0]
+    }
+  }
+
+  // Whole-script fallback when per-slice strict matching had 0 hits and wholeDiag resolves
+  // cleanly to a non-first statement or exceeds Query 1's bounds (preventing statement-local
+  // LINE 1 / `;` errors from falsely targeting Query 1).
+  if (
+    wholeDiagIdx !== null &&
+    (wholeDiagIdx > 0 ||
+      (explicitLineNum !== null && explicitLineNum > slice0Lines) ||
+      (explicitPosNum !== null && explicitPosNum > slice0Len + 1))
+  ) {
+    return wholeDiagIdx
+  }
+
+  // 2. Missing identifier matching (qualified paths -> table+column pairs -> bare -> tails)
+  //    Strictly enforces uniqueness: never guesses Query 1 when multiple slices match!
+  const missingIds = extractMissingIdentifierCandidates(msg)
+  const hasAnyMissingId =
+    missingIds.qualifiedPaths.length > 0 ||
+    missingIds.bareIdentifiers.length > 0 ||
+    missingIds.pairs.length > 0 ||
+    missingIds.tails.length > 0
+  if (hasAnyMissingId) {
+    const sliceTokens = stmtSlices.map((s) => lexSql(s.text, normalizedDialect).tokens)
+    const collectMatches = (predicate) => {
+      const hits = []
+      for (let i = 0; i < sliceTokens.length; i++) {
+        if (predicate(sliceTokens[i])) hits.push(i)
+      }
+      return hits
+    }
+    const resolveUnique = (hits) => {
+      if (hits.length === 1) return { resolved: true, index: hits[0] }
+      if (hits.length > 1) {
+        const errored = hits.filter((idx) => hasStaticErrorInSlice(stmtSlices[idx]))
+        if (errored.length === 1) return { resolved: true, index: errored[0] }
+        return { resolved: true, index: null }
+      }
+      return { resolved: false, index: null }
+    }
+
+    if (missingIds.qualifiedPaths.length > 0) {
+      const res = resolveUnique(
+        collectMatches((toks) =>
+          missingIds.qualifiedPaths.some((parts) => sliceTokensHaveQualifiedIdent(toks, parts))
+        )
+      )
+      if (res.resolved) return res.index
+    }
+
+    if (missingIds.pairs.length > 0) {
+      const res = resolveUnique(
+        collectMatches((toks) =>
+          missingIds.pairs.some(
+            (p) =>
+              sliceTokensHaveBareIdent(toks, p.relation) &&
+              sliceTokensHaveBareIdent(toks, p.column)
+          )
+        )
+      )
+      if (res.resolved) return res.index
+    }
+
+    if (missingIds.bareIdentifiers.length > 0) {
+      const res = resolveUnique(
+        collectMatches((toks) =>
+          missingIds.bareIdentifiers.some((cand) => sliceTokensHaveBareIdent(toks, cand))
+        )
+      )
+      if (res.resolved) return res.index
+    }
+
+    if (missingIds.tails.length > 0) {
+      const res = resolveUnique(
+        collectMatches((toks) =>
+          missingIds.tails.some((cand) => sliceTokensHaveBareIdent(toks, cand))
+        )
+      )
+      if (res.resolved) return res.index
+    }
+  }
+
+  const staticErrIndices = []
+  for (let i = 0; i < stmtSlices.length; i++) {
+    if (hasStaticErrorInSlice(stmtSlices[i])) {
+      staticErrIndices.push(i)
+    }
+  }
+  if (staticErrIndices.length === 1) {
+    return staticErrIndices[0]
+  }
+
+  return null
+}
+
+/**
+ * Resolves the failing SQL snippet and safe single-statement replacement target
+ * when a single or multi-statement execution throws an engine error.
+ */
+export function resolveExecutionErrorFixTarget(
+  execRange,
+  fallbackSql,
+  errorMessage,
+  stmtSlices,
+  dialect = 'sqlite',
+  failedStatementIndex = null,
+  expectedStatementCount = null
+) {
+  const safeFallback = String(fallbackSql || '').trim()
+  const slices = Array.isArray(stmtSlices) ? stmtSlices : []
+  const countMatchesSlices =
+    expectedStatementCount === null || expectedStatementCount === undefined
+      ? true
+      : typeof expectedStatementCount === 'number' &&
+        Number.isInteger(expectedStatementCount) &&
+        expectedStatementCount === slices.length
+  const explicitIdx =
+    countMatchesSlices &&
+    typeof failedStatementIndex === 'number' &&
+    Number.isInteger(failedStatementIndex) &&
+    failedStatementIndex >= 0 &&
+    failedStatementIndex < slices.length
+      ? failedStatementIndex
+      : null
+
+  if (!execRange) {
+    if (slices.length > 1) {
+      const failedIdx =
+        explicitIdx !== null
+          ? explicitIdx
+          : resolveFailedStatementInScript(safeFallback, errorMessage, slices, dialect)
+      if (failedIdx !== null && slices[failedIdx]) {
+        return {
+          failedSql: slices[failedIdx].text.trim() || safeFallback,
+          fixTargetRange: null,
+        }
+      }
+    } else if (slices.length === 1 && slices[0]?.text?.trim()) {
+      return {
+        failedSql: slices[0].text.trim(),
+        fixTargetRange: null,
+      }
+    }
+    return { failedSql: safeFallback, fixTargetRange: null }
+  }
+
+  if (slices.length > 1) {
+    const failedIdx =
+      explicitIdx !== null
+        ? explicitIdx
+        : resolveFailedStatementInScript(execRange.sql, errorMessage, slices, dialect)
+    if (failedIdx !== null && slices[failedIdx]) {
+      const slice = slices[failedIdx]
+      return {
+        failedSql: slice.text.trim() || safeFallback,
+        fixTargetRange: {
+          from: execRange.from + slice.start,
+          to: execRange.from + slice.end,
+          originalSlice: execRange.sql.slice(slice.start, slice.end),
+          statementIndex: failedIdx,
+          totalStatements: slices.length,
+          preserveOtherStatements: true,
+        },
+      }
+    }
+    return {
+      failedSql: safeFallback,
+      fixTargetRange: {
+        from: execRange.from,
+        to: execRange.to,
+        originalSlice: execRange.originalSlice,
+        totalStatements: slices.length,
+        preserveOtherStatements: true,
+      },
+    }
+  }
+
+  if (slices.length === 1 && slices[0] && slices[0].end > slices[0].start) {
+    const onlySlice = slices[0]
+    return {
+      failedSql: onlySlice.text.trim() || safeFallback,
+      fixTargetRange: {
+        from: execRange.from + onlySlice.start,
+        to: execRange.from + onlySlice.end,
+        originalSlice: execRange.sql.slice(onlySlice.start, onlySlice.end),
+        statementIndex: 0,
+        totalStatements: 1,
+        preserveOtherStatements: true,
+      },
+    }
+  }
+
+  return {
+    failedSql: safeFallback,
+    fixTargetRange: {
+      from: execRange.from,
+      to: execRange.to,
+      originalSlice: execRange.originalSlice,
+      statementIndex: 0,
+      totalStatements: 1,
+      preserveOtherStatements: true,
+    },
+  }
 }

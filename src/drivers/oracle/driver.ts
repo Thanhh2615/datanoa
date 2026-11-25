@@ -20,6 +20,9 @@ import type {
 import { sanitizeJsonPayload } from '../../protocol'
 import {
   DatabaseDriverError,
+  areChunksAlignedWithSqlSlices,
+  attachFailedStatementMeta,
+  copyFailedStatementMeta,
   runDriverConnectionTest,
   type ApplyChangesParams,
   type ApplyChangesResult,
@@ -205,7 +208,10 @@ function scrubOracleError(err: unknown): unknown {
       try {
         err.message = clean
       } catch {
-        return new DatabaseDriverError(clean, extractOracleErrorCode(err).code || 'ORACLE_ERROR', 'oracle', err)
+        return copyFailedStatementMeta(
+          err,
+          new DatabaseDriverError(clean, extractOracleErrorCode(err).code || 'ORACLE_ERROR', 'oracle', err)
+        )
       }
     }
   }
@@ -1040,6 +1046,11 @@ export class OracleSession implements IDatabaseSession {
     const chunks = splitOracleStatements(sql)
     const execChunks: OracleStatementChunk[] =
       chunks.length > 0 ? chunks : [{ text: stripTrailingSemicolon(sql), isPlSql: false }]
+    const chunksAligned = areChunksAlignedWithSqlSlices(
+      sql,
+      'oracle',
+      execChunks.map((c) => c.text)
+    )
 
     if (this.profile.readOnly && execChunks.some((c) => isOracleReadOnlyBlocked(c))) {
       this.assertWritable()
@@ -1068,7 +1079,8 @@ export class OracleSession implements IDatabaseSession {
         | undefined
 
       try {
-        for (const chunk of execChunks) {
+        for (let chunkIndex = 0; chunkIndex < execChunks.length; chunkIndex++) {
+          const chunk = execChunks[chunkIndex]
           if (activeEntry.cancelled || this.isClosed) {
             throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'oracle')
           }
@@ -1125,7 +1137,11 @@ export class OracleSession implements IDatabaseSession {
             if (activeEntry.cancelled || errorNum === 1013) {
               throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'oracle', err)
             }
-            throw scrubOracleError(err)
+            const scrubbed = scrubOracleError(err)
+            if (chunksAligned && (scrubbed instanceof Error || execChunks.length > 1)) {
+              throw attachFailedStatementMeta(scrubbed, chunkIndex, execChunks.length)
+            }
+            throw scrubbed
           }
 
           if (activeEntry.cancelled || this.isClosed) {

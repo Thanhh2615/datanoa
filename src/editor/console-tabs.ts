@@ -9,6 +9,9 @@ export interface SqlFixTargetRange {
   from: number
   to: number
   originalSlice: string
+  statementIndex?: number
+  totalStatements?: number
+  preserveOtherStatements?: boolean
 }
 
 export interface ResultBannerState {
@@ -49,7 +52,7 @@ export interface ResultSetTabRuntimeState {
   gridSubbarTitle: string
   gridPageInfo: string
   emptyMessage: string
-  explainTargetRange?: { from: number; to: number; originalSlice: string } | null
+  explainTargetRange?: SqlFixTargetRange | null
   explainAnalysis?: AiExplainAnalysisResult | null
   explainAnalysisError?: string | null
   explainAnalysisCollapsed?: boolean

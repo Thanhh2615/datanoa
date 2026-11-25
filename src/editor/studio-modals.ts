@@ -944,6 +944,9 @@ export function openStudioShortcutsModal(ctx: StudioModalMountContext): void {
         ['Ctrl+F / Ctrl+H', 'SQL Console: find & replace'],
         ['Ctrl+Shift+[ / ]', 'Fold / Unfold SQL block'],
         ['Shift+Alt+F', 'Format SQL in console'],
+        ['Tab / Ctrl+Right', 'Accept AI inline completion or full statement diff / next word'],
+        ['Ctrl+Alt+Right / Cmd+Alt+Right', 'Accept next line of AI inline suggestion'],
+        ['Alt+\\', 'Trigger AI Statement Edit (fix typos & complete)'],
       ],
     },
     {

@@ -22,6 +22,7 @@ import type {
 } from '../common/driver'
 import {
   DatabaseDriverError,
+  attachFailedStatementMeta,
   buildCombinedAbortSignal,
   createUnsupportedTransactionError,
   createUnsupportedTransactionState,
@@ -832,15 +833,32 @@ export class D1Session implements IDatabaseSession {
       let lastSelect: Omit<QueryResult, 'executionTimeMs'> | null = null
       let totalAffected = 0
 
-      const payloads =
-        statements.length > 1
-          ? await this.executeBatch(
-              statements.map((stmtSql) => ({ sql: stmtSql, params: [] })),
-              controller.signal
+      let payloads: D1QueryResultPayload[]
+      if (statements.length > 1) {
+        payloads = await this.executeBatch(
+          statements.map((stmtSql) => ({ sql: stmtSql, params: [] })),
+          controller.signal
+        )
+      } else if (statements.length === 1) {
+        try {
+          payloads = [await this.execute(statements[0], [], controller.signal)]
+        } catch (singleErr: unknown) {
+          if (
+            !active.cancelled &&
+            !(
+              singleErr instanceof DatabaseDriverError &&
+              (singleErr.code === 'cancelled' ||
+                singleErr.code === 'SESSION_CLOSED' ||
+                singleErr.code === 'TIMEOUT')
             )
-          : statements.length === 1
-            ? [await this.execute(statements[0], [], controller.signal)]
-            : []
+          ) {
+            throw attachFailedStatementMeta(singleErr, 0, 1)
+          }
+          throw singleErr
+        }
+      } else {
+        payloads = []
+      }
 
       if (payloads.length !== statements.length) {
         throw protocolError('Cloudflare D1 returned an unexpected number of batch results')
@@ -860,7 +878,11 @@ export class D1Session implements IDatabaseSession {
             stripped
           )
         ) {
-          throw new DatabaseDriverError('FOREIGN KEY constraint failed', 'D1_ERROR', 'd1')
+          throw attachFailedStatementMeta(
+            new DatabaseDriverError('FOREIGN KEY constraint failed', 'D1_ERROR', 'd1'),
+            index,
+            statements.length
+          )
         }
         const isSelect =
           columns.length > 0 ||
