@@ -75,12 +75,21 @@ function createMockAwsSslPlugin(state) {
 }
 
 // Plugin to replace whatwg-url with Node's native globalThis.URL / URLSearchParams (removing
-// tr46 \uNNNN escape tables and whatwg-url's eval("(async function* () {})")) and guard bson
-// against any eval("(async function* () {})") probes.
+// tr46 \uNNNN escape tables and whatwg-url's eval("(async function* () {})")), stub unused
+// mongocryptd CSFLE child_process spawning, replace dynamic import('os') with static require('os'),
+// and guard bson against any eval("(async function* () {})") probes.
 function createMongoCleanPlugin(state) {
   const expectedWhatwgImporter = path.resolve(
     projectRoot,
     'node_modules/mongodb-connection-string-url/lib/index.js'
+  )
+  const expectedMongocryptdPath = path.resolve(
+    projectRoot,
+    'node_modules/mongodb/lib/client-side-encryption/mongocryptd_manager.js'
+  )
+  const expectedRuntimeAdaptersPath = path.resolve(
+    projectRoot,
+    'node_modules/mongodb/lib/runtime_adapters.js'
   )
   return {
     name: 'mongo-clean',
@@ -101,6 +110,58 @@ function createMongoCleanPlugin(state) {
         contents: 'module.exports = { URL: globalThis.URL, URLSearchParams: globalThis.URLSearchParams };',
         loader: 'js',
       }))
+      build.onLoad(
+        { filter: /[\\/]mongodb[\\/]lib[\\/]client-side-encryption[\\/]mongocryptd_manager\.js$/ },
+        args => {
+          if (path.resolve(args.path) !== expectedMongocryptdPath) {
+            throw new Error(
+              `[bundle-drivers] mongo-clean mongocryptd_manager matched unexpected path: ${args.path} (expected ${expectedMongocryptdPath})`
+            )
+          }
+          state.mongocryptdReplacements += 1
+          return {
+            contents: `'use strict';
+class MongocryptdManager {
+  static { this.DEFAULT_MONGOCRYPTD_URI = 'mongodb://localhost:27020'; }
+  constructor(extraOptions = {}) {
+    this.spawnPath = '';
+    this.spawnArgs = [];
+    this.uri =
+      typeof extraOptions.mongocryptdURI === 'string' && extraOptions.mongocryptdURI.length > 0
+        ? extraOptions.mongocryptdURI
+        : MongocryptdManager.DEFAULT_MONGOCRYPTD_URI;
+    this.bypassSpawn = !!extraOptions.mongocryptdBypassSpawn;
+  }
+  async spawn() {
+    throw new Error('Datanoa bundled MongoDB driver does not spawn mongocryptd (CSFLE unsupported).');
+  }
+  async withRespawn(fn) {
+    return await fn();
+  }
+}
+module.exports = { MongocryptdManager };`,
+            loader: 'js',
+          }
+        }
+      )
+      build.onLoad({ filter: /[\\/]mongodb[\\/]lib[\\/]runtime_adapters\.js$/ }, args => {
+        if (path.resolve(args.path) !== expectedRuntimeAdaptersPath) {
+          throw new Error(
+            `[bundle-drivers] mongo-clean runtime_adapters matched unexpected path: ${args.path} (expected ${expectedRuntimeAdaptersPath})`
+          )
+        }
+        const source = fs.readFileSync(args.path, 'utf8')
+        if (!source.includes("await import('os')")) {
+          throw new Error(
+            `[bundle-drivers] mongo-clean expected await import('os') in ${expectedRuntimeAdaptersPath}`
+          )
+        }
+        state.runtimeOsImportReplacements += 1
+        return {
+          contents: source.replace(/\(\s*await\s+import\(['"]os['"]\)\s*\)/g, "require('os')"),
+          loader: 'js',
+        }
+      })
       build.onLoad({ filter: /[\\/]bson[\\/].*\.[cm]?js$/ }, args => {
         const source = fs.readFileSync(args.path, 'utf8')
         if (!source.includes('.eval("(async function* () {})")')) {
@@ -317,6 +378,20 @@ function validateBundle(filePath, name, { rejectEscapedRuns = false } = {}) {
   if (newFunctionMatch) {
     throw new Error(
       `[FAIL] ${name} contains prohibited 'new Function(' call (${newFunctionMatch.length} occurrences)!`
+    )
+  }
+
+  const childProcMatch = content.match(/\bchild_process\b/g)
+  if (childProcMatch) {
+    throw new Error(
+      `[FAIL] ${name} contains unexpected 'child_process' reference (${childProcMatch.length} occurrences)!`
+    )
+  }
+
+  const dynImportMatch = content.match(/\bimport\s*\(/g)
+  if (dynImportMatch) {
+    throw new Error(
+      `[FAIL] ${name} contains unexpected dynamic 'import(' call (${dynImportMatch.length} occurrences)!`
     )
   }
 
@@ -666,7 +741,12 @@ async function bundleMongoDB() {
   assertInstalledVersion('mongodb')
   assertInstalledVersion('bson')
   assertInstalledVersion('mongodb-connection-string-url')
-  const mongoCleanState = { whatwgUrlReplacements: 0, bsonEvalReplacements: 0 }
+  const mongoCleanState = {
+    whatwgUrlReplacements: 0,
+    bsonEvalReplacements: 0,
+    mongocryptdReplacements: 0,
+    runtimeOsImportReplacements: 0,
+  }
   const mongoCleanPlugin = createMongoCleanPlugin(mongoCleanState)
   const code = `
 import * as mongodb from 'mongodb';
@@ -745,6 +825,16 @@ export default mongodb;
   if (mongoCleanState.whatwgUrlReplacements !== 1) {
     throw new Error(
       `[bundle-drivers] mongo-clean expected 1 whatwg-url replacement, got ${mongoCleanState.whatwgUrlReplacements}.`
+    )
+  }
+  if (mongoCleanState.mongocryptdReplacements !== 1) {
+    throw new Error(
+      `[bundle-drivers] mongo-clean expected 1 mongocryptd_manager replacement, got ${mongoCleanState.mongocryptdReplacements}.`
+    )
+  }
+  if (mongoCleanState.runtimeOsImportReplacements !== 1) {
+    throw new Error(
+      `[bundle-drivers] mongo-clean expected 1 runtime_adapters os import replacement, got ${mongoCleanState.runtimeOsImportReplacements}.`
     )
   }
 

@@ -88,7 +88,7 @@ Or in **Orca**, open **Settings → Plugins → Community Plugins**, search **`D
 ### Via Orca CLI
 
 ```bash
-orca plugin install https://github.com/Thanhh2615/datanoa#v1.2.0
+orca plugin install https://github.com/Thanhh2615/datanoa#v1.2.1
 ```
 
 ### Local Development

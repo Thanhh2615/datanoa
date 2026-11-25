@@ -205,8 +205,8 @@ datanoa/
 │       ├── session-manager.ts            # Connection profile storage, lazy driver loader & secrets vault manager
 │       ├── discovery.ts                  # Bounded .env parser & async BFS SQLite scanner
 │       └── docker-compose-discovery.ts   # Hybrid Docker CLI & static Compose YAML discovery parser
-├── tests/                                # Vitest unit, property-based & E2E regression test suites
-└── vitest.config.ts                      # Vitest & v8 coverage configuration
+├── tests/                                # Local gitignored Vitest unit, property-based & E2E suites (excluded from release payload)
+└── vitest.config.ts                      # Local gitignored Vitest & v8 coverage configuration
 ```
 
 ---

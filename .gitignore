@@ -3,6 +3,8 @@ package-lock.json
 .orca/
 .datanoa/
 .serena/
+tests/
+vitest.config.ts
 *.log
 .DS_Store
 Thumbs.db

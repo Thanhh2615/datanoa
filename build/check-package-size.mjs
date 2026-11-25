@@ -17,9 +17,11 @@ const EXCLUDED_DIRS = new Set([
   '.serena',
   '.datanoa',
   '.vite',
+  'tests',
   'dist',
   'release',
 ])
+const EXCLUDED_FILES = new Set(['vitest.config.ts'])
 const MAX_VENDOR_FILE_BYTES = 1024 * 1024 // 1 MiB
 const MAX_TOTAL_BYTES = 25_000_000 // 25 MB package budget, inclusive
 
@@ -30,6 +32,7 @@ function collectFiles(dir, out = []) {
     if (entry.isDirectory()) {
       collectFiles(fullPath, out)
     } else if (entry.isFile()) {
+      if (EXCLUDED_FILES.has(entry.name)) continue
       const stat = fs.statSync(fullPath)
       const rel = path.relative(projectRoot, fullPath).replace(/\\/g, '/')
       out.push({ rel, bytes: stat.size })
