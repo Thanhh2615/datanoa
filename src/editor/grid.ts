@@ -150,6 +150,10 @@ export interface GridRuntimeSnapshot {
   connectionId: string
   schemaName: string
   dialect: DatabaseDriverType
+  originConnectionId?: string
+  originDriver?: DatabaseDriverType
+  originSchema?: string
+  originTable?: string
   emptyMessage: string
   foreignKeys: ForeignKeyInfo[]
 }
@@ -618,11 +622,15 @@ export class VirtualDataGrid {
   }
 
   public setTransposed(enabled: boolean): void {
+    if (this.activeEditor) {
+      this.flushActiveEditorBeforeRebuild()
+    }
     this.isTransposed = enabled
     this.invalidateColLayoutCache()
     this.resetRowPoolMountState()
     this.closeContextMenu()
     this.closeBulkFillPopover()
+    this.closeColumnFilterPopover()
     if (this.tableEl) {
       this.tableEl.className = enabled ? 'datanoa-grid-table transposed' : 'datanoa-grid-table'
     }
@@ -691,6 +699,9 @@ export class VirtualDataGrid {
     if (this.tableContainerEl) {
       this.tableContainerEl.scrollTop = 0
     }
+    this.selection.clear()
+    this.selectedRowIndex = null
+    this.selectedColIndex = null
     if (this.findQuery) {
       this.recomputeFindMatches()
       this.onFindStateChange?.({ total: this.findMatches.length, activeIndex: this.findActiveIndex })
@@ -707,12 +718,16 @@ export class VirtualDataGrid {
     if (this.tableContainerEl) {
       this.tableContainerEl.scrollTop = 0
     }
+    this.selection.clear()
+    this.selectedRowIndex = null
+    this.selectedColIndex = null
     if (this.findQuery) {
       this.recomputeFindMatches()
       this.onFindStateChange?.({ total: this.findMatches.length, activeIndex: this.findActiveIndex })
     }
     this.renderHeader()
     this.renderVisibleRows()
+    this.notifyAllSelectionListeners()
   }
 
   public clearSortIndicator(): void {
@@ -2074,9 +2089,10 @@ export class VirtualDataGrid {
     const isMod = e.ctrlKey || e.metaKey
 
     if (key === 'Escape') {
-      if (this.contextMenuEl || this.bulkFillPopoverEl) {
+      if (this.contextMenuEl || this.bulkFillPopoverEl || this.colFilterPopoverEl) {
         this.closeContextMenu()
         this.closeBulkFillPopover()
+        this.closeColumnFilterPopover()
       } else {
         this.clearSelection()
       }
@@ -2119,9 +2135,30 @@ export class VirtualDataGrid {
     if (key === 'ArrowUp' || key === 'ArrowDown' || key === 'ArrowLeft' || key === 'ArrowRight') {
       if (visibleRows.length === 0 || visibleCols.length === 0) return
       e.preventDefault()
-      const dRow = key === 'ArrowUp' ? -1 : key === 'ArrowDown' ? 1 : 0
-      const dCol = key === 'ArrowLeft' ? -1 : key === 'ArrowRight' ? 1 : 0
-      this.selection.moveFocus(dRow, dCol, visibleRows.length, visibleCols.length, e.shiftKey)
+      const maxVisRows = this.isTransposed ? Math.min(visibleRows.length, 100) : visibleRows.length
+      const dRow = this.isTransposed
+        ? key === 'ArrowLeft'
+          ? -1
+          : key === 'ArrowRight'
+            ? 1
+            : 0
+        : key === 'ArrowUp'
+          ? -1
+          : key === 'ArrowDown'
+            ? 1
+            : 0
+      const dCol = this.isTransposed
+        ? key === 'ArrowUp'
+          ? -1
+          : key === 'ArrowDown'
+            ? 1
+            : 0
+        : key === 'ArrowLeft'
+          ? -1
+          : key === 'ArrowRight'
+            ? 1
+            : 0
+      this.selection.moveFocus(dRow, dCol, maxVisRows, visibleCols.length, e.shiftKey)
       this.ensureFocusCellVisible()
       this.syncSelectionClasses()
       this.notifyAllSelectionListeners()
@@ -2180,9 +2217,15 @@ export class VirtualDataGrid {
       ) {
         return
       }
-      const td = this.tbodyEl?.querySelector(
+      let td = this.tbodyEl?.querySelector(
         `td[data-row-index="${this.selectedRowIndex}"][data-col-index="${this.selectedColIndex}"]`
       )
+      if (!(td instanceof HTMLTableCellElement)) {
+        this.ensureFocusCellVisible()
+        td = this.tbodyEl?.querySelector(
+          `td[data-row-index="${this.selectedRowIndex}"][data-col-index="${this.selectedColIndex}"]`
+        )
+      }
       if (td instanceof HTMLTableCellElement) {
         e.preventDefault()
         const header = this.model.headers[this.selectedColIndex]
@@ -2194,7 +2237,16 @@ export class VirtualDataGrid {
 
   private ensureFocusCellVisible(): void {
     const focus = this.selection.getFocus()
-    if (!focus || !this.tableContainerEl || !this.tbodyEl || this.isTransposed) return
+    if (!focus || !this.tableContainerEl || !this.tbodyEl) return
+    if (this.isTransposed) {
+      const td = this.tbodyEl.querySelector(
+        `td[data-vis-row="${focus.row}"][data-vis-col="${focus.col}"]`
+      )
+      if (td instanceof HTMLElement) {
+        td.scrollIntoView?.({ block: 'nearest', inline: 'nearest' })
+      }
+      return
+    }
     let td = this.tbodyEl.querySelector(
       `td[data-vis-row="${focus.row}"][data-vis-col="${focus.col}"]`
     )
@@ -2869,6 +2921,9 @@ export class VirtualDataGrid {
     const newValue = this.coerceEditedValue(rawNewValue, ed.originalValue, ed.colIndex)
     if (Object.is(newValue, ed.originalValue)) return
 
+    // In Staged/Batch mode (or inserted rows), keep the local staged draft in memory.
+    // In Auto-Commit mode, NEVER auto-commit live DB writes on virtual scroll rebuild —
+    // cancel cleanly so accidental wheel scrolling cannot persist unfinished text.
     if (this.batchMode || this.getStagedCount() > 0 || rowState?.kind === 'inserted') {
       if (this.stageCellValueInMemory(ed.rowIndex, ed.colIndex, newValue)) {
         this.invalidateDataCache()
@@ -2879,14 +2934,10 @@ export class VirtualDataGrid {
       return
     }
 
-    void this.applyDirectCellValue(
-      ed.rowIndex,
-      ed.colIndex,
-      columnName,
-      newValue,
-      ed.originalValue,
-      ed.td
-    )
+    const liveTd = this.findLiveCell(ed.rowIndex, ed.colIndex)
+    if (liveTd) {
+      this.refreshSingleCellDisplay(liveTd, ed.rowIndex, ed.colIndex, columnName, ed.originalValue)
+    }
   }
 
   private patchPooledRow(
@@ -3021,7 +3072,7 @@ export class VirtualDataGrid {
       return
     }
 
-    const indices = this.getFilteredRowIndices()
+    let indices = this.getFilteredRowIndices()
 
     if (this.isTransposed) {
       this.resetRowPoolMountState()
@@ -3058,25 +3109,28 @@ export class VirtualDataGrid {
     }
 
     const clientHeight = this.tableContainerEl.clientHeight || 440
-    const totalVisibleRows = indices.length
+    let totalVisibleRows = indices.length
     const headerH = this.theadEl?.offsetHeight || 28
     const bottomCushionPx = 28
-    const maxScrollTop = Math.max(
-      0,
-      headerH + totalVisibleRows * ROW_HEIGHT_PX + bottomCushionPx - clientHeight
-    )
-    const rawScrollTop = this.tableContainerEl.scrollTop
-    const scrollTop = Math.max(0, Math.min(rawScrollTop, maxScrollTop))
-    if (maxScrollTop === 0 && rawScrollTop > 0) {
-      this.tableContainerEl.scrollTop = 0
-    } else if (rawScrollTop > maxScrollTop + ROW_HEIGHT_PX * 3) {
-      this.tableContainerEl.scrollTop = maxScrollTop
+    const computeWindowBounds = (rowCount: number) => {
+      const maxTop = Math.max(0, headerH + rowCount * ROW_HEIGHT_PX + bottomCushionPx - clientHeight)
+      const rawTop = this.tableContainerEl?.scrollTop ?? 0
+      const clampedTop = Math.max(0, Math.min(rawTop, maxTop))
+      if (this.tableContainerEl) {
+        if (maxTop === 0 && rawTop > 0) {
+          this.tableContainerEl.scrollTop = 0
+        } else if (rawTop > maxTop + ROW_HEIGHT_PX * 3) {
+          this.tableContainerEl.scrollTop = maxTop
+        }
+        this.lastScrollTop = this.tableContainerEl.scrollTop
+      }
+      const { startIndex, endIndex } = calculateVisibleWindow(clampedTop, clientHeight)
+      return {
+        boundedStart: Math.max(0, startIndex - 5),
+        boundedEnd: Math.min(rowCount, endIndex + 5),
+      }
     }
-    this.lastScrollTop = this.tableContainerEl.scrollTop
-
-    const { startIndex, endIndex } = calculateVisibleWindow(scrollTop, clientHeight)
-    const boundedStart = Math.max(0, startIndex - 5)
-    const boundedEnd = Math.min(totalVisibleRows, endIndex + 5)
+    let { boundedStart, boundedEnd } = computeWindowBounds(totalVisibleRows)
 
     // Window cache hit: unchanged visible row window & data/filter/layout versions -> 0 DOM mutations
     const prevWin = this.lastRenderedWindow
@@ -3095,7 +3149,7 @@ export class VirtualDataGrid {
       return
     }
 
-    const canSlide =
+    let canSlide =
       !force &&
       this.isPoolMountedInTbody &&
       prevWin !== null &&
@@ -3106,7 +3160,8 @@ export class VirtualDataGrid {
       prevWin.colSpan === colSpan
 
     // Protect open inline editor: keep intact if its row stays mounted in slide window,
-    // otherwise commit cleanly before detaching/rebuilding so keyboard navigation never deadlocks.
+    // otherwise flush/cancel cleanly BEFORE computing final indices/slide window so
+    // lastRenderedWindow never stamps new versions onto stale indices.
     if (this.activeEditor !== null) {
       let keepEditorAlive = false
       if (canSlide) {
@@ -3121,7 +3176,23 @@ export class VirtualDataGrid {
         }
       }
       if (!keepEditorAlive) {
+        const preDataVer = this.dataVersion
+        const preFilterVer = this.filterVersion
         this.flushActiveEditorBeforeRebuild()
+        if (this.dataVersion !== preDataVer || this.filterVersion !== preFilterVer) {
+          canSlide = false
+          indices = this.getFilteredRowIndices()
+          totalVisibleRows = indices.length
+          if (totalVisibleRows === 0) {
+            this.resetRowPoolMountState()
+            this.tbodyEl.innerHTML = ''
+            this.renderEmptyStateRow(colSpan)
+            return
+          }
+          const recomputed = computeWindowBounds(totalVisibleRows)
+          boundedStart = recomputed.boundedStart
+          boundedEnd = recomputed.boundedEnd
+        }
       }
     }
 
@@ -3295,6 +3366,9 @@ export class VirtualDataGrid {
     const tbody = this.tbodyEl
     const model = this.model
     if (!tbody || !model) return
+    if (this.activeEditor) {
+      this.flushActiveEditorBeforeRebuild()
+    }
     tbody.innerHTML = ''
 
     if (indices.length === 0) {
@@ -3304,6 +3378,9 @@ export class VirtualDataGrid {
 
     const frag = document.createDocumentFragment()
     const visibleCols = this.getVisibleColumnIndices()
+    const focus = this.selection.getFocus()
+    const activeMatch =
+      this.findActiveIndex >= 0 ? (this.findMatches[this.findActiveIndex] ?? null) : null
     visibleCols.forEach((colIdx, visCol) => {
       const header = model.headers[colIdx]
       const tr = document.createElement('tr')
@@ -3330,8 +3407,8 @@ export class VirtualDataGrid {
           header,
           rowData,
           rowState,
-          null,
-          null,
+          focus,
+          activeMatch,
           null,
           false
         )
@@ -4125,10 +4202,13 @@ export class VirtualDataGrid {
     if (!rowState || rowState.deleted) return false
 
     const columnName = model.headers[colIndex]
-    const rowData = model.rows[rowIndex]
-    if (rowState.kind === 'existing' && rowState.original === rowData) {
-      rowState.original = cloneRow(rowData)
+    const prevRow = model.rows[rowIndex]
+    // Copy-on-write row mutation so cached GridRuntimeSnapshots remain immutable.
+    if (rowState.kind === 'existing' && rowState.original === prevRow) {
+      rowState.original = prevRow
     }
+    const rowData = cloneRow(prevRow)
+    model.rows[rowIndex] = rowData
     setCellValue(rowData, colIndex, columnName, newValue)
 
     if (rowState.kind === 'existing') {
@@ -4207,7 +4287,7 @@ export class VirtualDataGrid {
       const header = model.headers[colIndex]
       const currentVal = getCellValue(model.rows[rowIndex], colIndex, header)
       const nextVal =
-        typeof value === 'string' && value !== ''
+        typeof value === 'string'
           ? this.coerceEditedValue(value, currentVal, colIndex)
           : value
       if (nextVal === null && this.isCellEditable(rowIndex, colIndex) && !this.isColumnNullable(colIndex)) {
@@ -4668,6 +4748,21 @@ export class VirtualDataGrid {
     return null
   }
 
+  private isBinaryCellValue(value: unknown): boolean {
+    if (value instanceof Uint8Array || value instanceof ArrayBuffer) return true
+    if (typeof value === 'string' && /^\[(?:BLOB|BINARY)\b[^\]]*\]$/i.test(value.trim())) return true
+    if (
+      value &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      (value as Record<string, unknown>).type === 'Buffer' &&
+      Array.isArray((value as Record<string, unknown>).data)
+    ) {
+      return true
+    }
+    return false
+  }
+
   /**
    * Activates inline editing for a specific cell (F17-01).
    */
@@ -4679,6 +4774,10 @@ export class VirtualDataGrid {
     td: HTMLTableCellElement
   ): void {
     if (!this.model || !this.isCellEditable(rowIndex, colIndex)) return
+    if (this.isBinaryCellValue(originalValue)) {
+      this.onNotify?.(`Binary/BLOB cell "${columnName}" cannot be edited inline as text.`)
+      return
+    }
 
     if (this.activeEditor) {
       this.cancelCellEdit()
@@ -4790,8 +4889,8 @@ export class VirtualDataGrid {
     const vr = parseOptionalInt(td.dataset.visRow) ?? 0
     const vc = parseOptionalInt(td.dataset.visCol) ?? 0
     const visibleCols = this.getVisibleColumnIndices()
-    const pinnedCount = this.getPinnedVisibleCount(visibleCols)
-    const pinnedOffsets = this.computePinnedLeftOffsets(visibleCols, pinnedCount)
+    const pinnedCount = this.isTransposed ? 0 : this.getPinnedVisibleCount(visibleCols)
+    const pinnedOffsets = this.isTransposed ? [] : this.computePinnedLeftOffsets(visibleCols, pinnedCount)
     const activeMatch =
       this.findActiveIndex >= 0 ? (this.findMatches[this.findActiveIndex] ?? null) : null
 
@@ -4806,8 +4905,8 @@ export class VirtualDataGrid {
       rowState,
       this.selection.getFocus(),
       activeMatch,
-      vc < pinnedCount ? pinnedOffsets[vc] : null,
-      vc < pinnedCount && vc === pinnedCount - 1
+      !this.isTransposed && vc < pinnedCount ? pinnedOffsets[vc] : null,
+      !this.isTransposed && vc < pinnedCount && vc === pinnedCount - 1
     )
   }
 
@@ -4873,13 +4972,15 @@ export class VirtualDataGrid {
       this.onNotify?.(`Column "${columnName}" is NOT NULL — cannot set NULL.`)
       return
     }
-    const rowData = targetModel.rows[rowIndex]
+    const prevRow = targetModel.rows[rowIndex]
     const rowState = this.rowStates[rowIndex]
-    if (rowState && rowState.original === rowData) {
-      rowState.original = cloneRow(rowData)
+    if (rowState && rowState.original === prevRow) {
+      rowState.original = prevRow
     }
-
-    setCellValue(rowData, colIndex, columnName, newValue)
+    // Copy-on-write row ref used as stable row identity across sort/delete races.
+    const trackedRowRef = cloneRow(prevRow)
+    targetModel.rows[rowIndex] = trackedRowRef
+    setCellValue(trackedRowRef, colIndex, columnName, newValue)
     this.invalidateDataCache()
     this.invalidateFilterCache()
 
@@ -4892,7 +4993,7 @@ export class VirtualDataGrid {
     const primaryKeys: Record<string, unknown> = {}
     targetModel.primaryKey.forEach((pk) => {
       const pkColIdx = targetModel.headers.indexOf(pk)
-      primaryKeys[pk] = getCellValue(rowState?.original ?? rowData, pkColIdx, pk)
+      primaryKeys[pk] = getCellValue(rowState?.original ?? prevRow, pkColIdx, pk)
     })
 
     if (this.onUpdateCell) {
@@ -4905,35 +5006,44 @@ export class VirtualDataGrid {
           rowIndex,
         })
 
-        // Stale model guard: if user switched tables/reloaded while RPC was in flight, abort cleanly
-        if (this.model !== targetModel || rowIndex >= targetModel.rows.length) {
+        // Stale model or row-identity guard: resolve current index via stable row ref after sort/delete
+        if (this.model !== targetModel) {
+          return
+        }
+        const liveRowIndex = rowState
+          ? this.rowStates.indexOf(rowState)
+          : targetModel.rows.indexOf(trackedRowRef)
+        if (liveRowIndex < 0 || liveRowIndex >= targetModel.rows.length) {
           return
         }
 
         if (result.ok && (result.affectedRows === undefined || result.affectedRows > 0)) {
           if (result.updatedRecord) {
-            targetModel.rows[rowIndex] = cloneRow(result.updatedRecord)
+            const committedRow = cloneRow(result.updatedRecord)
+            targetModel.rows[liveRowIndex] = committedRow
             if (rowState) {
-              rowState.original = cloneRow(result.updatedRecord)
+              rowState.original = committedRow
             }
           } else if (rowState) {
-            setCellValue(rowState.original, colIndex, columnName, newValue)
+            const nextOrig = cloneRow(rowState.original)
+            setCellValue(nextOrig, colIndex, columnName, newValue)
+            rowState.original = nextOrig
           }
           this.invalidateDataCache()
           this.invalidateFilterCache()
-          const liveTd = this.findLiveCell(rowIndex, colIndex)
+          const liveTd = this.findLiveCell(liveRowIndex, colIndex)
           if (liveTd) {
             liveTd.classList.remove('datanoa-cell-saving')
-            const updatedVal = getCellValue(targetModel.rows[rowIndex], colIndex, columnName)
-            this.refreshSingleCellDisplay(liveTd, rowIndex, colIndex, columnName, updatedVal)
+            const updatedVal = getCellValue(targetModel.rows[liveRowIndex], colIndex, columnName)
+            this.refreshSingleCellDisplay(liveTd, liveRowIndex, colIndex, columnName, updatedVal)
           }
           this.refreshFindMatchesIfActive()
           this.notifyAllSelectionListeners()
         } else {
-          this.rollbackCell(targetModel, rowIndex, colIndex, columnName, originalValue)
+          this.rollbackCell(targetModel, rowState ?? trackedRowRef, colIndex, columnName, originalValue)
         }
       } catch {
-        this.rollbackCell(targetModel, rowIndex, colIndex, columnName, originalValue)
+        this.rollbackCell(targetModel, rowState ?? trackedRowRef, colIndex, columnName, originalValue)
       }
     } else {
       const liveTd = this.findLiveCell(rowIndex, colIndex) ?? initialTd
@@ -4946,19 +5056,38 @@ export class VirtualDataGrid {
 
   /**
    * Rolls back cell value to original on conflict or error (F17-05).
-   * Guards against stale model and re-queries live <td> in tbodyEl instead of mutating detached references.
+   * Resolves the row by stable rowState/row reference so in-memory sort or row deletion never mutates a sibling row.
    */
+  private static isInternalRowState(
+    value: InternalRowState | Record<string, unknown> | unknown[] | number
+  ): value is InternalRowState {
+    return (
+      typeof value === 'object' &&
+      value !== null &&
+      !Array.isArray(value) &&
+      'dirtyCols' in value &&
+      value.dirtyCols instanceof Map
+    )
+  }
+
   private rollbackCell(
     targetModel: GridModel,
-    rowIndex: number,
+    rowIdentity: InternalRowState | Record<string, unknown> | unknown[] | number,
     colIndex: number,
     columnName: string,
     originalValue: unknown
   ): void {
     if (this.model !== targetModel) return
+    const rowIndex =
+      typeof rowIdentity === 'number'
+        ? rowIdentity
+        : VirtualDataGrid.isInternalRowState(rowIdentity)
+          ? this.rowStates.indexOf(rowIdentity)
+          : targetModel.rows.indexOf(rowIdentity)
     if (rowIndex < 0 || rowIndex >= targetModel.rows.length) return
-    const rowData = targetModel.rows[rowIndex]
-    setCellValue(rowData, colIndex, columnName, originalValue)
+    const nextRow = cloneRow(targetModel.rows[rowIndex])
+    setCellValue(nextRow, colIndex, columnName, originalValue)
+    targetModel.rows[rowIndex] = nextRow
     this.invalidateDataCache()
     this.invalidateFilterCache()
 
@@ -4967,11 +5096,15 @@ export class VirtualDataGrid {
       this.refreshSingleCellDisplay(liveTd, rowIndex, colIndex, columnName, originalValue)
       liveTd.classList.add('datanoa-cell-conflict')
 
+      const targetRef = this.rowStates[rowIndex]
       const timer = setTimeout(() => {
         this.timers.delete(timer)
-        if (this.model === targetModel) {
-          const currentTd = this.findLiveCell(rowIndex, colIndex)
-          currentTd?.classList.remove('datanoa-cell-conflict')
+        if (this.model === targetModel && targetRef) {
+          const idxNow = this.rowStates.indexOf(targetRef)
+          if (idxNow >= 0) {
+            const currentTd = this.findLiveCell(idxNow, colIndex)
+            currentTd?.classList.remove('datanoa-cell-conflict')
+          }
         }
         liveTd.classList.remove('datanoa-cell-conflict')
       }, 1500)
@@ -4979,6 +5112,37 @@ export class VirtualDataGrid {
     }
 
     this.refreshFindMatchesIfActive()
+    this.notifyAllSelectionListeners()
+  }
+
+  /**
+   * Marks all staged changes as committed in-memory without reverting edited cells
+   * back to pre-commit values (protects UI consistency when post-commit refresh fails).
+   */
+  public markStagedChangesCommitted(): void {
+    const model = this.model
+    if (!model) return
+    const nextRows: Array<Record<string, unknown> | unknown[]> = []
+    const nextStates: InternalRowState[] = []
+    for (let i = 0; i < model.rows.length; i++) {
+      const st = this.rowStates[i]
+      if (st?.deleted) continue
+      const row = model.rows[i]
+      nextRows.push(row)
+      nextStates.push({
+        kind: 'existing',
+        deleted: false,
+        original: row,
+        dirtyCols: new Map(),
+      })
+    }
+    model.rows = nextRows
+    model.rowCount = nextRows.length
+    this.rowStates = nextStates
+    this.invalidateDataCache()
+    this.invalidateFilterCache()
+    this.renderVisibleRows(true)
+    this.onStageChange?.(0)
     this.notifyAllSelectionListeners()
   }
 
@@ -5057,11 +5221,13 @@ export class VirtualDataGrid {
   }
 
   public exportRuntimeState(): GridRuntimeSnapshot {
+    // Copy-on-write snapshot: rows are replaced on mutation, so retaining immutable row refs
+    // eliminates 4x O(N*cols) deep clones on every Filter/Find keystroke and tab switch.
     const model = this.model
       ? {
           headers: [...this.model.headers],
           columns: this.model.columns.map((c) => ({ ...c })),
-          rows: this.model.rows.map((r) => cloneRow(r)),
+          rows: [...this.model.rows],
           rowCount: this.model.rowCount,
           canEdit: this.model.canEdit,
           primaryKey: [...this.model.primaryKey],
@@ -5071,7 +5237,7 @@ export class VirtualDataGrid {
       kind: st.kind,
       ...(st.origin ? { origin: st.origin } : {}),
       deleted: st.deleted,
-      original: cloneRow(st.original),
+      original: st.original,
       dirtyCols: new Map(st.dirtyCols),
     }))
     const fkSeen = new Set<ForeignKeyInfo>(this.foreignKeyByColumn.values())
@@ -5092,6 +5258,10 @@ export class VirtualDataGrid {
       connectionId: this.connectionId,
       schemaName: this.schemaName,
       dialect: this.dialect,
+      originConnectionId: this.connectionId,
+      originDriver: this.dialect,
+      originSchema: this.schemaName,
+      originTable: this.tableName,
       emptyMessage: this.emptyMessage,
       foreignKeys: Array.from(fkSeen),
     }
@@ -5117,7 +5287,7 @@ export class VirtualDataGrid {
       ? {
           headers: [...snap.model.headers],
           columns: snap.model.columns.map((c) => ({ ...c })),
-          rows: snap.model.rows.map((r) => cloneRow(r)),
+          rows: [...snap.model.rows],
           rowCount: snap.model.rowCount,
           canEdit: snap.model.canEdit,
           primaryKey: [...snap.model.primaryKey],
@@ -5127,7 +5297,7 @@ export class VirtualDataGrid {
       kind: st.kind,
       ...(st.origin ? { origin: st.origin } : {}),
       deleted: st.deleted,
-      original: cloneRow(st.original),
+      original: st.original,
       dirtyCols: new Map(st.dirtyCols),
     }))
 

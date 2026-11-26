@@ -766,21 +766,70 @@ function collectRealTables(
   return Array.from(byKey.values())
 }
 
-function extractCteNames(sql: string): Set<string> {
+function extractCteNames(sql: string, dialect?: AiDialect): Set<string> {
   const ctes = new Set<string>()
-  const withHeadRe = /\bWITH\s+(?:RECURSIVE\s+)?([A-Za-z_][A-Za-z0-9_$]*)\s*(?:\([^)]*\)\s*)?\bAS\s*\(/gi
-  let m: RegExpExecArray | null
-  while ((m = withHeadRe.exec(sql)) !== null) {
-    if (m[1]) ctes.add(m[1].toLowerCase())
+  const tokens = tokenizeSqlForDiff(sql, dialect).filter(
+    (t) => t.kind !== 'ws' && t.kind !== 'nl' && t.kind !== 'comment'
+  )
+  const isIdentTok = (t: SqlDiffToken | undefined): boolean =>
+    Boolean(t && (t.kind === 'word' || (t.kind === 'quoted_ident' && t.closed !== false)))
+  const skipBalancedParens = (startIdx: number): number => {
+    if (tokens[startIdx]?.text !== '(') return startIdx
+    let depth = 0
+    for (let j = startIdx; j < tokens.length; j += 1) {
+      if (tokens[j]?.text === '(') depth += 1
+      else if (tokens[j]?.text === ')') {
+        depth -= 1
+        if (depth === 0) return j + 1
+      }
+    }
+    return tokens.length
   }
-  const nextCteRe = /\)\s*,\s*([A-Za-z_][A-Za-z0-9_$]*)\s*(?:\([^)]*\)\s*)?\bAS\s*\(/gi
-  while ((m = nextCteRe.exec(sql)) !== null) {
-    if (m[1]) ctes.add(m[1].toLowerCase())
+
+  for (let i = 0; i < tokens.length; i += 1) {
+    const tok = tokens[i]
+    if (!tok || tok.kind !== 'word' || tok.text.toUpperCase() !== 'WITH') continue
+    let idx = i + 1
+    if (tokens[idx]?.kind === 'word' && tokens[idx]?.text.toUpperCase() === 'RECURSIVE') {
+      idx += 1
+    }
+    while (idx < tokens.length) {
+      const nameTok = tokens[idx]
+      if (!isIdentTok(nameTok) || !nameTok) break
+      let cursor = idx + 1
+      if (tokens[cursor]?.text === '(') {
+        cursor = skipBalancedParens(cursor)
+      }
+      if (tokens[cursor]?.kind !== 'word' || tokens[cursor]?.text.toUpperCase() !== 'AS') break
+      cursor += 1
+      // Optional PostgreSQL `[NOT] MATERIALIZED`
+      if (tokens[cursor]?.kind === 'word' && tokens[cursor]?.text.toUpperCase() === 'NOT') {
+        cursor += 1
+      }
+      if (tokens[cursor]?.kind === 'word' && tokens[cursor]?.text.toUpperCase() === 'MATERIALIZED') {
+        cursor += 1
+      }
+      if (tokens[cursor]?.text !== '(') break
+      const clean = unquoteSqlIdent(nameTok.text).toLowerCase()
+      if (clean) ctes.add(clean)
+      cursor = skipBalancedParens(cursor)
+      if (tokens[cursor]?.text !== ',') break
+      idx = cursor + 1
+    }
   }
   return ctes
 }
 
-function applyDiagnosticsToShadowSql(sql: string, diags: readonly SqlDiagnostic[]): string {
+interface ShadowPatch {
+  origFrom: number
+  origTo: number
+  replacementLen: number
+}
+
+function applyDiagnosticsToShadowSqlWithMap(
+  sql: string,
+  diags: readonly SqlDiagnostic[]
+): { shadow: string; patches: ShadowPatch[] } {
   const sorted = [...diags]
     .filter(
       (d) =>
@@ -792,12 +841,54 @@ function applyDiagnosticsToShadowSql(sql: string, diags: readonly SqlDiagnostic[
     .sort((a, b) => b.from - a.from)
   let out = sql
   let prevFrom = Infinity
+  const patches: ShadowPatch[] = []
   for (const d of sorted) {
     if (!d.suggestion || d.to > prevFrom || d.from < 0 || d.to > out.length) continue
     out = `${out.slice(0, d.from)}${d.suggestion}${out.slice(d.to)}`
+    patches.push({ origFrom: d.from, origTo: d.to, replacementLen: d.suggestion.length })
     prevFrom = d.from
   }
-  return out
+  patches.reverse()
+  return { shadow: out, patches }
+}
+
+function mapShadowOffsetToOrig(
+  shadowOffset: number,
+  patches: readonly ShadowPatch[],
+  origLen: number
+): number {
+  let shadowCursor = 0
+  let origCursor = 0
+  for (const p of patches) {
+    const unchangedLen = p.origFrom - origCursor
+    if (shadowOffset <= shadowCursor + unchangedLen) {
+      return Math.max(0, Math.min(origLen, origCursor + (shadowOffset - shadowCursor)))
+    }
+    shadowCursor += unchangedLen
+    origCursor = p.origFrom
+    if (shadowOffset < shadowCursor + p.replacementLen) {
+      return Math.max(0, Math.min(origLen, p.origFrom))
+    }
+    shadowCursor += p.replacementLen
+    origCursor = p.origTo
+  }
+  return Math.max(0, Math.min(origLen, origCursor + (shadowOffset - shadowCursor)))
+}
+
+function mapOrigOffsetToShadow(
+  origOffset: number,
+  patches: readonly ShadowPatch[],
+  shadowLen: number
+): number {
+  let delta = 0
+  for (const p of patches) {
+    if (origOffset <= p.origFrom) break
+    if (origOffset < p.origTo) {
+      return Math.max(0, Math.min(shadowLen, p.origFrom + delta))
+    }
+    delta += p.replacementLen - (p.origTo - p.origFrom)
+  }
+  return Math.max(0, Math.min(shadowLen, origOffset + delta))
 }
 
 function findFuzzyTableMatch(
@@ -1262,22 +1353,29 @@ function runTwoPassDiagnostics(
   relCursor: number
 ): { diagnostics: SqlDiagnostic[]; shadowFromDiags: string } {
   const diagnosticsInitial = analyzeSqlDiagnostics(stmtText, { dialect, cursorOffset: relCursor })
-  let shadowFromDiags = applyDiagnosticsToShadowSql(stmtText, diagnosticsInitial)
+  const pass1 = applyDiagnosticsToShadowSqlWithMap(stmtText, diagnosticsInitial)
+  let shadowFromDiags = pass1.shadow
   if (shadowFromDiags === stmtText) {
     return { diagnostics: diagnosticsInitial, shadowFromDiags }
   }
+  const mappedCursor = mapOrigOffsetToShadow(relCursor, pass1.patches, shadowFromDiags.length)
   const secondDiags = analyzeSqlDiagnostics(shadowFromDiags, {
     dialect,
-    cursorOffset: Math.min(relCursor, shadowFromDiags.length),
+    cursorOffset: mappedCursor,
   })
   if (secondDiags.length === 0) {
     return { diagnostics: diagnosticsInitial, shadowFromDiags }
   }
-  shadowFromDiags = applyDiagnosticsToShadowSql(shadowFromDiags, secondDiags)
+  shadowFromDiags = applyDiagnosticsToShadowSqlWithMap(shadowFromDiags, secondDiags).shadow
   const merged = [...diagnosticsInitial]
   for (const sd of secondDiags) {
-    if (!merged.some((md) => Math.abs(md.from - sd.from) <= 1 && md.code === sd.code)) {
-      merged.push(sd)
+    const remappedFrom = mapShadowOffsetToOrig(sd.from, pass1.patches, stmtText.length)
+    const remappedTo = Math.max(
+      remappedFrom,
+      mapShadowOffsetToOrig(sd.to, pass1.patches, stmtText.length)
+    )
+    if (!merged.some((md) => Math.abs(md.from - remappedFrom) <= 1 && md.code === sd.code)) {
+      merged.push({ ...sd, from: remappedFrom, to: remappedTo })
     }
   }
   return { diagnostics: merged, shadowFromDiags }
@@ -1382,29 +1480,55 @@ function resolveFromJoinAliases(
 ): { userAliases: Set<string>; aliasToCols: Map<string, Set<string>> } {
   const userAliases = new Set<string>()
   const aliasToCols = new Map<string, Set<string>>()
+  const parseTableAndAlias = (startIdx: number): number => {
+    let idx = startIdx
+    if (shadowNonWs[idx]?.kind === 'word' && shadowNonWs[idx]?.text.toUpperCase() === 'ONLY') {
+      idx += 1
+    }
+    const firstIdent = shadowNonWs[idx]
+    if (!firstIdent || (firstIdent.kind !== 'word' && firstIdent.kind !== 'quoted_ident')) {
+      return startIdx
+    }
+    let tableBare = unquoteSqlIdent(firstIdent.text).toLowerCase()
+    idx += 1
+    // Support 2-part (schema.table) and 3-part (catalog.schema.table) table references
+    let dotParts = 0
+    while (dotParts < 2 && shadowNonWs[idx]?.text === '.' && shadowNonWs[idx + 1]) {
+      tableBare = unquoteSqlIdent(shadowNonWs[idx + 1]?.text ?? '').toLowerCase()
+      idx += 2
+      dotParts += 1
+    }
+    if (shadowNonWs[idx]?.kind === 'word' && shadowNonWs[idx]?.text.toUpperCase() === 'AS') {
+      idx += 1
+    }
+    const aliasTok = shadowNonWs[idx]
+    if (aliasTok?.kind === 'word') {
+      const aliasUpper = aliasTok.text.toUpperCase()
+      if (!VALID_SQL_WORDS.has(aliasUpper) && !CLAUSE_BARRIER_WORDS.has(aliasUpper)) {
+        const aliasLower = aliasTok.text.toLowerCase()
+        userAliases.add(aliasLower)
+        const mappedCols = tableColsByBare.get(tableBare)
+        if (mappedCols) aliasToCols.set(aliasLower, mappedCols)
+        idx += 1
+      }
+    }
+    return idx
+  }
+
   for (let i = 0; i < shadowNonWs.length; i += 1) {
     const cur = shadowNonWs[i]
     if (!cur || cur.kind !== 'word') continue
     const kwUpper = cur.text.toUpperCase()
     if (kwUpper !== 'FROM' && kwUpper !== 'JOIN') continue
-    let idx = i + 1
-    const firstIdent = shadowNonWs[idx]
-    if (!firstIdent || (firstIdent.kind !== 'word' && firstIdent.kind !== 'quoted_ident')) continue
-    let tableBare = unquoteSqlIdent(firstIdent.text).toLowerCase()
-    idx += 1
-    if (shadowNonWs[idx]?.text === '.' && shadowNonWs[idx + 1]) {
-      tableBare = unquoteSqlIdent(shadowNonWs[idx + 1]?.text ?? '').toLowerCase()
-      idx += 2
+    let nextIdx = parseTableAndAlias(i + 1)
+    if (kwUpper === 'FROM') {
+      // Support comma-separated tables (`FROM t1 a, t2 b`)
+      while (nextIdx > i + 1 && shadowNonWs[nextIdx]?.text === ',') {
+        const afterComma = parseTableAndAlias(nextIdx + 1)
+        if (afterComma === nextIdx + 1) break
+        nextIdx = afterComma
+      }
     }
-    if (shadowNonWs[idx]?.kind === 'word' && shadowNonWs[idx]?.text.toUpperCase() === 'AS') idx += 1
-    const aliasTok = shadowNonWs[idx]
-    if (aliasTok?.kind !== 'word') continue
-    const aliasUpper = aliasTok.text.toUpperCase()
-    if (VALID_SQL_WORDS.has(aliasUpper) || CLAUSE_BARRIER_WORDS.has(aliasUpper)) continue
-    const aliasLower = aliasTok.text.toLowerCase()
-    userAliases.add(aliasLower)
-    const mappedCols = tableColsByBare.get(tableBare)
-    if (mappedCols) aliasToCols.set(aliasLower, mappedCols)
   }
   return { userAliases, aliasToCols }
 }
@@ -1549,14 +1673,21 @@ export function shadowHealStatementForSchema(
   activeSchema?: string
 ): ShadowHealResult {
   const { diagnostics, shadowFromDiags } = runTwoPassDiagnostics(stmt.text, dialect, stmt.relCursor)
+  const realTables = collectRealTables(snapshot, schemaMap)
+  const preCteNames = extractCteNames(shadowFromDiags, dialect)
+  const knownIdentifiers = new Set<string>(preCteNames)
+  for (const rt of realTables) {
+    knownIdentifiers.add(rt.bareLower)
+    knownIdentifiers.add(rt.qualified.toLowerCase())
+    for (const c of rt.cols) knownIdentifiers.add(c.toLowerCase())
+  }
   const prefixBeforeCursor = shadowFromDiags.slice(0, Math.min(stmt.relCursor, shadowFromDiags.length))
-  const trailingTypo = resolveTrailingTypoToken(prefixBeforeCursor, dialect)
+  const trailingTypo = resolveTrailingTypoToken(prefixBeforeCursor, dialect, knownIdentifiers)
   const shadowSql = trailingTypo
     ? `${trailingTypo.healedPrefix}${shadowFromDiags.slice(prefixBeforeCursor.length)}`
     : shadowFromDiags
 
-  const cteNames = extractCteNames(shadowSql)
-  const realTables = collectRealTables(snapshot, schemaMap)
+  const cteNames = extractCteNames(shadowSql, dialect)
   const realBareMap = new Map<string, RealTableEntry[]>()
   for (const entry of realTables) {
     const arr = realBareMap.get(entry.bareLower) ?? []
@@ -2535,18 +2666,22 @@ export function extractRewriteTagContent(
   text = stripSpecialCompletionTokens(text).replace(/<CURSOR>/gi, '')
   if (!text.trim()) return ''
 
-  // Truncation guard
+  // Truncation guard (upstream stop sequence `</REWRITE>` may strip the closing tag with finishReason `stop`/`end_turn`/`stop_sequence`)
   const truncatedReason = finishReason === 'length' || finishReason === 'max_tokens'
-  if (!hasClosingTag && (truncatedReason || (origStmt.length > 25 && text.length < origStmt.length * 0.55))) {
+  const stoppedCleanly =
+    finishReason === 'stop' || finishReason === 'end_turn' || finishReason === 'stop_sequence'
+  const clearlyTruncated = origStmt.length > 25 && text.length < origStmt.length * 0.55
+  if (!hasClosingTag && (truncatedReason || clearlyTruncated || (!stoppedCleanly && !openTag))) {
     return ''
   }
 
   if (looksInjected(text)) return ''
 
   const commentStripped = stripSqlCommentsForProseCheck(text)
-  const startsWithSql = /^\s*(?:SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|EXPLAIN|SHOW|PRAGMA|DESCRIBE|BEGIN|COMMIT|ROLLBACK|MERGE|VALUES|TABLE)\b/i.test(
-    commentStripped
-  )
+  const startsWithSql =
+    /^\s*(?:SELECT|WITH|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|EXPLAIN|SHOW|PRAGMA|DESCRIBE|DESC|BEGIN|COMMIT|ROLLBACK|MERGE|VALUES|TABLE|CALL|EXEC|EXECUTE|TRUNCATE|USE|SET|GRANT|REVOKE|ANALYZE|VACUUM|COPY|DO|REPLACE|UPSERT|COMMENT|ATTACH|DETACH|DECLARE)\b/i.test(
+      commentStripped
+    )
   if (!openTag && !startsWithSql && isProseExplanation(commentStripped)) {
     return ''
   }

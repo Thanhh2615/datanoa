@@ -1,4 +1,5 @@
 import { Worker } from 'node:worker_threads'
+import { DatabaseSync } from 'node:sqlite'
 import * as fs from 'node:fs'
 import type {
   ApplyChangesParams,
@@ -347,6 +348,25 @@ export class SqliteSession implements IDatabaseSession {
     return details
   }
 
+  private isMemoryDb(): boolean {
+    const raw = (this.profile.filePath || '').trim()
+    return raw.length === 0 || raw === ':memory:'
+  }
+
+  private async snapshotMemoryStateIfNeeded(): Promise<void> {
+    if (!this.isMemoryDb() || this.isClosed || !this.worker || this.txState.active) {
+      return
+    }
+    try {
+      const bytes = await this.sendToWorker<Uint8Array>('serialize')
+      if (bytes instanceof Uint8Array && bytes.byteLength <= 32 * 1024 * 1024) {
+        this.serializedState = bytes
+      }
+    } catch {
+      // Best-effort snapshot for in-memory cancel recovery
+    }
+  }
+
   async fetchPage(params: FetchPageParams): Promise<TableBrowseResult> {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'sqlite')
@@ -365,6 +385,45 @@ export class SqliteSession implements IDatabaseSession {
       whereClause: params.whereClause,
       orderByClause: params.orderByClause,
     })
+
+    if (params.bypassTransaction && this.txState.active) {
+      if (this.isMemoryDb()) {
+        throw new DatabaseDriverError(
+          'Cannot bypass active transaction on an in-memory SQLite database',
+          'NOT_SUPPORTED',
+          'sqlite'
+        )
+      }
+      const roDb = new DatabaseSync(this.profile.filePath || ':memory:', {
+        readOnly: true,
+        readBigInts: true,
+        timeout: 5000,
+      })
+      try {
+        const normalizeRow = (row: unknown): Record<string, unknown> => {
+          if (!row || typeof row !== 'object') return {}
+          const out: Record<string, unknown> = {}
+          for (const [k, v] of Object.entries(row as Record<string, unknown>)) {
+            out[k] = typeof v === 'bigint' ? (Number.isSafeInteger(Number(v)) ? Number(v) : v.toString()) : v
+          }
+          return out
+        }
+        const bindParams = queryParams.map((p) =>
+          p === undefined || p === null ? null : typeof p === 'boolean' ? (p ? 1 : 0) : (p as string | number | bigint | Uint8Array)
+        )
+        const countRaw = roDb.prepare(countSql).get()
+        const rowsRaw = roDb.prepare(sql).all(...bindParams)
+        return assembleTableBrowseResult({
+          tableDetails: details,
+          rows: rowsRaw.map(normalizeRow),
+          countRow: normalizeRow(countRaw) || { total: 0 },
+          page: params.page,
+          pageSize: params.pageSize,
+        })
+      } finally {
+        roDb.close()
+      }
+    }
 
     const countRow = await this.sendToWorker<Record<string, unknown>>('get', { sql: countSql })
     const rows = await this.sendToWorker<Record<string, unknown>[]>('all', {
@@ -439,7 +498,7 @@ export class SqliteSession implements IDatabaseSession {
         })) || undefined
     }
 
-    this.tableDetailsCache.clear()
+    await this.snapshotMemoryStateIfNeeded()
 
     return {
       ok: true,
@@ -519,7 +578,7 @@ export class SqliteSession implements IDatabaseSession {
       if (result.txState) {
         this.txState = result.txState
       }
-      this.tableDetailsCache.clear()
+      await this.snapshotMemoryStateIfNeeded()
       return {
         ok: true,
         inserted: result.inserted,
@@ -627,7 +686,11 @@ export class SqliteSession implements IDatabaseSession {
       activeWorker.postMessage({ id: reqId, type: 'query', sql, statements, maxRows })
     })
 
-    return queryPromise
+    const queryResult = await queryPromise
+    if (this.isMemoryDb() && !this.txState.active && (isDdl || !queryResult.isSelect || (queryResult.affectedRows ?? 0) > 0)) {
+      await this.snapshotMemoryStateIfNeeded()
+    }
+    return queryResult
   }
 
   async cancelQuery(queryId: string): Promise<{ ok: boolean }> {
@@ -647,6 +710,7 @@ export class SqliteSession implements IDatabaseSession {
     }
 
     const runCancel = async (): Promise<{ ok: boolean }> => {
+      const preservedAutoCommit = this.txState.autoCommit
       // 1. Reject active query with 'cancelled' code
       this.pendingRequests.delete(active.reqId)
       active.reject(
@@ -681,7 +745,7 @@ export class SqliteSession implements IDatabaseSession {
       }
       this.txState = {
         active: false,
-        autoCommit: true,
+        autoCommit: preservedAutoCommit,
         statementCount: 0,
         supported: true,
       }
@@ -689,6 +753,14 @@ export class SqliteSession implements IDatabaseSession {
       try {
         spawnedWorker = this.spawnWorker()
         await this.init(true)
+        if (!preservedAutoCommit) {
+          const restoredState = await this.sendToWorker<TransactionState>(
+            'txSetAutoCommit',
+            { enabled: false },
+            true
+          )
+          this.txState = restoredState
+        }
       } catch (respawnErr) {
         this.isClosed = true
         this.worker = null
@@ -731,6 +803,7 @@ export class SqliteSession implements IDatabaseSession {
     }
     const state = await this.sendToWorker<TransactionState>('txCommit')
     this.txState = state
+    await this.snapshotMemoryStateIfNeeded()
     return { ...this.txState }
   }
 

@@ -372,13 +372,16 @@ export class MssqlSession implements IDatabaseSession {
     sql: string,
     params?: unknown[]
   ): Promise<Record<string, unknown>[]> => {
-    if (this.isClosed) {
-      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'mssql')
+    const run = async (): Promise<Record<string, unknown>[]> => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'mssql')
+      }
+      const req = this.createRequest(this.tx)
+      await bindMssqlParams(req, params)
+      const res = await req.query(sql)
+      return Array.isArray(res.recordset) ? (res.recordset as Record<string, unknown>[]) : []
     }
-    const req = this.createRequest(this.tx)
-    await bindMssqlParams(req, params)
-    const res = await req.query(sql)
-    return Array.isArray(res.recordset) ? (res.recordset as Record<string, unknown>[]) : []
+    return this.tx !== null ? this.runExclusiveTxOp(run) : run()
   }
 
   private async runScrubbed<T>(fn: () => Promise<T>): Promise<T> {
@@ -813,7 +816,6 @@ export class MssqlSession implements IDatabaseSession {
         } else {
           this.statementCount += batch.deletes.length + batch.updates.length + batch.chunkedInserts.length
         }
-        this.tableDetailsCache.clear()
         return {
           ok: true,
           inserted,
@@ -852,7 +854,12 @@ export class MssqlSession implements IDatabaseSession {
     })
   }
 
-  async runQuery(queryId: string, sql: string, maxRows = 1000): Promise<QueryResult> {
+  async runQuery(
+    queryId: string,
+    sql: string,
+    maxRows = 1000,
+    timeoutMs?: number
+  ): Promise<QueryResult> {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'mssql')
     }
@@ -863,7 +870,9 @@ export class MssqlSession implements IDatabaseSession {
       this.assertWritable()
     }
 
-    const startsTx = execBatches.some((b) => hasStandaloneBeginTran(b))
+    const startsTx = execBatches.some(
+      (b) => hasStandaloneBeginTran(b) || /\bBEGIN\s+(?:TRAN|TRANSACTION)\b/i.test(stripLeadingSqlComments(b, 'mssql'))
+    )
     const needsTxLock = !this.autoCommit || this.tx !== null || startsTx
 
     const executeRun = async (): Promise<QueryResult> => {
@@ -884,6 +893,35 @@ export class MssqlSession implements IDatabaseSession {
         cancelled: false,
       }
       this.activeQueries.set(queryId, activeEntry)
+
+      const hasExplicitTimeout =
+        typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
+      const effectiveTimeoutMs = hasExplicitTimeout ? Math.max(1, Math.round(timeoutMs)) : 0
+      let timedOut = false
+      let timeoutTimer: ReturnType<typeof setTimeout> | undefined
+      const timeoutRacePromise = hasExplicitTimeout
+        ? new Promise<never>((_, reject) => {
+            timeoutTimer = setTimeout(() => {
+              timedOut = true
+              activeEntry.cancelled = true
+              try {
+                activeEntry.request.cancel()
+              } catch {
+                // Best-effort TDS attention cancel
+              }
+              reject(
+                new DatabaseDriverError(
+                  `MSSQL query timed out after ${effectiveTimeoutMs}ms`,
+                  'TIMEOUT',
+                  'mssql'
+                )
+              )
+            }, effectiveTimeoutMs)
+          })
+        : null
+      if (timeoutRacePromise) {
+        timeoutRacePromise.catch(() => {})
+      }
 
       try {
         for (let batchIndex = 0; batchIndex < execBatches.length; batchIndex++) {
@@ -965,8 +1003,106 @@ export class MssqlSession implements IDatabaseSession {
 
           let res: MssqlQueryResultLike
           try {
-            res = await req.query(batchSql)
+            const streamableReq = req as unknown as {
+              stream?: boolean
+              on?: (event: string, cb: (...args: unknown[]) => void) => unknown
+              query: (sqlText: string) => Promise<MssqlQueryResultLike>
+              cancel: () => void
+            }
+            const canStreamBatch =
+              maxRows > 0 &&
+              execBatches.length === 1 &&
+              /^(?:SELECT|WITH|EXEC|EXECUTE)\b/i.test(norm) &&
+              typeof streamableReq.on === 'function'
+
+            const batchExecPromise = canStreamBatch
+              ? (async () => {
+                  streamableReq.stream = true
+                  return await new Promise<MssqlQueryResultLike>((resolve, reject) => {
+                    const recordsets: Array<unknown[] & { columns?: Record<string, { name?: string; type?: unknown }> }> = []
+                    let currentRows: (unknown[] & { columns?: Record<string, { name?: string; type?: unknown }> }) | null = null
+                    let rowsAffected: number[] = []
+                    let truncatedCancel = false
+                    let settled = false
+                    const finish = (err?: unknown): void => {
+                      if (settled) return
+                      settled = true
+                      if (err) reject(err)
+                      else {
+                        resolve({
+                          recordsets: recordsets as unknown as MssqlQueryResultLike['recordsets'],
+                          recordset: (recordsets[recordsets.length - 1] ?? []) as unknown as MssqlQueryResultLike['recordset'],
+                          rowsAffected,
+                        })
+                      }
+                    }
+                    streamableReq.on?.('recordset', (columns: unknown) => {
+                      const arr = [] as unknown[] & { columns?: Record<string, { name?: string; type?: unknown }> }
+                      if (columns && typeof columns === 'object') {
+                        arr.columns = columns as Record<string, { name?: string; type?: unknown }>
+                      }
+                      currentRows = arr
+                      recordsets.push(arr)
+                    })
+                    streamableReq.on?.('row', (row: unknown) => {
+                      if (!currentRows) {
+                        currentRows = [] as unknown[] & { columns?: Record<string, { name?: string; type?: unknown }> }
+                        recordsets.push(currentRows)
+                      }
+                      if (currentRows.length <= maxRows) {
+                        currentRows.push(row)
+                      }
+                      if (currentRows.length > maxRows && !truncatedCancel) {
+                        truncatedCancel = true
+                        try {
+                          streamableReq.cancel()
+                        } catch {
+                          // Ignore cancel error after row cap
+                        }
+                      }
+                    })
+                    streamableReq.on?.('rowsaffected', (count: unknown) => {
+                      if (typeof count === 'number') rowsAffected.push(count)
+                    })
+                    streamableReq.on?.('error', (err: unknown) => {
+                      if (truncatedCancel && extractMssqlErrorCode(err) === 'ECANCEL') {
+                        finish()
+                      } else {
+                        finish(err)
+                      }
+                    })
+                    streamableReq.on?.('done', (result: unknown) => {
+                      if (result && typeof result === 'object' && Array.isArray((result as { rowsAffected?: unknown }).rowsAffected)) {
+                        rowsAffected = ((result as { rowsAffected: unknown[] }).rowsAffected).map((n) => Number(n) || 0)
+                      }
+                      finish()
+                    })
+                    void streamableReq.query(batchSql).catch((err: unknown) => {
+                      if (truncatedCancel && extractMssqlErrorCode(err) === 'ECANCEL') {
+                        finish()
+                      } else {
+                        finish(err)
+                      }
+                    })
+                  })
+                })()
+              : req.query(batchSql)
+
+            res = timeoutRacePromise
+              ? await Promise.race([batchExecPromise, timeoutRacePromise])
+              : await batchExecPromise
           } catch (err) {
+            if (timedOut) {
+              if (err instanceof DatabaseDriverError && err.code === 'TIMEOUT') {
+                throw err
+              }
+              throw new DatabaseDriverError(
+                `MSSQL query timed out after ${effectiveTimeoutMs}ms`,
+                'TIMEOUT',
+                'mssql',
+                err
+              )
+            }
             if (activeEntry.cancelled || extractMssqlErrorCode(err) === 'ECANCEL') {
               throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'mssql', err)
             }
@@ -977,6 +1113,13 @@ export class MssqlSession implements IDatabaseSession {
             throw scrubbed
           }
 
+          if (timedOut) {
+            throw new DatabaseDriverError(
+              `MSSQL query timed out after ${effectiveTimeoutMs}ms`,
+              'TIMEOUT',
+              'mssql'
+            )
+          }
           if (activeEntry.cancelled || this.isClosed) {
             throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'mssql')
           }
@@ -1057,6 +1200,9 @@ export class MssqlSession implements IDatabaseSession {
               ...(collectedSets.length > 1 ? { resultSets: collectedSets } : {}),
             }
       } finally {
+        if (timeoutTimer !== undefined) {
+          clearTimeout(timeoutTimer)
+        }
         if (containsDdlStatement(sql, 'mssql')) {
           this.tableDetailsCache.clear()
         }
@@ -1368,7 +1514,7 @@ export async function buildMssqlPoolConfig(
     password: resolvedPassword,
     database,
     connectionTimeout: 10_000,
-    requestTimeout: 60_000,
+    requestTimeout: 120_000,
     pool: {
       min: 0,
       max: 5,
@@ -1377,6 +1523,7 @@ export async function buildMssqlPoolConfig(
       encrypt,
       trustServerCertificate,
       enableArithAbort: true,
+      ...(profile.readOnly ? { readOnlyIntent: true } : {}),
       ...(instanceName ? { instanceName } : {}),
       ...(effectiveServerName ? { serverName: effectiveServerName } : {}),
       ...(cryptoCredentialsDetails ? { cryptoCredentialsDetails } : {}),

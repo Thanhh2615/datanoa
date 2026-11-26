@@ -2,9 +2,12 @@ import type { DatabaseDriverType } from '../../protocol'
 import { isMssqlReadOnlyBlocked } from './mssql-sql'
 import { splitOracleStatements } from './oracle-sql'
 import {
+  DIALECT_LEXER_RULES,
   containsDdlStatement,
+  findStatementAtOffset,
   formatSqlBinaryLiteral,
   formatSqlLiteral,
+  getDialectLexerRules,
   isIdentContChar,
   isIdentStartChar,
   isPostgresEscapeStringStart,
@@ -14,21 +17,30 @@ import {
   quoteIdentForDialect,
   quoteTableReference,
   scanBlockCommentEnd,
+  scanBracketIdentEnd,
   scanLineCommentEnd,
+  scanOracleQuoteEnd,
   scanQuotedSegmentEnd,
   splitSqlStatements,
+  stripCommentsAndLiteralsDetailed,
   stripLeadingSqlComments,
+  supportsBracketIdentifiers,
   supportsDollarQuoting,
   supportsNestedBlockComments,
+  supportsSlashLineComments,
   usesBackslashAndHash,
-  findStatementAtOffset,
+  type DialectLexerRule,
   type SqlStatementSlice,
 } from '../../shared-sql-core.js'
+import { tokenizeRedisCommandLine } from '../../shared-sql-safety.js'
 
 export {
+  DIALECT_LEXER_RULES,
   containsDdlStatement,
+  findStatementAtOffset,
   formatSqlBinaryLiteral,
   formatSqlLiteral,
+  getDialectLexerRules,
   isIdentContChar,
   isIdentStartChar,
   isPostgresEscapeStringStart,
@@ -38,36 +50,25 @@ export {
   quoteIdentForDialect,
   quoteTableReference,
   scanBlockCommentEnd,
+  scanBracketIdentEnd,
   scanLineCommentEnd,
+  scanOracleQuoteEnd,
   scanQuotedSegmentEnd,
   splitSqlStatements,
+  stripCommentsAndLiteralsDetailed,
   stripLeadingSqlComments,
+  supportsBracketIdentifiers,
   supportsDollarQuoting,
   supportsNestedBlockComments,
+  supportsSlashLineComments,
   usesBackslashAndHash,
-  findStatementAtOffset,
+  type DialectLexerRule,
   type SqlStatementSlice,
-}
-
-function scanMssqlBracketIdentEnd(sql: string, start: number): { end: number; closed: boolean } {
-  let i = start + 1
-  const len = sql.length
-  while (i < len) {
-    if (sql[i] === ']') {
-      if (i + 1 < len && sql[i + 1] === ']') {
-        i += 2
-        continue
-      }
-      return { end: i + 1, closed: true }
-    }
-    i++
-  }
-  return { end: len, closed: false }
 }
 
 /**
  * Strips SQL comments and string/dollar literals to spaces while preserving
- * quoted identifiers (including MSSQL `[...]`) as neutral `x` placeholders so
+ * quoted identifiers (including SQLite/MSSQL `[...]`) as neutral `x` placeholders so
  * `SELECT * INTO [dbo].[copy]` does not degenerate into `INTO  . `.
  */
 export function stripCommentsAndLiterals(
@@ -75,93 +76,27 @@ export function stripCommentsAndLiterals(
   dialect?: DatabaseDriverType,
   preserveMysqlExecComments = true
 ): string {
-  const backslashAndHash = usesBackslashAndHash(dialect)
-  const nestedComments = supportsNestedBlockComments(dialect)
-  const dollarQuotes = supportsDollarQuoting(dialect)
-  let out = ''
-  let i = 0
-  let execCommentDepth = 0
-  const len = sql.length
-
-  while (i < len) {
-    const ch = sql[i]
-    if (ch === '-' && i + 1 < len && sql[i + 1] === '-') {
-      out += ' '
-      i = scanLineCommentEnd(sql, i)
-      continue
-    }
-    if (ch === '#' && backslashAndHash) {
-      out += ' '
-      i = scanLineCommentEnd(sql, i - 1)
-      continue
-    }
-    if (execCommentDepth > 0 && ch === '*' && i + 1 < len && sql[i + 1] === '/') {
-      out += ' '
-      execCommentDepth--
-      i += 2
-      continue
-    }
-    if (ch === '/' && i + 1 < len && sql[i + 1] === '*') {
-      const execLen = preserveMysqlExecComments
-        ? matchMysqlExecCommentPrefix(sql, i, dialect)
-        : 0
-      if (execLen > 0) {
-        out += ' '
-        execCommentDepth++
-        i += execLen
-        continue
-      }
-      out += ' '
-      i = scanBlockCommentEnd(sql, i, nestedComments)
-      continue
-    }
-    if (isPostgresEscapeStringStart(sql, i, dialect)) {
-      out += ' '
-      i = scanQuotedSegmentEnd(sql, i + 1, "'", true).end
-      continue
-    }
-    if (ch === "'") {
-      out += ' '
-      i = scanQuotedSegmentEnd(sql, i, "'", backslashAndHash).end
-      continue
-    }
-    if (ch === '"' || ch === '`') {
-      out += ' x '
-      i = scanQuotedSegmentEnd(sql, i, ch, false).end
-      continue
-    }
-    if (ch === '[' && dialect === 'mssql') {
-      out += ' x '
-      i = scanMssqlBracketIdentEnd(sql, i).end
-      continue
-    }
-    if (dollarQuotes && ch === '$') {
-      const tag = matchDollarQuoteTag(sql, i)
-      if (tag !== null) {
-        out += ' '
-        const closeIdx = sql.indexOf(tag, i + tag.length)
-        i = closeIdx >= 0 ? closeIdx + tag.length : len
-        continue
-      }
-    }
-    out += ch
-    i++
-  }
-
-  return out
+  return stripCommentsAndLiteralsDetailed(sql, dialect, {
+    preserveMysqlExecComments,
+    literalPlaceholder: ' ',
+    identPlaceholder: ' x ',
+  }).text
 }
 
 /** Collapses SQL to a single line and bounds its length for display previews. */
 export function compactSql(sql: string, maxLength = 80): string {
   const compact = sql.replace(/\s+/g, ' ').trim()
-  return compact.length > maxLength ? `${compact.slice(0, maxLength - 3)}...` : compact
+  if (maxLength <= 0) return ''
+  if (compact.length <= maxLength) return compact
+  if (maxLength <= 3) return compact.slice(0, maxLength)
+  return `${compact.slice(0, maxLength - 3)}...`
 }
 
 const LEADING_FILTER_KEYWORD_REGEX = /^(?:WHERE|ORDER\s+BY)\b\s*/i
 
 /**
  * Normalizes a table WHERE or ORDER BY filter clause and rejects unquoted SQL statement breakouts
- * (`;`, `--`, `/*`, dialect-specific `#`, or unclosed string/identifier quotes).
+ * (`;`, `--`, `/*`, dialect-specific `#` / `//`, unbalanced parentheses, or unclosed quotes).
  */
 export function sanitizeFilterClause(
   clause?: string,
@@ -174,10 +109,10 @@ export function sanitizeFilterClause(
   trimmed = trimmed.replace(LEADING_FILTER_KEYWORD_REGEX, '').trim()
   if (!trimmed) return undefined
 
-  const backslashAndHash = usesBackslashAndHash(dialect)
-  const allowDollarQuotes =
-    dialect === undefined || dialect === 'postgres' || dialect === 'cockroachdb'
+  const rules = getDialectLexerRules(dialect)
+  const allowDollarQuotes = dialect === undefined || rules.dollarQuoting
   let i = 0
+  let parenDepth = 0
   const len = trimmed.length
   while (i < len) {
     const ch = trimmed[i]
@@ -189,8 +124,18 @@ export function sanitizeFilterClause(
       i = seg.end
       continue
     }
-    if (ch === "'" || ch === '"' || ch === '`') {
-      const allowBackslash = ch === "'" && backslashAndHash
+    const oracleQuote = scanOracleQuoteEnd(trimmed, i, dialect)
+    if (oracleQuote) {
+      if (!oracleQuote.closed) {
+        throw new Error("Invalid filter clause: unclosed q'...' quote literal.")
+      }
+      i = oracleQuote.end
+      continue
+    }
+    if (ch === "'" || ch === '"' || (ch === '`' && rules.backtickIdentifiers)) {
+      const allowBackslash =
+        (ch === "'" && rules.backslashEscapesSingleQuote) ||
+        (ch === '"' && rules.backslashEscapesDoubleQuote)
       const seg = scanQuotedSegmentEnd(trimmed, i, ch, allowBackslash)
       if (!seg.closed) {
         throw new Error(`Invalid filter clause: unclosed ${ch} quote literal.`)
@@ -198,8 +143,8 @@ export function sanitizeFilterClause(
       i = seg.end
       continue
     }
-    if (ch === '[' && dialect === 'mssql') {
-      const seg = scanMssqlBracketIdentEnd(trimmed, i)
+    if (ch === '[' && rules.bracketIdentifiers !== 'none') {
+      const seg = scanBracketIdentEnd(trimmed, i, rules.bracketIdentifiers === 'doubling')
       if (!seg.closed) {
         throw new Error('Invalid filter clause: unclosed [ bracket identifier.')
       }
@@ -217,19 +162,39 @@ export function sanitizeFilterClause(
         continue
       }
     }
+    if (ch === '(') {
+      parenDepth++
+      i++
+      continue
+    }
+    if (ch === ')') {
+      parenDepth--
+      if (parenDepth < 0) {
+        throw new Error('Invalid filter clause: unbalanced closing parenthesis ).')
+      }
+      i++
+      continue
+    }
     if (ch === ';') {
       throw new Error('Invalid filter clause: unquoted semicolon (;) is not allowed.')
     }
-    if (ch === '#' && backslashAndHash) {
+    if (ch === '#' && rules.lineCommentHash) {
       throw new Error('Invalid filter clause: unquoted SQL comment (#) is not allowed.')
     }
     if (ch === '-' && i + 1 < len && trimmed[i + 1] === '-') {
       throw new Error('Invalid filter clause: unquoted SQL comment (--) is not allowed.')
     }
+    if (ch === '/' && i + 1 < len && trimmed[i + 1] === '/' && rules.lineCommentSlash) {
+      throw new Error('Invalid filter clause: unquoted SQL comment (//) is not allowed.')
+    }
     if (ch === '/' && i + 1 < len && trimmed[i + 1] === '*') {
       throw new Error('Invalid filter clause: unquoted SQL block comment (/*) is not allowed.')
     }
     i++
+  }
+
+  if (parenDepth !== 0) {
+    throw new Error('Invalid filter clause: unbalanced parentheses.')
   }
 
   return trimmed
@@ -274,77 +239,60 @@ export function buildQuickFilterPredicate(
   return predicate
 }
 
-const SQL_MUTATING_VERBS: ReadonlySet<string> = new Set([
-  'INSERT',
-  'UPDATE',
-  'DELETE',
-  'REPLACE',
-  'UPSERT',
-  'MERGE',
-  'DROP',
-  'ALTER',
-  'CREATE',
-  'TRUNCATE',
-  'GRANT',
-  'REVOKE',
-  'ATTACH',
-  'DETACH',
-  'VACUUM',
-  'REINDEX',
-  'RENAME',
-  'COMMENT',
-  'CALL',
-  'DO',
-  'LOCK',
-  'KILL',
-  'OPTIMIZE',
-  'REPAIR',
-  'FLUSH',
-  'PURGE',
-  'LOAD',
-  'IMPORT',
-  'COPY',
-  'EXEC',
-  'EXECUTE',
-  'ANALYZE',
-  'ANALYSE',
-  'SHUTDOWN',
-  'RESTART',
-  'RESET',
-  'SET',
-  'SYSTEM',
-  'EXCHANGE',
-  'REFRESH',
-  'CLUSTER',
-  'RESTORE',
-  'INSTALL',
-  'UNINSTALL',
-  'REASSIGN',
-  'PREPARE',
-  'BEGIN',
-  'USE',
-  'START',
-  'COMMIT',
-  'ROLLBACK',
-  'SAVEPOINT',
-  'RELEASE',
-  'DEALLOCATE',
-  'DISCARD',
-  'CHECKPOINT',
+/** Fail-closed read-only SQL top-level verb allowlist. Any verb outside this set is blocked on RO connections. */
+const SQL_READONLY_VERBS: ReadonlySet<string> = new Set([
+  'SELECT',
+  'WITH',
+  'VALUES',
+  'TABLE',
+  'SHOW',
+  'DESCRIBE',
+  'DESC',
+  'EXPLAIN',
+  'PRAGMA',
 ])
 
-const SQLITE_READONLY_PARENS_PRAGMAS: ReadonlySet<string> = new Set([
+/** 16 read-only reporting pragmas allowed bare or with parens (never with `=`). */
+const SQLITE_REPORTING_PRAGMAS: ReadonlySet<string> = new Set([
   'TABLE_INFO',
   'TABLE_XINFO',
-  'FOREIGN_KEY_LIST',
-  'FOREIGN_KEY_CHECK',
+  'TABLE_LIST',
   'INDEX_LIST',
   'INDEX_INFO',
   'INDEX_XINFO',
-  'TABLE_LIST',
+  'FOREIGN_KEY_LIST',
+  'FOREIGN_KEY_CHECK',
+  'DATABASE_LIST',
+  'COLLATION_LIST',
+  'FUNCTION_LIST',
+  'MODULE_LIST',
+  'PRAGMA_LIST',
+  'COMPILE_OPTIONS',
   'INTEGRITY_CHECK',
   'QUICK_CHECK',
   'COLLATE',
+])
+
+/** Read-only SQLite metadata getter pragmas allowed ONLY bare (no `=` and no `(...)`). */
+const SQLITE_READONLY_BARE_GETTER_PRAGMAS: ReadonlySet<string> = new Set([
+  'USER_VERSION',
+  'SCHEMA_VERSION',
+  'DATA_VERSION',
+  'APPLICATION_ID',
+  'PAGE_COUNT',
+  'PAGE_SIZE',
+  'FREELIST_COUNT',
+  'ENCODING',
+  'FOREIGN_KEYS',
+  'JOURNAL_MODE',
+  'CACHE_SIZE',
+  'SYNCHRONOUS',
+  'AUTO_VACUUM',
+  'TEMP_STORE',
+  'LOCKING_MODE',
+  'READ_UNCOMMITTED',
+  'BUSY_TIMEOUT',
+  'MAX_PAGE_COUNT',
 ])
 
 const SQL_CTE_MUTATING_REGEX =
@@ -396,10 +344,34 @@ const REDIS_READONLY_COMMANDS: ReadonlySet<string> = new Set([
   'XLEN',
   'XRANGE',
   'XREVRANGE',
-  'OBJECT',
-  'MEMORY',
-  'COMMAND',
   'ROLE',
+])
+
+const REDIS_READONLY_MEMORY_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  'USAGE',
+  'STATS',
+  'DOCTOR',
+  'MALLOC-STATS',
+  'HELP',
+])
+
+const REDIS_READONLY_OBJECT_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  'ENCODING',
+  'FREQ',
+  'IDLETIME',
+  'REFCOUNT',
+  'HELP',
+])
+
+const REDIS_READONLY_COMMAND_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  '',
+  'COUNT',
+  'DOCS',
+  'GETKEYS',
+  'GETKEYSANDFLAGS',
+  'INFO',
+  'LIST',
+  'HELP',
 ])
 
 const REDIS_WRITE_COMMANDS: ReadonlySet<string> = new Set([
@@ -477,6 +449,7 @@ const REDIS_WRITE_COMMANDS: ReadonlySet<string> = new Set([
 interface ParsedExplainInfo {
   hasAnalyze: boolean
   hasWriteOption: boolean
+  hasOraclePlanWrite: boolean
   remainder: string
 }
 
@@ -492,10 +465,14 @@ function findMatchingParenIndex(text: string, openIdx: number): number {
   return -1
 }
 
-function parseExplainOptions(afterExplain: string): ParsedExplainInfo {
+function parseExplainOptions(
+  afterExplain: string,
+  dialect?: DatabaseDriverType
+): ParsedExplainInfo {
   let rest = afterExplain.trimStart()
   let hasAnalyze = false
   let hasWriteOption = false
+  let hasOraclePlanWrite = false
   let allowParenOptions = true
 
   while (rest.length > 0) {
@@ -506,9 +483,12 @@ function parseExplainOptions(afterExplain: string): ParsedExplainInfo {
         break
       }
       const groupContent = rest.slice(1, closeIdx)
-      const analyzeMatch = /\bANALY[ZS]E\b(?:\s+(FALSE|OFF|0)\b)?/i.exec(groupContent)
-      if (analyzeMatch && !analyzeMatch[1]) {
-        hasAnalyze = true
+      const analyzeRe = /\bANALY[ZS]E\b(?:\s+(FALSE|OFF|0)\b)?/gi
+      let analyzeMatch: RegExpExecArray | null
+      while ((analyzeMatch = analyzeRe.exec(groupContent)) !== null) {
+        if (!analyzeMatch[1]) {
+          hasAnalyze = true
+        }
       }
       if (/\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i.test(groupContent)) {
         hasWriteOption = true
@@ -527,7 +507,7 @@ function parseExplainOptions(afterExplain: string): ParsedExplainInfo {
     }
 
     const stdOpt =
-      /^(?:VERBOSE|QUERY\s+PLAN|EXTENDED|PARTITIONS|DISTSQL|OPT|TYPES|VEC|AST|SYNTAX|PLAN|PIPELINE|ESTIMATE|TABLE\s+OVERRIDE|CURRENT\s+TRANSACTION|FOR\s+CONNECTION\s+\d+|FORMAT\s*=\s*[A-Za-z0-9_]+|FORMAT\s+[A-Za-z0-9_]+)\b/i.exec(
+      /^(?:VERBOSE|QUERY\s+PLAN|EXTENDED|PARTITIONS|DISTSQL|OPT|TYPES|VEC|AST|SYNTAX|PLAN|PIPELINE|ESTIMATE|TABLE\s+OVERRIDE|CURRENT\s+TRANSACTION|FOR\s+CONNECTION\s+\d+|FORMAT\s*=\s*(?:''|[A-Za-z0-9_]+)|FORMAT\s+(?:''|[A-Za-z0-9_]+))/i.exec(
         rest
       )
     if (stdOpt) {
@@ -537,9 +517,8 @@ function parseExplainOptions(afterExplain: string): ParsedExplainInfo {
     }
 
     // Oracle EXPLAIN PLAN [SET STATEMENT_ID = ...] [INTO [schema.]table[@dblink]] FOR <stmt>
-    const oracleSetOpt = /^SET\s+STATEMENT_ID\s*=\s*(?:[A-Za-z0-9_]+)?(?=\s*(?:\bINTO\b|\bFOR\b))/i.exec(
-      rest
-    )
+    const oracleSetOpt =
+      /^SET\s+STATEMENT_ID\s*=\s*(?:''|[A-Za-z0-9_]+)?(?=\s*(?:\bINTO\b|\bFOR\b))/i.exec(rest)
     if (oracleSetOpt) {
       allowParenOptions = false
       rest = rest.slice(oracleSetOpt[0].length).trimStart()
@@ -548,6 +527,7 @@ function parseExplainOptions(afterExplain: string): ParsedExplainInfo {
 
     const oracleIntoOpt = /^INTO\s+(?!OUTFILE\b|DUMPFILE\b)[\s\S]*?(?=\bFOR\b)/i.exec(rest)
     if (oracleIntoOpt) {
+      hasOraclePlanWrite = true
       allowParenOptions = false
       rest = rest.slice(oracleIntoOpt[0].length).trimStart()
       continue
@@ -560,8 +540,9 @@ function parseExplainOptions(afterExplain: string): ParsedExplainInfo {
       continue
     }
 
-    // ClickHouse EXPLAIN PLAN settings e.g. `header = 1, actions = 1`
-    const chSettingOpt = /^[A-Za-z_][A-Za-z0-9_]*\s*=\s*[A-Za-z0-9_]+\s*,?/i.exec(rest)
+    // ClickHouse EXPLAIN PLAN settings e.g. `header = 1, actions = 1` or `format = ''`
+    const chSettingOpt =
+      /^[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:''|[A-Za-z0-9_]+)\s*,?/i.exec(rest)
     if (chSettingOpt) {
       allowParenOptions = false
       rest = rest.slice(chSettingOpt[0].length).trimStart()
@@ -575,18 +556,31 @@ function parseExplainOptions(afterExplain: string): ParsedExplainInfo {
     hasWriteOption = true
   }
 
-  return { hasAnalyze, hasWriteOption, remainder: rest }
+  return { hasAnalyze, hasWriteOption, hasOraclePlanWrite, remainder: rest }
+}
+
+function stripForReadOnlyAnalysis(
+  sql: string,
+  dialect?: DatabaseDriverType,
+  backslashOverride?: boolean
+): { text: string; hasUnclosedQuote: boolean; hasUnclosedComment: boolean } {
+  return stripCommentsAndLiteralsDetailed(sql, dialect, {
+    preserveMysqlExecComments: true,
+    literalPlaceholder: " '' ",
+    identPlaceholder: ' x ',
+    backslashOverride,
+  })
 }
 
 /**
  * Checks whether an EXPLAIN statement enables ANALYZE/ANALYSE execution (US or British spelling,
- * bare or inside PostgreSQL parenthesized option lists).
+ * bare or inside PostgreSQL parenthesized option lists, including repeated ANALYZE flags).
  */
 export function hasExplainAnalyzeOption(sql: string, dialect?: DatabaseDriverType): boolean {
-  const clean = stripCommentsAndLiterals(sql, dialect, true).replace(/^[\s(]+/, '').trim()
+  const clean = stripForReadOnlyAnalysis(sql, dialect).text.replace(/^[\s(]+/, '').trim()
   const firstMatch = /^EXPLAIN\b/i.exec(clean)
   if (!firstMatch) return false
-  return parseExplainOptions(clean.slice(firstMatch[0].length)).hasAnalyze
+  return parseExplainOptions(clean.slice(firstMatch[0].length), dialect).hasAnalyze
 }
 
 /**
@@ -594,15 +588,17 @@ export function hasExplainAnalyzeOption(sql: string, dialect?: DatabaseDriverTyp
  * with EXPLAIN) is mutating, independent of whether ANALYZE was specified.
  */
 export function isExplainTargetMutating(sql: string, dialect?: DatabaseDriverType): boolean {
-  const clean = stripCommentsAndLiterals(sql, dialect, true).replace(/^[\s(]+/, '').trim()
+  const detail = stripForReadOnlyAnalysis(sql, dialect)
+  if (detail.hasUnclosedQuote || detail.hasUnclosedComment) return true
+  const clean = detail.text.replace(/^[\s(]+/, '').trim()
   if (!clean) return false
   const firstMatch = /^EXPLAIN\b/i.exec(clean)
   if (!firstMatch) {
-    return isCleanSingleStatementMutating(clean)
+    return isCleanSingleStatementMutating(clean, false, dialect)
   }
-  const parsed = parseExplainOptions(clean.slice(firstMatch[0].length))
+  const parsed = parseExplainOptions(clean.slice(firstMatch[0].length), dialect)
   if (parsed.hasWriteOption) return true
-  return isCleanSingleStatementMutating(parsed.remainder)
+  return isCleanSingleStatementMutating(parsed.remainder, false, dialect)
 }
 
 const SQL_READONLY_FOLLOWING_WITH_VERBS: ReadonlySet<string> = new Set([
@@ -614,23 +610,20 @@ const SQL_READONLY_FOLLOWING_WITH_VERBS: ReadonlySet<string> = new Set([
   'DESC',
 ])
 
-function isSelectStatementMutating(clean: string): boolean {
+const SQL_OUTSIDE_REACH_AND_STATEFUL_FN_RE =
+  /\b(?:nextval|setval|set_config|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|pg_switch_wal|pg_create_restore_point|pg_create_logical_replication_slot|pg_create_physical_replication_slot|pg_drop_replication_slot|pg_advisory_lock|pg_advisory_xact_lock|pg_try_advisory_lock|pg_advisory_unlock|pg_advisory_unlock_all|pg_read_file|pg_read_binary_file|pg_ls_dir|pg_stat_file|pg_ls_logdir|pg_ls_waldir|pg_ls_tmpdir|lo_unlink|lo_import|lo_export|lo_create|lo_creat|lo_open|lo_put|lo_from_bytea|dblink|dblink_exec|dblink_connect|dblink_send_query|load_file|load_extension|sqlite_load_extension)\s*\(/i
+
+const CLICKHOUSE_OUTSIDE_REACH_FN_RE =
+  /\b(?:file|url|s3|s3Cluster|hdfs|odbc|jdbc|mysql|postgresql|remote|remoteSecure|input)\s*\(/i
+
+function isSelectStatementMutating(clean: string, dialect?: DatabaseDriverType): boolean {
   if (/\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i.test(clean)) return true
-  if (/\bINTO\s+(?:(?:TEMP|TEMPORARY|UNLOGGED)\s+)?(?:TABLE\s+)?[#\[A-Za-z_"]/i.test(clean)) {
-    const fromMatch = /\bFROM\b/i.exec(clean)
-    const intoMatch = /\bINTO\b/i.exec(clean)
-    if (intoMatch && (!fromMatch || intoMatch.index < fromMatch.index)) {
-      return true
-    }
-  }
+  // Unquoted INTO in SELECT is either SELECT ... INTO (before OR after FROM, including UNION branches)
+  if (/\bINTO\b/i.test(clean)) return true
   if (/\bFOR\s+(?:NO\s+KEY\s+)?UPDATE\b/i.test(clean)) return true
-  if (
-    /\b(?:setval|pg_terminate_backend|pg_cancel_backend|lo_unlink|lo_import|lo_export)\s*\(/i.test(
-      clean
-    )
-  ) {
-    return true
-  }
+  if (/\bNEXT\s+VALUE\s+FOR\b/i.test(clean)) return true
+  if (SQL_OUTSIDE_REACH_AND_STATEFUL_FN_RE.test(clean)) return true
+  if (dialect === 'clickhouse' && CLICKHOUSE_OUTSIDE_REACH_FN_RE.test(clean)) return true
   return false
 }
 
@@ -678,7 +671,8 @@ function parseWithCteStatement(
 
 function isCleanSingleStatementMutating(
   rawClean: string,
-  failClosedOnUnknown = false
+  failClosedOnUnknown = false,
+  dialect?: DatabaseDriverType
 ): boolean {
   const clean = rawClean.trim()
   if (!clean) return failClosedOnUnknown
@@ -687,7 +681,7 @@ function isCleanSingleStatementMutating(
     const closeIdx = findMatchingParenIndex(clean, 0)
     if (closeIdx < 0) return true
     const inner = clean.slice(1, closeIdx).trim()
-    if (!inner || isCleanSingleStatementMutating(inner, failClosedOnUnknown)) return true
+    if (!inner || isCleanSingleStatementMutating(inner, failClosedOnUnknown, dialect)) return true
 
     const after = clean.slice(closeIdx + 1).trim()
     if (!after) return false
@@ -698,12 +692,12 @@ function isCleanSingleStatementMutating(
       return true
     }
     const setOpMatch =
-      /^(?:UNION(?:\s+(?:ALL|DISTINCT))?|INTERSECT(?:\s+(?:ALL|DISTINCT))?|EXCEPT(?:\s+(?:ALL|DISTINCT))?)\b\s*/i.exec(
+      /^(?:UNION(?:\s+(?:ALL|DISTINCT))?|INTERSECT(?:\s+(?:ALL|DISTINCT))?|EXCEPT(?:\s+(?:ALL|DISTINCT))?|MINUS)\b\s*/i.exec(
         after
       )
     if (setOpMatch) {
       const afterSetOp = after.slice(setOpMatch[0].length).trim()
-      return !afterSetOp || isCleanSingleStatementMutating(afterSetOp, failClosedOnUnknown)
+      return !afterSetOp || isCleanSingleStatementMutating(afterSetOp, failClosedOnUnknown, dialect)
     }
     if (/^(?:ORDER\s+BY|LIMIT|OFFSET|FETCH)\b/i.test(after)) {
       return false
@@ -718,41 +712,50 @@ function isCleanSingleStatementMutating(
   if (failClosedOnUnknown && !SQL_READONLY_FOLLOWING_WITH_VERBS.has(verb)) {
     return true
   }
+  if (!SQL_READONLY_VERBS.has(verb)) {
+    return true
+  }
   if (verb === 'SHOW' || verb === 'DESCRIBE' || verb === 'DESC') {
-    return false
+    return /\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i.test(clean)
   }
   if (verb === 'VALUES' || verb === 'TABLE') {
     return (
       /\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i.test(clean) ||
-      /\bFOR\s+(?:NO\s+KEY\s+)?UPDATE\b/i.test(clean)
+      /\bFOR\s+(?:NO\s+KEY\s+)?UPDATE\b/i.test(clean) ||
+      /\bNEXT\s+VALUE\s+FOR\b/i.test(clean) ||
+      SQL_OUTSIDE_REACH_AND_STATEFUL_FN_RE.test(clean)
     )
   }
   if (verb === 'SELECT') {
-    return isSelectStatementMutating(clean)
+    return isSelectStatementMutating(clean, dialect)
   }
   if (verb === 'PRAGMA') {
-    const upper = clean.toUpperCase()
-    if (
-      /\bWRITABLE_SCHEMA\b/.test(upper) ||
-      /\bWAL_CHECKPOINT\b/.test(upper) ||
-      /\bOPTIMIZE\b/.test(upper) ||
-      clean.includes('=')
-    ) {
+    if (clean.includes('=')) {
       return true
     }
-    const parenMatch =
-      /^PRAGMA\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(/i.exec(clean)
-    if (parenMatch) {
-      return !SQLITE_READONLY_PARENS_PRAGMAS.has(parenMatch[1].toUpperCase())
+    const pragmaMatch =
+      /^PRAGMA\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)(\s*\([\s\S]*\))?\s*$/i.exec(
+        clean
+      )
+    if (!pragmaMatch) {
+      return true
     }
-    return false
+    const pragmaName = pragmaMatch[1].toUpperCase()
+    const hasParens = Boolean(pragmaMatch[2])
+    if (SQLITE_REPORTING_PRAGMAS.has(pragmaName)) {
+      return false
+    }
+    if (!hasParens && SQLITE_READONLY_BARE_GETTER_PRAGMAS.has(pragmaName)) {
+      return false
+    }
+    return true
   }
   if (verb === 'EXPLAIN') {
-    const parsed = parseExplainOptions(clean.slice(firstMatch[0].length))
-    if (parsed.hasAnalyze || parsed.hasWriteOption) {
+    const parsed = parseExplainOptions(clean.slice(firstMatch[0].length), dialect)
+    if (parsed.hasAnalyze || parsed.hasWriteOption || parsed.hasOraclePlanWrite) {
       return true
     }
-    return isCleanSingleStatementMutating(parsed.remainder, failClosedOnUnknown)
+    return isCleanSingleStatementMutating(parsed.remainder, failClosedOnUnknown, dialect)
   }
   if (verb === 'WITH') {
     if (SQL_CTE_MUTATING_REGEX.test(clean) || /\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i.test(clean)) {
@@ -762,18 +765,30 @@ function isCleanSingleStatementMutating(
     if (!parsedWith) {
       return true
     }
-    if (parsedWith.cteBodies.some((body) => isCleanSingleStatementMutating(body))) {
+    if (parsedWith.cteBodies.some((body) => isCleanSingleStatementMutating(body, false, dialect))) {
       return true
     }
-    return isCleanSingleStatementMutating(parsedWith.remainder, true)
+    return isCleanSingleStatementMutating(parsedWith.remainder, true, dialect)
   }
-  return SQL_MUTATING_VERBS.has(verb)
+  return true
 }
 
 function isSingleSqlStatementMutating(stmtText: string, dialect?: DatabaseDriverType): boolean {
-  const stripped = stripCommentsAndLiterals(stmtText, dialect, true)
-  const parts = stripped.includes(';') ? stripped.split(';') : [stripped]
-  return parts.some((part) => isCleanSingleStatementMutating(part))
+  const rules = getDialectLexerRules(dialect)
+  const modes: Array<boolean | undefined> = rules.backslashEscapesSingleQuote
+    ? [false, true]
+    : [undefined]
+  for (const bsMode of modes) {
+    const detail = stripForReadOnlyAnalysis(stmtText, dialect, bsMode)
+    if (detail.hasUnclosedQuote || detail.hasUnclosedComment) {
+      return true
+    }
+    const parts = detail.text.includes(';') ? detail.text.split(';') : [detail.text]
+    if (parts.some((part) => isCleanSingleStatementMutating(part, false, dialect))) {
+      return true
+    }
+  }
+  return false
 }
 
 function isRedisCommandMutating(script: string): boolean {
@@ -783,9 +798,15 @@ function isRedisCommandMutating(script: string): boolean {
     if (!line || line.startsWith('#') || line.startsWith('--') || line.startsWith('//')) {
       continue
     }
-    const tokens = line.split(/\s+/)
-    const cmd = tokens[0].replace(/^["']|["']$/g, '').toUpperCase()
-    const sub = (tokens[1] ?? '').replace(/^["']|["']$/g, '').toUpperCase()
+    let tokens: string[]
+    try {
+      tokens = tokenizeRedisCommandLine(line, { strict: true })
+    } catch {
+      return true
+    }
+    if (tokens.length === 0) continue
+    const cmd = tokens[0].toUpperCase()
+    const sub = (tokens[1] ?? '').toUpperCase()
 
     if (REDIS_WRITE_COMMANDS.has(cmd)) return true
     if (cmd === 'CONFIG') {
@@ -802,6 +823,18 @@ function isRedisCommandMutating(script: string): boolean {
     }
     if (cmd === 'SCRIPT') {
       if (sub !== 'EXISTS') return true
+      continue
+    }
+    if (cmd === 'MEMORY') {
+      if (!REDIS_READONLY_MEMORY_SUBCOMMANDS.has(sub)) return true
+      continue
+    }
+    if (cmd === 'OBJECT') {
+      if (!REDIS_READONLY_OBJECT_SUBCOMMANDS.has(sub)) return true
+      continue
+    }
+    if (cmd === 'COMMAND') {
+      if (!REDIS_READONLY_COMMAND_SUBCOMMANDS.has(sub)) return true
       continue
     }
     if (!REDIS_READONLY_COMMANDS.has(cmd)) {
@@ -883,24 +916,65 @@ const MONGODB_READONLY_DB_METHODS: ReadonlySet<string> = new Set([
 
 const MONGODB_COLLECTION_SHORTHAND_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,127};?$/
 
-function skipMongoJsString(text: string, start: number): { end: number; value: string } {
+function skipMongoJsString(
+  text: string,
+  start: number
+): { end: number; value: string; closed: boolean } {
   const quote = text[start]
   let i = start + 1
   let value = ''
   while (i < text.length) {
     const ch = text[i]
     if (ch === '\\') {
-      if (i + 1 < text.length) value += text[i + 1]
+      if (i + 1 >= text.length) {
+        return { end: text.length, value, closed: false }
+      }
+      const next = text[i + 1]
+      if (next === 'u') {
+        if (text[i + 2] === '{') {
+          const closeBrace = text.indexOf('}', i + 3)
+          const hex = closeBrace > i + 3 ? text.slice(i + 3, closeBrace) : ''
+          if (/^[0-9a-fA-F]{1,6}$/.test(hex)) {
+            const cp = parseInt(hex, 16)
+            if (cp <= 0x10ffff) {
+              value += String.fromCodePoint(cp)
+              i = closeBrace + 1
+              continue
+            }
+          }
+        } else if (i + 5 < text.length && /^[0-9a-fA-F]{4}$/.test(text.slice(i + 2, i + 6))) {
+          value += String.fromCharCode(parseInt(text.slice(i + 2, i + 6), 16))
+          i += 6
+          continue
+        }
+      } else if (next === 'x' && i + 3 < text.length && /^[0-9a-fA-F]{2}$/.test(text.slice(i + 2, i + 4))) {
+        value += String.fromCharCode(parseInt(text.slice(i + 2, i + 4), 16))
+        i += 4
+        continue
+      } else if (next === 'n') {
+        value += '\n'
+        i += 2
+        continue
+      } else if (next === 'r') {
+        value += '\r'
+        i += 2
+        continue
+      } else if (next === 't') {
+        value += '\t'
+        i += 2
+        continue
+      }
+      value += next
       i += 2
       continue
     }
     if (ch === quote) {
-      return { end: i + 1, value }
+      return { end: i + 1, value, closed: true }
     }
     value += ch
     i++
   }
-  return { end: text.length, value }
+  return { end: text.length, value, closed: false }
 }
 
 function scanMongoGroupEnd(text: string, openPos: number, openChar: string, closeChar: string): number {
@@ -1077,6 +1151,7 @@ function hasMongoWriteKeyInObjectText(text: string): boolean {
     const ch = text[i]
     if (ch === "'" || ch === '"' || ch === '`') {
       const seg = skipMongoJsString(text, i)
+      if (!seg.closed) return true
       let k = seg.end
       while (k < text.length && /\s/.test(text[k])) k++
       if (text[k] === ':' && (seg.value === '$out' || seg.value === '$merge')) {
@@ -1093,6 +1168,9 @@ function hasMongoWriteKeyInObjectText(text: string): boolean {
         if (text[k] === ':') return true
       }
     }
+    if (ch === '\\' && text[i + 1] === 'u') {
+      return true
+    }
     i++
   }
   return false
@@ -1104,6 +1182,7 @@ function extractFirstObjectKey(objText: string): string | null {
   if (i >= objText.length || objText[i] === '}') return null
   if (objText[i] === '"' || objText[i] === "'" || objText[i] === '`') {
     const seg = skipMongoJsString(objText, i)
+    if (!seg.closed) return null
     let k = seg.end
     while (k < objText.length && /\s/.test(objText[k])) k++
     return objText[k] === ':' ? seg.value : null
@@ -1119,17 +1198,20 @@ function isMongoRawCommandObjectMutating(rawObjText: string): boolean {
     const rec = JSON.parse(trimmed) as Record<string, unknown>
     const keys = Object.keys(rec)
     if (keys.length === 0) return true
-    const cmd = keys[0].toLowerCase()
+    const cmdKey = keys[0]
+    const cmd = cmdKey.toLowerCase()
     if (cmd === 'aggregate') return hasMongoPipelineWriteStage(rec)
     if (cmd === 'explain') {
-      if (hasMongoPipelineWriteStage(rec.explain)) return true
-      if (rec.explain && typeof rec.explain === 'object' && !Array.isArray(rec.explain)) {
-        const innerKeys = Object.keys(rec.explain as Record<string, unknown>)
-        if (innerKeys.length > 0 && !MONGODB_READONLY_COMMANDS.has(innerKeys[0].toLowerCase())) {
+      const explainVal = rec[cmdKey]
+      if (hasMongoPipelineWriteStage(explainVal)) return true
+      if (explainVal && typeof explainVal === 'object' && !Array.isArray(explainVal)) {
+        const innerKeys = Object.keys(explainVal as Record<string, unknown>)
+        if (innerKeys.length === 0 || !MONGODB_READONLY_COMMANDS.has(innerKeys[0].toLowerCase())) {
           return true
         }
+        return false
       }
-      return false
+      return true
     }
     return !MONGODB_READONLY_COMMANDS.has(cmd)
   } catch {
@@ -1561,7 +1643,11 @@ export function rewriteCockroachViewBodyWithMeta(
 
       const dbIdent =
         parts[0].kind === 'word' ? parts[0].value.toLowerCase() : parts[0].value
-      if (parts.length >= 3 && dbIdent === sourceDatabase) {
+      const sourceMatch =
+        parts[0].kind === 'word'
+          ? dbIdent === sourceDatabase.toLowerCase()
+          : dbIdent === sourceDatabase
+      if (parts.length >= 3 && sourceMatch) {
         sawSourceRelation = true
         if (parts.length > 3 || chainEndsWithDot || hasComment) {
           unsafe = true

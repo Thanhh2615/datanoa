@@ -83,6 +83,20 @@ export function parseJsonPreservingBigInts(raw) {
       const validExp = !hasExp || (expDigitsEnd > expDigitsStart && expAllZero)
 
       if (!hasLeadingZero && digitCount >= 16 && validFrac && validExp) {
+        // Never rewrite unquoted object keys like `{9007199254740993: 1}` into valid JSON strings!
+        let peek = i
+        while (
+          peek < len &&
+          (source[peek] === ' ' ||
+            source[peek] === '\t' ||
+            source[peek] === '\r' ||
+            source[peek] === '\n')
+        ) {
+          peek++
+        }
+        if (peek < len && source[peek] === ':') {
+          continue
+        }
         const intStr = source.slice(start, intEnd)
         if (!Number.isSafeInteger(Number(intStr))) {
           chunks.push(source.slice(lastFlush, start), `"${intStr}"`)
@@ -236,6 +250,7 @@ function detectClipboardDelimiter(text) {
   let inQuotes = false
   let atFieldStart = true
   let hasQuotedCommaBoundary = false
+  let hasMalformedQuote = false
   const lineCommaCounts = []
   let currentCommas = 0
   let currentLineHasChars = false
@@ -249,8 +264,24 @@ function detectClipboardDelimiter(text) {
           continue
         }
         inQuotes = false
-        if (i + 1 < text.length && text[i + 1] === ',') {
-          hasQuotedCommaBoundary = true
+        if (i + 1 < text.length) {
+          const nextCh = text[i + 1]
+          if (nextCh === ',') {
+            // Avoid classifying single-line English prose like `"Hello", she said` as CSV:
+            // require either no space after comma (`"a,b",c`) or next non-space char is `"` (`"a", "b"`).
+            const afterComma = text[i + 2]
+            if (afterComma === ' ' || afterComma === '\t') {
+              let k = i + 2
+              while (k < text.length && (text[k] === ' ' || text[k] === '\t')) k++
+              if (k < text.length && text[k] === '"') {
+                hasQuotedCommaBoundary = true
+              }
+            } else {
+              hasQuotedCommaBoundary = true
+            }
+          } else if (nextCh !== '\r' && nextCh !== '\n' && nextCh !== '\t') {
+            hasMalformedQuote = true
+          }
         }
         continue
       }
@@ -308,11 +339,30 @@ function detectClipboardDelimiter(text) {
     return '\t'
   }
 
-  if (hasQuotedCommaBoundary && lineCommaCounts[0] >= 1) {
+  if (!hasMalformedQuote && hasQuotedCommaBoundary && lineCommaCounts[0] >= 1) {
     return ','
   }
 
   return '\t'
+}
+
+function isValidRfc4180QuotedFieldStart(raw, startIdx, delimiter) {
+  const len = raw.length
+  let k = startIdx + 1
+  while (k < len) {
+    if (raw[k] === '"') {
+      if (k + 1 < len && raw[k + 1] === '"') {
+        k += 2
+        continue
+      }
+      if (k + 1 >= len) return true
+      const after = raw[k + 1]
+      return after === delimiter || after === '\r' || after === '\n'
+    }
+    k++
+  }
+  // Unterminated leading quote with no closing quote keeps RFC-4180 streaming tolerance
+  return true
 }
 
 /**
@@ -357,7 +407,7 @@ export function parseDelimitedClipboard(text, options) {
       continue
     }
 
-    if (atFieldStart && ch === '"') {
+    if (atFieldStart && ch === '"' && isValidRfc4180QuotedFieldStart(raw, i, delimiter)) {
       inQuotes = true
       atFieldStart = false
       i++
@@ -408,21 +458,35 @@ function isAutoOrGeneratedColumn(col) {
 }
 
 function buildColumnNameLookup(allColumns) {
-  const lookup = new Map()
-  allColumns.forEach((col, idx) => lookup.set(String(col.name || '').trim().toLowerCase(), idx))
-  return lookup
+  const exact = new Map()
+  const lower = new Map()
+  allColumns.forEach((col, idx) => {
+    const trimmed = String(col.name || '').trim()
+    if (!exact.has(trimmed)) exact.set(trimmed, idx)
+    const lowerKey = trimmed.toLowerCase()
+    if (!lower.has(lowerKey)) lower.set(lowerKey, idx)
+  })
+  return { exact, lower }
+}
+
+function lookupColumnIndex(lookup, rawHeader) {
+  const trimmed = String(rawHeader || '').trim()
+  if (!trimmed) return undefined
+  const exactHit = lookup.exact.get(trimmed)
+  if (exactHit !== undefined) return exactHit
+  return lookup.lower.get(trimmed.toLowerCase())
 }
 
 function detectHeaderColumnMapping(firstRow, allColumns, rowCount, explicitHasHeaders) {
   if (rowCount < 2 || !Array.isArray(firstRow) || firstRow.length === 0) return null
   const lookup = buildColumnNameLookup(allColumns)
   const mapped = []
+  const seen = new Set()
   for (const cell of firstRow) {
     if (typeof cell !== 'string') return null
-    const key = cell.trim().toLowerCase()
-    if (!key) return null
-    const idx = lookup.get(key)
-    if (idx === undefined) return null
+    const idx = lookupColumnIndex(lookup, cell)
+    if (idx === undefined || seen.has(idx)) return null
+    seen.add(idx)
     mapped.push(idx)
   }
   if (mapped.length === 1 && !explicitHasHeaders) return null
@@ -436,7 +500,7 @@ function resolveSourceHeaderMapping(sourceHeaders, clipWidth, allColumns) {
   const lookup = buildColumnNameLookup(allColumns)
   const mapped = []
   for (let i = 0; i < sourceHeaders.length; i++) {
-    const idx = lookup.get(String(sourceHeaders[i] || '').trim().toLowerCase())
+    const idx = lookupColumnIndex(lookup, sourceHeaders[i])
     if (idx === undefined) return null
     mapped.push(idx)
   }
@@ -585,6 +649,9 @@ export function planGridPaste(input) {
     const inserts = dataRows.map((rowCells) => ({
       cells: buildInsertCells(rowCells, insertColResolver),
     }))
+    const firstInsertVisCol = inserts.find((r) => r.cells.length > 0)?.cells[0]?.visColIdx
+    const insertStartVisCol =
+      typeof firstInsertVisCol === 'number' && firstInsertVisCol >= 0 ? firstInsertVisCol : 0
 
     return {
       mode: 'insert',
@@ -592,7 +659,7 @@ export function planGridPaste(input) {
       overwrites: [],
       inserts,
       startVisRow: existingRowCount,
-      startVisCol: 0,
+      startVisCol: insertStartVisCol,
     }
   }
 
@@ -626,6 +693,7 @@ export function planGridPaste(input) {
       for (let dc = 0; dc < rowCells.length; dc++) {
         const target = resolveColumn(dc)
         if (!target) continue
+        if (allColumns[target.modelColIdx]?.isGenerated === true) continue
         cells.push({
           modelColIdx: target.modelColIdx,
           visColIdx: target.visColIdx,
@@ -655,6 +723,104 @@ export function planGridPaste(input) {
   }
 }
 
+function isWindowsPathChar(ch) {
+  return ch !== "'" && ch !== '"' && ch !== '<' && ch !== '>' && ch !== '\r' && ch !== '\n' && ch !== '|' && ch !== '*' && ch !== '?'
+}
+
+/**
+ * Linear-time redactor for Windows drive (`C:\...`) and UNC (`\\server\share\...`) paths,
+ * preserving spaces inside directory segments (`C:\Users\John Doe\payroll.db`) without
+ * catastrophic regex backtracking and without swallowing trailing prose (`... and /Users/...`).
+ */
+function redactWindowsPaths(text) {
+  const len = text.length
+  let out = ''
+  let cursor = 0
+  let i = 0
+  while (i < len) {
+    const isDrive =
+      i + 2 < len &&
+      ((text[i] >= 'A' && text[i] <= 'Z') || (text[i] >= 'a' && text[i] <= 'z')) &&
+      text[i + 1] === ':' &&
+      text[i + 2] === '\\' &&
+      (i === 0 || !/[A-Za-z0-9_]/.test(text[i - 1]))
+    const isUnc =
+      i + 3 < len &&
+      text[i] === '\\' &&
+      text[i + 1] === '\\' &&
+      /[A-Za-z0-9_.-]/.test(text[i + 2]) &&
+      (i === 0 || !/[\\A-Za-z0-9_]/.test(text[i - 1]))
+
+    if (!isDrive && !isUnc) {
+      i++
+      continue
+    }
+
+    let j = isDrive ? i + 3 : i + 2
+    if (isUnc) {
+      while (j < len && /[A-Za-z0-9_.-]/.test(text[j])) j++
+      if (j >= len || text[j] !== '\\') {
+        i += 2
+        continue
+      }
+      j++
+    }
+
+    let pathEnd = j
+    // Advance across backslash-delimited segments (allowing spaces inside dir names when a `\` follows)
+    while (j < len) {
+      let segEnd = j
+      while (segEnd < len && isWindowsPathChar(text[segEnd]) && !/\s/.test(text[segEnd]) && text[segEnd] !== '\\') {
+        segEnd++
+      }
+      if (segEnd > j) {
+        pathEnd = segEnd
+      }
+      if (segEnd < len && text[segEnd] === '\\') {
+        pathEnd = segEnd + 1
+        j = segEnd + 1
+        continue
+      }
+      // If spaces follow, peek ahead for another `\` on the same path segment (before quotes/delims/newlines)
+      if (segEnd < len && text[segEnd] === ' ') {
+        let peek = segEnd
+        let nextSlash = -1
+        while (peek < len && isWindowsPathChar(text[peek]) && text[peek] !== '/' && text[peek] !== ',' && text[peek] !== ';') {
+          if (text[peek] === '\\') {
+            nextSlash = peek
+            break
+          }
+          peek++
+        }
+        if (nextSlash > segEnd) {
+          pathEnd = nextSlash + 1
+          j = nextSlash + 1
+          continue
+        }
+      }
+      break
+    }
+
+    if (pathEnd > i + 2) {
+      out += text.slice(cursor, i) + '<redacted-path>'
+      cursor = pathEnd
+      i = pathEnd
+    } else {
+      i++
+    }
+  }
+  return cursor === 0 ? text : out + text.slice(cursor)
+}
+
+function sliceSurrogateSafe(str, maxLen) {
+  if (str.length <= maxLen) return str
+  const cut = str.charCodeAt(maxLen - 1)
+  if (cut >= 0xd800 && cut <= 0xdbff) {
+    return str.slice(0, maxLen - 1)
+  }
+  return str.slice(0, maxLen)
+}
+
 /**
  * Strips URI credentials, secrets, hostnames, IPs, and filesystem paths from an error string.
  */
@@ -671,11 +837,20 @@ export function sanitizeDiagnosticErrorText(rawError, options = {}) {
   let clean = raw
     .replace(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s'"<>]+/g, '<redacted-uri>')
     .replace(
-      /\b(?:password|passwd|pwd|user|username|token|secret|authToken|api_?key)\s*[:=]\s*[^\s,;'"<>]+/gi,
+      /"(?:[A-Za-z0-9_.-]*_)?(?:password|passwd|pwd|passphrase|user|username|token|secret|auth_?token|api_?key|apikey|private_?key|credential)"\s*:\s*"(?:\\.|[^"])*"/gi,
       '<redacted-secret>'
     )
-    .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer <redacted-token>')
-    .replace(/[A-Za-z]:\\[^\s'"<>]+/g, '<redacted-path>')
+    .replace(
+      /(^|[\s,;({\[])(?:[A-Za-z0-9_.-]*_)?(?:password|passwd|pwd|passphrase|user|username|token|secret|auth_?token|api_?key|apikey|private_?key|credential)\s*[:=]\s*(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\{(?:[^}]|\}\})*\}|[^\s,;'"<>}\])]+)/gi,
+      '$1<redacted-secret>'
+    )
+    .replace(/\b(Bearer|Basic)\s+(?!<redacted-token>)[A-Za-z0-9._~+/=-]+/gi, '$1 <redacted-token>')
+    .replace(
+      /(^|[\s'"(=,])[A-Za-z_][A-Za-z0-9_$#]*\/[^/\s'",;()]+@(?:\[?[A-Za-z0-9.-]+\]?)(?::\d{1,5})\/[A-Za-z0-9_.$#-]+/g,
+      '$1<redacted-endpoint>'
+    )
+
+  clean = redactWindowsPaths(clean)
     .replace(/\/(?:Users|home|var|tmp|etc|opt|private|mnt|srv)\/[^\s'"<>]+/g, '<redacted-path>')
     .replace(/[^\s@'"<>]+@[^\s@'"<>]+\.[^\s@'"<>]+/g, '<redacted-endpoint>')
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g, '<redacted-ip>')
@@ -689,7 +864,7 @@ export function sanitizeDiagnosticErrorText(rawError, options = {}) {
     clean = clean.trim()
   }
   if (ellipsis && clean.length > 280) {
-    return `${clean.slice(0, 277)}...`
+    return `${sliceSurrogateSafe(clean, 277)}...`
   }
-  return clean.slice(0, 280)
+  return sliceSurrogateSafe(clean, 280)
 }

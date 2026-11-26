@@ -167,7 +167,14 @@ function parseStrictRespInt(raw: string, offset: number, label: string): number 
   return num
 }
 
-function decodeRespFrame(buf: Buffer, offset: number): DecodedFrame {
+const MAX_RESP_DEPTH = 64
+const MAX_RESP_BUFFER_BYTES = 32 * 1024 * 1024
+const MAX_FULL_HASH_FIELDS = 500
+
+function decodeRespFrame(buf: Buffer, offset: number, depth = 0): DecodedFrame {
+  if (depth > MAX_RESP_DEPTH) {
+    throw new RespProtocolError(`Maximum RESP nesting depth (${MAX_RESP_DEPTH}) exceeded`)
+  }
   if (offset >= buf.length) return null
   const prefix = String.fromCharCode(buf[offset])
 
@@ -249,7 +256,7 @@ function decodeRespFrame(buf: Buffer, offset: number): DecodedFrame {
     let cursor = lineEnd + 2
     const items: unknown[] = []
     for (let i = 0; i < count; i++) {
-      const elem = decodeRespFrame(buf, cursor)
+      const elem = decodeRespFrame(buf, cursor, depth + 1)
       if (!elem) return null
       items.push(elem.value)
       cursor = elem.nextOffset
@@ -271,13 +278,18 @@ function decodeRespFrame(buf: Buffer, offset: number): DecodedFrame {
     let cursor = lineEnd + 2
     const obj: Record<string, unknown> = {}
     for (let i = 0; i < pairs; i++) {
-      const keyFrame = decodeRespFrame(buf, cursor)
+      const keyFrame = decodeRespFrame(buf, cursor, depth + 1)
       if (!keyFrame) return null
       cursor = keyFrame.nextOffset
-      const valFrame = decodeRespFrame(buf, cursor)
+      const valFrame = decodeRespFrame(buf, cursor, depth + 1)
       if (!valFrame) return null
       cursor = valFrame.nextOffset
-      obj[String(keyFrame.value)] = valFrame.value
+      Object.defineProperty(obj, String(keyFrame.value), {
+        value: valFrame.value,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      })
     }
     return { value: obj, nextOffset: cursor }
   }
@@ -296,20 +308,20 @@ function decodeRespFrame(buf: Buffer, offset: number): DecodedFrame {
     }
     let cursor = lineEnd + 2
     for (let i = 0; i < pairs; i++) {
-      const keyFrame = decodeRespFrame(buf, cursor)
+      const keyFrame = decodeRespFrame(buf, cursor, depth + 1)
       if (!keyFrame) return null
       cursor = keyFrame.nextOffset
-      const valFrame = decodeRespFrame(buf, cursor)
+      const valFrame = decodeRespFrame(buf, cursor, depth + 1)
       if (!valFrame) return null
       cursor = valFrame.nextOffset
     }
-    return decodeRespFrame(buf, cursor)
+    return decodeRespFrame(buf, cursor, depth + 1)
   }
 
   throw new RespProtocolError(`Unsupported RESP prefix '${prefix}'`)
 }
 
-function encodeRespCommand(args: Array<string | number>): Buffer {
+export function encodeRespCommand(args: Array<string | number>): Buffer {
   const parts: Buffer[] = [Buffer.from(`*${args.length}\r\n`, 'utf8')]
   for (const arg of args) {
     const text = String(arg)
@@ -326,9 +338,11 @@ interface PendingReply {
   reject: (err: unknown) => void
 }
 
-class RespSocketClient {
+export class RespSocketClient {
   readonly socket: net.Socket
-  private readBuffer: Buffer = Buffer.alloc(0)
+  private rxBuf: Buffer = Buffer.alloc(0)
+  private rxReadOffset = 0
+  private rxWriteOffset = 0
   private readonly pending: PendingReply[] = []
   private closed = false
 
@@ -396,20 +410,85 @@ class RespSocketClient {
     return !this.closed && !this.socket.destroyed
   }
 
+  private resetRxBuffer(): void {
+    this.rxReadOffset = 0
+    this.rxWriteOffset = 0
+    if (this.rxBuf.length > 65_536) {
+      this.rxBuf = Buffer.alloc(0)
+    }
+  }
+
+  private appendChunkLinear(chunk: Buffer): void {
+    const unread = this.rxWriteOffset - this.rxReadOffset
+    const needed = unread + chunk.length
+    if (this.rxWriteOffset + chunk.length > this.rxBuf.length) {
+      if (this.rxReadOffset > 0 && needed <= this.rxBuf.length) {
+        this.rxBuf.copy(this.rxBuf, 0, this.rxReadOffset, this.rxWriteOffset)
+        this.rxWriteOffset = unread
+        this.rxReadOffset = 0
+      } else {
+        const nextCap = Math.min(
+          MAX_RESP_BUFFER_BYTES,
+          Math.max(4096, this.rxBuf.length * 2, needed)
+        )
+        const nextBuf = Buffer.allocUnsafe(nextCap)
+        if (unread > 0) {
+          this.rxBuf.copy(nextBuf, 0, this.rxReadOffset, this.rxWriteOffset)
+        }
+        this.rxBuf = nextBuf
+        this.rxReadOffset = 0
+        this.rxWriteOffset = unread
+      }
+    }
+    chunk.copy(this.rxBuf, this.rxWriteOffset)
+    this.rxWriteOffset += chunk.length
+  }
+
   private handleData(chunk: Buffer): void {
-    this.readBuffer = Buffer.concat([this.readBuffer, chunk])
-    while (this.readBuffer.length > 0) {
+    if (chunk.length === 0) return
+    const unreadBefore = this.rxWriteOffset - this.rxReadOffset
+    if (unreadBefore + chunk.length > MAX_RESP_BUFFER_BYTES) {
+      this.rxBuf = Buffer.alloc(0)
+      this.rxReadOffset = 0
+      this.rxWriteOffset = 0
+      this.failAll(
+        new DatabaseDriverError(
+          `Redis response exceeded maximum buffer limit (${MAX_RESP_BUFFER_BYTES} bytes)`,
+          'REDIS_RESPONSE_TOO_LARGE',
+          'redis'
+        )
+      )
+      this.destroy()
+      return
+    }
+
+    // Zero-copy fast path when no partial frame is buffered
+    let decodeView: Buffer
+    let usingDirectChunk = false
+    if (unreadBefore === 0) {
+      decodeView = chunk
+      usingDirectChunk = true
+    } else {
+      this.appendChunkLinear(chunk)
+      decodeView = this.rxBuf.subarray(this.rxReadOffset, this.rxWriteOffset)
+    }
+
+    let offset = 0
+    while (offset < decodeView.length) {
       let decoded: DecodedFrame
       try {
-        decoded = decodeRespFrame(this.readBuffer, 0)
+        decoded = decodeRespFrame(decodeView, offset, 0)
       } catch (err) {
+        this.rxBuf = Buffer.alloc(0)
+        this.rxReadOffset = 0
+        this.rxWriteOffset = 0
         this.failAll(err)
         this.destroy()
         return
       }
       if (!decoded) break
 
-      this.readBuffer = this.readBuffer.subarray(decoded.nextOffset)
+      offset = decoded.nextOffset
       // Out-of-band RESP3 push frames (`>`) must not consume command reply waiters
       if (decoded.isPush) {
         continue
@@ -430,6 +509,23 @@ class RespSocketClient {
       } else {
         waiter.resolve(decoded.value)
       }
+    }
+
+    if (usingDirectChunk) {
+      if (offset < chunk.length) {
+        this.appendChunkLinear(offset === 0 ? chunk : chunk.subarray(offset))
+      }
+      return
+    }
+
+    this.rxReadOffset += offset
+    if (this.rxReadOffset >= this.rxWriteOffset) {
+      this.resetRxBuffer()
+    } else if (this.rxReadOffset > 0 && this.rxReadOffset >= this.rxWriteOffset / 2) {
+      const remaining = this.rxWriteOffset - this.rxReadOffset
+      this.rxBuf.copy(this.rxBuf, 0, this.rxReadOffset, this.rxWriteOffset)
+      this.rxReadOffset = 0
+      this.rxWriteOffset = remaining
     }
   }
 
@@ -602,10 +698,122 @@ export function redactRedisCommandArgs(cmdArgs: readonly string[]): string[] {
   return out
 }
 
-function globToRegex(glob: string): RegExp {
-  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&')
-  const regexStr = '^' + escaped.replace(/\*/g, '.*').replace(/\?/g, '.') + '$'
-  return new RegExp(regexStr, 'i')
+/**
+ * Linear-time case-insensitive wildcard glob matcher (`*` and `?`) with zero regex backtracking.
+ */
+export function matchRedisGlob(pattern: string, input: string): boolean {
+  const p = pattern.toLowerCase()
+  const s = input.toLowerCase()
+  type GlobToken =
+    | { kind: 'star' }
+    | { kind: 'any' }
+    | { kind: 'lit'; ch: string }
+    | { kind: 'class'; negated: boolean; chars: Set<string>; ranges: Array<[number, number]> }
+
+  const tokens: GlobToken[] = []
+  for (let i = 0; i < p.length; i++) {
+    const ch = p[i]
+    if (ch === '*') {
+      if (tokens.length === 0 || tokens[tokens.length - 1]?.kind !== 'star') {
+        tokens.push({ kind: 'star' })
+      }
+      continue
+    }
+    if (ch === '?') {
+      tokens.push({ kind: 'any' })
+      continue
+    }
+    if (ch === '\\' && i + 1 < p.length) {
+      i += 1
+      tokens.push({ kind: 'lit', ch: p[i] })
+      continue
+    }
+    if (ch === '[') {
+      let j = i + 1
+      let negated = false
+      if (j < p.length && p[j] === '^') {
+        negated = true
+        j += 1
+      }
+      const chars = new Set<string>()
+      const ranges: Array<[number, number]> = []
+      let closed = false
+      while (j < p.length) {
+        if (p[j] === ']' && (chars.size > 0 || ranges.length > 0 || j > i + (negated ? 2 : 1))) {
+          closed = true
+          break
+        }
+        let c = p[j]
+        if (c === '\\' && j + 1 < p.length) {
+          j += 1
+          c = p[j]
+        }
+        if (j + 2 < p.length && p[j + 1] === '-' && p[j + 2] !== ']') {
+          let endChar = p[j + 2]
+          j += 2
+          if (endChar === '\\' && j + 1 < p.length) {
+            j += 1
+            endChar = p[j]
+          }
+          const lo = c.charCodeAt(0)
+          const hi = endChar.charCodeAt(0)
+          ranges.push(lo <= hi ? [lo, hi] : [hi, lo])
+        } else {
+          chars.add(c)
+        }
+        j += 1
+      }
+      if (closed) {
+        tokens.push({ kind: 'class', negated, chars, ranges })
+        i = j
+        continue
+      }
+    }
+    tokens.push({ kind: 'lit', ch })
+  }
+
+  const m = tokens.length
+  const n = s.length
+  let prev = new Uint8Array(n + 1)
+  let curr = new Uint8Array(n + 1)
+  prev[0] = 1
+  for (let ti = 0; ti < m; ti++) {
+    const tok = tokens[ti]
+    curr.fill(0)
+    if (tok.kind === 'star') {
+      let seen = 0
+      for (let si = 0; si <= n; si++) {
+        if (prev[si]) seen = 1
+        curr[si] = seen
+      }
+    } else {
+      for (let si = 1; si <= n; si++) {
+        if (!prev[si - 1]) continue
+        const sc = s[si - 1]
+        if (tok.kind === 'any') {
+          curr[si] = 1
+        } else if (tok.kind === 'lit') {
+          if (sc === tok.ch) curr[si] = 1
+        } else {
+          const code = sc.charCodeAt(0)
+          let inClass = tok.chars.has(sc)
+          if (!inClass) {
+            for (const [lo, hi] of tok.ranges) {
+              if (code >= lo && code <= hi) {
+                inClass = true
+                break
+              }
+            }
+          }
+          if (tok.negated ? !inClass : inClass) curr[si] = 1
+        }
+      }
+    }
+    const swap = prev
+    prev = curr
+    curr = swap
+  }
+  return prev[n] === 1
 }
 
 function buildKeyMatcher(whereClause?: string): ((key: string) => boolean) | null {
@@ -616,8 +824,7 @@ function buildKeyMatcher(whereClause?: string): ((key: string) => boolean) | nul
   const likeMatch = /^key\s+LIKE\s+['"](.+)['"]$/i.exec(trimmed)
   if (likeMatch) {
     const glob = likeMatch[1].replace(/%/g, '*').replace(/_/g, '?')
-    const regex = globToRegex(glob)
-    return (key) => regex.test(key)
+    return (key) => matchRedisGlob(glob, key)
   }
 
   const eqMatch = /^key\s*=\s*['"](.+)['"]$/i.exec(trimmed)
@@ -627,8 +834,7 @@ function buildKeyMatcher(whereClause?: string): ((key: string) => boolean) | nul
   }
 
   if (trimmed.includes('*') || trimmed.includes('?')) {
-    const regex = globToRegex(trimmed)
-    return (key) => regex.test(key)
+    return (key) => matchRedisGlob(trimmed, key)
   }
 
   const needle = trimmed.toLowerCase()
@@ -712,6 +918,8 @@ export class RedisSession implements IDatabaseSession {
   private sharedClient: RespSocketClient | null = null
   private connectPromise: Promise<RespSocketClient> | null = null
   private readonly activeQueries = new Map<string, ActiveRedisQuery>()
+  private readonly partialHashKeys = new Set<string>()
+  private readonly hydratedHashFields = new Map<string, Set<string>>()
   private isClosed = false
 
   private readonly extraSecrets?: DriverTlsOptions
@@ -724,7 +932,9 @@ export class RedisSession implements IDatabaseSession {
   }
 
   isAlive(): boolean {
-    return !this.isClosed
+    if (this.isClosed) return false
+    if (this.sharedClient && !this.sharedClient.isAlive()) return false
+    return true
   }
 
   private assertWritable(): void {
@@ -1080,7 +1290,49 @@ export class RedisSession implements IDatabaseSession {
         const rowIdx = valCmdIndices[j]
         const valRes = valSettled[j]
         if (valRes?.status === 'fulfilled') {
-          valuesByIdx[rowIdx] = formatRedisStructureValue(types[rowIdx], valRes.value)
+          let effectiveRaw: unknown = valRes.value
+          if (types[rowIdx] === 'hash') {
+            const keyName = chunk[rowIdx]
+            const isCursorScan =
+              Array.isArray(effectiveRaw) &&
+              effectiveRaw.length === 2 &&
+              (Array.isArray(effectiveRaw[1]) ||
+                (effectiveRaw[1] !== null && typeof effectiveRaw[1] === 'object'))
+            const scanCursor = isCursorScan ? String((effectiveRaw as unknown[])[0] ?? '0') : '0'
+            if (isCursorScan && scanCursor !== '0') {
+              let loadedFull = false
+              try {
+                const hlen = Number(await client.sendCommand(['HLEN', keyName]))
+                if (Number.isFinite(hlen) && hlen > 0 && hlen <= MAX_FULL_HASH_FIELDS) {
+                  effectiveRaw = await client.sendCommand(['HGETALL', keyName])
+                  loadedFull = true
+                }
+              } catch {
+                // Fall back to partial preview tracking if HLEN/HGETALL unavailable
+              }
+              if (loadedFull) {
+                this.partialHashKeys.delete(keyName)
+              } else {
+                this.partialHashKeys.add(keyName)
+              }
+            } else {
+              this.partialHashKeys.delete(keyName)
+            }
+            const formatted = formatRedisStructureValue('hash', effectiveRaw)
+            valuesByIdx[rowIdx] = formatted
+            if (formatted) {
+              try {
+                const parsedObj = JSON.parse(formatted) as Record<string, unknown>
+                if (parsedObj && typeof parsedObj === 'object' && !Array.isArray(parsedObj)) {
+                  this.hydratedHashFields.set(keyName, new Set(Object.keys(parsedObj)))
+                }
+              } catch {
+                // Ignore malformed preview
+              }
+            }
+          } else {
+            valuesByIdx[rowIdx] = formatRedisStructureValue(types[rowIdx], effectiveRaw)
+          }
         } else {
           valuesByIdx[rowIdx] = null
         }
@@ -1215,22 +1467,37 @@ export class RedisSession implements IDatabaseSession {
       const commands: Array<Array<string | number>> = []
       const previews: string[] = []
       const nextKeys = new Set(Object.keys(parsed))
+      const isPartial = this.partialHashKeys.has(key)
+      const shownFields = this.hydratedHashFields.get(key)
 
       if (!previewOnly) {
-        try {
-          const existingRaw = await client.sendCommand(['HKEYS', key])
-          if (Array.isArray(existingRaw)) {
-            const removedFields = existingRaw
-              .map((f) => String(f))
-              .filter((f) => !nextKeys.has(f))
-            if (removedFields.length > 0) {
-              const delArgs = ['HDEL', key, ...removedFields]
+        if (isPartial) {
+          // Partial hash preview (>500 fields): NEVER HDEL unseen fields beyond the preview.
+          // Only delete fields that were explicitly shown and removed by the user.
+          if (shownFields) {
+            const removedShown = Array.from(shownFields).filter((f) => !nextKeys.has(f))
+            if (removedShown.length > 0) {
+              const delArgs = ['HDEL', key, ...removedShown]
               commands.push(delArgs)
               previews.push(delArgs.map(quoteRedisArg).join(' '))
             }
           }
-        } catch {
-          // Ignore HKEYS error if server does not support it in mock
+        } else {
+          try {
+            const existingRaw = await client.sendCommand(['HKEYS', key])
+            if (Array.isArray(existingRaw)) {
+              const removedFields = existingRaw
+                .map((f) => String(f))
+                .filter((f) => !nextKeys.has(f) && (!shownFields || shownFields.has(f)))
+              if (removedFields.length > 0) {
+                const delArgs = ['HDEL', key, ...removedFields]
+                commands.push(delArgs)
+                previews.push(delArgs.map(quoteRedisArg).join(' '))
+              }
+            }
+          } catch {
+            // Ignore HKEYS error if server does not support it in mock
+          }
         }
       }
 
@@ -1260,29 +1527,53 @@ export class RedisSession implements IDatabaseSession {
   private async runKeepTtlAwarePipeline(
     client: {
       sendPipeline(cmds: Array<Array<string | number>>): Promise<unknown[]>
+      sendPipelineSettled?(cmds: Array<Array<string | number>>): Promise<PromiseSettledResult<unknown>[]>
       sendCommand(args: Array<string | number>): Promise<unknown>
     },
     cmds: Array<Array<string | number>>
   ): Promise<unknown[]> {
+    const isKeepTtlCmd = (cmd: Array<string | number>): boolean =>
+      String(cmd[0] ?? '').toUpperCase() === 'SET' &&
+      String(cmd[3] ?? '').toUpperCase() === 'KEEPTTL'
+
+    if (typeof client.sendPipelineSettled === 'function') {
+      const settled = await client.sendPipelineSettled(cmds)
+      const replies: unknown[] = []
+      for (let i = 0; i < cmds.length; i++) {
+        const res = settled[i]
+        if (res && res.status === 'fulfilled') {
+          replies.push(res.value)
+          continue
+        }
+        const reason = res?.status === 'rejected' ? res.reason : new Error('Redis pipeline command failed')
+        const msg = reason instanceof Error ? reason.message : String(reason)
+        const cmd = cmds[i]
+        if (isKeepTtlCmd(cmd) && /syntax/i.test(msg)) {
+          // Redis < 6.0 rejects SET ... KEEPTTL; retry ONLY the failed KEEPTTL command (never earlier DEL/HSET)
+          const pttlRaw = await client.sendCommand(['PTTL', String(cmd[1])])
+          const pttl = Number(pttlRaw)
+          if (Number.isFinite(pttl) && pttl > 0) {
+            replies.push(await client.sendCommand(['SET', cmd[1], cmd[2], 'PX', Math.floor(pttl)]))
+          } else {
+            replies.push(await client.sendCommand(['SET', cmd[1], cmd[2]]))
+          }
+          continue
+        }
+        throw reason
+      }
+      return replies
+    }
+
     try {
       return await client.sendPipeline(cmds)
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err)
-      const hasKeepTtl = cmds.some(
-        (c) =>
-          String(c[0] ?? '').toUpperCase() === 'SET' &&
-          String(c[3] ?? '').toUpperCase() === 'KEEPTTL'
-      )
-      if (!hasKeepTtl || !/syntax/i.test(msg)) {
+      if (!cmds.some(isKeepTtlCmd) || !/syntax/i.test(msg)) {
         throw err
       }
-      // Redis < 6.0 rejects SET ... KEEPTTL; preserve existing TTL via PTTL + SET ... PX
       const replies: unknown[] = []
       for (const cmd of cmds) {
-        const isSetKeepTtl =
-          String(cmd[0] ?? '').toUpperCase() === 'SET' &&
-          String(cmd[3] ?? '').toUpperCase() === 'KEEPTTL'
-        if (isSetKeepTtl) {
+        if (isKeepTtlCmd(cmd)) {
           const pttlRaw = await client.sendCommand(['PTTL', String(cmd[1])])
           const pttl = Number(pttlRaw)
           if (Number.isFinite(pttl) && pttl > 0) {
@@ -1306,6 +1597,13 @@ export class RedisSession implements IDatabaseSession {
     const key = String(params.primaryKeys?.key ?? '')
     if (key.length === 0) {
       throw new DatabaseDriverError('Primary key "key" is required for Redis updates', 'invalid_params', 'redis')
+    }
+    if (params.column !== 'value' && params.column !== 'ttl') {
+      throw new DatabaseDriverError(
+        `Redis column "${params.column}" is not editable (only "value" and "ttl" may be updated).`,
+        'invalid_params',
+        'redis'
+      )
     }
 
     const client = await this.getClient()

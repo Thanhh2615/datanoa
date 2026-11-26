@@ -6,6 +6,66 @@ import { findStatementAtCaret } from './panel-core.js'
 
 const MAX_PANEL_CONSOLE_TABS = 20
 const MAX_PANEL_CONSOLE_SQL_LEN = 50000
+const MAX_INACTIVE_PANEL_RESULT_BYTES = 12_000_000
+
+const SQL_ALIAS_KEYWORDS = new Set([
+  'where',
+  'join',
+  'inner',
+  'left',
+  'right',
+  'full',
+  'cross',
+  'outer',
+  'natural',
+  'on',
+  'using',
+  'set',
+  'group',
+  'order',
+  'having',
+  'limit',
+  'offset',
+  'fetch',
+  'union',
+  'except',
+  'intersect',
+  'values',
+  'into',
+  'select',
+  'from',
+  'and',
+  'or',
+  'when',
+  'then',
+  'else',
+  'end',
+  'returning',
+  'for',
+  'window',
+  'qualify',
+])
+
+function estimatePanelResultBytes(result) {
+  if (!result || typeof result !== 'object') return 0
+  const sets = Array.isArray(result.resultSets) && result.resultSets.length > 0 ? result.resultSets : [result]
+  let bytes = 0
+  for (const rs of sets) {
+    const rows = Array.isArray(rs?.rows) ? rs.rows : []
+    if (rows.length === 0) continue
+    const sample = Math.min(rows.length, 16)
+    let sampleLen = 0
+    for (let i = 0; i < sample; i++) {
+      try {
+        sampleLen += JSON.stringify(rows[i])?.length ?? 64
+      } catch {
+        sampleLen += 128
+      }
+    }
+    bytes += Math.ceil((sampleLen / sample) * rows.length * 2)
+  }
+  return bytes
+}
 
 function generatePanelTabId() {
   return `ptab_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
@@ -74,22 +134,55 @@ export function createPanelConsoleTabsManager(initial) {
     return `Console ${n}`
   }
 
+  let accessClock = 1
+
+  function touchTab(tab) {
+    if (tab) tab.lastAccessedAt = ++accessClock
+  }
+
+  function evictInactivePanelResultsIfNeeded(budgetBytes = MAX_INACTIVE_PANEL_RESULT_BYTES) {
+    const inactive = tabs
+      .filter((t) => t.id !== activeTabId && t.lastResult)
+      .map((t) => ({ tab: t, bytes: estimatePanelResultBytes(t.lastResult) }))
+      .filter((x) => x.bytes > 0)
+    let total = inactive.reduce((acc, x) => acc + x.bytes, 0)
+    if (total <= budgetBytes) return
+    inactive.sort((a, b) => (a.tab.lastAccessedAt || 0) - (b.tab.lastAccessedAt || 0))
+    for (const item of inactive) {
+      if (total <= budgetBytes) break
+      item.tab.lastResult = null
+      item.tab.resultStates = {}
+      total -= item.bytes
+    }
+  }
+
   function switchTab(tabId) {
     const found = tabs.find((t) => t.id === tabId)
     if (!found) return false
     activeTabId = tabId
+    touchTab(found)
+    evictInactivePanelResultsIfNeeded()
     return true
   }
 
   function addTab(initialSql = '', customTitle) {
+    if (tabs.length >= MAX_PANEL_CONSOLE_TABS) {
+      const oldestInactive = tabs
+        .filter((t) => t.id !== activeTabId)
+        .sort((a, b) => (a.lastAccessedAt || 0) - (b.lastAccessedAt || 0))[0]
+      if (oldestInactive) {
+        const idx = tabs.indexOf(oldestInactive)
+        if (idx >= 0) tabs.splice(idx, 1)
+      } else {
+        return getActiveTab()
+      }
+    }
     const title = (customTitle && customTitle.trim()) || generateNextTitle()
     const newTab = buildEmptyTab(generatePanelTabId(), title, initialSql)
-    if (tabs.length >= MAX_PANEL_CONSOLE_TABS) {
-      tabs[tabs.length - 1] = newTab
-    } else {
-      tabs.push(newTab)
-    }
+    touchTab(newTab)
+    tabs.push(newTab)
     activeTabId = newTab.id
+    evictInactivePanelResultsIfNeeded()
     return newTab
   }
 
@@ -146,6 +239,8 @@ export function createPanelConsoleTabsManager(initial) {
       if (executedConnectionId !== undefined) tab.executedConnectionId = executedConnectionId
       tab.resultStates = resultStates ? { ...resultStates } : {}
     }
+    touchTab(tab)
+    evictInactivePanelResultsIfNeeded()
     return true
   }
 
@@ -451,7 +546,12 @@ export function computePanelSqlCompletions(
       while ((m = aliasRegex.exec(stmtText)) !== null) {
         const rawTbl = m[1]
         const rawAlias = m[2]
-        if (rawTbl && rawAlias && rawAlias.toLowerCase() === rawQualifier.toLowerCase()) {
+        if (
+          rawTbl &&
+          rawAlias &&
+          !SQL_ALIAS_KEYWORDS.has(rawAlias.toLowerCase()) &&
+          rawAlias.toLowerCase() === rawQualifier.toLowerCase()
+        ) {
           const found = Object.keys(safeSchema).find((t) => t.toLowerCase() === rawTbl.toLowerCase())
           if (found) {
             resolvedTable = found

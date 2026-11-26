@@ -189,6 +189,31 @@ export const EDITOR_BASE_STYLE = `
     color-scheme: light;
   }
 
+  /* Explicit Command Palette theme override stays legible even when host --orca-* tokens use the opposite scheme */
+  html[data-theme-override="light"] {
+    --bg: #ffffff;
+    --text: #0f172a;
+    --muted: #475569;
+    --popover: #f8fafc;
+    --border: rgba(15, 23, 42, 0.14);
+    --primary: #0f172a;
+    --primary-fg: #ffffff;
+    --danger: #b91c1c;
+    --danger-fg: #ffffff;
+  }
+
+  html[data-theme-override="dark"] {
+    --bg: #0b0d10;
+    --text: #e6e6e6;
+    --muted: #9aa4b2;
+    --popover: #14181f;
+    --border: rgba(230, 230, 230, 0.12);
+    --primary: #e6e6e6;
+    --primary-fg: #0b0d10;
+    --danger: #f87171;
+    --danger-fg: #1a0606;
+  }
+
   .db-svg {
     display: block;
     flex-shrink: 0;
@@ -667,7 +692,7 @@ export const EDITOR_BASE_STYLE = `
 
   .datanoa-custom-select-popover {
     position: fixed;
-    z-index: 10090;
+    z-index: 10060;
     display: flex;
     flex-direction: column;
     gap: 8px;

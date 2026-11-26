@@ -46,8 +46,15 @@ export function buildByodInstallCommand(
   const installStep = pkg ? ` && npm install --ignore-scripts ${pkg}` : ''
   const isWin = platform === 'win32' || /^[A-Za-z]:[/\\]/.test(cleanDir)
   if (isWin) {
-    const winSafe = cleanDir.replace(/"/g, '').replace(/%/g, '%%')
-    return `mkdir "${winSafe}" 2>nul & cd /d "${winSafe}" && npm init -y && npm pkg set type=module main=index.mjs${installStep}`
+    // PowerShell single-quoted literal strings suppress ALL $(), $var, and backtick expansion.
+    const psQuoted = `'${cleanDir.replace(/'/g, "''")}'`
+    const psInstall = pkg ? `; if ($?) { npm install --ignore-scripts ${pkg} }` : ''
+    return (
+      `New-Item -ItemType Directory -Force -Path ${psQuoted} | Out-Null; ` +
+      `Set-Location -LiteralPath ${psQuoted}; ` +
+      `if ($?) { npm init -y }; ` +
+      `if ($?) { npm pkg set type=module main=index.mjs }${psInstall}`
+    )
   }
   const posixSafe = cleanDir.startsWith('$HOME/')
     ? `"$HOME/${cleanDir.slice('$HOME/'.length).replace(/(["$`\\])/g, '\\$1')}"`
@@ -103,6 +110,7 @@ export function openStudioDriverManagerModal(ctx: StudioDriverManagerModalContex
   let loadSeq = 0
   const pendingInspects = new Map<string, { rawPath: string; result: DriverInspectResult }>()
   const pendingRetrusts = new Map<string, string>()
+  const draftPaths = new Map<string, string>()
 
   const modal = document.createElement('div')
   modal.className = 'datanoa-driver-mgr-modal'
@@ -304,7 +312,13 @@ export function openStudioDriverManagerModal(ctx: StudioDriverManagerModalContex
       input.type = 'text'
       input.className = 'datanoa-conn-input is-mono'
       input.placeholder = '/path/to/driver/index.mjs or driver folder'
-      input.value = pendingInspect ? pendingInspect.rawPath : item.localPath || ''
+      const savedDraft = draftPaths.get(item.id)
+      input.value =
+        savedDraft !== undefined
+          ? savedDraft
+          : pendingInspect
+            ? pendingInspect.rawPath
+            : item.localPath || ''
       input.setAttribute('aria-label', `Local driver path for ${item.name}`)
       row.appendChild(input)
 
@@ -374,6 +388,7 @@ export function openStudioDriverManagerModal(ctx: StudioDriverManagerModalContex
         actions.appendChild(btn)
       }
       input.addEventListener('input', () => {
+        draftPaths.set(item.id, input.value)
         if (pendingInspects.has(item.id)) {
           pendingInspects.delete(item.id)
           inspectBoxEl?.remove()
@@ -424,15 +439,15 @@ export function openStudioDriverManagerModal(ctx: StudioDriverManagerModalContex
     setBusy(true)
     try {
       const res = await ctx.requestPlugin<{ drivers?: DriverRegistryItem[] }>('drivers.list', {})
-      if (seq !== loadSeq) return
+      if (seq !== loadSeq || !isOpen()) return
       items = Array.isArray(res?.drivers) ? res.drivers : []
       render()
     } catch (err: unknown) {
-      if (seq === loadSeq) {
+      if (seq === loadSeq && isOpen()) {
         showNotice('error', `Failed to load drivers: ${err instanceof Error ? err.message : String(err)}`)
       }
     } finally {
-      if (seq === loadSeq) {
+      if (seq === loadSeq && isOpen()) {
         loading.style.display = 'none'
         setBusy(false)
       }

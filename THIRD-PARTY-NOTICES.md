@@ -1,8 +1,8 @@
 # Third-Party Notices
 
-Datanoa incorporates or bundles the following open-source software components across its nine pre-bundled vendor modules (`vendor/iconv-lite.js`, `vendor/pg.js`, `vendor/mysql2.js`, `vendor/mongodb.js`, `vendor/mssql.js`, `vendor/oracledb.js`, `vendor/codemirror.js`, `vendor/sql-parser-pg-sqlite.js`, and `vendor/sql-parser-mysql-mssql.js`) and embedded font asset (`src/assets/geist-font.js`). Each component is subject to its own license terms reproduced below.
+Datanoa incorporates or bundles the following open-source software components across its ten pre-bundled vendor modules (`vendor/iconv-lite.js`, `vendor/pg.js`, `vendor/mysql2.js`, `vendor/mongodb.js`, `vendor/mssql.js`, `vendor/oracledb.js`, `vendor/codemirror.js`, `vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js`, and `vendor/ssh2.js`) and embedded font asset (`src/assets/geist-font.js`). Each component is subject to its own license terms reproduced below.
 
-## Summary of Bundled Components (61 Components)
+## Summary of Bundled Components (65 Components)
 
 | Package | Version | Bundle | License | Copyright Holder |
 |---|---|---|---|---|
@@ -27,7 +27,7 @@ Datanoa incorporates or bundles the following open-source software components ac
 | `inherits` | `2.0.4` | `vendor/mssql.js` | ISC | Isaac Z. Schlueter |
 | `native-duplexpair` | `1.0.0` | `vendor/mssql.js` | MIT | Anna Henningsen |
 | `iconv-lite` | `0.7.3` | `vendor/iconv-lite.js` | MIT | Alexander Shtuchkin |
-| `safer-buffer` | `2.1.2` | `vendor/iconv-lite.js` | MIT | Nikita Skovoroda |
+| `safer-buffer` | `2.1.2` | `vendor/iconv-lite.js`, `vendor/ssh2.js` | MIT | Nikita Skovoroda |
 | `mysql2` | `3.24.6` | `vendor/mysql2.js` | MIT | Andrey Sidorov and contributors |
 | `long` | `5.3.2` | `vendor/mysql2.js` | Apache-2.0 | The Closure Library Authors; Daniel Wirtz / The long.js Authors |
 | `sql-escaper` | `1.9.1` | `vendor/mysql2.js` | MIT | Weslley Araújo, Andrey Sidorov, Douglas Wilson, and contributors |
@@ -66,6 +66,10 @@ Datanoa incorporates or bundles the following open-source software components ac
 | `crelt` | `1.0.7` | `vendor/codemirror.js` | MIT | Marijn Haverbeke |
 | `node-sql-parser` | `5.4.0` | `vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js` | Apache-2.0 | taozhi8833998 and contributors |
 | `big-integer` | `1.6.52` | `vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js` | Unlicense | Peter Olson |
+| `ssh2` | `1.17.0` | `vendor/ssh2.js` | MIT | Brian White |
+| `asn1` | `0.2.6` | `vendor/ssh2.js` | MIT | Mark Cavage |
+| `bcrypt-pbkdf` | `1.0.2` | `vendor/ssh2.js` | BSD-3-Clause / ISC | Niels Provos; Ted Unangst; Joyent Inc |
+| `tweetnacl` | `0.14.5` | `vendor/ssh2.js` | Unlicense | TweetNaCl-js Contributors |
 | Geist Variable Font (`src/assets/geist-font.js`) | Variable | `src/assets/geist-font.js` | SIL OFL-1.1 | Vercel Inc. (bundled via Orca Desktop) |
 
 ---
@@ -445,6 +449,57 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
+### `bcrypt-pbkdf@1.0.2` (`vendor/ssh2.js`)
+
+```text
+The Blowfish portions are under the following license:
+
+Blowfish block cipher for OpenBSD
+Copyright 1997 Niels Provos <provos@physnet.uni-hamburg.de>
+All rights reserved.
+
+Implementation advice by David Mazieres <dm@lcs.mit.edu>.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+3. The name of the author may not be used to endorse or promote products
+   derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The bcrypt_pbkdf portions are under the following license:
+
+Copyright (c) 2013 Ted Unangst <tedu@openbsd.org>
+Copyright 2016, Joyent Inc (Author: Alex Wilson <alex.wilson@joyent.com>)
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+```
+
 ---
 
 ## ISC License Components
@@ -546,6 +601,11 @@ The following bundled packages are licensed under the MIT License, with each com
 - **`@marijn/find-cluster-break@1.0.4`**: `Copyright (C) 2024 by Marijn Haverbeke <marijn@haverbeke.berlin>`
 - **`w3c-keyname@2.2.8`**: `Copyright (C) 2016 by Marijn Haverbeke <marijn@haverbeke.berlin> and others`
 - **`crelt@1.0.7`**: `Copyright (C) 2020 by Marijn Haverbeke <marijn@haverbeke.berlin>`
+
+### `vendor/ssh2.js`
+
+- **`ssh2@1.17.0`**: `Copyright Brian White. All rights reserved.`
+- **`asn1@0.2.6`**: `Copyright (c) 2011 Mark Cavage, All rights reserved.`
 
 ### MIT License
 
@@ -664,7 +724,7 @@ DAMAGES.
 
 ## Unlicense (Public Domain) Components
 
-### `big-integer@1.6.52` (`vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js`)
+### `big-integer@1.6.52` (`vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js`) & `tweetnacl@0.14.5` (`vendor/ssh2.js`)
 
 ```text
 This is free and unencumbered software released into the public domain.

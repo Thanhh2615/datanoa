@@ -10,6 +10,7 @@ import {
   formatSelectionAsOutput,
   formatRelativeTime,
   analyzeDangerousSql,
+  comparePanelCellValues,
 } from './panel-core.js'
 import {
   PANEL_SQL_EDITOR_MIN_HEIGHT,
@@ -657,11 +658,13 @@ export function createPanelSqlController(ctx) {
     let kind = null
     let cls = 'banner warn'
     let msg = ''
-    if (conn.readOnly && conn.colorTag === 'prod') {
+    const normColorTag = String(conn.colorTag || '').trim().toLowerCase()
+    const isProdConn = normColorTag === 'prod' || normColorTag === 'production'
+    if (conn.readOnly && isProdConn) {
       kind = 'prod-ro'
       cls = 'banner warn'
       msg = 'PROD + READ-ONLY — Mutating SQL, MQL, and Redis commands are blocked by worker policy.'
-    } else if (conn.colorTag === 'prod') {
+    } else if (isProdConn) {
       kind = 'prod'
       cls = 'banner warn'
       msg = 'PROD environment — review statements carefully before executing.'
@@ -821,6 +824,10 @@ export function createPanelSqlController(ctx) {
     state.sqlColWidths = []
     sortedSqlRowsCache = { res: null, colIdx: null, dir: 'ASC', rows: [] }
     sqlVirt.active = false
+    sqlVirt.sortedRows = []
+    sqlVirt.columns = []
+    sqlVirt.start = -1
+    sqlVirt.end = -1
     getSqlGridSel()?.clear(true)
     const bar = $('sqlResultSetsBar')
     if (bar) {
@@ -1940,24 +1947,7 @@ export function createPanelSqlController(ctx) {
     ) {
       const idx = state.sqlSortColIdx
       const dir = state.sqlSortDir === 'DESC' ? -1 : 1
-      rows.sort((a, b) => {
-        const va = a[idx]
-        const vb = b[idx]
-        if (va == null && vb == null) return 0
-        if (va == null) return -1 * dir
-        if (vb == null) return 1 * dir
-        const na = Number(va)
-        const nb = Number(vb)
-        if (
-          typeof va === 'number' &&
-          typeof vb === 'number' &&
-          Number.isFinite(na) &&
-          Number.isFinite(nb)
-        ) {
-          return (na - nb) * dir
-        }
-        return String(va).localeCompare(String(vb), undefined, { numeric: true }) * dir
-      })
+      rows.sort((a, b) => comparePanelCellValues(a[idx], b[idx], dir))
     }
     sortedSqlRowsCache = { res, colIdx: state.sqlSortColIdx, dir: state.sqlSortDir, rows }
     return rows
@@ -1980,7 +1970,6 @@ export function createPanelSqlController(ctx) {
     }
     strip.hidden = false
     strip.textContent = txt
-    setLastPanelCopiedText(txt)
   }
 
   function copySqlSelection(format = 'tsv', includeHeaders = false) {
@@ -2063,6 +2052,7 @@ export function createPanelSqlController(ctx) {
     tdIdx.addEventListener('mousedown', (e) => {
       if (e.button !== 0 || !sqlGridSel) return
       e.preventDefault()
+      e.stopPropagation()
       $('sqlResultWrap')?.focus({ preventScroll: true })
       sqlGridSel.selectRow(rowIdx, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
     })
@@ -2545,10 +2535,12 @@ export function createPanelSqlController(ctx) {
         })
       } catch (stmtErr) {
         if (runSeq !== sqlRunSeq || state.activeConnectionId !== runConnId) return null
+        const errText = String(stmtErr?.message || '')
         const isCancelled =
           cancelledSqlRunSeq === runSeq ||
           stmtErr?.code === 'cancelled' ||
-          /cancel/i.test(String(stmtErr?.message || ''))
+          stmtErr?.name === 'AbortError' ||
+          /\b(?:query|explain)\s+(?:execution\s+)?(?:was\s+)?cancell?ed\b/i.test(errText)
         if (statements.length === 1 || isCancelled) throw stmtErr
         collectedSets.push({
           index: i,
@@ -2578,7 +2570,20 @@ export function createPanelSqlController(ctx) {
           configuredMaxRows = Math.max(1, Math.min(50000, Math.floor(rawMax)))
         }
       } catch {}
-      if (runSeq !== sqlRunSeq || state.activeConnectionId !== runConnId) return { stale: true }
+      if (
+        runSeq !== sqlRunSeq ||
+        cancelledSqlRunSeq === runSeq ||
+        state.activeConnectionId !== runConnId
+      ) {
+        return { stale: true }
+      }
+    }
+    if (
+      runSeq !== sqlRunSeq ||
+      cancelledSqlRunSeq === runSeq ||
+      state.activeConnectionId !== runConnId
+    ) {
+      return { stale: true }
     }
     const payload = {
       connectionId: runConnId,
@@ -2615,7 +2620,15 @@ export function createPanelSqlController(ctx) {
     let explainProgressText = ''
     const phaseWord = mode === 'explain' ? 'Explaining' : 'Running'
     const setRunningBadge = (elapsed) => {
-      if (runSeq !== sqlRunSeq || state.activeConnectionId !== runConnId) return
+      if (
+        runSeq !== sqlRunSeq ||
+        state.activeConnectionId !== runConnId ||
+        consoleTabs.getActiveTabId() !== originTabId
+      ) {
+        return
+      }
+      meta.hidden = false
+      meta.className = 'badge badge-info'
       meta.textContent = ''
       const sp = document.createElement('span')
       sp.className = 'btn-spinner btn-spinner-sm'

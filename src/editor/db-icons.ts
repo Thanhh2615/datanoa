@@ -174,8 +174,13 @@ export function setButtonLoading(
 }
 
 export function formatAggregateNumber(value: number): string {
-  if (!Number.isFinite(value)) return '0'
+  if (Number.isNaN(value)) return '0'
+  if (!Number.isFinite(value)) return value > 0 ? 'Infinity' : '-Infinity'
+  if (value === 0) return '0'
   if (Number.isInteger(value)) return String(value)
+  if (Math.abs(value) < 1e-4) {
+    return value.toPrecision(4).replace(/\.?0+(?=e|$)/, '')
+  }
   return String(Number(value.toFixed(4)))
 }
 

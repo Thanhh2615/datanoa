@@ -28,9 +28,47 @@ export interface IsolatedAiSqlStatement {
   } | null
 }
 
+export interface DialectLexerRule {
+  readonly lineCommentDash: boolean
+  readonly lineCommentHash: boolean
+  readonly lineCommentSlash: boolean
+  readonly nestedBlockComments: boolean
+  readonly backslashEscapesSingleQuote: boolean
+  readonly backslashEscapesDoubleQuote: boolean
+  readonly dollarQuoting: boolean
+  readonly postgresEscapeString: boolean
+  readonly oracleQQuote: boolean
+  readonly mysqlExecComments: boolean
+  readonly mysqlDelimiter: boolean
+  readonly bracketIdentifiers: 'none' | 'no-doubling' | 'doubling'
+  readonly backtickIdentifiers: boolean
+  readonly doubleQuoteIdentifiers: boolean
+  readonly compoundRoutineBegin: boolean
+}
+
+export declare const DIALECT_LEXER_RULES: Readonly<Record<DatabaseDriverType, DialectLexerRule>>
+export declare function getDialectLexerRules(dialect?: DatabaseDriverType): DialectLexerRule
 export declare function usesBackslashAndHash(dialect?: DatabaseDriverType): boolean
 export declare function supportsNestedBlockComments(dialect?: DatabaseDriverType): boolean
 export declare function supportsDollarQuoting(dialect?: DatabaseDriverType): boolean
+export declare function supportsBracketIdentifiers(dialect?: DatabaseDriverType): boolean
+export declare function supportsSlashLineComments(dialect?: DatabaseDriverType): boolean
+export declare function scanBracketIdentEnd(
+  sql: string,
+  start: number,
+  allowDoubling?: boolean
+): { end: number; closed: boolean }
+export interface MongoJsToken {
+  kind: 'ws' | 'comment' | 'string' | 'regex' | 'punct' | 'ident' | 'number' | 'op'
+  end: number
+  text: string
+  nextPrevKind: string
+}
+export declare function advanceMongoJsToken(
+  text: string,
+  index: number,
+  prevKind: string
+): MongoJsToken
 export declare function matchMysqlExecCommentPrefix(
   sql: string,
   index: number,
@@ -135,6 +173,22 @@ export declare function stripLeadingSqlComments(
   sql: string,
   dialect?: DatabaseDriverType
 ): string
+export interface StripCommentsDetailedOptions {
+  preserveMysqlExecComments?: boolean
+  literalPlaceholder?: string
+  identPlaceholder?: string
+  backslashOverride?: boolean
+}
+export interface StripCommentsDetailedResult {
+  text: string
+  hasUnclosedQuote: boolean
+  hasUnclosedComment: boolean
+}
+export declare function stripCommentsAndLiteralsDetailed(
+  sql: string,
+  dialect?: DatabaseDriverType,
+  options?: StripCommentsDetailedOptions
+): StripCommentsDetailedResult
 export declare function stripCommentsAndLiterals(
   sql: string,
   dialect?: DatabaseDriverType,

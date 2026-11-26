@@ -33,6 +33,7 @@ import {
   scrubSensitiveText,
 } from '../shared-sql-safety.js'
 import {
+  isBlockedScanRoot,
   isLocalWorkspaceHost,
   normalizePathForCompare,
   resolveSqliteFilePath,
@@ -229,6 +230,10 @@ export function sanitizeConnectionProfile(conn: ConnectionProfile): ConnectionPr
     conn.sshPort <= 65535
       ? conn.sshPort
       : undefined
+  const aiPolicy =
+    conn.aiPolicy === 'allow' || conn.aiPolicy === 'ask' || conn.aiPolicy === 'never'
+      ? conn.aiPolicy
+      : undefined
 
   return sanitizeJsonPayload({
     id: conn.id,
@@ -268,6 +273,7 @@ export function sanitizeConnectionProfile(conn: ConnectionProfile): ConnectionPr
     sshPrivateKeyPath: text(conn.sshPrivateKeyPath),
     hasSshPassphrase: conn.hasSshPassphrase ? true : undefined,
     hasSshPassword: conn.hasSshPassword ? true : undefined,
+    ...(aiPolicy !== undefined ? { aiPolicy } : {}),
   })
 }
 
@@ -531,6 +537,34 @@ export async function readClampedTimeoutSeconds(orca: OrcaWorkerApi): Promise<nu
     : 30
 }
 
+const CANCEL_SETTLE_GRACE_MS = 5_000
+
+async function awaitCancelSettlement(
+  session: IDatabaseSession,
+  queryId: string,
+  queryPromise: Promise<QueryResult>,
+  graceMs = CANCEL_SETTLE_GRACE_MS
+): Promise<void> {
+  const cancelCall = Promise.resolve()
+    .then(() => session.cancelQuery(queryId))
+    .catch(() => {})
+  const settledQuery = queryPromise.then(
+    () => undefined,
+    () => undefined
+  )
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      Promise.all([cancelCall, settledQuery]),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, graceMs)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 export async function executeSessionQuery(
   tracker: QueryRuntimeTracker,
   session: IDatabaseSession,
@@ -538,15 +572,24 @@ export async function executeSessionQuery(
   sql: string,
   maxRows: number,
   timeoutSeconds: number,
-  signal: AbortSignal
+  signal: AbortSignal,
+  cancelGraceMs = CANCEL_SETTLE_GRACE_MS
 ): Promise<QueryResult> {
   tracker.activeQuerySessions.set(queryId, session)
+
+  const queryPromise = session.runQuery(queryId, sql, maxRows, Math.max(100, Math.round(timeoutSeconds * 1000)))
+  queryPromise.catch(() => {})
 
   let abortCleanup: (() => void) | undefined
   const abortPromise = new Promise<QueryResult>((_, reject) => {
     const onAbort = () => {
-      void session.cancelQuery(queryId).catch(() => {})
-      reject(createHostError('cancelled', 'Query execution was cancelled'))
+      void awaitCancelSettlement(session, queryId, queryPromise, cancelGraceMs).finally(() => {
+        reject(createHostError('cancelled', 'Query execution was cancelled'))
+      })
+    }
+    if (signal.aborted) {
+      onAbort()
+      return
     }
     signal.addEventListener('abort', onAbort, { once: true })
     abortCleanup = () => signal.removeEventListener('abort', onAbort)
@@ -556,15 +599,14 @@ export async function executeSessionQuery(
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined
   const timeoutPromise = new Promise<QueryResult>((_, reject) => {
     timeoutHandle = setTimeout(() => {
-      void session.cancelQuery(queryId).catch(() => {})
-      reject(createHostError('timeout', `Query timed out after ${timeoutSeconds}s`))
+      void awaitCancelSettlement(session, queryId, queryPromise, cancelGraceMs).finally(() => {
+        reject(createHostError('timeout', `Query timed out after ${timeoutSeconds}s`))
+      })
     }, timeoutSeconds * 1000)
   })
   timeoutPromise.catch(() => {})
 
   try {
-    const queryPromise = session.runQuery(queryId, sql, maxRows)
-    queryPromise.catch(() => {})
     return await Promise.race([queryPromise, abortPromise, timeoutPromise])
   } finally {
     if (timeoutHandle !== undefined) {
@@ -854,7 +896,11 @@ export async function saveUiSessionSnapshot(
     typeof input.dataCache === 'object' &&
     !Array.isArray(input.dataCache)
   ) {
-    nextDataCache = sanitizeUiDataCache({ ...(prev.dataCache || {}), ...input.dataCache })
+    const mergedCache = sanitizeUiDataCache({ ...(prev.dataCache || {}), ...input.dataCache })
+    const bounded = fitResponseWithinOrcaIpcLimit({ dataCache: mergedCache }) as {
+      dataCache?: Record<string, unknown> | null
+    }
+    nextDataCache = bounded.dataCache ?? null
   }
   const updatedAt = Date.now()
   inMemoryUiSessionSnapshots.set(surface, {
@@ -1425,11 +1471,14 @@ export async function ensureByodDirectoryScaffolded(
 }> {
   const id = assertValidByodSetupDriverId(driverId)
   const rawDir = typeof localPath === 'string' ? localPath.trim() : ''
-  if (!rawDir) {
-    throw createHostError('invalid_params', 'Target folder path is required')
+  if (!rawDir || CONTROL_CHARS_RE.test(rawDir)) {
+    throw createHostError('invalid_params', 'Target folder path is required and must not contain control characters')
   }
   const isExplicitFile = /[/\\][^/\\]+\.(?:mjs|cjs|js)$/i.test(rawDir)
   const dirPath = isExplicitFile ? path.dirname(path.resolve(rawDir)) : path.resolve(rawDir)
+  if (isBlockedScanRoot(dirPath)) {
+    throw createHostError('not_permitted', `Refusing to scaffold BYOD driver directly in system/home root: ${dirPath}`)
+  }
   await fs.promises.mkdir(dirPath, { recursive: true })
 
   const entryPath = isExplicitFile ? path.resolve(rawDir) : path.join(dirPath, 'index.mjs')
@@ -1527,14 +1576,53 @@ export const MAX_ORCA_IPC_RESPONSE_BYTES = 950_000
 function truncateUtf8String(text: string, maxBytes: number): string {
   const buf = Buffer.from(text, 'utf8')
   if (buf.byteLength <= maxBytes) return text
-  return buf.subarray(0, maxBytes).toString('utf8')
+  let end = Math.max(0, maxBytes)
+  // Step back over UTF-8 continuation bytes (10xxxxxx)
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) {
+    end -= 1
+  }
+  // If end landed on a multi-byte lead byte whose sequence overflows maxBytes, drop it too
+  if (end > 0) {
+    let lead = end - 1
+    while (lead > 0 && (buf[lead] & 0xc0) === 0x80) {
+      lead -= 1
+    }
+    const leadByte = buf[lead]
+    const seqLen =
+      leadByte < 0x80
+        ? 1
+        : (leadByte & 0xe0) === 0xc0
+          ? 2
+          : (leadByte & 0xf0) === 0xe0
+            ? 3
+            : (leadByte & 0xf8) === 0xf0
+              ? 4
+              : 1
+    if (lead + seqLen > end) {
+      end = lead
+    }
+  }
+  return buf.subarray(0, end).toString('utf8')
+}
+
+function sliceUtf16Safe(text: string, maxChars: number): string {
+  if (maxChars <= 0) return ''
+  if (text.length <= maxChars) return text
+  let cut = maxChars
+  // Never split a UTF-16 surrogate pair (high surrogate 0xD800..0xDBFF at cut - 1)
+  const code = text.charCodeAt(cut - 1)
+  if (code >= 0xd800 && code <= 0xdbff) {
+    cut -= 1
+  }
+  return text.slice(0, cut)
 }
 
 function compactCellValue(value: unknown, maxChars: number): { value: unknown; changed: boolean } {
   if (typeof value === 'string') {
     if (value.length > maxChars) {
+      const prefix = sliceUtf16Safe(value, maxChars)
       return {
-        value: `${value.slice(0, maxChars)}… [+${value.length - maxChars} chars]`,
+        value: `${prefix}… [+${value.length - prefix.length} chars]`,
         changed: true,
       }
     }
@@ -1544,8 +1632,9 @@ function compactCellValue(value: unknown, maxChars: number): { value: unknown; c
     try {
       const json = JSON.stringify(value)
       if (json && json.length > maxChars) {
+        const prefix = sliceUtf16Safe(json, maxChars)
         return {
-          value: `${json.slice(0, maxChars)}… [+${json.length - maxChars} chars]`,
+          value: `${prefix}… [+${json.length - prefix.length} chars]`,
           changed: true,
         }
       }
@@ -1556,13 +1645,23 @@ function compactCellValue(value: unknown, maxChars: number): { value: unknown; c
   return { value, changed: false }
 }
 
-function compactRowsStrings(rows: unknown[], maxChars: number): unknown[] {
-  return rows.map((row) => {
+function compactRowsStrings(
+  rows: unknown[],
+  maxChars: number,
+  exemptNames?: ReadonlySet<string>,
+  exemptIndices?: ReadonlySet<number>
+): { rows: unknown[]; anyChanged: boolean } {
+  let anyChanged = false
+  const out = rows.map((row) => {
     if (Array.isArray(row)) {
       let changed = false
-      const nextRow = row.map((cell) => {
+      const nextRow = row.map((cell, idx) => {
+        if (exemptIndices?.has(idx)) return cell
         const compacted = compactCellValue(cell, maxChars)
-        if (compacted.changed) changed = true
+        if (compacted.changed) {
+          changed = true
+          anyChanged = true
+        }
         return compacted.value
       })
       return changed ? nextRow : row
@@ -1572,37 +1671,75 @@ function compactRowsStrings(rows: unknown[], maxChars: number): unknown[] {
       let changed = false
       const nextObj: Record<string, unknown> = {}
       for (const [k, v] of Object.entries(rec)) {
+        if (exemptNames?.has(k)) {
+          nextObj[k] = v
+          continue
+        }
         const compacted = compactCellValue(v, maxChars)
-        if (compacted.changed) changed = true
+        if (compacted.changed) {
+          changed = true
+          anyChanged = true
+        }
         nextObj[k] = compacted.value
       }
       return changed ? nextObj : row
     }
     return row
   })
+  return { rows: out, anyChanged }
 }
 
-function shrinkDdlFieldToFit(rec: Record<string, unknown>): boolean {
+function resolvePrimaryKeyExemptions(rec: Record<string, unknown>): {
+  exemptNames?: ReadonlySet<string>
+  exemptIndices?: ReadonlySet<number>
+} {
+  if (!Array.isArray(rec.primaryKey) || rec.primaryKey.length === 0) return {}
+  const names = new Set<string>()
+  for (const pk of rec.primaryKey) {
+    if (typeof pk === 'string' && pk.length > 0) names.add(pk)
+  }
+  if (names.size === 0) return {}
+  let indices: Set<number> | undefined
+  if (Array.isArray(rec.columns)) {
+    indices = new Set<number>()
+    rec.columns.forEach((col, idx) => {
+      const colName =
+        typeof col === 'string'
+          ? col
+          : col && typeof col === 'object' && typeof (col as { name?: unknown }).name === 'string'
+            ? (col as { name: string }).name
+            : ''
+      if (colName && names.has(colName)) indices?.add(idx)
+    })
+  }
+  return { exemptNames: names, exemptIndices: indices }
+}
+
+function measureJsonBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8')
+}
+
+function shrinkDdlFieldToFit(rec: Record<string, unknown>, maxBytes: number): boolean {
   if (typeof rec.ddl !== 'string' || rec.ddl.length === 0) return false
   const suffix = '\n-- [Truncated to fit 1 MiB Orca IPC response limit]\n'
   const origDdl = rec.ddl
-  let targetBytes = Math.min(Buffer.byteLength(origDdl, 'utf8'), 820_000)
+  let targetBytes = Math.min(Buffer.byteLength(origDdl, 'utf8'), Math.max(1024, maxBytes - 130_000))
   for (let i = 0; i < 8 && targetBytes > 0; i++) {
     rec.ddl = `${truncateUtf8String(origDdl, targetBytes)}${suffix}`
-    const curBytes = Buffer.byteLength(JSON.stringify(rec), 'utf8')
-    if (curBytes <= MAX_ORCA_IPC_RESPONSE_BYTES) return true
-    const ratio = MAX_ORCA_IPC_RESPONSE_BYTES / curBytes
+    const curBytes = measureJsonBytes(rec)
+    if (curBytes <= maxBytes) return true
+    const ratio = maxBytes / curBytes
     targetBytes = Math.max(0, Math.floor(targetBytes * ratio * 0.85))
   }
   rec.ddl = '-- [DDL truncated to fit 1 MiB Orca IPC response limit]\n'
-  return Buffer.byteLength(JSON.stringify(rec), 'utf8') <= MAX_ORCA_IPC_RESPONSE_BYTES
+  return measureJsonBytes(rec) <= maxBytes
 }
 
-function clampViewStateToFit(rec: Record<string, unknown>): void {
+function clampViewStateToFit(rec: Record<string, unknown>, maxBytes: number): void {
   if (!rec.viewState || typeof rec.viewState !== 'object' || Array.isArray(rec.viewState)) return
   const vs = { ...(rec.viewState as Record<string, unknown>) }
   if (typeof vs.sqlDraft === 'string' && vs.sqlDraft.length > 8000) {
-    vs.sqlDraft = vs.sqlDraft.slice(0, 8000)
+    vs.sqlDraft = sliceUtf16Safe(vs.sqlDraft, 8000)
   }
   if (vs.consoleTabs && typeof vs.consoleTabs === 'object' && !Array.isArray(vs.consoleTabs)) {
     const ct = { ...(vs.consoleTabs as Record<string, unknown>) }
@@ -1611,7 +1748,7 @@ function clampViewStateToFit(rec: Record<string, unknown>): void {
         if (!tab || typeof tab !== 'object' || Array.isArray(tab)) return tab
         const tRec = { ...(tab as Record<string, unknown>) }
         if (typeof tRec.sql === 'string' && tRec.sql.length > 4000) {
-          tRec.sql = tRec.sql.slice(0, 4000)
+          tRec.sql = sliceUtf16Safe(tRec.sql, 4000)
         }
         return tRec
       })
@@ -1619,13 +1756,13 @@ function clampViewStateToFit(rec: Record<string, unknown>): void {
     vs.consoleTabs = ct
   }
   rec.viewState = vs
-  if (Buffer.byteLength(JSON.stringify(rec), 'utf8') > MAX_ORCA_IPC_RESPONSE_BYTES) {
+  if (measureJsonBytes(rec) > maxBytes) {
     delete vs.sqlDraft
     delete vs.consoleTabs
     delete vs.columnConfigByTable
     rec.viewState = vs
   }
-  if (Buffer.byteLength(JSON.stringify(rec), 'utf8') > MAX_ORCA_IPC_RESPONSE_BYTES) {
+  if (measureJsonBytes(rec) > maxBytes) {
     rec.viewState = null
   }
 }
@@ -1635,14 +1772,17 @@ function clampViewStateToFit(rec: Record<string, unknown>): void {
  * IPC response limit so wide tables (e.g. chrome_profile with large JSON/cookie columns),
  * large DDL exports, top-level arrays, or session snapshots never fail with "<method> answered with more than 1 MiB".
  */
-export function fitResponseWithinOrcaIpcLimit<T>(payload: T): T {
+export function fitResponseWithinOrcaIpcLimit<T>(
+  payload: T,
+  maxBytes = MAX_ORCA_IPC_RESPONSE_BYTES
+): T {
   let serialized: string
   try {
     serialized = JSON.stringify(payload)
   } catch {
     return payload
   }
-  if (!serialized || Buffer.byteLength(serialized, 'utf8') <= MAX_ORCA_IPC_RESPONSE_BYTES) {
+  if (!serialized || Buffer.byteLength(serialized, 'utf8') <= maxBytes) {
     return payload
   }
   if (!payload || typeof payload !== 'object') {
@@ -1651,10 +1791,11 @@ export function fitResponseWithinOrcaIpcLimit<T>(payload: T): T {
 
   // 0. Top-level array response (e.g. schema.listObjects / connections.list)
   if (Array.isArray(payload)) {
-    let items = compactRowsStrings(payload, 512)
-    while (items.length > 0 && Buffer.byteLength(JSON.stringify(items), 'utf8') > MAX_ORCA_IPC_RESPONSE_BYTES) {
-      const curBytes = Buffer.byteLength(JSON.stringify(items), 'utf8')
-      const ratio = MAX_ORCA_IPC_RESPONSE_BYTES / curBytes
+    let items = compactRowsStrings(payload, 512).rows
+    for (;;) {
+      const curBytes = measureJsonBytes(items)
+      if (items.length === 0 || curBytes <= maxBytes) break
+      const ratio = maxBytes / curBytes
       const nextLen = Math.max(0, Math.min(items.length - 1, Math.floor(items.length * ratio * 0.9)))
       items = items.slice(0, nextLen)
     }
@@ -1668,51 +1809,52 @@ export function fitResponseWithinOrcaIpcLimit<T>(payload: T): T {
     if (rec.dataCache && typeof rec.dataCache === 'object' && !Array.isArray(rec.dataCache)) {
       const dc = { ...(rec.dataCache as Record<string, unknown>) }
       if (dc.pageData && typeof dc.pageData === 'object') {
-        dc.pageData = fitResponseWithinOrcaIpcLimit(dc.pageData)
+        dc.pageData = fitResponseWithinOrcaIpcLimit(dc.pageData, maxBytes)
       }
       if (dc.lastSqlResult && typeof dc.lastSqlResult === 'object') {
-        dc.lastSqlResult = fitResponseWithinOrcaIpcLimit(dc.lastSqlResult)
+        dc.lastSqlResult = fitResponseWithinOrcaIpcLimit(dc.lastSqlResult, maxBytes)
       }
       rec.dataCache = dc
-      if (Buffer.byteLength(JSON.stringify(rec), 'utf8') <= MAX_ORCA_IPC_RESPONSE_BYTES) {
+      if (measureJsonBytes(rec) <= maxBytes) {
         return rec as T
       }
       delete dc.pageData
       delete dc.lastSqlResult
       rec.dataCache = dc
-      if (Buffer.byteLength(JSON.stringify(rec), 'utf8') <= MAX_ORCA_IPC_RESPONSE_BYTES) {
+      if (measureJsonBytes(rec) <= maxBytes) {
         return rec as T
       }
       rec.dataCache = null
-      if (Buffer.byteLength(JSON.stringify(rec), 'utf8') <= MAX_ORCA_IPC_RESPONSE_BYTES) {
+      if (measureJsonBytes(rec) <= maxBytes) {
         return rec as T
       }
     }
-    clampViewStateToFit(rec)
-    if (Buffer.byteLength(JSON.stringify(rec), 'utf8') <= MAX_ORCA_IPC_RESPONSE_BYTES) {
+    clampViewStateToFit(rec, maxBytes)
+    if (measureJsonBytes(rec) <= maxBytes) {
       return rec as T
     }
   }
 
   // 2. Large DDL string response (schema.exportSchemaDdl / schema.generateDdl / schema.tableDetails)
   if (typeof rec.ddl === 'string' && rec.ddl.length > 0) {
-    if (shrinkDdlFieldToFit(rec)) {
+    if (shrinkDdlFieldToFit(rec, maxBytes)) {
       return rec as T
     }
   }
 
   // 2.5. List wrapper `{ entries: [...] }` (queries.saved.list / query.history.list)
   if (Array.isArray(rec.entries)) {
-    let entries = compactRowsStrings(rec.entries as unknown[], 4096)
+    let entries = compactRowsStrings(rec.entries as unknown[], 4096).rows
     rec.entries = entries
-    if (Buffer.byteLength(JSON.stringify(rec), 'utf8') <= MAX_ORCA_IPC_RESPONSE_BYTES) {
+    if (measureJsonBytes(rec) <= maxBytes) {
       return rec as T
     }
-    entries = compactRowsStrings(rec.entries as unknown[], 1024)
+    entries = compactRowsStrings(rec.entries as unknown[], 1024).rows
     rec.entries = entries
-    while (entries.length > 0 && Buffer.byteLength(JSON.stringify(rec), 'utf8') > MAX_ORCA_IPC_RESPONSE_BYTES) {
-      const curBytes = Buffer.byteLength(JSON.stringify(rec), 'utf8')
-      const ratio = MAX_ORCA_IPC_RESPONSE_BYTES / curBytes
+    for (;;) {
+      const curBytes = measureJsonBytes(rec)
+      if (entries.length === 0 || curBytes <= maxBytes) break
+      const ratio = maxBytes / curBytes
       const nextLen = Math.max(0, Math.min(entries.length - 1, Math.floor(entries.length * ratio * 0.88)))
       entries = entries.slice(0, nextLen)
       rec.entries = entries
@@ -1726,25 +1868,44 @@ export function fitResponseWithinOrcaIpcLimit<T>(payload: T): T {
     const origResultSets = Array.isArray(rec.resultSets)
       ? (rec.resultSets as Array<Record<string, unknown>>)
       : null
+    const { exemptNames, exemptIndices } = resolvePrimaryKeyExemptions(rec)
     const charTiers = [8192, 4096, 2048, 1024, 512, 256, 128, 64, 32]
 
     for (const maxChars of charTiers) {
+      let compactedAny = false
       if (origRows) {
-        rec.rows = compactRowsStrings(origRows, maxChars)
+        const res = compactRowsStrings(origRows, maxChars, exemptNames, exemptIndices)
+        rec.rows = res.rows
+        if (res.anyChanged) compactedAny = true
       }
       if (origResultSets) {
-        rec.resultSets = origResultSets.map((rs) =>
-          rs && typeof rs === 'object' && Array.isArray(rs.rows)
-            ? { ...rs, rows: compactRowsStrings(rs.rows as unknown[], maxChars) }
-            : rs
-        )
+        rec.resultSets = origResultSets.map((rs) => {
+          if (rs && typeof rs === 'object' && Array.isArray(rs.rows)) {
+            const rsExempt = resolvePrimaryKeyExemptions(rs)
+            const res = compactRowsStrings(
+              rs.rows as unknown[],
+              maxChars,
+              rsExempt.exemptNames,
+              rsExempt.exemptIndices
+            )
+            if (res.anyChanged) {
+              compactedAny = true
+              return { ...rs, rows: res.rows, truncated: true }
+            }
+            return { ...rs, rows: res.rows }
+          }
+          return rs
+        })
       }
-      if (Buffer.byteLength(JSON.stringify(rec), 'utf8') <= MAX_ORCA_IPC_RESPONSE_BYTES) {
+      if (compactedAny) {
+        rec.truncated = true
+      }
+      if (measureJsonBytes(rec) <= maxBytes) {
         return rec as T
       }
     }
 
-    // 4. Clamp row counts across rec.rows and rec.resultSets until safely < 950 KB
+    // 4. Clamp row counts across rec.rows and rec.resultSets until safely <= maxBytes
     let compactedRows = Array.isArray(rec.rows) ? (rec.rows as unknown[]) : []
     let compactedResultSets = Array.isArray(rec.resultSets)
       ? (rec.resultSets as Array<Record<string, unknown>>)
@@ -1759,9 +1920,9 @@ export function fitResponseWithinOrcaIpcLimit<T>(payload: T): T {
     }
 
     while (compactedRows.length > 0 || totalNestedRows() > 0) {
-      const curBytes = Buffer.byteLength(JSON.stringify(rec), 'utf8')
-      if (curBytes <= MAX_ORCA_IPC_RESPONSE_BYTES) break
-      const ratio = MAX_ORCA_IPC_RESPONSE_BYTES / curBytes
+      const curBytes = measureJsonBytes(rec)
+      if (curBytes <= maxBytes) break
+      const ratio = maxBytes / curBytes
 
       if (compactedRows.length > 1) {
         const nextLen = Math.max(
@@ -1800,7 +1961,7 @@ export function fitResponseWithinOrcaIpcLimit<T>(payload: T): T {
         })
         rec.resultSets = compactedResultSets
         rec.truncated = true
-        if (!shrunkAny && Buffer.byteLength(JSON.stringify(rec), 'utf8') > MAX_ORCA_IPC_RESPONSE_BYTES) {
+        if (!shrunkAny && measureJsonBytes(rec) > maxBytes) {
           compactedResultSets = []
           rec.resultSets = []
           break

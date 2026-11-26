@@ -23,6 +23,17 @@ import {
 export type QueryExecutor = (sql: string, params?: unknown[]) => Promise<Record<string, unknown>[]>
 
 export const DEFAULT_METADATA_CACHE_TTL_MS = 15_000
+const MAX_TABLE_DETAILS_CACHE_ENTRIES = 512
+
+function cloneTableDetails(details: TableDetails): TableDetails {
+  return {
+    ...details,
+    columns: details.columns.map((c) => ({ ...c })),
+    primaryKey: [...details.primaryKey],
+    indexes: details.indexes.map((idx) => ({ ...idx, columns: [...idx.columns] })),
+    foreignKeys: details.foreignKeys.map((fk) => ({ ...fk })),
+  }
+}
 
 /**
  * Short-lived TTL cache for TableDetails metadata to skip redundant
@@ -30,10 +41,12 @@ export const DEFAULT_METADATA_CACHE_TTL_MS = 15_000
  */
 export class TableDetailsCache {
   private readonly ttlMs: number
+  private readonly maxEntries: number
   private readonly entries = new Map<string, { details: TableDetails; expiresAt: number }>()
 
-  constructor(ttlMs = DEFAULT_METADATA_CACHE_TTL_MS) {
+  constructor(ttlMs = DEFAULT_METADATA_CACHE_TTL_MS, maxEntries = MAX_TABLE_DETAILS_CACHE_ENTRIES) {
     this.ttlMs = ttlMs
+    this.maxEntries = Math.max(1, maxEntries)
   }
 
   private makeKey(schema: string | undefined, defaultSchema: string, table: string): string {
@@ -49,7 +62,7 @@ export class TableDetailsCache {
       this.entries.delete(key)
       return undefined
     }
-    return { ...entry.details }
+    return cloneTableDetails(entry.details)
   }
 
   set(
@@ -59,10 +72,23 @@ export class TableDetailsCache {
     details: TableDetails
   ): void {
     const key = this.makeKey(schema, defaultSchema, table)
+    if (this.entries.has(key)) {
+      this.entries.delete(key)
+    } else if (this.entries.size >= this.maxEntries) {
+      const oldestKey = this.entries.keys().next().value
+      if (oldestKey !== undefined) {
+        this.entries.delete(oldestKey)
+      }
+    }
     this.entries.set(key, {
-      details: { ...details },
+      details: cloneTableDetails(details),
       expiresAt: Date.now() + this.ttlMs,
     })
+  }
+
+  invalidateTable(schema: string | undefined, defaultSchema: string, table: string): void {
+    const key = this.makeKey(schema, defaultSchema, table)
+    this.entries.delete(key)
   }
 
   clear(): void {

@@ -91,6 +91,7 @@ export interface StudioDomRefs {
   queryBannerTitleEl: HTMLSpanElement
   queryBannerDetailEl: HTMLDivElement
   queryBannerRetryBtn: HTMLButtonElement
+  queryBannerEditConnBtn: HTMLButtonElement
   queryBannerBackBtn: HTMLButtonElement
   queryBannerFixAiBtn: HTMLButtonElement
   queryBannerCopyBtn: HTMLButtonElement
@@ -771,6 +772,12 @@ export function createStudioDomTree(
   queryBannerRetryBtn.textContent = 'Retry'
   queryBannerRetryBtn.style.display = 'none'
 
+  const queryBannerEditConnBtn = document.createElement('button')
+  queryBannerEditConnBtn.type = 'button'
+  queryBannerEditConnBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-error-edit-conn-btn'
+  queryBannerEditConnBtn.textContent = 'Edit Connection'
+  queryBannerEditConnBtn.style.display = 'none'
+
   const queryBannerBackBtn = document.createElement('button')
   queryBannerBackBtn.type = 'button'
   queryBannerBackBtn.className = 'datanoa-btn datanoa-btn-sm'
@@ -803,6 +810,7 @@ export function createStudioDomTree(
   queryBannerCloseBtn.textContent = 'Dismiss'
 
   bannerActions.appendChild(queryBannerRetryBtn)
+  bannerActions.appendChild(queryBannerEditConnBtn)
   bannerActions.appendChild(queryBannerBackBtn)
   bannerActions.appendChild(queryBannerFixAiBtn)
   bannerActions.appendChild(queryBannerCopyBtn)
@@ -989,6 +997,7 @@ export function createStudioDomTree(
     queryBannerTitleEl,
     queryBannerDetailEl,
     queryBannerRetryBtn,
+    queryBannerEditConnBtn,
     queryBannerBackBtn,
     queryBannerFixAiBtn,
     queryBannerCopyBtn,

@@ -52,6 +52,7 @@ export class TransactionToolbarController {
   private state: TransactionState = { ...DEFAULT_TX_STATE }
   private isExpanded = false
   private busy = false
+  private busyAction: 'commit' | 'rollback' | 'begin' | 'toggle' | null = null
   private contextGeneration = 0
   private mutationEpoch = 0
   private nextMutationToken = 0
@@ -224,6 +225,7 @@ export class TransactionToolbarController {
     if (this.activeMutationToken !== token) return
     this.activeMutationToken = null
     this.busy = false
+    this.busyAction = null
     this.mutationEpoch++
     this.updateToolbar()
   }
@@ -278,7 +280,7 @@ export class TransactionToolbarController {
         this.inFlightSetAutoCommit.rollbackOnSettle = true
         this.trackConnectionCleanup(prevConnId, this.inFlightSetAutoCommit.done)
       }
-      if (this.hasActiveOrManualTx()) {
+      if (this.hasActiveOrManualTx() && this.busyAction !== 'commit') {
         const rollbackPromise = this.host
           .requestPlugin<TransactionState>('tx.rollback', {
             connectionId: prevConnId,
@@ -297,6 +299,7 @@ export class TransactionToolbarController {
     this.inFlightSetAutoCommit = null
     this.state = { ...DEFAULT_TX_STATE }
     this.busy = false
+    this.busyAction = null
   }
 
   public resetLocalStateAndRender(): void {
@@ -479,7 +482,7 @@ export class TransactionToolbarController {
 
   public async toggleAutoCommit(): Promise<void> {
     const connId = this.host.getActiveConnectionId()
-    if (!connId || this.busy || !this.state.supported || this.host.isReadOnly()) {
+    if (!connId || this.busy || !this.state.supported || this.host.isReadOnly() || this.host.isQueryRunning()) {
       return
     }
     const gen = this.contextGeneration
@@ -488,6 +491,7 @@ export class TransactionToolbarController {
     this.activeMutationToken = token
     this.mutationEpoch++
     this.busy = true
+    this.busyAction = 'toggle'
     this.updateToolbar()
 
     let resolveDone: () => void = () => {}
@@ -545,7 +549,7 @@ export class TransactionToolbarController {
 
   public async begin(): Promise<void> {
     const connId = this.host.getActiveConnectionId()
-    if (!connId || this.busy || !this.state.supported || this.host.isReadOnly()) {
+    if (!connId || this.busy || !this.state.supported || this.host.isReadOnly() || this.host.isQueryRunning()) {
       return
     }
     const gen = this.contextGeneration
@@ -553,6 +557,7 @@ export class TransactionToolbarController {
     this.activeMutationToken = token
     this.mutationEpoch++
     this.busy = true
+    this.busyAction = 'begin'
     this.updateToolbar()
 
     let resolveDone: () => void = () => {}
@@ -613,12 +618,13 @@ export class TransactionToolbarController {
 
   public async commit(): Promise<void> {
     const connId = this.host.getActiveConnectionId()
-    if (!connId || this.busy || !this.state.active) return
+    if (!connId || this.busy || !this.state.active || this.host.isQueryRunning()) return
     const gen = this.contextGeneration
     const token = ++this.nextMutationToken
     this.activeMutationToken = token
     this.mutationEpoch++
     this.busy = true
+    this.busyAction = 'commit'
     this.updateToolbar()
     try {
       if (this.pendingConnectionCleanups.has(connId)) {
@@ -649,12 +655,13 @@ export class TransactionToolbarController {
 
   public async rollback(): Promise<void> {
     const connId = this.host.getActiveConnectionId()
-    if (!connId || this.busy || !this.state.active) return
+    if (!connId || this.busy || !this.state.active || this.host.isQueryRunning()) return
     const gen = this.contextGeneration
     const token = ++this.nextMutationToken
     this.activeMutationToken = token
     this.mutationEpoch++
     this.busy = true
+    this.busyAction = 'rollback'
     this.updateToolbar()
     try {
       if (this.pendingConnectionCleanups.has(connId)) {

@@ -2,8 +2,13 @@
 // Spreadsheet-style rectangular cell/row/column selection controller for Datanoa Side Panel grids.
 
 import {
+  addExactDecimal,
+  compareExactDecimal,
   formatAggNum,
+  formatExactAverage,
+  formatExactDecimal,
   normalizeCellRange,
+  parseExactDecimal,
   subtractCellFromRange,
   subtractRowFromRange,
   subtractColFromRange,
@@ -17,6 +22,7 @@ export class PanelGridSelection {
     this.getDimensions = opts.getDimensions
     this.getValueAt = opts.getValueAt
     this.getSnapshot = opts.getSnapshot || null
+    this.isTransposed = typeof opts.isTransposed === 'function' ? opts.isTransposed : () => false
     this.onSelectionChange = opts.onSelectionChange || (() => {})
     this.onCopy = opts.onCopy || (() => {})
     this.onPaste = opts.onPaste || (() => {})
@@ -299,9 +305,9 @@ export class PanelGridSelection {
     let cellCount = 0
     let nonNullCount = 0
     let numericCount = 0
-    let sum = 0
-    let min = Infinity
-    let max = -Infinity
+    let sumExact = null
+    let minExact = null
+    let maxExact = null
     let truncated = false
     const seen = singleRange ? null : new Set()
     const stride = Math.max(1, cols + 1)
@@ -327,22 +333,25 @@ export class PanelGridSelection {
           const v = snap.getValue(r, c)
           if (v !== null && v !== undefined) {
             nonNullCount++
-            let num = NaN
-            if (typeof v === 'number') {
-              num = v
-            } else if (typeof v === 'string') {
-              const tr = v.trim()
-              if (tr !== '' && /^-?\d+(?:\.\d+)?$/.test(tr)) num = Number(tr)
-            }
-            if (Number.isFinite(num)) {
+            const dec = parseExactDecimal(v)
+            if (dec !== null) {
               numericCount++
-              sum += num
-              if (num < min) min = num
-              if (num > max) max = num
+              sumExact = sumExact === null ? dec : addExactDecimal(sumExact, dec)
+              if (minExact === null || compareExactDecimal(dec, minExact) < 0) minExact = dec
+              if (maxExact === null || compareExactDecimal(dec, maxExact) > 0) maxExact = dec
             }
           }
         }
       }
+    }
+    const sumFormatted = numericCount > 0 && sumExact ? formatExactDecimal(sumExact) : null
+    const avgFormatted = numericCount > 0 && sumExact ? formatExactAverage(sumExact, numericCount) : null
+    const minFormatted = numericCount > 0 && minExact ? formatExactDecimal(minExact) : null
+    const maxFormatted = numericCount > 0 && maxExact ? formatExactDecimal(maxExact) : null
+    const toNum = (str) => {
+      if (str === null) return 0
+      const n = Number(str)
+      return Number.isFinite(n) ? n : null
     }
     return {
       rowCount,
@@ -350,10 +359,14 @@ export class PanelGridSelection {
       cellCount,
       nonNullCount,
       numericCount,
-      sum,
-      avg: numericCount > 0 ? sum / numericCount : 0,
-      min: numericCount > 0 ? min : 0,
-      max: numericCount > 0 ? max : 0,
+      sum: toNum(sumFormatted),
+      avg: toNum(avgFormatted),
+      min: toNum(minFormatted),
+      max: toNum(maxFormatted),
+      sumFormatted,
+      avgFormatted,
+      minFormatted,
+      maxFormatted,
       truncated,
     }
   }
@@ -361,16 +374,15 @@ export class PanelGridSelection {
   formatStatsText() {
     const s = this.computeSummary()
     if (!s || s.cellCount === 0) return ''
-    const fmtNum = formatAggNum
     const parts = [
       `Selected: ${s.rowCount} row${s.rowCount === 1 ? '' : 's'} × ${s.colCount} col${s.colCount === 1 ? '' : 's'} (${s.cellCount}${s.truncated ? '+' : ''} cell${s.cellCount === 1 ? '' : 's'})`,
       `Non-null: ${s.nonNullCount}`,
     ]
     if (s.numericCount > 0) {
-      parts.push(`Sum: ${fmtNum(s.sum)}`)
-      parts.push(`Avg: ${fmtNum(s.avg)}`)
-      parts.push(`Min: ${fmtNum(s.min)}`)
-      parts.push(`Max: ${fmtNum(s.max)}`)
+      parts.push(`Sum: ${s.sumFormatted ?? formatAggNum(s.sum)}`)
+      parts.push(`Avg: ${s.avgFormatted ?? formatAggNum(s.avg)}`)
+      parts.push(`Min: ${s.minFormatted ?? formatAggNum(s.min)}`)
+      parts.push(`Max: ${s.maxFormatted ?? formatAggNum(s.max)}`)
     }
     return parts.join(' · ')
   }
@@ -702,10 +714,18 @@ export class PanelGridSelection {
         const cur = this.focus || { r: 0, c: 0 }
         let nr = cur.r
         let nc = cur.c
-        if (key === 'ArrowUp') nr = Math.max(0, cur.r - 1)
-        if (key === 'ArrowDown') nr = Math.min(rows - 1, cur.r + 1)
-        if (key === 'ArrowLeft') nc = Math.max(0, cur.c - 1)
-        if (key === 'ArrowRight') nc = Math.min(cols - 1, cur.c + 1)
+        const transposed = Boolean(this.isTransposed())
+        if (transposed) {
+          if (key === 'ArrowUp') nc = Math.max(0, cur.c - 1)
+          if (key === 'ArrowDown') nc = Math.min(cols - 1, cur.c + 1)
+          if (key === 'ArrowLeft') nr = Math.max(0, cur.r - 1)
+          if (key === 'ArrowRight') nr = Math.min(rows - 1, cur.r + 1)
+        } else {
+          if (key === 'ArrowUp') nr = Math.max(0, cur.r - 1)
+          if (key === 'ArrowDown') nr = Math.min(rows - 1, cur.r + 1)
+          if (key === 'ArrowLeft') nc = Math.max(0, cur.c - 1)
+          if (key === 'ArrowRight') nc = Math.min(cols - 1, cur.c + 1)
+        }
         if (this.onEnsureCellVisible) this.onEnsureCellVisible(nr, nc)
         this.selectCell(nr, nc, { shift: e.shiftKey })
         const targetTd = this.tableEl.querySelector(`tbody td[data-row-idx="${nr}"][data-col-idx="${nc}"]`)

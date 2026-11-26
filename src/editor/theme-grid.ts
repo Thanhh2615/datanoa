@@ -902,10 +902,11 @@ export const EDITOR_GRID_STYLE = `
   /* Query Execution Feedback Banner (Success & Error) */
   .datanoa-query-banner {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
-    gap: 12px;
-    margin: 6px 10px 4px 10px;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    margin: 8px 12px 4px 12px;
     padding: 8px 12px;
     border-radius: var(--radius);
     border: 1px solid var(--border-strong);
@@ -964,7 +965,8 @@ export const EDITOR_GRID_STYLE = `
   .datanoa-query-banner-actions {
     display: flex;
     align-items: center;
-    gap: 6px;
+    flex-wrap: wrap;
+    gap: 8px;
     flex-shrink: 0;
   }
 

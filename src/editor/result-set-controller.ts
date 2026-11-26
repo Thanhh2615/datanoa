@@ -248,7 +248,9 @@ export function buildCombinedExplainResult(
     executionTimeMs: totalMs,
     truncated: lead.truncated,
     isSelect: true,
-    ...(collectedSets.length > 1 ? { resultSets: collectedSets } : {}),
+    ...(collectedSets.length > 1 || collectedSets.some((s) => s.isError)
+      ? { resultSets: collectedSets }
+      : {}),
   }
 }
 

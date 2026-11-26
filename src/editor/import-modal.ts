@@ -567,7 +567,7 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
     skipAllBtn.disabled = disabled || !dataset || dataset.headers.length === 0
     cancelBtn.disabled = disabled
     stageRadio.disabled =
-      disabled || !ctx.canStageInGrid || builtResult.rows.length > MAX_STAGE_IN_GRID_ROWS
+      disabled || !ctx.canStageInGrid || totalReadyRowCount > MAX_STAGE_IN_GRID_ROWS
     directRadio.disabled = disabled
     for (const sel of mappingSelectEls) {
       sel.disabled = disabled
@@ -575,12 +575,12 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
   }
 
   const syncModeSelection = (): void => {
-    const canStage = ctx.canStageInGrid && builtResult.rows.length <= MAX_STAGE_IN_GRID_ROWS
+    const canStage = ctx.canStageInGrid && totalReadyRowCount <= MAX_STAGE_IN_GRID_ROWS
     if (!canStage) {
       deliveryMode = 'direct'
     } else if (!userPickedMode) {
       deliveryMode =
-        builtResult.rows.length <= AUTO_STAGE_IN_GRID_THRESHOLD ? 'stage' : 'direct'
+        totalReadyRowCount <= AUTO_STAGE_IN_GRID_THRESHOLD ? 'stage' : 'direct'
     }
     stageRadio.checked = deliveryMode === 'stage'
     directRadio.checked = deliveryMode === 'direct'
@@ -588,7 +588,7 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
     stageLabel.classList.toggle('disabled', !canStage)
     stageLabel.title = !ctx.canStageInGrid
       ? 'Grid staging requires an editable active table with a Primary Key'
-      : builtResult.rows.length > MAX_STAGE_IN_GRID_ROWS
+      : totalReadyRowCount > MAX_STAGE_IN_GRID_ROWS
         ? `Datasets over ${MAX_STAGE_IN_GRID_ROWS} rows use Direct Batch Insert for performance`
         : 'Stage imported rows in the grid so you can inspect, edit, preview DML, or revert before Submit'
   }
@@ -715,12 +715,39 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
     })
   }
 
+  const MAX_IMPORT_PREVIEW_ROWS = 50
+  const countImportableSourceRows = (
+    srcDataset: ParsedImportDataset,
+    skipEmpty: boolean
+  ): { totalReady: number; skippedEmptyRows: number } => {
+    if (!skipEmpty) {
+      return { totalReady: srcDataset.rows.length, skippedEmptyRows: 0 }
+    }
+    let totalReady = 0
+    let skippedEmptyRows = 0
+    for (const row of srcDataset.rows) {
+      let blank = true
+      for (const cell of row) {
+        if (cell === null || cell === undefined) continue
+        if (typeof cell === 'string' && cell.trim() === '') continue
+        blank = false
+        break
+      }
+      if (blank) skippedEmptyRows++
+      else totalReady++
+    }
+    return { totalReady, skippedEmptyRows }
+  }
+
+  let totalReadyRowCount = 0
+
   const rebuildPreviewAndValidation = (): void => {
     if (parseError) {
       errorBox.textContent = parseError
       errorBox.style.display = 'block'
       warnBox.style.display = 'none'
       builtResult = { rows: [], skippedEmptyRows: 0 }
+      totalReadyRowCount = 0
       renderDataPreview([])
       sqlPre.textContent = `-- ${parseError}`
       summaryEl.textContent = 'Parse error'
@@ -734,6 +761,7 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
       errorBox.style.display = 'none'
       warnBox.style.display = 'none'
       builtResult = { rows: [], skippedEmptyRows: 0 }
+      totalReadyRowCount = 0
       renderDataPreview([])
       sqlPre.textContent = isMongo
         ? '-- Choose a CSV, TSV, JSON, or NDJSON file to preview insertOne() commands.'
@@ -751,11 +779,15 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
         ? buildInferredMongoColumns(dataset.headers)
         : ctx.targetColumns
     const validation = validateImportMapping(mapping, effectiveCols)
+    const rowStats = countImportableSourceRows(dataset, skipEmptyRows)
+    totalReadyRowCount = validation.valid ? rowStats.totalReady : 0
     builtResult = validation.valid
       ? buildMappedImportRecords(dataset, mapping, effectiveCols, {
           nullHandling: nullHandlingOpt,
           trimValues,
           skipEmptyRows,
+          sourceFormat: dataset.resolvedFormat,
+          maxRows: MAX_IMPORT_PREVIEW_ROWS,
         })
       : { rows: [], skippedEmptyRows: 0 }
 
@@ -764,7 +796,7 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
       .filter((col): col is string => typeof col === 'string' && col.length > 0)
 
     const allErrors = [...validation.errors]
-    if (validation.valid && builtResult.rows.length === 0) {
+    if (validation.valid && totalReadyRowCount === 0) {
       allErrors.push('No non-empty data rows found to import.')
     }
 
@@ -776,8 +808,8 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
     }
 
     const allWarnings = [...dataset.warnings, ...validation.warnings]
-    if (builtResult.skippedEmptyRows > 0) {
-      allWarnings.push(`Skipped ${builtResult.skippedEmptyRows} empty row(s).`)
+    if (rowStats.skippedEmptyRows > 0) {
+      allWarnings.push(`Skipped ${rowStats.skippedEmptyRows} empty row(s).`)
     }
     if (allWarnings.length > 0) {
       warnBox.textContent = allWarnings.join(' ')
@@ -802,7 +834,7 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
 
     syncModeSelection()
 
-    const count = builtResult.rows.length
+    const count = totalReadyRowCount
     const delimLabel =
       dataset.resolvedDelimiter === '\t'
         ? 'TAB'
@@ -961,7 +993,9 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
 
   autoMapBtn.addEventListener('click', () => {
     if (!dataset || isImporting) return
-    mapping = autoMapImportColumns(dataset.headers, ctx.targetColumns, dataset.hasNamedHeaders)
+    const colsForMapping =
+      isMongo && ctx.targetColumns.length === 0 ? mappableTargetColumns : ctx.targetColumns
+    mapping = autoMapImportColumns(dataset.headers, colsForMapping, dataset.hasNamedHeaders)
     committedRowCount = 0
     renderMappingTable()
     rebuildPreviewAndValidation()
@@ -997,8 +1031,19 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
   })
 
   importBtn.addEventListener('click', () => {
-    if (isImporting || builtResult.rows.length === 0 || !ctx.activeConnectionId) return
-    const recordsToImport = builtResult.rows
+    if (isImporting || !dataset || totalReadyRowCount === 0 || !ctx.activeConnectionId) return
+    const effectiveCols: ColumnInfo[] =
+      isMongo && ctx.targetColumns.length === 0
+        ? buildInferredMongoColumns(dataset.headers)
+        : ctx.targetColumns
+    const fullBuilt = buildMappedImportRecords(dataset, mapping, effectiveCols, {
+      nullHandling: nullHandlingOpt,
+      trimValues,
+      skipEmptyRows,
+      sourceFormat: dataset.resolvedFormat,
+    })
+    const recordsToImport = fullBuilt.rows
+    if (recordsToImport.length === 0) return
 
     if (deliveryMode === 'stage') {
       const stagedCount = ctx.onStageRows(recordsToImport)
@@ -1073,7 +1118,6 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
         }
         batchSucceeded = !abortedByClose
       } catch (err: unknown) {
-        stopTimer()
         isImporting = false
         setButtonLoading(importBtn, false)
         setControlsDisabled(false)
@@ -1100,11 +1144,15 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
           }
         }
         return
+      } finally {
+        stopTimer()
+        if (abortedByClose) {
+          isImporting = false
+        }
       }
 
       if (batchSucceeded) {
         committedRowCount = 0
-        stopTimer()
         isImporting = false
         closeModalSafe()
         try {

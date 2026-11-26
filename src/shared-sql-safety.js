@@ -3,23 +3,23 @@
 // Shared by Worker/Studio (.ts) and native-ESM Side Panel (.js) modules.
 
 import {
+  advanceMongoJsToken,
+  getDialectLexerRules,
   isIdentContChar,
   isIdentStartChar,
   isPostgresEscapeStringStart,
   matchDollarQuoteTag,
   matchMysqlExecCommentPrefix,
   scanBlockCommentEnd,
+  scanBracketIdentEnd,
   scanLineCommentEnd,
   scanOracleQuoteEnd,
   scanQuotedSegmentEnd,
   splitMssqlBatches,
   splitOracleSlashChunks,
   splitSqlStatements,
-  stripCommentsAndLiterals,
+  stripCommentsAndLiteralsDetailed,
   stripLeadingSqlComments,
-  supportsDollarQuoting,
-  supportsNestedBlockComments,
-  usesBackslashAndHash,
 } from './shared-sql-core.js'
 
 const SENSITIVE_QUERY_KEY_RE =
@@ -274,7 +274,13 @@ const SENSITIVE_TEXT_KV_PARAM_PREFIX_RE = /([?&#])([^=&\s#;"'{}\\]+)=/g
 const SCRUB_URI_FRAGMENT_RE =
   /(?<![a-zA-Z0-9+.-])([a-zA-Z][a-zA-Z0-9+.-]{0,31}:(?:\\*\/){2}(?:\\+\/|[^\\\s#'"`<>}])+)#((?:\\+\/|[^\\\s'"`<>}])*)/g
 const ADO_KV_SECRET_PREFIX_RE =
-  /(^|[;\s,"'{(\[]|\\["'nrt])(pass(?:word|wd|phrase)?|pwd|sslpassword|tlsCertificateKeyFilePassword|auth[-_]?token|authtoken|jwt|secret|client[-_]?secret|access[-_]?token|refresh[-_]?token|id[-_]?token|private[-_]?key|api[-_]?key|apikey|token|bearer|credentials?|authorization|sig(?:nature)?)\s*=\s*/gi
+  /(^|[;\s,"'{(\[]|\\["'nrt])((?:[A-Za-z0-9_.-]*[-_])?(?:pass(?:word|wd|phrase)?|pwd|sslpassword|tlsCertificateKeyFilePassword|auth[-_]?token|authtoken|jwt|secret|client[-_]?secret|access[-_]?token|refresh[-_]?token|id[-_]?token|private[-_]?key|api[-_]?key|apikey|token|bearer|credentials?|authorization|sig(?:nature)?)|(?:pg|db|mysql|maria|redis|mongo|oracle|mssql|sql|aws|gcp|azure|openai|anthropic|gemini|smtp|ldap|ssh|tls|ssl|app|service|admin|root|user)[A-Za-z0-9_-]*(?:pass(?:word|wd|phrase)?|pwd|secret|token|apikey))\s*=\s*/gi
+
+const JSON_KV_SECRET_RE =
+  /("(?:[^"\\]*(?:pass(?:word|wd|phrase)?|pwd|secret|token|api[-_]?key|apikey|private[-_]?key|client[-_]?secret|authorization|credentials?))"\s*:\s*")(?!\[REDACTED\]")((?:\\.|[^"\\])+)(")/gi
+
+const ORACLE_EASY_CONNECT_SECRET_RE =
+  /(?<![:/\\A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_$.#-]{0,63})\/(?!\[REDACTED\]@)([^\s/@"'`<>]{1,128})@([A-Za-z0-9_.-]+(?::\d{1,5})?\/[A-Za-z0-9_.$#-]+)/g
 
 function isSecretValueTerminator(ch, mode) {
   if (!ch) return true
@@ -448,11 +454,31 @@ function isUriSchemeBoundaryValid(text, matchIndex) {
   return matchIndex === 0 || !/[a-zA-Z0-9+.-]/.test(text[matchIndex - 1])
 }
 
-function scanUriBodyEnd(input, startIdx) {
+function scanUriBodyEnd(input, startIdx, outerQuote = '') {
   let i = startIdx
-  while (i < input.length && !/[\s'"`<>]/.test(input[i])) {
+  while (i < input.length && !/[\s`<>]/.test(input[i])) {
+    const ch = input[i]
+    if (ch === '"' || ch === "'") {
+      if (outerQuote && ch === outerQuote) {
+        break
+      }
+      // Allow single/double quote inside URI password ONLY when `@host` follows before whitespace
+      let probe = i + 1
+      let sawAtBeforeWs = false
+      while (probe < input.length && !/[\s`<>]/.test(input[probe])) {
+        if (outerQuote && input[probe] === outerQuote) break
+        if (input[probe] === '@') {
+          sawAtBeforeWs = true
+          break
+        }
+        probe++
+      }
+      if (!sawAtBeforeWs) {
+        break
+      }
+    }
     if (
-      input[i] === '\\' &&
+      ch === '\\' &&
       i + 1 < input.length &&
       (input[i + 1] === '"' || input[i + 1] === "'")
     ) {
@@ -481,8 +507,10 @@ function redactUriCredentials(input) {
     if (!isUriSchemeBoundaryValid(input, matchStart)) continue
 
     const bodyStart = matchStart + match[0].length
+    const prevCh = matchStart > 0 ? input[matchStart - 1] : ''
+    const outerQuote = prevCh === '"' || prevCh === "'" ? prevCh : ''
 
-    const restEnd = scanUriBodyEnd(input, bodyStart)
+    const restEnd = scanUriBodyEnd(input, bodyStart, outerQuote)
     const body = input.slice(bodyStart, restEnd)
     const colonIdx = body.search(/[:/?#@[\]\\]/)
     if (colonIdx < 0 || body[colonIdx] !== ':') continue
@@ -546,6 +574,8 @@ export function scrubSensitiveText(input, options = {}) {
     )
 
   out = replaceKvSecretsWithScanner(out, ADO_KV_SECRET_PREFIX_RE, 'ado', '[REDACTED]')
+  out = out.replace(JSON_KV_SECRET_RE, '$1[REDACTED]$3')
+  out = out.replace(ORACLE_EASY_CONNECT_SECRET_RE, '$1/[REDACTED]@$3')
 
   return out
 }
@@ -691,7 +721,13 @@ export function detectRedisCredentialCommand(script) {
     if (cmd === 'CONFIG' && args[1].toUpperCase() === 'SET') {
       for (let i = 2; i + 1 < args.length; i += 2) {
         const param = args[i].toLowerCase()
-        if ((param === 'requirepass' || param === 'masterauth') && isRealSecretToken(args[i + 1])) {
+        if (
+          (param === 'requirepass' ||
+            param === 'masterauth' ||
+            param === 'tls-key-file-pass' ||
+            /(?:^|[-_])(?:pass(?:word|phrase)?|secret|auth)$/.test(param)) &&
+          isRealSecretToken(args[i + 1])
+        ) {
           return true
         }
       }
@@ -733,6 +769,27 @@ export function scrubSqlPreviewForStorage(raw) {
   return scrubSensitiveText(raw, { stripOpaqueFragment: true })
 }
 
+function scrubErrorTextForStorage(raw) {
+  let out = scrubSensitiveText(raw, { stripOpaqueFragment: true })
+  out = out
+    .replace(
+      /\b(identified\s+by\s+)(?:'(?:''|[^'])*'|"(?:""|[^"])*"|[^\s;,()]+)/gi,
+      '$1[REDACTED]'
+    )
+    .replace(
+      /\b((?:with|encrypted|unencrypted)\s+password\s+)(?:'(?:''|[^'])*'|"(?:""|[^"])*"|[^\s;,()]+)/gi,
+      '$1[REDACTED]'
+    )
+    .replace(
+      /\b(set\s+password(?:\s+for\s+[^\s=]+)?\s*=\s*)(?:'(?:''|[^'])*'|"(?:""|[^"])*")/gi,
+      '$1[REDACTED]'
+    )
+  if (detectRedisCredentialCommand(out)) {
+    return '[REDACTED]'
+  }
+  return out
+}
+
 function sanitizeSqlResultNode(node) {
   if (!node || typeof node !== 'object' || Array.isArray(node)) return node
   const copy = { ...node }
@@ -745,10 +802,10 @@ function sanitizeSqlResultNode(node) {
       : scrubSensitiveText(copy.sql, { stripOpaqueFragment: true })
   }
   if (typeof copy.error === 'string') {
-    copy.error = scrubSensitiveText(copy.error, { stripOpaqueFragment: true })
+    copy.error = scrubErrorTextForStorage(copy.error)
   }
   if (typeof copy.errorMessage === 'string') {
-    copy.errorMessage = scrubSensitiveText(copy.errorMessage, { stripOpaqueFragment: true })
+    copy.errorMessage = scrubErrorTextForStorage(copy.errorMessage)
   }
   return copy
 }
@@ -776,7 +833,13 @@ export function scrubConnectionNameForStorage(raw) {
 }
 
 function parseExplainAnalyzeAndMutating(rawText, dialect) {
-  const clean = stripCommentsAndLiterals(rawText, dialect, true).replace(/^[\s(]+/, '').trim()
+  const clean = stripCommentsAndLiteralsDetailed(rawText, dialect, {
+    preserveMysqlExecComments: true,
+    literalPlaceholder: " '' ",
+    identPlaceholder: ' x ',
+  })
+    .text.replace(/^[\s(]+/, '')
+    .trim()
   let rest = clean.replace(/^EXPLAIN\b/i, '').trimStart()
   let hasAnalyze = false
   let hasWriteOption = false
@@ -800,9 +863,12 @@ function parseExplainAnalyzeAndMutating(rawText, dialect) {
         break
       }
       const groupContent = rest.slice(1, closeIdx)
-      const analyzeMatch = /\bANALY[ZS]E\b(?:\s+(FALSE|OFF|0)\b)?/i.exec(groupContent)
-      if (analyzeMatch && !analyzeMatch[1]) {
-        hasAnalyze = true
+      const analyzeRe = /\bANALY[ZS]E\b(?:\s+(FALSE|OFF|0)\b)?/gi
+      let analyzeMatch
+      while ((analyzeMatch = analyzeRe.exec(groupContent)) !== null) {
+        if (!analyzeMatch[1]) {
+          hasAnalyze = true
+        }
       }
       if (/\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i.test(groupContent)) {
         hasWriteOption = true
@@ -819,7 +885,7 @@ function parseExplainAnalyzeAndMutating(rawText, dialect) {
     }
 
     const stdOpt =
-      /^(?:VERBOSE|QUERY\s+PLAN|EXTENDED|PARTITIONS|DISTSQL|OPT|TYPES|VEC|AST|SYNTAX|PLAN|PIPELINE|ESTIMATE|TABLE\s+OVERRIDE|CURRENT\s+TRANSACTION|FOR\s+CONNECTION\s+\d+|FORMAT\s*=\s*[A-Za-z0-9_]+|FORMAT\s+[A-Za-z0-9_]+)\b/i.exec(
+      /^(?:VERBOSE|QUERY\s+PLAN|EXTENDED|PARTITIONS|DISTSQL|OPT|TYPES|VEC|AST|SYNTAX|PLAN|PIPELINE|ESTIMATE|TABLE\s+OVERRIDE|CURRENT\s+TRANSACTION|FOR\s+CONNECTION\s+\d+|FORMAT\s*=\s*(?:''|[A-Za-z0-9_]+)|FORMAT\s+(?:''|[A-Za-z0-9_]+))/i.exec(
         rest
       )
     if (stdOpt) {
@@ -827,7 +893,7 @@ function parseExplainAnalyzeAndMutating(rawText, dialect) {
       continue
     }
 
-    const chSettingOpt = /^[A-Za-z_][A-Za-z0-9_]*\s*=\s*[A-Za-z0-9_]+\s*,?/i.exec(rest)
+    const chSettingOpt = /^[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:''|[A-Za-z0-9_]+)\s*,?/i.exec(rest)
     if (chSettingOpt) {
       rest = rest.slice(chSettingOpt[0].length).trimStart()
       continue
@@ -857,11 +923,7 @@ function parseExplainAnalyzeAndMutating(rawText, dialect) {
 function tokenizeStatementForSafety(sql, dialect) {
   const tokens = []
   const len = sql.length
-  const backslashAndHash = usesBackslashAndHash(dialect)
-  const nestedComments = supportsNestedBlockComments(dialect)
-  const dollarQuotes = supportsDollarQuoting(dialect)
-  const bracketIdents =
-    dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1' || dialect === 'mssql'
+  const rules = getDialectLexerRules(dialect)
   let depth = 0
   let execCommentDepth = 0
   let i = 0
@@ -869,12 +931,17 @@ function tokenizeStatementForSafety(sql, dialect) {
   while (i < len) {
     const ch = sql[i]
 
-    if (ch === '-' && i + 1 < len && sql[i + 1] === '-') {
+    if (rules.lineCommentDash && ch === '-' && i + 1 < len && sql[i + 1] === '-') {
       i = scanLineCommentEnd(sql, i)
       continue
     }
 
-    if (ch === '#' && backslashAndHash) {
+    if (rules.lineCommentSlash && ch === '/' && i + 1 < len && sql[i + 1] === '/') {
+      i = scanLineCommentEnd(sql, i)
+      continue
+    }
+
+    if (rules.lineCommentHash && ch === '#') {
       i = scanLineCommentEnd(sql, i - 1)
       continue
     }
@@ -892,7 +959,7 @@ function tokenizeStatementForSafety(sql, dialect) {
         i += execLen
         continue
       }
-      i = scanBlockCommentEnd(sql, i, nestedComments)
+      i = scanBlockCommentEnd(sql, i, rules.nestedBlockComments)
       continue
     }
 
@@ -908,11 +975,11 @@ function tokenizeStatementForSafety(sql, dialect) {
     }
 
     if (ch === "'") {
-      i = scanQuotedSegmentEnd(sql, i, "'", backslashAndHash).end
+      i = scanQuotedSegmentEnd(sql, i, "'", rules.backslashEscapesSingleQuote).end
       continue
     }
 
-    if (dollarQuotes && ch === '$') {
+    if (rules.dollarQuoting && ch === '$') {
       const tag = matchDollarQuoteTag(sql, i)
       if (tag !== null) {
         const closeIdx = sql.indexOf(tag, i + tag.length)
@@ -921,30 +988,22 @@ function tokenizeStatementForSafety(sql, dialect) {
       }
     }
 
-    if (ch === '"' || ch === '`') {
-      const seg = scanQuotedSegmentEnd(sql, i, ch, false)
+    if (ch === '"' || (ch === '`' && rules.backtickIdentifiers)) {
+      const allowBs = ch === '"' && rules.backslashEscapesDoubleQuote
+      const seg = scanQuotedSegmentEnd(sql, i, ch, allowBs)
       const raw = sql.slice(i + 1, seg.closed ? seg.end - 1 : seg.end)
       const unescaped = ch === '`' ? raw.replace(/``/g, '`') : raw.replace(/""/g, '"')
       tokens.push({ text: unescaped, depth, kind: 'quoted' })
       i = seg.end
       continue
     }
-    if (bracketIdents && ch === '[') {
-      let j = i + 1
-      while (j < len) {
-        if (sql[j] === ']') {
-          if (j + 1 < len && sql[j + 1] === ']') {
-            j += 2
-            continue
-          }
-          break
-        }
-        j++
-      }
-      const raw = sql.slice(i + 1, j)
-      const unescaped = raw.replace(/]]/g, ']')
+    if (rules.bracketIdentifiers !== 'none' && ch === '[') {
+      const allowDoubling = rules.bracketIdentifiers === 'doubling'
+      const seg = scanBracketIdentEnd(sql, i, allowDoubling)
+      const raw = sql.slice(i + 1, seg.closed ? seg.end - 1 : seg.end)
+      const unescaped = allowDoubling ? raw.replace(/]]/g, ']') : raw
       tokens.push({ text: unescaped, depth, kind: 'quoted' })
-      i = j < len ? j + 1 : len
+      i = seg.end
       continue
     }
 
@@ -1021,9 +1080,10 @@ const DROP_TARGET_MODIFIERS = new Set([
   'INDEX',
 ])
 
-const CTE_MAIN_DML_KEYWORDS = new Set(['DELETE', 'UPDATE', 'DROP', 'TRUNCATE'])
+const CTE_MAIN_DML_KEYWORDS = new Set(['DELETE', 'UPDATE', 'DROP', 'TRUNCATE', 'MERGE'])
 const NO_MODIFIERS = new Set()
 const TRUNCATE_TARGET_MODIFIERS = new Set(['TABLE'])
+const MERGE_TARGET_MODIFIERS = new Set(['INTO'])
 
 function findTargetAtDepth(tokens, startIdx, targetDepth, modifiers) {
   for (let i = startIdx + 1; i < tokens.length; i++) {
@@ -1040,15 +1100,29 @@ function findTargetAtDepth(tokens, startIdx, targetDepth, modifiers) {
 function unwrapExplainAnalyzeOffset(tokens, rawText, dialect) {
   const firstWord = tokens[0]?.kind === 'word' ? tokens[0].text.toUpperCase() : ''
   if (firstWord === 'ANALYZE' && dialect === 'mariadb' && tokens.length > 1) {
-    const nextUpper = tokens[1].kind === 'word' ? tokens[1].text.toUpperCase() : ''
+    let idx = 1
+    if (tokens[idx]?.kind === 'word' && tokens[idx].text.toUpperCase() === 'FORMAT') {
+      idx++
+      // Note: '=' was skipped by safety tokenizer, so next token is format value (or skipped string)
+      if (
+        idx < tokens.length &&
+        tokens[idx].kind === 'word' &&
+        !CTE_MAIN_DML_KEYWORDS.has(tokens[idx].text.toUpperCase()) &&
+        tokens[idx].text.toUpperCase() !== 'WITH'
+      ) {
+        idx++
+      }
+    }
+    const nextUpper = tokens[idx]?.kind === 'word' ? tokens[idx].text.toUpperCase() : ''
     if (
       nextUpper === 'DELETE' ||
       nextUpper === 'UPDATE' ||
       nextUpper === 'DROP' ||
       nextUpper === 'TRUNCATE' ||
+      nextUpper === 'MERGE' ||
       nextUpper === 'WITH'
     ) {
-      return 1
+      return idx
     }
   }
   if (firstWord === 'EXPLAIN') {
@@ -1083,7 +1157,8 @@ const SCOPE_WHERE_STOP_KEYWORDS = new Set([
   'DECLARE',
 ])
 
-const MSSQL_DML_EVENT_PREDECESSORS = new Set(['ON', 'AFTER', 'FOR', 'OF'])
+const MSSQL_DML_EVENT_PREDECESSORS = new Set(['ON', 'AFTER', 'FOR', 'OF', 'GRANT', 'REVOKE', 'DENY', 'AS'])
+const MSSQL_PERMISSION_STARTERS = new Set(['GRANT', 'REVOKE', 'DENY'])
 const MSSQL_STANDALONE_DROP_OBJECTS = new Set([
   'TABLE',
   'DATABASE',
@@ -1247,16 +1322,40 @@ function inspectScopeForDangerousDml(tokens, startIdx, scopeDepth, stmtIdx, prev
       target,
       message: `TRUNCATE statement will remove all rows from "${target || 'table'}"`,
     })
+    return
+  }
+
+  if (mainWord === 'MERGE') {
+    const target = findTargetAtDepth(tokens, startIdx, scopeDepth, MERGE_TARGET_MODIFIERS)
+    let hasDeleteBranch = false
+    for (let i = startIdx + 1; i < tokens.length; i++) {
+      const t = tokens[i]
+      if (t.depth < scopeDepth) break
+      if (t.depth !== scopeDepth || t.kind !== 'word') continue
+      if (isPrecededByDot(tokens, i)) continue
+      const u = t.text.toUpperCase()
+      if (u === 'DELETE') {
+        hasDeleteBranch = true
+        break
+      }
+    }
+    if (hasDeleteBranch) {
+      findings.push({
+        kind: 'delete_without_where',
+        statementIndex: stmtIdx,
+        statementPreview: preview,
+        target,
+        message: `MERGE statement ${target ? `on "${target}" ` : ''}contains a DELETE branch`,
+      })
+    }
   }
 }
 
 function isRedisDangerousCommand(sql) {
   for (const line of sql.split(/\r?\n/)) {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) continue
-    const match = /^["']?([A-Za-z_][A-Za-z0-9_-]*)["']?/.exec(trimmed)
-    if (!match) continue
-    const cmd = match[1].toUpperCase()
+    const args = tokenizeRedisCommandLine(line)
+    if (args.length === 0) continue
+    const cmd = args[0].toUpperCase()
     if (cmd === 'FLUSHALL' || cmd === 'FLUSHDB') {
       return true
     }
@@ -1264,71 +1363,146 @@ function isRedisDangerousCommand(sql) {
   return false
 }
 
-function scanJsStringTokenEnd(src, start, quoteChar) {
-  let i = start + 1
-  const len = src.length
-  while (i < len) {
-    const ch = src[i]
-    if (ch === '\\') {
+function decodeJsEscapes(raw) {
+  let out = ''
+  let i = 0
+  while (i < raw.length) {
+    if (raw[i] === '\\' && i + 1 < raw.length) {
+      const next = raw[i + 1]
+      if (next === 'u') {
+        if (raw[i + 2] === '{') {
+          const closeBrace = raw.indexOf('}', i + 3)
+          const hex = closeBrace > i + 3 ? raw.slice(i + 3, closeBrace) : ''
+          if (/^[0-9a-fA-F]{1,6}$/.test(hex)) {
+            const cp = parseInt(hex, 16)
+            if (cp <= 0x10ffff) {
+              out += String.fromCodePoint(cp)
+              i = closeBrace + 1
+              continue
+            }
+          }
+        } else if (i + 5 < raw.length && /^[0-9a-fA-F]{4}$/.test(raw.slice(i + 2, i + 6))) {
+          out += String.fromCharCode(parseInt(raw.slice(i + 2, i + 6), 16))
+          i += 6
+          continue
+        }
+      } else if (next === 'x' && i + 3 < raw.length && /^[0-9a-fA-F]{2}$/.test(raw.slice(i + 2, i + 4))) {
+        out += String.fromCharCode(parseInt(raw.slice(i + 2, i + 4), 16))
+        i += 4
+        continue
+      } else if (next === 'n') {
+        out += '\n'
+        i += 2
+        continue
+      } else if (next === 'r') {
+        out += '\r'
+        i += 2
+        continue
+      } else if (next === 't') {
+        out += '\t'
+        i += 2
+        continue
+      }
+      out += next
       i += 2
       continue
     }
-    if (ch === quoteChar) {
-      return i + 1
-    }
+    out += raw[i]
     i++
   }
-  return len
+  return out
 }
 
 function tokenizeMongoScript(script) {
   const tokens = []
   let i = 0
+  let prevKind = 'start'
   const len = script.length
+
   while (i < len) {
     const ch = script[i]
     if (/\s/.test(ch)) {
       i++
       continue
     }
-    if (ch === '/' && script[i + 1] === '/') {
-      const nl = script.indexOf('\n', i + 2)
-      i = nl < 0 ? len : nl + 1
+    // Honor leading `-- ` SQL-style comment lines (when at line start and followed by space/EOL),
+    // while NEVER treating JS postfix/prefix `--` decrement (`n--; db.users.drop()`) as a comment!
+    if (ch === '-' && i + 1 < len && script[i + 1] === '-') {
+      let ls = i - 1
+      while (ls >= 0 && (script[ls] === ' ' || script[ls] === '\t')) ls--
+      const atLineStart = ls < 0 || script[ls] === '\n' || script[ls] === '\r'
+      const afterCh = script[i + 2]
+      if (atLineStart && (afterCh === undefined || afterCh === ' ' || afterCh === '\t' || afterCh === '\r' || afterCh === '\n')) {
+        const nl = script.indexOf('\n', i + 2)
+        i = nl < 0 ? len : nl + 1
+        continue
+      }
+    }
+    // Handle JS Unicode-escaped identifier starts (e.g. `\u0064rop`)
+    if (ch === '\\' && i + 1 < len && script[i + 1] === 'u') {
+      let j = i
+      while (j < len && (/[A-Za-z0-9_$]/.test(script[j]) || (script[j] === '\\' && script[j + 1] === 'u'))) {
+        if (script[j] === '\\' && script[j + 1] === 'u') {
+          if (script[j + 2] === '{') {
+            const cb = script.indexOf('}', j + 3)
+            j = cb > j + 3 ? cb + 1 : j + 2
+          } else {
+            j += 6
+          }
+        } else {
+          j++
+        }
+      }
+      const raw = script.slice(i, j)
+      tokens.push({ kind: 'ident', text: decodeJsEscapes(raw), start: i, end: j })
+      prevKind = 'ident'
+      i = j
       continue
     }
-    if (ch === '-' && script[i + 1] === '-') {
-      const nl = script.indexOf('\n', i + 2)
-      i = nl < 0 ? len : nl + 1
+
+    const tok = advanceMongoJsToken(script, i, prevKind)
+    if (tok.kind === 'ws' || tok.kind === 'comment') {
+      i = tok.end
       continue
     }
-    if (ch === '/' && script[i + 1] === '*') {
-      const close = script.indexOf('*/', i + 2)
-      i = close < 0 ? len : close + 2
-      continue
-    }
-    if (ch === "'" || ch === '"' || ch === '`') {
-      const end = scanJsStringTokenEnd(script, i, ch)
-      const inner = end > i + 1 && script[end - 1] === ch ? script.slice(i + 1, end - 1) : script.slice(i + 1, end)
-      tokens.push({ kind: 'string', text: script.slice(i, end), value: inner, start: i, end })
+    if (tok.kind === 'string') {
+      const q = script[i]
+      const closed = tok.end > i + 1 && script[tok.end - 1] === q
+      const rawInner = closed ? script.slice(i + 1, tok.end - 1) : script.slice(i + 1, tok.end)
+      tokens.push({
+        kind: 'string',
+        text: tok.text,
+        value: decodeJsEscapes(rawInner),
+        closed,
+        start: i,
+        end: tok.end,
+      })
+    } else if (tok.kind === 'ident') {
+      // Check if ident continues with `\uXXXX`
+      let end = tok.end
+      while (end < len && script[end] === '\\' && script[end + 1] === 'u') {
+        if (script[end + 2] === '{') {
+          const cb = script.indexOf('}', end + 3)
+          end = cb > end + 3 ? cb + 1 : end + 2
+        } else {
+          end += 6
+        }
+        while (end < len && /[A-Za-z0-9_$]/.test(script[end])) end++
+      }
+      const raw = script.slice(i, end)
+      tokens.push({ kind: 'ident', text: decodeJsEscapes(raw), start: i, end })
+      prevKind = tok.nextPrevKind
       i = end
       continue
+    } else if (tok.kind === 'regex') {
+      tokens.push({ kind: 'regex', text: tok.text, start: i, end: tok.end })
+    } else if (tok.kind === 'number') {
+      tokens.push({ kind: 'number', text: tok.text, start: i, end: tok.end })
+    } else {
+      tokens.push({ kind: 'punct', text: tok.text, start: i, end: tok.end })
     }
-    if (/[A-Za-z_$]/.test(ch)) {
-      let j = i + 1
-      while (j < len && /[A-Za-z0-9_$]/.test(script[j])) j++
-      tokens.push({ kind: 'ident', text: script.slice(i, j), start: i, end: j })
-      i = j
-      continue
-    }
-    if (/[0-9]/.test(ch)) {
-      let j = i + 1
-      while (j < len && /[0-9.]/.test(script[j])) j++
-      tokens.push({ kind: 'number', text: script.slice(i, j), start: i, end: j })
-      i = j
-      continue
-    }
-    tokens.push({ kind: 'punct', text: ch, start: i, end: i + 1 })
-    i++
+    prevKind = tok.nextPrevKind
+    i = tok.end
   }
   return tokens
 }
@@ -1442,12 +1616,12 @@ function isEmptyFilterArgTokens(argTokens) {
   )
 }
 
-function resolveShellTargetName(tokens, dotIdx) {
-  if (dotIdx <= 0) return undefined
-  const prev = tokens[dotIdx - 1]
+function resolveShellTargetName(tokens, memberIdx) {
+  if (memberIdx <= 0) return undefined
+  const prev = tokens[memberIdx - 1]
   if (prev.kind === 'ident') {
     const parts = [prev.text]
-    let cursor = dotIdx - 1
+    let cursor = memberIdx - 1
     while (
       cursor >= 2 &&
       tokens[cursor - 1].kind === 'punct' &&
@@ -1461,18 +1635,29 @@ function resolveShellTargetName(tokens, dotIdx) {
     }
     return parts.join('.')
   }
+  // Handle db["users"].drop() or db['users']["drop"]()
+  if (
+    prev.kind === 'punct' &&
+    prev.text === ']' &&
+    memberIdx >= 3 &&
+    tokens[memberIdx - 2].kind === 'string' &&
+    tokens[memberIdx - 3].kind === 'punct' &&
+    tokens[memberIdx - 3].text === '['
+  ) {
+    return tokens[memberIdx - 2].value
+  }
   // Handle db.getCollection("orders").drop() or db.getCollection('orders')
   if (
     prev.kind === 'punct' &&
     prev.text === ')' &&
-    dotIdx >= 4 &&
-    tokens[dotIdx - 2].kind === 'string' &&
-    tokens[dotIdx - 3].kind === 'punct' &&
-    tokens[dotIdx - 3].text === '(' &&
-    tokens[dotIdx - 4].kind === 'ident' &&
-    tokens[dotIdx - 4].text === 'getCollection'
+    memberIdx >= 4 &&
+    tokens[memberIdx - 2].kind === 'string' &&
+    tokens[memberIdx - 3].kind === 'punct' &&
+    tokens[memberIdx - 3].text === '(' &&
+    tokens[memberIdx - 4].kind === 'ident' &&
+    tokens[memberIdx - 4].text === 'getCollection'
   ) {
-    return tokens[dotIdx - 2].value
+    return tokens[memberIdx - 2].value
   }
   return undefined
 }
@@ -1640,29 +1825,52 @@ function inspectMongoCommandObjectTokens(argTokens, stmtIdx, preview, findings) 
   return true
 }
 
-function readFirstCallArgTokens(tokens, openParenIdx) {
-  const firstArg = []
+function readCallArgTokensList(tokens, openParenIdx) {
+  const args = []
+  let current = []
   let parenDepth = 1
   let braceDepth = 0
   let bracketDepth = 0
+  let closed = false
   for (let i = openParenIdx + 1; i < tokens.length; i++) {
     const t = tokens[i]
     if (t.kind === 'punct') {
       if (t.text === '(') parenDepth++
       else if (t.text === ')') {
         parenDepth--
-        if (parenDepth === 0) break
+        if (parenDepth === 0) {
+          closed = true
+          break
+        }
       } else if (t.text === '{') braceDepth++
       else if (t.text === '}') braceDepth = Math.max(0, braceDepth - 1)
       else if (t.text === '[') bracketDepth++
       else if (t.text === ']') bracketDepth = Math.max(0, bracketDepth - 1)
       else if (t.text === ',' && parenDepth === 1 && braceDepth === 0 && bracketDepth === 0) {
-        break
+        args.push(current)
+        current = []
+        continue
       }
     }
-    firstArg.push(t)
+    current.push(t)
   }
-  return firstArg
+  if (current.length > 0 || args.length > 0) {
+    args.push(current)
+  }
+  return { args, closed }
+}
+
+function hasMongoAggregateWriteStageTokens(argTokens) {
+  for (let i = 0; i + 1 < argTokens.length; i++) {
+    const tok = argTokens[i]
+    const next = argTokens[i + 1]
+    if (next.kind !== 'punct' || next.text !== ':') continue
+    const key = tok.kind === 'string' ? tok.value : tok.kind === 'ident' ? tok.text : ''
+    if (key === '$out' || key === '$merge') {
+      return key
+    }
+  }
+  return null
 }
 
 function analyzeDangerousMongo(sql) {
@@ -1690,18 +1898,38 @@ function analyzeDangerousMongo(sql) {
     }
 
     for (let i = 0; i + 2 < stmtTokens.length; i++) {
+      let method = ''
+      let openParenIdx = -1
+      const memberIdx = i
+
       if (
-        stmtTokens[i].kind !== 'punct' ||
-        stmtTokens[i].text !== '.' ||
-        stmtTokens[i + 1].kind !== 'ident' ||
-        stmtTokens[i + 2].kind !== 'punct' ||
-        stmtTokens[i + 2].text !== '('
+        stmtTokens[i].kind === 'punct' &&
+        stmtTokens[i].text === '.' &&
+        stmtTokens[i + 1].kind === 'ident' &&
+        stmtTokens[i + 2].kind === 'punct' &&
+        stmtTokens[i + 2].text === '('
       ) {
+        method = stmtTokens[i + 1].text
+        openParenIdx = i + 2
+      } else if (
+        i + 3 < stmtTokens.length &&
+        stmtTokens[i].kind === 'punct' &&
+        stmtTokens[i].text === '[' &&
+        stmtTokens[i + 1].kind === 'string' &&
+        stmtTokens[i + 2].kind === 'punct' &&
+        stmtTokens[i + 2].text === ']' &&
+        stmtTokens[i + 3].kind === 'punct' &&
+        stmtTokens[i + 3].text === '('
+      ) {
+        method = stmtTokens[i + 1].value
+        openParenIdx = i + 3
+      } else {
         continue
       }
 
-      const method = stmtTokens[i + 1].text
-      const target = resolveShellTargetName(stmtTokens, i)
+      const target = resolveShellTargetName(stmtTokens, memberIdx)
+      const { args } = readCallArgTokensList(stmtTokens, openParenIdx)
+      const firstArg = args[0] || []
 
       if (method === 'drop') {
         findings.push({
@@ -1719,30 +1947,93 @@ function analyzeDangerousMongo(sql) {
           target: 'database',
           message: 'dropDatabase() will permanently delete the entire database',
         })
-      } else if (method === 'deleteMany' || method === 'remove') {
-        const firstArg = readFirstCallArgTokens(stmtTokens, i + 2)
+      } else if (
+        method === 'deleteMany' ||
+        method === 'remove' ||
+        method === 'deleteOne' ||
+        method === 'findOneAndDelete' ||
+        method === 'findOneAndRemove'
+      ) {
         if (isEmptyFilterArgTokens(firstArg)) {
           findings.push({
             kind: 'delete_without_where',
             statementIndex: stmtIdx,
             statementPreview: preview,
             target,
-            message: `${method}({}) on ${target ? `"${target}" ` : 'collection '}has an empty filter and will delete all documents`,
+            message: `${method}({}) on ${target ? `"${target}" ` : 'collection '}has an empty filter and will delete documents`,
           })
         }
-      } else if (method === 'updateMany') {
-        const firstArg = readFirstCallArgTokens(stmtTokens, i + 2)
+      } else if (method === 'updateMany' || method === 'replaceOne') {
         if (isEmptyFilterArgTokens(firstArg)) {
           findings.push({
             kind: 'update_without_where',
             statementIndex: stmtIdx,
             statementPreview: preview,
             target,
-            message: `updateMany({}) on ${target ? `"${target}" ` : 'collection '}has an empty filter and will modify all documents`,
+            message: `${method}({}) on ${target ? `"${target}" ` : 'collection '}has an empty filter and will modify documents`,
           })
         }
+      } else if (method === 'update') {
+        const thirdArg = args[2]
+        const optsProps = thirdArg ? parseMongoObjectTopLevelProps(thirdArg) : null
+        const multiVal = optsProps?.get('multi')
+        const isMultiTrue =
+          Array.isArray(multiVal) &&
+          multiVal.length === 1 &&
+          multiVal[0].kind === 'ident' &&
+          multiVal[0].text === 'true'
+        if (isMultiTrue && isEmptyFilterArgTokens(firstArg)) {
+          findings.push({
+            kind: 'update_without_where',
+            statementIndex: stmtIdx,
+            statementPreview: preview,
+            target,
+            message: `update({}, ..., { multi: true }) on ${target ? `"${target}" ` : 'collection '}will modify all documents`,
+          })
+        }
+      } else if (method === 'aggregate') {
+        const stage = hasMongoAggregateWriteStageTokens(firstArg)
+        if (stage) {
+          findings.push({
+            kind: stage === '$out' ? 'truncate' : 'update_without_where',
+            statementIndex: stmtIdx,
+            statementPreview: preview,
+            target,
+            message: `aggregate(${stage}) on ${target ? `"${target}" ` : 'collection '}will overwrite/merge documents into target collection`,
+          })
+        }
+      } else if (method === 'bulkWrite') {
+        for (const opTokens of splitMongoArrayTopLevelElements(firstArg)) {
+          const opProps = parseMongoObjectTopLevelProps(opTokens)
+          if (!opProps) continue
+          for (const delKey of ['deleteMany', 'deleteOne']) {
+            const spec = opProps.get(delKey)
+            const specProps = spec ? parseMongoObjectTopLevelProps(spec) : null
+            if (specProps && specProps.has('filter') && isEmptyFilterArgTokens(specProps.get('filter'))) {
+              findings.push({
+                kind: 'delete_without_where',
+                statementIndex: stmtIdx,
+                statementPreview: preview,
+                target,
+                message: `bulkWrite ${delKey} on ${target ? `"${target}" ` : 'collection '}has an empty filter {}`,
+              })
+            }
+          }
+          for (const updKey of ['updateMany', 'updateOne', 'replaceOne']) {
+            const spec = opProps.get(updKey)
+            const specProps = spec ? parseMongoObjectTopLevelProps(spec) : null
+            if (specProps && specProps.has('filter') && isEmptyFilterArgTokens(specProps.get('filter'))) {
+              findings.push({
+                kind: 'update_without_where',
+                statementIndex: stmtIdx,
+                statementPreview: preview,
+                target,
+                message: `bulkWrite ${updKey} on ${target ? `"${target}" ` : 'collection '}has an empty filter {}`,
+              })
+            }
+          }
+        }
       } else if (method === 'runCommand' || method === 'adminCommand') {
-        const firstArg = readFirstCallArgTokens(stmtTokens, i + 2)
         inspectMongoCommandObjectTokens(firstArg, stmtIdx, preview, findings)
       }
     }
@@ -2006,12 +2297,21 @@ export function analyzeDangerousSql(sql, dialect) {
 
     if (dialect === 'mssql') {
       const triggerHeaderEnd = findMssqlTriggerHeaderEnd(tokens, baseOffset, firstWord)
+      const isPermissionStmt = MSSQL_PERMISSION_STARTERS.has(firstWord)
+      let seenPermissionTargetClause = false
       for (let i = baseOffset + 1; i < tokens.length; i++) {
         if (inspectedIndices.has(i)) continue
         const t = tokens[i]
         if (t.depth !== 0 || t.kind !== 'word') continue
         if (isPrecededByDot(tokens, i)) continue
         const u = t.text.toUpperCase()
+        if (isPermissionStmt && u === 'ON') {
+          seenPermissionTargetClause = true
+          continue
+        }
+        if (isPermissionStmt && !seenPermissionTargetClause && (u === 'DELETE' || u === 'UPDATE')) {
+          continue
+        }
         if (!CTE_MAIN_DML_KEYWORDS.has(u)) continue
         if (u === 'DELETE' || u === 'UPDATE') {
           if (triggerHeaderEnd >= 0 && i < triggerHeaderEnd) continue

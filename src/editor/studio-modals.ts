@@ -96,6 +96,7 @@ export interface StudioCommandPaletteContext extends StudioModalMountContext {
   openShortcutsModal: () => void
   openFeedbackModal: (initialKind?: 'bug' | 'feature') => void
   openSavedQueriesModal?: () => void
+  onThemeToggled?: (isLight: boolean) => void
 }
 
 export function openStudioCreateTableModal(ctx: StudioCreateTableModalContext): void {
@@ -525,11 +526,12 @@ export function openStudioDangerTableModal(
   const body = document.createElement('div')
   body.className = 'datanoa-modal-body'
 
-  if (conn.colorTag === 'prod') {
+  const normalizedTag = String(conn.colorTag || '').trim().toLowerCase()
+  if (normalizedTag === 'prod' || normalizedTag === 'production') {
     const prodWarn = document.createElement('div')
     prodWarn.className = 'datanoa-modal-box error'
     prodWarn.textContent =
-      'PRODUCTION CONNECTION WARNING: This action is irreversible and will immediately affect production data!'
+      'PRODUCTION CONNECTION WARNING: This action is irreversible and will immediately affect production data.'
     body.appendChild(prodWarn)
   }
 
@@ -721,6 +723,16 @@ export function openStudioCommandPalette(ctx: StudioCommandPaletteContext): void
           },
         ]
       : []),
+    ...(ctx.openDriverManagerModal
+      ? [
+          {
+            label: 'Driver Manager (BYOD Drivers)...',
+            category: 'Command',
+            searchText: 'driver manager byod install oracle mssql mongodb duckdb snowflake bigquery',
+            run: () => ctx.openDriverManagerModal?.(),
+          },
+        ]
+      : []),
     {
       label: 'Toggle Sidebar / Horizontal Top Bar',
       category: 'Command',
@@ -792,8 +804,10 @@ export function openStudioCommandPalette(ctx: StudioCommandPaletteContext): void
           const isLight = !document.documentElement.classList.contains('light')
           document.documentElement.classList.toggle('light', isLight)
           document.documentElement.classList.toggle('dark', !isLight)
+          document.documentElement.dataset.themeOverride = isLight ? 'light' : 'dark'
           document.body?.classList.toggle('light', isLight)
           document.body?.classList.toggle('dark', !isLight)
+          ctx.onThemeToggled?.(isLight)
         }
       },
     },

@@ -5,16 +5,16 @@
 import type { DatabaseDriverType } from '../protocol.js'
 import { formatSqlValue } from '../drivers/common/update-builder.js'
 import {
+  getDialectLexerRules,
   isIdentContChar,
   isIdentStartChar,
   isPostgresEscapeStringStart,
   matchDollarQuoteTag,
   scanBlockCommentEnd,
+  scanBracketIdentEnd,
   scanLineCommentEnd,
+  scanOracleQuoteEnd,
   scanQuotedSegmentEnd,
-  supportsDollarQuoting,
-  supportsNestedBlockComments,
-  usesBackslashAndHash,
 } from '../drivers/common/sql-lexer.js'
 
 export type SqlParamStyle = 'named-colon' | 'named-at' | 'positional-dollar'
@@ -53,33 +53,37 @@ function scanSqlParameterTokens(
   const tokens: ScannedSqlToken[] = []
   const assignedMysqlUserVars = new Set<string>()
   const len = sql.length
-  const backslashAndHash = usesBackslashAndHash(dialect)
-  const dollarQuotes = supportsDollarQuoting(dialect)
-  const nestedComments = supportsNestedBlockComments(dialect)
+  const rules = getDialectLexerRules(dialect)
+  const isMysqlFamily = dialect === 'mysql' || dialect === 'mariadb'
+  const isPostgresFamily = dialect === 'postgres' || dialect === 'cockroachdb'
+  let pgBracketDepth = 0
+  let inMysqlSetStmt = false
   let i = 0
 
   while (i < len) {
     const ch = sql[i]
 
     // 1. Line comments: -- ...
-    if (ch === '-' && i + 1 < len && sql[i + 1] === '-') {
+    if (rules.lineCommentDash && ch === '-' && i + 1 < len && sql[i + 1] === '-') {
+      i = scanLineCommentEnd(sql, i)
+      continue
+    }
+
+    // 1b. ClickHouse line comments: // ...
+    if (rules.lineCommentSlash && ch === '/' && i + 1 < len && sql[i + 1] === '/') {
       i = scanLineCommentEnd(sql, i)
       continue
     }
 
     // 2. MySQL / MariaDB / ClickHouse line comments: # ...
-    if (ch === '#' && backslashAndHash) {
-      let j = i + 1
-      while (j < len && sql[j] !== '\n') {
-        j++
-      }
-      i = j < len ? j + 1 : len
+    if (rules.lineCommentHash && ch === '#') {
+      i = scanLineCommentEnd(sql, i - 1)
       continue
     }
 
-    // 3. Block comments: /* ... */ (nested only for PG / CockroachDB)
+    // 3. Block comments: /* ... */ (nested for PG / CockroachDB / MSSQL / ClickHouse)
     if (ch === '/' && i + 1 < len && sql[i + 1] === '*') {
-      i = scanBlockCommentEnd(sql, i, nestedComments)
+      i = scanBlockCommentEnd(sql, i, rules.nestedBlockComments)
       continue
     }
 
@@ -89,43 +93,75 @@ function scanSqlParameterTokens(
       continue
     }
 
+    // 4b. Oracle q'[...]' / nq'[...]' alternative quote literals
+    const oracleQuote = scanOracleQuoteEnd(sql, i, dialect)
+    if (oracleQuote) {
+      i = oracleQuote.end
+      continue
+    }
+
     // 5. Quoted literals & identifiers: '...', "...", `...`
-    if (ch === "'" || ch === '"' || ch === '`') {
-      const allowBackslash = ch === "'" && backslashAndHash
+    if (ch === "'" || ch === '"' || (ch === '`' && rules.backtickIdentifiers)) {
+      const allowBackslash =
+        (ch === "'" && rules.backslashEscapesSingleQuote) ||
+        (ch === '"' && rules.backslashEscapesDoubleQuote)
       i = scanQuotedSegmentEnd(sql, i, ch, allowBackslash).end
       continue
     }
 
     // 6. Bracket identifiers: [...] (SQLite / LibSQL / D1 / MSSQL)
-    if (
-      ch === '[' &&
-      (dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1' || dialect === 'mssql')
-    ) {
-      let j = i + 1
-      while (j < len) {
-        if (sql[j] === ']') {
-          if (j + 1 < len && sql[j + 1] === ']') {
-            j += 2
-            continue
-          }
-          j++
-          break
-        }
-        j++
-      }
-      i = j
+    if (ch === '[' && rules.bracketIdentifiers !== 'none') {
+      i = scanBracketIdentEnd(sql, i, true).end
+      continue
+    }
+
+    // 6b. Track Postgres array subscript/slice brackets `[start:end]`
+    if (isPostgresFamily && ch === '[') {
+      pgBracketDepth++
+      i++
+      continue
+    }
+    if (isPostgresFamily && ch === ']' && pgBracketDepth > 0) {
+      pgBracketDepth--
+      i++
       continue
     }
 
     // 7. PostgreSQL / CockroachDB dollar-quoted blocks: $$...$$ and $tag$...$tag$
     // CRITICAL: Never mistake $tag$ for positional $1!
-    if (dollarQuotes && ch === '$') {
+    if (rules.dollarQuoting && ch === '$') {
       const tag = matchDollarQuoteTag(sql, i)
       if (tag !== null) {
         const closeIdx = sql.indexOf(tag, i + tag.length)
         i = closeIdx >= 0 ? closeIdx + tag.length : len
         continue
       }
+    }
+
+    // Track MySQL `SET @var = ...` statement scope
+    if (isMysqlFamily && ch === ';') {
+      inMysqlSetStmt = false
+      i++
+      continue
+    }
+    if (isMysqlFamily && isIdentStartChar(sql.charCodeAt(i))) {
+      let j = i + 1
+      while (j < len && isIdentContChar(sql.charCodeAt(j))) j++
+      const wordUpper = sql.slice(i, j).toUpperCase()
+      if (wordUpper === 'SET') {
+        inMysqlSetStmt = true
+      } else if (
+        wordUpper === 'SELECT' ||
+        wordUpper === 'FROM' ||
+        wordUpper === 'WHERE' ||
+        wordUpper === 'UPDATE' ||
+        wordUpper === 'INSERT' ||
+        wordUpper === 'DELETE'
+      ) {
+        inMysqlSetStmt = false
+      }
+      i = j
+      continue
     }
 
     // 8. PostgreSQL type casts: ::type
@@ -150,7 +186,12 @@ function scanSqlParameterTokens(
     }
 
     // 10. Named colon parameter: :name ([A-Za-z_][A-Za-z0-9_]*)
+    // Skip Postgres array slice syntax `arr[:end_idx]` inside `[...]`
     if (ch === ':') {
+      if (isPostgresFamily && pgBracketDepth > 0) {
+        i++
+        continue
+      }
       const prevIsIdent = i > 0 && isIdentContChar(sql.charCodeAt(i - 1))
       if (!prevIsIdent && i + 1 < len && isIdentStartChar(sql.charCodeAt(i + 1))) {
         let j = i + 2
@@ -178,16 +219,18 @@ function scanSqlParameterTokens(
         while (j < len && isIdentContChar(sql.charCodeAt(j))) {
           j++
         }
-        // MySQL / MariaDB user variable assignment target or previously assigned @var
-        if (dialect === 'mysql' || dialect === 'mariadb') {
+        // MySQL / MariaDB user variable assignment target (`SET @v =` or `@v :=`) or previously assigned @var
+        if (isMysqlFamily) {
           let k = j
           while (k < len && /\s/.test(sql[k])) {
             k++
           }
           const rawVar = sql.slice(i, j)
-          if (k + 1 < len && sql[k] === ':' && sql[k + 1] === '=') {
+          const isColonAssign = k + 1 < len && sql[k] === ':' && sql[k + 1] === '='
+          const isSetEqAssign = inMysqlSetStmt && k < len && sql[k] === '='
+          if (isColonAssign || isSetEqAssign) {
             assignedMysqlUserVars.add(rawVar.toLowerCase())
-            i = k
+            i = isColonAssign ? k + 2 : k + 1
             continue
           }
           if (assignedMysqlUserVars.has(rawVar.toLowerCase())) {
@@ -310,6 +353,11 @@ export function coerceBindParamValue(input: BindParamInput): unknown {
         }
         return num
       }
+      if (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)) {
+        throw new Error(
+          `Invalid numeric parameter value: "${value}" is not a valid decimal number`
+        )
+      }
       const num = Number(trimmed)
       if (!Number.isFinite(num)) {
         throw new Error(
@@ -425,7 +473,21 @@ export function bindSqlParameters(
         throw new Error('Parameter value cannot contain NUL (\\0) bytes')
       }
       const coerced = coerceBindParamValue(input)
-      result += formatSqlValue(coerced, dialect)
+      let formatted = formatSqlValue(coerced, dialect)
+      // Prevent token pasting into comments: `-` + `-5` -> `--5` (SQL line comment!) or `/` + `*` -> `/*`
+      const prevChar = result.length > 0 ? result[result.length - 1] : ''
+      if (
+        (typeof coerced === 'number' || typeof coerced === 'bigint') &&
+        formatted.startsWith('-') &&
+        prevChar === '-'
+      ) {
+        formatted = `(${formatted})`
+      } else if (prevChar === '-' && formatted.startsWith('-')) {
+        formatted = ` ${formatted}`
+      } else if (prevChar === '/' && (formatted.startsWith('*') || formatted.startsWith('/'))) {
+        formatted = ` ${formatted}`
+      }
+      result += formatted
     } else {
       result += sql.slice(token.start, token.end)
     }

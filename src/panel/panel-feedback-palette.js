@@ -26,6 +26,7 @@ export function createPanelFeedbackAndPaletteController(ctx) {
     refreshConnections,
     copyText,
     showBanner,
+    onThemeToggled,
   } = ctx
 
   let feedbackKind = 'bug'
@@ -233,8 +234,12 @@ export function createPanelFeedbackAndPaletteController(ctx) {
           const isLight = !document.documentElement.classList.contains('light')
           document.documentElement.classList.toggle('light', isLight)
           document.documentElement.classList.toggle('dark', !isLight)
+          document.documentElement.dataset.themeOverride = isLight ? 'light' : 'dark'
           document.body?.classList.toggle('light', isLight)
           document.body?.classList.toggle('dark', !isLight)
+          if (typeof onThemeToggled === 'function') {
+            onThemeToggled(isLight)
+          }
         },
       },
     ]

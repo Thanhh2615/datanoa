@@ -4,18 +4,66 @@
  * plus exact DB engine syntax error span extraction.
  */
 
+import { getDialectLexerRules, scanBracketIdentEnd } from './shared-sql-core.js'
+
 const MAX_DOC_LENGTH = 100_000
 const MAX_DIAGNOSTICS = 25
 const MAX_UNTERMINATED_SPAN = 24
+const MAX_ERROR_SCAN_LENGTH = 8_192
 
 const NON_SQL_DIALECTS = new Set(['redis', 'mongodb', 'elasticsearch', 'neo4j'])
-const BACKSLASH_STRING_DIALECTS = new Set(['mysql', 'mariadb', 'clickhouse', 'snowflake', 'bigquery'])
-const BACKSLASH_DOUBLE_QUOTE_DIALECTS = new Set(['mysql', 'mariadb', 'bigquery'])
-const HASH_COMMENT_DIALECTS = new Set(['mysql', 'mariadb', 'clickhouse', 'bigquery'])
-const NESTED_COMMENT_DIALECTS = new Set(['postgres', 'postgresql', 'cockroachdb', 'duckdb'])
-const DOLLAR_QUOTE_DIALECTS = new Set(['', 'postgres', 'postgresql', 'cockroachdb', 'duckdb', 'snowflake'])
-const PG_ESCAPE_STRING_DIALECTS = new Set(['', 'postgres', 'postgresql', 'cockroachdb', 'duckdb', 'snowflake'])
 const TRAILING_COMMA_OK_DIALECTS = new Set(['duckdb', 'bigquery'])
+
+function resolveDiagnosticsLexerRules(dialect) {
+  const norm = typeof dialect === 'string' ? dialect.trim().toLowerCase() : ''
+  const canonical = norm === 'postgresql' ? 'postgres' : norm
+  if (canonical === 'duckdb') {
+    return {
+      ...getDialectLexerRules('postgres'),
+      nestedBlockComments: true,
+      dollarQuoting: true,
+      postgresEscapeString: true,
+      backtickIdentifiers: false,
+    }
+  }
+  if (canonical === 'bigquery') {
+    return {
+      ...getDialectLexerRules('mysql'),
+      lineCommentHash: true,
+      lineCommentSlash: false,
+      nestedBlockComments: false,
+      backslashEscapesSingleQuote: true,
+      backslashEscapesDoubleQuote: true,
+      dollarQuoting: false,
+      postgresEscapeString: false,
+      oracleQQuote: false,
+      mysqlDelimiter: false,
+      bracketIdentifiers: 'none',
+      backtickIdentifiers: true,
+    }
+  }
+  if (canonical === 'snowflake') {
+    return {
+      ...getDialectLexerRules('postgres'),
+      backslashEscapesSingleQuote: true,
+      backslashEscapesDoubleQuote: false,
+      nestedBlockComments: false,
+      dollarQuoting: true,
+      postgresEscapeString: true,
+    }
+  }
+  if (!canonical) {
+    return {
+      ...getDialectLexerRules(undefined),
+      dollarQuoting: true,
+      postgresEscapeString: true,
+      oracleQQuote: true,
+      backtickIdentifiers: true,
+      doubleQuoteIdentifiers: true,
+    }
+  }
+  return getDialectLexerRules(canonical)
+}
 
 const ORACLE_Q_DELIMS = {
   '[': ']',
@@ -46,7 +94,8 @@ const VALID_STATEMENT_STARTERS = new Set([
   'SYSTEM', 'WATCH', 'EXISTS', 'BACKUP', 'RESTORE', 'DBCC', 'RECONFIGURE',
   // Security / DCL / Admin
   'GRANT', 'REVOKE', 'DENY', 'REASSIGN', 'SECURITY', 'CHANGE', 'STOP', 'SLAVE',
-  'REPLICA', 'MASTER', 'SOURCE',
+  'REPLICA', 'MASTER', 'SOURCE', 'DISABLE', 'ENABLE', 'RECEIVE', 'SEND', 'REVERT',
+  'SETUSER', 'WRITETEXT', 'UPDATETEXT', 'READTEXT', 'ADD', 'RESTART',
   // Procedural block statements
   'IF', 'ELSE', 'ELSIF', 'ELSEIF', 'ENDIF', 'WHILE', 'LOOP', 'FOR', 'FOREACH',
   'RETURN', 'EXCEPTION', 'WHEN', 'BREAK', 'CONTINUE', 'EXIT', 'GOTO', 'TRY',
@@ -362,15 +411,19 @@ function scanBlockComment(sql, start, allowNested) {
 function lexSql(sql, dialect) {
   const tokens = []
   const diagnostics = []
+  const commentSpans = []
   const parenStack = []
   const len = sql.length
 
-  const backslashStrings = BACKSLASH_STRING_DIALECTS.has(dialect)
-  const backslashDoubleQuotes = BACKSLASH_DOUBLE_QUOTE_DIALECTS.has(dialect)
-  const hashComments = HASH_COMMENT_DIALECTS.has(dialect)
-  const nestedComments = NESTED_COMMENT_DIALECTS.has(dialect)
-  const dollarQuotes = DOLLAR_QUOTE_DIALECTS.has(dialect)
-  const pgEscapeStrings = PG_ESCAPE_STRING_DIALECTS.has(dialect)
+  const rules = resolveDiagnosticsLexerRules(dialect)
+  const backslashStrings = rules.backslashEscapesSingleQuote
+  const backslashDoubleQuotes = rules.backslashEscapesDoubleQuote
+  const hashComments = rules.lineCommentHash
+  const slashComments = rules.lineCommentSlash
+  const nestedComments = rules.nestedBlockComments
+  const dollarQuotes = rules.dollarQuoting
+  const pgEscapeStrings = rules.postgresEscapeString
+  const bracketMode = rules.bracketIdentifiers
   const isMssql = dialect === 'mssql'
   const isBigQuery = dialect === 'bigquery'
 
@@ -388,20 +441,34 @@ function lexSql(sql, dialect) {
     // Line comment: --
     if (ch === '-' && i + 1 < len && sql[i + 1] === '-') {
       const nl = sql.indexOf('\n', i + 2)
-      i = nl === -1 ? len : nl + 1
+      const end = nl === -1 ? len : nl + 1
+      commentSpans.push({ from: i, to: end })
+      i = end
+      continue
+    }
+
+    // Slash line comment: // (ClickHouse)
+    if (slashComments && ch === '/' && i + 1 < len && sql[i + 1] === '/') {
+      const nl = sql.indexOf('\n', i + 2)
+      const end = nl === -1 ? len : nl + 1
+      commentSpans.push({ from: i, to: end })
+      i = end
       continue
     }
 
     // Hash line comment (MySQL / MariaDB / ClickHouse / BigQuery)
     if (hashComments && ch === '#') {
       const nl = sql.indexOf('\n', i + 1)
-      i = nl === -1 ? len : nl + 1
+      const end = nl === -1 ? len : nl + 1
+      commentSpans.push({ from: i, to: end })
+      i = end
       continue
     }
 
     // Block comment: /* ... */
     if (ch === '/' && i + 1 < len && sql[i + 1] === '*') {
       const res = scanBlockComment(sql, i, nestedComments)
+      commentSpans.push({ from: i, to: res.end })
       if (!res.closed) {
         diagnostics.push({
           from: i,
@@ -629,10 +696,10 @@ function lexSql(sql, dialect) {
       continue
     }
 
-    // MSSQL bracket identifier [...] ONLY when dialect === 'mssql'
+    // Bracket identifier [...] when dialect supports bracket identifiers (MSSQL doubling / SQLite-family no-doubling)
     if (ch === '[') {
-      if (isMssql) {
-        const res = scanBracketIdent(sql, i)
+      if (bracketMode !== 'none') {
+        const res = scanBracketIdentEnd(sql, i, bracketMode === 'doubling')
         if (!res.closed) {
           const span = computeUnterminatedSpan(sql, i)
           diagnostics.push({
@@ -978,7 +1045,7 @@ function lexSql(sql, dialect) {
     })
   }
 
-  return { tokens, diagnostics }
+  return { tokens, diagnostics, commentSpans }
 }
 
 /**
@@ -1134,6 +1201,40 @@ const NON_BLOCK_END_FOLLOWERS = new Set([
   'IF', 'LOOP', 'WHILE', 'REPEAT', 'FOR', 'CASE',
 ])
 
+const PROCEDURAL_BEGIN_PREDECESSORS = new Set([
+  'AS', 'IS', 'THEN', 'ELSE', 'DO', 'LOOP', 'ROW', 'ATOMIC', 'TRY', 'CATCH',
+  'WHEN', 'DECLARE', 'DETERMINISTIC', 'SQL', 'CONTAINS', 'READS', 'MODIFIES',
+  'BEGIN', 'ON', 'BEFORE', 'AFTER', 'INSTEAD', 'LANGUAGE', 'RETURNS',
+])
+
+const NON_PROCEDURAL_BEGIN_PREDECESSORS = new Set([
+  'SELECT', 'DISTINCT', 'ALL', 'FROM', 'WHERE', 'HAVING', 'AND', 'OR', 'NOT',
+  'SET', 'VALUES', 'INTO', 'BY', 'JOIN', 'UNION', 'INTERSECT', 'EXCEPT',
+])
+
+function isProceduralBeginToken(stmtTokens, idx) {
+  const next = idx + 1 < stmtTokens.length ? stmtTokens[idx + 1] : null
+  const isTransactionBegin =
+    !next || (next.type === 'word' && TRANSACTION_BEGIN_FOLLOWERS.has(next.upper))
+  if (isTransactionBegin) return false
+  if (idx === 0) return true
+  const prev = stmtTokens[idx - 1]
+  if (!prev) return true
+  if (prev.type === 'comma' || prev.type === 'op' || prev.type === 'lparen' || prev.type === 'dot') {
+    return false
+  }
+  if (prev.type === 'word') {
+    if (NON_PROCEDURAL_BEGIN_PREDECESSORS.has(prev.upper)) return false
+    if (PROCEDURAL_BEGIN_PREDECESSORS.has(prev.upper)) return true
+  }
+  // e.g. CREATE TRIGGER trg AFTER INSERT ON items BEGIN ... / CREATE PROCEDURE p() BEGIN ...
+  const firstUpper = stmtTokens[0]?.type === 'word' ? stmtTokens[0].upper : ''
+  if (firstUpper === 'CREATE' || firstUpper === 'ALTER' || firstUpper === 'DECLARE' || firstUpper === 'DO') {
+    return true
+  }
+  return false
+}
+
 function isStandaloneLineToken(sql, tok) {
   let left = tok.from - 1
   while (left >= 0 && (sql[left] === ' ' || sql[left] === '\t')) left--
@@ -1145,16 +1246,78 @@ function isStandaloneLineToken(sql, tok) {
   return true
 }
 
+function matchStandaloneMssqlGo(sql, tokens, idx) {
+  const tok = tokens[idx]
+  if (!tok || tok.type !== 'word' || tok.upper !== 'GO' || tok.parenDepth !== 0) return -1
+  let left = tok.from - 1
+  while (left >= 0 && (sql[left] === ' ' || sql[left] === '\t')) left--
+  if (left >= 0 && sql[left] !== '\n' && sql[left] !== '\r') return -1
+
+  let endIdx = idx
+  let right = tok.to
+  const next = tokens[idx + 1]
+  if (next && next.type === 'number' && /^\d+$/.test(next.raw)) {
+    const between = sql.slice(tok.to, next.from)
+    if (!between.includes('\n') && !between.includes('\r')) {
+      endIdx = idx + 1
+      right = next.to
+    }
+  }
+  while (right < sql.length && (sql[right] === ' ' || sql[right] === '\t')) right++
+  if (
+    right >= sql.length ||
+    sql[right] === '\n' ||
+    sql[right] === '\r' ||
+    (sql[right] === '-' && right + 1 < sql.length && sql[right + 1] === '-')
+  ) {
+    return endIdx
+  }
+  return -1
+}
+
+function matchMysqlDelimiterDirective(sql, tokens, idx) {
+  const tok = tokens[idx]
+  if (!tok || tok.type !== 'word' || tok.upper !== 'DELIMITER' || tok.parenDepth !== 0) return null
+  let left = tok.from - 1
+  while (left >= 0 && (sql[left] === ' ' || sql[left] === '\t')) left--
+  if (left >= 0 && sql[left] !== '\n' && sql[left] !== '\r') return null
+
+  const nl = sql.indexOf('\n', tok.to)
+  const lineEnd = nl === -1 ? sql.length : nl
+  const rest = sql.slice(tok.to, lineEnd).replace(/\r$/, '').trim()
+  if (!rest) return null
+  const delim = rest.split(/\s+/)[0]
+  if (!delim) return null
+
+  let lastIdx = idx
+  while (lastIdx + 1 < tokens.length && tokens[lastIdx + 1].from < lineEnd) {
+    lastIdx++
+  }
+  return { delimiter: delim, endIdx: lastIdx }
+}
+
 function splitStatements(tokens, sql, dialect) {
   const statements = []
   let current = []
   let procDepth = 0
+  let routineCaseDepth = 0
+  let activeDelimiter = ';'
+  const supportsMysqlDelimiter = dialect === 'mysql' || dialect === 'mariadb'
 
   const flushStatement = (hasSemicolon) => {
     if (current.length === 0) return
-    const startedInProc = procDepth > 0
+    const startedInProc = procDepth > 0 || routineCaseDepth > 0
+    const firstUpper = current[0]?.type === 'word' ? current[0].upper : ''
+    const isRoutineDef =
+      (firstUpper === 'CREATE' || firstUpper === 'ALTER') &&
+      current.some(
+        (t) =>
+          t.type === 'word' &&
+          (t.upper === 'FUNCTION' || t.upper === 'PROCEDURE' || t.upper === 'TRIGGER')
+      )
     let localCaseDepth = 0
     let containsProcBegin = false
+    let containsRoutineCase = false
 
     for (let i = 0; i < current.length; i++) {
       if (!isKeywordCandidate(current, i)) continue
@@ -1163,19 +1326,25 @@ function splitStatements(tokens, sql, dialect) {
       const next = i + 1 < current.length ? current[i + 1] : null
 
       if (u === 'BEGIN') {
-        const isTransactionBegin =
-          !next || (next.type === 'word' && TRANSACTION_BEGIN_FOLLOWERS.has(next.upper))
-        if (!isTransactionBegin) {
+        if (isProceduralBeginToken(current, i)) {
           procDepth++
           containsProcBegin = true
         }
       } else if (u === 'CASE') {
         if (!(prev?.type === 'word' && prev.upper === 'END')) {
-          localCaseDepth++
+          if (isRoutineDef && procDepth === 0) {
+            routineCaseDepth++
+            containsRoutineCase = true
+          } else {
+            localCaseDepth++
+          }
         }
       } else if (u === 'END') {
         if (next?.type === 'word' && NON_BLOCK_END_FOLLOWERS.has(next.upper)) {
-          if (next.upper === 'CASE' && localCaseDepth > 0) localCaseDepth--
+          if (next.upper === 'CASE') {
+            if (routineCaseDepth > 0) routineCaseDepth--
+            else if (localCaseDepth > 0) localCaseDepth--
+          }
         } else if (localCaseDepth > 0) {
           localCaseDepth--
         } else if (procDepth > 0) {
@@ -1187,14 +1356,38 @@ function splitStatements(tokens, sql, dialect) {
     statements.push({
       tokens: current,
       hasSemicolon,
-      inProceduralBlock: startedInProc || containsProcBegin,
+      inProceduralBlock: startedInProc || containsProcBegin || containsRoutineCase,
     })
     current = []
   }
 
   for (let i = 0; i < tokens.length; i++) {
     const tok = tokens[i]
-    if (tok.type === 'semicolon' && tok.parenDepth === 0) {
+
+    // MySQL / MariaDB `DELIMITER <delim>` directive line
+    if (supportsMysqlDelimiter) {
+      const delimMatch = matchMysqlDelimiterDirective(sql, tokens, i)
+      if (delimMatch) {
+        flushStatement(true)
+        procDepth = 0
+        routineCaseDepth = 0
+        activeDelimiter = delimMatch.delimiter
+        i = delimMatch.endIdx
+        continue
+      }
+      if (activeDelimiter !== ';' && tok.parenDepth === 0 && sql.startsWith(activeDelimiter, tok.from)) {
+        const delimEndPos = tok.from + activeDelimiter.length
+        while (i + 1 < tokens.length && tokens[i + 1].to <= delimEndPos) {
+          i++
+        }
+        flushStatement(true)
+        procDepth = 0
+        routineCaseDepth = 0
+        continue
+      }
+    }
+
+    if (activeDelimiter === ';' && tok.type === 'semicolon' && tok.parenDepth === 0) {
       flushStatement(true)
       continue
     }
@@ -1208,19 +1401,19 @@ function splitStatements(tokens, sql, dialect) {
     ) {
       flushStatement(true)
       procDepth = 0
+      routineCaseDepth = 0
       continue
     }
-    // MSSQL `GO` batch separator on its own line
-    if (
-      dialect === 'mssql' &&
-      tok.type === 'word' &&
-      tok.upper === 'GO' &&
-      tok.parenDepth === 0 &&
-      isStandaloneLineToken(sql, tok)
-    ) {
-      flushStatement(true)
-      procDepth = 0
-      continue
+    // MSSQL `GO [count]` batch separator on its own line
+    if (dialect === 'mssql') {
+      const goEndIdx = matchStandaloneMssqlGo(sql, tokens, i)
+      if (goEndIdx !== -1) {
+        flushStatement(true)
+        procDepth = 0
+        routineCaseDepth = 0
+        i = goEndIdx
+        continue
+      }
     }
     current.push(tok)
   }
@@ -1373,6 +1566,20 @@ function skipExplainPrefix(topTokens) {
     const t = topTokens[idx]
     if (t.type === 'group') {
       idx++
+      continue
+    }
+    // Handle MySQL `EXPLAIN FORMAT=JSON ...` and ClickHouse `EXPLAIN PLAN header = 1 ...`
+    if (
+      t.type === 'word' &&
+      topTokens[idx + 1]?.type === 'op' &&
+      topTokens[idx + 1].raw === '=' &&
+      idx + 2 < topTokens.length &&
+      (topTokens[idx + 2].type === 'word' ||
+        topTokens[idx + 2].type === 'number' ||
+        topTokens[idx + 2].type === 'string' ||
+        topTokens[idx + 2].type === 'param')
+    ) {
+      idx += 3
       continue
     }
     if (t.type === 'word' && EXPLAIN_OPTION_WORDS.has(t.upper)) {
@@ -1550,8 +1757,7 @@ function analyzeQueryBranch(branch, branchStarter, meta, diagnostics) {
         const isQualifiedOrExpr = next2?.type === 'dot' || next2?.type === 'op'
         const isColumnNamedLimitOrOffset =
           (next.upper === 'LIMIT' || next.upper === 'OFFSET') &&
-          (next2?.type === 'comma' ||
-            (next2?.type === 'word' && (next2.upper === 'FROM' || next2.upper === 'AS')))
+          !isLimitOffsetArgToken(next2)
         if (!isQualifiedOrExpr && !isColumnNamedLimitOrOffset) {
           diagnostics.push({
             from: tok.from,
@@ -1599,6 +1805,10 @@ function analyzeQueryBranch(branch, branchStarter, meta, diagnostics) {
         } else if (
           (tok.upper === 'LIMIT' || tok.upper === 'OFFSET') &&
           currentClause !== 'SELECT' &&
+          currentClause !== 'GROUP' &&
+          currentClause !== 'ORDER' &&
+          currentClause !== 'WHERE' &&
+          currentClause !== 'HAVING' &&
           EMPTY_LIMIT_FOLLOWERS.has(next.upper)
         ) {
           diagnostics.push({
@@ -1611,7 +1821,8 @@ function analyzeQueryBranch(branch, branchStarter, meta, diagnostics) {
         } else if (
           (tok.upper === 'AND' || tok.upper === 'OR') &&
           !(tok.upper === 'OR' && prev?.type === 'word' && prev.upper === 'INSERT') &&
-          EMPTY_BOOL_FOLLOWERS.has(next.upper)
+          EMPTY_BOOL_FOLLOWERS.has(next.upper) &&
+          !((next.upper === 'LIMIT' || next.upper === 'OFFSET') && !isLimitOffsetArgToken(next2))
         ) {
           diagnostics.push({
             from: tok.from,
@@ -1669,8 +1880,14 @@ function analyzeQueryBranch(branch, branchStarter, meta, diagnostics) {
       !KNOWN_SQL_KEYWORDS.has(tok.upper) &&
       !isActiveTypingPrefix(tok, cursorOffset)
     ) {
-      // 6a. <TYPO> BY (ODRER BY, ORDR BY, GRUOP BY, GROP BY)
-      if (next?.type === 'word' && next.upper === 'BY' && !VALID_BEFORE_BY.has(tok.upper)) {
+      // 6a. <TYPO> BY (ODRER BY, ORDR BY, GRUOP BY, GROP BY) — only in clause position after FROM / SET
+      if (
+        (seenFrom || (branchStarter === 'UPDATE' && currentClause === 'SET')) &&
+        isClauseBoundaryPredecessor(prev) &&
+        next?.type === 'word' &&
+        next.upper === 'BY' &&
+        !VALID_BEFORE_BY.has(tok.upper)
+      ) {
         const sug = findBestTypo(tok.upper, ['ORDER', 'GROUP'])
         if (sug) {
           detectedMisspelledClause = { clause: sug, suggestion: sug }
@@ -1869,9 +2086,22 @@ function analyzeQueryBranch(branch, branchStarter, meta, diagnostics) {
   // 8. Dangling clause keyword at end of branch / statement
   const lastIdx = branch.length - 1
   const lastTok = branch[lastIdx]
+  const prevLast = lastIdx > 0 ? branch[lastIdx - 1] : null
+  const isTrailingLimitOffsetColumn =
+    (lastTok?.upper === 'OFFSET' || lastTok?.upper === 'LIMIT') &&
+    (prevLast?.type === 'comma' ||
+      prevLast?.type === 'op' ||
+      (prevLast?.type === 'word' &&
+        (prevLast.upper === 'AND' ||
+          prevLast.upper === 'OR' ||
+          prevLast.upper === 'SELECT' ||
+          prevLast.upper === 'WHERE' ||
+          prevLast.upper === 'HAVING' ||
+          prevLast.upper === 'BY')))
   if (
     isKeywordCandidate(branch, lastIdx) &&
     DANGLING_CLAUSE_KEYWORDS.has(lastTok.upper) &&
+    !isTrailingLimitOffsetColumn &&
     !missingSelectFromPositions.has(lastTok.from) &&
     !duplicatePairFirstIndices.has(lastIdx - 1)
   ) {
@@ -1988,26 +2218,48 @@ function analyzeStatement(stmt, isLastStatement, dialect, cursorOffset, diagnost
   let queryStartIdx = 0
   let queryStarter = effectiveStarter
 
+  const resolveInnerStarter = (tokIdx) => {
+    const nextTok = topTokens[tokIdx]
+    if (!nextTok) return ''
+    if (nextTok.type === 'group') return 'SELECT'
+    if (nextTok.type !== 'word') return ''
+    if (QUERY_DML_STARTERS.has(nextTok.upper) || VALID_STATEMENT_STARTERS.has(nextTok.upper)) {
+      return nextTok.upper
+    }
+    if (!isActiveTypingPrefix(nextTok, cursorOffset)) {
+      const suggestion = findBestTypo(nextTok.upper, STARTER_TYPO_TARGETS)
+      if (suggestion) {
+        diagnostics.push({
+          from: nextTok.from,
+          to: nextTok.to,
+          severity: 'error',
+          code: 'unknown-keyword',
+          message: `Unknown SQL keyword "${nextTok.raw}". Did you mean "${suggestion}"?`,
+          suggestion,
+        })
+        return suggestion
+      }
+    }
+    return nextTok.upper
+  }
+
   if (queryStarter === 'EXPLAIN') {
     queryStartIdx = skipExplainPrefix(topTokens)
     if (queryStartIdx >= topTokens.length) return
-    const nextTok = topTokens[queryStartIdx]
-    queryStarter = nextTok.type === 'group' ? 'SELECT' : nextTok.type === 'word' ? nextTok.upper : ''
+    queryStarter = resolveInnerStarter(queryStartIdx)
   }
 
   if (queryStarter === 'CREATE') {
     const viewStart = findCreateViewQueryStart(topTokens)
     if (viewStart === -1 || viewStart >= topTokens.length) return
     queryStartIdx = viewStart
-    const nextTok = topTokens[queryStartIdx]
-    queryStarter = nextTok.type === 'group' ? 'SELECT' : nextTok.type === 'word' ? nextTok.upper : ''
+    queryStarter = resolveInnerStarter(queryStartIdx)
   }
 
   if (queryStarter === 'WITH') {
     queryStartIdx = skipWithCtes(topTokens, queryStartIdx)
     if (queryStartIdx >= topTokens.length) return
-    const nextTok = topTokens[queryStartIdx]
-    queryStarter = nextTok.type === 'group' ? 'SELECT' : nextTok.type === 'word' ? nextTok.upper : ''
+    queryStarter = resolveInnerStarter(queryStartIdx)
   }
 
   if (!QUERY_DML_STARTERS.has(queryStarter)) return
@@ -2186,7 +2438,19 @@ function stripErrorIdentQuotes(raw) {
   return stripIdentifierQuotes(raw)
 }
 
-function findTokenInRange(tokens, scopeText, tokenText, startBound, endBound) {
+function isSpanInsideCommentOrString(start, end, commentSpans, tokens, skipStrings) {
+  for (const span of commentSpans) {
+    if (start < span.to && end > span.from) return true
+  }
+  if (skipStrings) {
+    for (const tok of tokens) {
+      if (tok.type === 'string' && start < tok.to && end > tok.from) return true
+    }
+  }
+  return false
+}
+
+function findTokenInRange(tokens, scopeText, tokenText, startBound, endBound, commentSpans = []) {
   if (!tokenText) return null
   const targetLower = tokenText.toLowerCase()
   const bareToken = stripIdentifierQuotes(tokenText)
@@ -2217,21 +2481,86 @@ function findTokenInRange(tokens, scopeText, tokenText, startBound, endBound) {
   }
 
   // Pass 3: raw substring fallback for non-word tokens (e.g. partial string literal `'abc` or bracket `[x`)
+  // Strictly skips SQL comments (and closed string literals unless searching for a quote-prefixed token).
   const isPureWord = /^[A-Za-z_][A-Za-z0-9_$]*$/.test(tokenText)
   const isQuotedPureWord = bareToken !== tokenText && /^[A-Za-z_][A-Za-z0-9_$]*$/.test(bareToken)
   if (!isPureWord && !isQuotedPureWord) {
     const slice = scopeText.slice(startBound, endBound)
-    const exactIdx = slice.indexOf(tokenText)
-    if (exactIdx !== -1) {
-      return { from: startBound + exactIdx, to: startBound + exactIdx + tokenText.length }
+    const skipStrings = !tokenText.startsWith("'")
+    let searchFrom = 0
+    while (searchFrom <= slice.length - tokenText.length) {
+      const exactIdx = slice.indexOf(tokenText, searchFrom)
+      if (exactIdx === -1) break
+      const absFrom = startBound + exactIdx
+      const absTo = absFrom + tokenText.length
+      if (!isSpanInsideCommentOrString(absFrom, absTo, commentSpans, tokens, skipStrings)) {
+        return { from: absFrom, to: absTo }
+      }
+      searchFrom = exactIdx + 1
     }
-    const ciIdx = slice.toLowerCase().indexOf(targetLower)
-    if (ciIdx !== -1) {
-      return { from: startBound + ciIdx, to: startBound + ciIdx + tokenText.length }
+    const lowerSlice = slice.toLowerCase()
+    searchFrom = 0
+    while (searchFrom <= lowerSlice.length - targetLower.length) {
+      const ciIdx = lowerSlice.indexOf(targetLower, searchFrom)
+      if (ciIdx === -1) break
+      const absFrom = startBound + ciIdx
+      const absTo = absFrom + tokenText.length
+      if (!isSpanInsideCommentOrString(absFrom, absTo, commentSpans, tokens, skipStrings)) {
+        return { from: absFrom, to: absTo }
+      }
+      searchFrom = ciIdx + 1
     }
   }
 
   return null
+}
+
+function countUtf8Bytes(text) {
+  let bytes = 0
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    if (code <= 0x7f) {
+      bytes += 1
+    } else if (code <= 0x7ff) {
+      bytes += 2
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      const next = text.charCodeAt(i + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4
+        i++
+        continue
+      }
+      bytes += 3
+    } else {
+      bytes += 3
+    }
+  }
+  return bytes
+}
+
+function utf8ByteOffsetToUtf16Index(text, targetByteOffset) {
+  if (targetByteOffset <= 0) return 0
+  let bytes = 0
+  for (let i = 0; i < text.length; i++) {
+    if (bytes >= targetByteOffset) return i
+    const code = text.charCodeAt(i)
+    if (code <= 0x7f) {
+      bytes += 1
+    } else if (code <= 0x7ff) {
+      bytes += 2
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      const next = text.charCodeAt(i + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4
+        i++
+        continue
+      }
+      bytes += 3
+    } else {
+      bytes += 3
+    }
+  }
+  return text.length
 }
 
 function findFirstTokenSpanAt(tokens, scopeText, offset) {
@@ -2296,11 +2625,11 @@ function extractDbSyntaxErrorInternal(
       : docText.length
 
   const scopeText = docText.slice(rangeFrom, rangeTo)
-  if (scopeText.length === 0) return null
+  if (scopeText.length === 0 || scopeText.length > MAX_DOC_LENGTH) return null
 
   const cleanMessage = errorMessage.trim()
   const normalizedDialect = typeof dialect === 'string' ? dialect.trim().toLowerCase() : ''
-  const { tokens } = lexSql(scopeText, normalizedDialect)
+  const { tokens, commentSpans } = lexSql(scopeText, normalizedDialect)
 
   const makeDiag = (localSpan) => {
     if (!localSpan) return null
@@ -2316,17 +2645,22 @@ function extractDbSyntaxErrorInternal(
     }
   }
 
-  // 1. ClickHouse: Syntax error: failed at position N [('TOKEN')]
+  // 1. ClickHouse: Syntax error: failed at position N [('TOKEN')] (1-based UTF-8 byte offset)
   const chMatch = /Syntax error:\s*failed at position\s+(\d+)(?:\s*\('([^']*)'\))?/i.exec(
     cleanMessage
   )
   if (chMatch) {
     const pos = Number.parseInt(chMatch[1], 10)
     const chToken = chMatch[2] || ''
-    if (!Number.isFinite(pos) || pos < 1 || pos > scopeText.length + 1) {
+    const totalUtf8Bytes = countUtf8Bytes(scopeText)
+    if (!Number.isFinite(pos) || pos < 1 || pos > totalUtf8Bytes + 1) {
+      if (!strictLineBounds && chToken) {
+        const tokenSpan = findTokenInRange(tokens, scopeText, chToken, 0, scopeText.length, commentSpans)
+        if (tokenSpan) return makeDiag(tokenSpan)
+      }
       return null
     }
-    const zeroIdx = pos - 1
+    const zeroIdx = utf8ByteOffsetToUtf16Index(scopeText, pos - 1)
     if (zeroIdx >= scopeText.length) {
       return makeDiag(findLastTokenSpanBefore(tokens, scopeText.length))
     }
@@ -2341,7 +2675,7 @@ function extractDbSyntaxErrorInternal(
       if (strictLineBounds) {
         return null
       }
-      const tokenSpan = findTokenInRange(tokens, scopeText, chToken, 0, scopeText.length)
+      const tokenSpan = findTokenInRange(tokens, scopeText, chToken, 0, scopeText.length, commentSpans)
       if (tokenSpan) return makeDiag(tokenSpan)
     }
     return makeDiag(spanAtPos)
@@ -2368,7 +2702,11 @@ function extractDbSyntaxErrorInternal(
     const trimmedSnippet = snippet.trimStart()
     const searchStart = bounds ? bounds.start : 0
     const exactIdx = scopeText.indexOf(trimmedSnippet, searchStart)
-    if (exactIdx !== -1 && (!bounds || exactIdx <= bounds.end)) {
+    if (
+      exactIdx !== -1 &&
+      (!bounds || exactIdx <= bounds.end) &&
+      !isSpanInsideCommentOrString(exactIdx, exactIdx + trimmedSnippet.length, commentSpans, tokens, false)
+    ) {
       const firstTokSpan = findFirstTokenSpanAt(tokens, scopeText, exactIdx)
       if (firstTokSpan && firstTokSpan.from === exactIdx) {
         return makeDiag(firstTokSpan)
@@ -2382,17 +2720,17 @@ function extractDbSyntaxErrorInternal(
     const leadTok = extractLeadingToken(snippet.slice(trimmedLeading))
     if (leadTok) {
       if (bounds) {
-        const onLine = findTokenInRange(tokens, scopeText, leadTok, bounds.start, bounds.end)
+        const onLine = findTokenInRange(tokens, scopeText, leadTok, bounds.start, bounds.end, commentSpans)
         if (onLine) return makeDiag(onLine)
         if (strictLineBounds) return null
       }
-      const anywhere = findTokenInRange(tokens, scopeText, leadTok, 0, scopeText.length)
+      const anywhere = findTokenInRange(tokens, scopeText, leadTok, 0, scopeText.length, commentSpans)
       if (anywhere) return makeDiag(anywhere)
     }
     return null
   }
 
-  // 3. PostgreSQL / CockroachDB: syntax error at or near "TOKEN" (with optional LINE N:)
+  // 3. PostgreSQL / CockroachDB: syntax error at or near "TOKEN" OR syntax error at end of input
   const pgMatch = /syntax error at or near "("(?:""|[^"])*"|[^"]+)"/i.exec(cleanMessage)
   if (pgMatch) {
     const token = pgMatch[1]
@@ -2401,21 +2739,39 @@ function extractDbSyntaxErrorInternal(
     if (lineNum !== null) {
       const bounds = getLineBounds(scopeText, lineNum)
       if (bounds) {
-        const onLine = findTokenInRange(tokens, scopeText, token, bounds.start, bounds.end)
+        const onLine = findTokenInRange(tokens, scopeText, token, bounds.start, bounds.end, commentSpans)
         if (onLine) return makeDiag(onLine)
         if (strictLineBounds) return null
       } else if (strictLineBounds) {
         return null
       }
     }
-    return makeDiag(findTokenInRange(tokens, scopeText, token, 0, scopeText.length))
+    return makeDiag(findTokenInRange(tokens, scopeText, token, 0, scopeText.length, commentSpans))
+  }
+
+  if (/syntax error at end of input/i.test(cleanMessage)) {
+    const lineMatch = /\bLINE\s+(\d+)\s*:/i.exec(cleanMessage)
+    const lineNum = lineMatch ? Number.parseInt(lineMatch[1], 10) : null
+    if (lineNum !== null) {
+      const bounds = getLineBounds(scopeText, lineNum)
+      if (bounds) {
+        const lastOnLine = findLastTokenSpanBefore(tokens, bounds.end)
+        if (lastOnLine && (!strictLineBounds || lastOnLine.from >= bounds.start)) {
+          return makeDiag(lastOnLine)
+        }
+        if (strictLineBounds) return null
+      } else if (strictLineBounds) {
+        return null
+      }
+    }
+    return makeDiag(findLastTokenSpanBefore(tokens, scopeText.length))
   }
 
   // 4. SQLite / LibSQL: near "TOKEN": syntax error (including double-quoted near ""ident"": syntax error)
   const sqliteMatch = /near "(.+?)":\s*syntax error/i.exec(cleanMessage)
   if (sqliteMatch) {
     const token = sqliteMatch[1]
-    return makeDiag(findTokenInRange(tokens, scopeText, token, 0, scopeText.length))
+    return makeDiag(findTokenInRange(tokens, scopeText, token, 0, scopeText.length, commentSpans))
   }
 
   // 5. MSSQL: Incorrect syntax near [the keyword] 'TOKEN'
@@ -2427,14 +2783,26 @@ function extractDbSyntaxErrorInternal(
     if (lineNum !== null) {
       const bounds = getLineBounds(scopeText, lineNum)
       if (bounds) {
-        const onLine = findTokenInRange(tokens, scopeText, token, bounds.start, bounds.end)
+        const onLine = findTokenInRange(tokens, scopeText, token, bounds.start, bounds.end, commentSpans)
         if (onLine) return makeDiag(onLine)
         if (strictLineBounds) return null
       } else if (strictLineBounds) {
         return null
       }
     }
-    return makeDiag(findTokenInRange(tokens, scopeText, token, 0, scopeText.length))
+    return makeDiag(findTokenInRange(tokens, scopeText, token, 0, scopeText.length, commentSpans))
+  }
+
+  // 6. Oracle syntax errors (ORA-00900 / 00905 / 00907 / 00923 / 00933 / 00936)
+  if (/\bORA-00(?:900|905|907|923|933|936)\b/i.test(cleanMessage)) {
+    const staticFallback = analyzeSqlDiagnostics(scopeText, { dialect: normalizedDialect || 'oracle' })
+    const firstStaticErr = staticFallback.find((d) => d.severity === 'error')
+    if (firstStaticErr) {
+      return makeDiag({ from: firstStaticErr.from, to: firstStaticErr.to })
+    }
+    if (!strictLineBounds) {
+      return makeDiag(findLastTokenSpanBefore(tokens, scopeText.length))
+    }
   }
 
   return null
@@ -2454,6 +2822,9 @@ export function extractDbSyntaxErrorDiagnostic(
 }
 
 function findStatementIndexAtOffset(stmtSlices, offset) {
+  if (!Array.isArray(stmtSlices) || stmtSlices.length === 0) return null
+  // Reject offsets strictly inside leading comments/whitespace before Statement 0
+  if (offset < stmtSlices[0].start) return null
   for (let i = 0; i < stmtSlices.length; i++) {
     const s = stmtSlices[i]
     if (offset >= s.start && offset <= s.end) {
@@ -2465,7 +2836,7 @@ function findStatementIndexAtOffset(stmtSlices, offset) {
       return i
     }
   }
-  return stmtSlices.length > 0 ? 0 : null
+  return null
 }
 
 const ERROR_IDENT_SEG_SRC =
@@ -2579,7 +2950,7 @@ function extractMissingIdentifierCandidates(errorMessage) {
     addParts(parseIdentifierPathParts(rawPath), isColumnKind)
   }
 
-  let scrubbed = String(errorMessage || '')
+  let scrubbed = String(errorMessage || '').slice(0, MAX_ERROR_SCAN_LENGTH)
 
   // 1. PostgreSQL: column "X" of relation "Y" does not exist (mask span so "relation Y does not exist" isn't re-matched)
   const pgColOfRelRe = new RegExp(
@@ -2596,10 +2967,12 @@ function extractMissingIdentifierCandidates(errorMessage) {
     return ' '.repeat(full.length)
   })
 
-  // 2. SQLite INSERT/UPDATE: table X has no column named Y
+  // 2. SQLite INSERT/UPDATE: table X has no column named Y (linear, non-backtracking & supports quoted names with parens)
   if (/has no column named/i.test(scrubbed)) {
-    const sqliteNoColRe =
-      /table\s+([^\r\n]+?)\s+has no column named\s+([^\r\n;,()]+?)(?=\s*\(|\s+in\s+|\s+at\s+|$)/gim
+    const sqliteNoColRe = new RegExp(
+      `table\\s+(${ERROR_IDENT_PATH_SRC}|[^\\r\\n\\s]+)\\s+has no column named\\s+(${ERROR_IDENT_PATH_SRC}|[^\\r\\n;,()]+?)(?=\\s*\\(|\\s+in\\s+|\\s+at\\s+|$)`,
+      'gim'
+    )
     scrubbed = scrubbed.replace(sqliteNoColRe, (full, tblRaw, colRaw) => {
       const tblParts = parseIdentifierPathParts(tblRaw)
       const colParts = parseIdentifierPathParts(colRaw)
@@ -2628,7 +3001,7 @@ function extractMissingIdentifierCandidates(errorMessage) {
     addPath(m[2], String(m[1] || '').toLowerCase() === 'column')
   }
 
-  // 5. MySQL / ClickHouse: Unknown column/table/identifier + Missing columns
+  // 5. MySQL / ClickHouse: Unknown column/table/identifier + Missing columns (supports multiple quoted columns)
   const unknownRe = new RegExp(
     `Unknown\\s+(expression or function identifier|table expression identifier|expression identifier|identifier|column|table)\\s+(${ERROR_IDENT_PATH_SRC})`,
     'gi'
@@ -2637,15 +3010,18 @@ function extractMissingIdentifierCandidates(errorMessage) {
     const kind = String(m[1] || '').toLowerCase()
     addPath(m[2], kind === 'column' || kind.includes('identifier'))
   }
-  const chMissingColsRe = /Missing columns:\s*'([^']+)'/gi
-  while ((m = chMissingColsRe.exec(scrubbed)) !== null) {
-    addPath(m[1], true)
+  const chMissingColsBlockRe = /Missing columns:\s*((?:'(?:''|[^'])+'[\s,]*)+)/gi
+  while ((m = chMissingColsBlockRe.exec(scrubbed)) !== null) {
+    const colMatches = m[1].matchAll(/'((?:''|[^'])+)'/g)
+    for (const cm of colMatches) {
+      addPath(cm[1].replace(/''/g, "'"), true)
+    }
   }
 
-  // 6. MSSQL: Invalid object/column name 'X'
-  const mssqlInvalidRe = /Invalid\s+(object|column)\s+name\s+'([^']+)'/gi
+  // 6. MSSQL: Invalid object/column name 'X' (handles doubled '' inside quotes)
+  const mssqlInvalidRe = /Invalid\s+(object|column)\s+name\s+'((?:''|[^'])+)'/gi
   while ((m = mssqlInvalidRe.exec(scrubbed)) !== null) {
-    addPath(m[2], String(m[1] || '').toLowerCase() === 'column')
+    addPath(m[2].replace(/''/g, "'"), String(m[1] || '').toLowerCase() === 'column')
   }
 
   // 7. Oracle: ORA-00904: <ident>: invalid identifier
@@ -2747,7 +3123,7 @@ export function resolveFailedStatementInScript(
   const staticDiags = analyzeSqlDiagnostics(scriptText, { dialect: normalizedDialect })
   const hasStaticErrorInSlice = (slice) =>
     staticDiags.some(
-      (d) => d.severity === 'error' && d.from >= slice.start && d.from <= slice.end
+      (d) => d.severity === 'error' && d.from >= slice.start && d.from < slice.end
     )
 
   const explicitLineMatch = /\b(?:at\s+line|line)\s+(\d+)\b/i.exec(msg)

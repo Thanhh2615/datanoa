@@ -2,6 +2,23 @@
 // Single canonical source of truth for BYOD starter adapters conforming 100% to
 // IDatabaseDriver + IDatabaseSession (TableDetails, TableBrowseResult, QueryResult, ApplyChangesResult, TransactionState).
 
+const BYOD_SQL_READONLY_GUARD_SNIPPET = String.raw`function stripLeadingSqlComments(raw) {
+  let s = String(raw || '')
+  let prev = ''
+  while (s !== prev) {
+    prev = s
+    s = s.replace(/^\s+/, '').replace(/^--[^\r\n]*/, '').replace(/^\/\*[\s\S]*?\*\//, '')
+  }
+  return s.trim()
+}
+function assertReadOnlySql(sql, allowedLeadRe) {
+  const clean = stripLeadingSqlComments(sql)
+  const noComments = clean.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\r\n]*/g, ' ').replace(/'(?:''|\\.|[^'\\])*'/g, "''")
+  if (!allowedLeadRe.test(noComments.trim()) || /\b(?:INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|CREATE|TRUNCATE|COPY|ATTACH|DETACH|PUT|GET|BATCH|EXEC|EXECUTE|CALL|GRANT|REVOKE|VACUUM|PRAGMA\s+\w+\s*=)\b/i.test(noComments)) {
+    throw new Error('Connection is read-only.')
+  }
+}`
+
 const BYOD_OPTIONS_PARSER_SNIPPET = String.raw`function parseKeyValueOrJsonOptions(raw) {
   if (!raw || typeof raw !== 'string') return {}
   const trimmed = raw.trim()
@@ -66,6 +83,8 @@ export function getCanonicalByodStarterCode(driverId: string): string {
 import { DuckDBInstance } from '@duckdb/node-api'
 
 const TX_UNSUPPORTED = { supported: false, autoCommit: true, active: false, statementCount: 0 }
+
+${BYOD_SQL_READONLY_GUARD_SNIPPET}
 
 function quoteDuckIdent(ident) {
   return '"' + String(ident).replace(/"/g, '""') + '"'
@@ -184,8 +203,8 @@ export default {
       getDdl: async (table, schema = 'main') => '-- DuckDB Object: ' + quoteDuckIdent(schema) + '.' + quoteDuckIdent(table),
       runQuery: async (_queryId, sql, maxRows = 1000) => {
         const start = performance.now()
-        if (profile.readOnly && /^\\s*(?:INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|COPY|ATTACH|DETACH)\\b/i.test(sql)) {
-          throw new Error('Connection is read-only.')
+        if (profile.readOnly) {
+          assertReadOnlySql(sql, /^(?:SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|VALUES|SUMMARIZE|TABLE)\\b/i)
         }
         const res = await readRows(sql)
         const limit = maxRows > 0 ? maxRows : res.rows.length
@@ -225,6 +244,7 @@ import snowflake from 'snowflake-sdk'
 const TX_UNSUPPORTED = { supported: false, autoCommit: true, active: false, statementCount: 0 }
 
 ${BYOD_OPTIONS_PARSER_SNIPPET}
+${BYOD_SQL_READONLY_GUARD_SNIPPET}
 const parseSfOptions = parseKeyValueOrJsonOptions
 
 function quoteSfIdent(ident) {
@@ -356,8 +376,8 @@ export default {
       },
       runQuery: async (queryId, sql, maxRows = 1000) => {
         const start = performance.now()
-        if (profile.readOnly && /^\\s*(?:INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|CREATE|TRUNCATE|PUT|GET|COPY)\\b/i.test(sql)) {
-          throw new Error('Connection is read-only.')
+        if (profile.readOnly) {
+          assertReadOnlySql(sql, /^(?:SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|VALUES)\\b/i)
         }
         const { stmt, rows } = await execSql(sql, [], queryId)
         const sfCols = stmt && typeof stmt.getColumns === 'function' ? stmt.getColumns() : []
@@ -406,10 +426,11 @@ import { BigQuery } from '@google-cloud/bigquery'
 const TX_UNSUPPORTED = { supported: false, autoCommit: true, active: false, statementCount: 0 }
 
 ${BYOD_OPTIONS_PARSER_SNIPPET}
+${BYOD_SQL_READONLY_GUARD_SNIPPET}
 const parseBqOptions = parseKeyValueOrJsonOptions
 
 function quoteBqIdent(ident) {
-  return '\`' + String(ident).replace(/\`/g, '') + '\`'
+  return '\`' + String(ident).replace(/\\\\/g, '\\\\\\\\').replace(/\`/g, '\\\\\`') + '\`'
 }
 
 export default {
@@ -489,8 +510,8 @@ export default {
       getDdl: async (table, schema = defaultDataset) => '-- BigQuery Table: ' + quoteBqIdent(schema) + '.' + quoteBqIdent(table),
       runQuery: async (_queryId, sql, maxRows = 1000) => {
         const start = performance.now()
-        if (profile.readOnly && /^\\s*(?:INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|CREATE|TRUNCATE)\\b/i.test(sql)) {
-          throw new Error('Connection is read-only.')
+        if (profile.readOnly) {
+          assertReadOnlySql(sql, /^(?:SELECT|WITH|EXPLAIN|VALUES)\\b/i)
         }
         const [rows] = await bq.query({ query: sql, ...(maxRows > 0 ? { maxResults: maxRows + 1 } : {}) })
         const limit = maxRows > 0 ? maxRows : rows.length
@@ -531,6 +552,7 @@ import cassandra from 'cassandra-driver'
 const TX_UNSUPPORTED = { supported: false, autoCommit: true, active: false, statementCount: 0 }
 
 ${BYOD_OPTIONS_PARSER_SNIPPET}
+${BYOD_SQL_READONLY_GUARD_SNIPPET}
 const parseCassOptions = parseKeyValueOrJsonOptions
 
 function quoteCqlIdent(ident) {
@@ -641,8 +663,8 @@ export default {
       getDdl: async (table, schema = profile.database || 'system') => '-- Cassandra Table: ' + quoteCqlIdent(schema) + '.' + quoteCqlIdent(table),
       runQuery: async (_queryId, cql, maxRows = 1000) => {
         const start = performance.now()
-        if (profile.readOnly && /^\\s*(?:INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|BATCH)\\b/i.test(cql)) {
-          throw new Error('Connection is read-only.')
+        if (profile.readOnly) {
+          assertReadOnlySql(cql, /^(?:SELECT|DESCRIBE|DESC|LIST)\\b/i)
         }
         const res = await client.execute(cql, [], { prepare: false })
         const rawRows = res.rows || []
@@ -1011,6 +1033,8 @@ import mssql from 'mssql'
 
 const TX_UNSUPPORTED = { supported: false, autoCommit: true, active: false, statementCount: 0 }
 
+${BYOD_SQL_READONLY_GUARD_SNIPPET}
+
 export default {
   type: 'mssql',
   async createSession(profile, password) {
@@ -1130,6 +1154,9 @@ export default {
       getDdl: async (table, schema = 'dbo') => \`-- SQL Server Object: [\${schema}].[\${table}]\`,
       runQuery: async (_queryId, sql) => {
         const start = performance.now()
+        if (profile.readOnly) {
+          assertReadOnlySql(sql, /^(?:SELECT|WITH|VALUES)\\b/i)
+        }
         const res = await pool.request().query(sql)
         const rec = res.recordset || []
         const columns = rec.length > 0 ? Object.keys(rec[0]).map((name) => ({ name, type: 'text' })) : []
@@ -1165,6 +1192,8 @@ import oracledb from 'oracledb'
 
 const TX_UNSUPPORTED = { supported: false, autoCommit: true, active: false, statementCount: 0 }
 
+${BYOD_SQL_READONLY_GUARD_SNIPPET}
+
 export default {
   type: 'oracle',
   async createSession(profile, password) {
@@ -1174,15 +1203,20 @@ export default {
       connectString: \`\${profile.host || 'localhost'}:\${Number(profile.port) || 1521}/\${profile.database || 'FREEPDB1'}\`,
     })
     const defaultSchema = (profile.user || 'USER').toUpperCase()
+    let closed = false
     return {
       driverType: 'oracle',
       profile,
-      isAlive: () => true,
+      isAlive: () => !closed,
       test: async () => {
         await conn.execute('SELECT 1 FROM DUAL')
         return { ok: true, message: 'Oracle Database connection valid' }
       },
-      close: async () => { await conn.close() },
+      close: async () => {
+        if (closed) return
+        closed = true
+        await conn.close()
+      },
       listObjects: async () => {
         const res = await conn.execute(
           "SELECT OBJECT_NAME, OBJECT_TYPE FROM USER_OBJECTS WHERE OBJECT_TYPE IN ('TABLE','VIEW') ORDER BY OBJECT_NAME"
@@ -1254,7 +1288,13 @@ export default {
       getDdl: async (table) => \`-- Oracle Object: "\${table}"\`,
       runQuery: async (_queryId, sql) => {
         const start = performance.now()
-        const res = await conn.execute(sql, [], { autoCommit: true })
+        let res
+        if (profile.readOnly) {
+          assertReadOnlySql(sql, /^(?:SELECT|WITH|EXPLAIN\\s+PLAN)\\b/i)
+          res = await conn.execute(sql, [], { autoCommit: false })
+        } else {
+          res = await conn.execute(sql, [], { autoCommit: true })
+        }
         const columns = (res.metaData || []).map((m) => ({ name: String(m.name), type: 'text' }))
         const rows = res.rows || []
         return {
@@ -1319,6 +1359,22 @@ function hasMongoWriteStage(node) {
 
 const MONGO_COLLECTION_SHORTHAND_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,127};?$/
 
+function isReadOnlyMongoCommandObj(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false
+  const keys = Object.keys(obj)
+  if (keys.length === 0) return false
+  const cmd = keys[0].toLowerCase()
+  if (cmd === 'aggregate') {
+    return !hasMongoWriteStage(obj)
+  }
+  if (cmd === 'explain') {
+    const inner = obj.explain
+    if (!inner || typeof inner !== 'object' || Array.isArray(inner)) return false
+    return isReadOnlyMongoCommandObj(inner)
+  }
+  return MONGO_READONLY_COMMANDS.has(cmd)
+}
+
 function isReadOnlyMongoCommand(rawText) {
   const trimmed = String(rawText || '').trim()
   if (MONGO_COLLECTION_SHORTHAND_RE.test(trimmed)) return true
@@ -1329,14 +1385,7 @@ function isReadOnlyMongoCommand(rawText) {
   } catch {
     return false
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false
-  const keys = Object.keys(parsed)
-  if (keys.length === 0) return false
-  const cmd = keys[0].toLowerCase()
-  if (cmd === 'aggregate') {
-    return !hasMongoWriteStage(parsed)
-  }
-  return MONGO_READONLY_COMMANDS.has(cmd)
+  return isReadOnlyMongoCommandObj(parsed)
 }
 
 function buildMongoUri(profile, password) {
@@ -1363,15 +1412,20 @@ export default {
     const client = new MongoClient(uri)
     await client.connect()
     const db = client.db(dbName)
+    let closed = false
     return {
       driverType: 'mongodb',
       profile,
-      isAlive: () => true,
+      isAlive: () => !closed,
       test: async () => {
         await db.command({ ping: 1 })
         return { ok: true, message: 'MongoDB connection valid' }
       },
-      close: async () => { await client.close() },
+      close: async () => {
+        if (closed) return
+        closed = true
+        await client.close()
+      },
       listObjects: async () => {
         const cols = await db.listCollections().toArray()
         return cols.map((c) => ({ schema: dbName, name: c.name, kind: 'table' }))

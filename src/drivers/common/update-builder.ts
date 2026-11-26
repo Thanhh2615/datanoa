@@ -8,6 +8,7 @@ import type {
 import { SUPPORTED_DRIVERS } from './connection-uri'
 import { formatSqlBinaryLiteral } from './sql-lexer'
 import { quoteIdentForDialect, sanitizeFilterClause } from './sql-tools'
+import { normalizeJsonValue } from '../../shared-sql-core.js'
 
 const SUPPORTED_DRIVER_SET: ReadonlySet<string> = new Set(SUPPORTED_DRIVERS)
 const BACKTICK_DIALECTS: ReadonlySet<DriverType> = new Set(['mysql', 'mariadb', 'clickhouse'])
@@ -47,7 +48,7 @@ export function quoteIdentifier(
 ): string
 export function quoteIdentifier(identifier: string, dialect: DriverType): string
 export function quoteIdentifier(first: string, second: string, schema?: string): string {
-  if (schema === undefined && !isDriverType(first) && isDriverType(second)) {
+  if (schema === undefined && isDriverType(second)) {
     return quoteIdentForDialect(first, second)
   }
 
@@ -77,7 +78,13 @@ export function makePlaceholder(driver: DriverType, index: number): string {
 export function formatSqlValue(value: unknown, dialect: DriverType): string {
   if (value === null || value === undefined) return 'NULL'
   if (typeof value === 'boolean') {
-    return dialect === 'mssql' ? (value ? '1' : '0') : value ? 'TRUE' : 'FALSE'
+    return dialect === 'mssql' || dialect === 'oracle'
+      ? value
+        ? '1'
+        : '0'
+      : value
+        ? 'TRUE'
+        : 'FALSE'
   }
   if (typeof value === 'number') return Number.isFinite(value) ? String(value) : 'NULL'
   if (typeof value === 'bigint') return value.toString()
@@ -99,13 +106,20 @@ export function formatSqlValue(value: unknown, dialect: DriverType): string {
   }
 
   if (typeof value === 'object') {
-    return formatSqlStringLiteral(JSON.stringify(value), dialect)
+    return formatSqlStringLiteral(JSON.stringify(normalizeJsonValue(value)), dialect)
   }
 
   return formatSqlStringLiteral(String(value), dialect)
 }
 
 function formatSqlStringLiteral(raw: string, dialect: DriverType): string {
+  if (
+    raw.includes('\0') &&
+    (dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1')
+  ) {
+    const parts = raw.split('\0').map((seg) => `'${seg.replace(/'/g, "''")}'`)
+    return parts.join(' || char(0) || ')
+  }
   let escaped = raw
   if (BACKTICK_DIALECTS.has(dialect)) {
     escaped = escaped.replace(/\\/g, '\\\\').replace(/\0/g, '\\0')
@@ -132,22 +146,65 @@ export interface BuildUpdateResult {
 
 const APPROXIMATE_FLOAT_TYPE_REGEX =
   /\b(?:float|float4|float8|float32|float64|real|double(?:\s+precision)?|binary_float|binary_double)\b/i
-const NON_EQUALITY_JSON_TYPE_REGEX = /^json$/i
+const NON_EQUALITY_TYPE_SET: ReadonlySet<string> = new Set([
+  'json',
+  'jsonb',
+  'xml',
+  'xmltype',
+  'geography',
+  'geometry',
+  'point',
+  'polygon',
+  'path',
+  'box',
+  'circle',
+  'line',
+  'lseg',
+  'ntext',
+  'image',
+  'clob',
+  'nclob',
+  'blob',
+  'tinyblob',
+  'mediumblob',
+  'longblob',
+  'long',
+  'long raw',
+  'bfile',
+  'bytea',
+  'varbinary',
+  'binary',
+  'raw',
+])
+const BLOB_PLACEHOLDER_REGEX = /^\[BLOB\s+\d+\s*B\]$/i
 
-export function canBindOptimisticLockValue(val: unknown, columnType?: string): boolean {
+function normalizeBaseColumnType(rawType: string): string {
+  const withoutParens = rawType.trim().replace(/\([^)]*\)/g, '').trim()
+  const dotIdx = withoutParens.lastIndexOf('.')
+  const bare = dotIdx >= 0 ? withoutParens.slice(dotIdx + 1) : withoutParens
+  return bare.replace(/^["`\[]|["`\]]$/g, '').replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+export function canBindOptimisticLockValue(
+  val: unknown,
+  columnType?: string,
+  driver?: DriverType
+): boolean {
   if (val === undefined) return false
   if (typeof columnType === 'string' && columnType.trim().length > 0) {
     const normalizedType = columnType.trim()
+    const baseType = normalizeBaseColumnType(normalizedType)
     if (
       APPROXIMATE_FLOAT_TYPE_REGEX.test(normalizedType) ||
-      NON_EQUALITY_JSON_TYPE_REGEX.test(normalizedType)
+      NON_EQUALITY_TYPE_SET.has(baseType) ||
+      (driver === 'mssql' && baseType === 'text')
     ) {
       return false
     }
   }
   if (val === null) return true
   if (typeof val === 'object') return false
-  if (typeof val === 'string' && /^\[BLOB\s+\d+\s*B\]$/i.test(val.trim())) return false
+  if (typeof val === 'string' && BLOB_PLACEHOLDER_REGEX.test(val.trim())) return false
   return true
 }
 
@@ -169,10 +226,18 @@ export function buildUpdateSql(options: BuildUpdateOptions): BuildUpdateResult {
   if (!column || typeof column !== 'string') {
     throw new Error('Column name is required for buildUpdateSql')
   }
-  if (!primaryKeys || Object.keys(primaryKeys).length === 0) {
+  const pkEntries = Object.entries(primaryKeys || {})
+  if (pkEntries.length === 0) {
     throw new Error(
       'Cannot generate UPDATE statement without primary key conditions (safety guard)'
     )
+  }
+  for (const [pkCol, pkVal] of pkEntries) {
+    if (pkVal === undefined) {
+      throw new Error(
+        `Cannot generate UPDATE statement with undefined primary key value for "${pkCol}" (safety guard)`
+      )
+    }
   }
 
   const params: unknown[] = []
@@ -185,9 +250,9 @@ export function buildUpdateSql(options: BuildUpdateOptions): BuildUpdateResult {
   const setClause = `${quotedCol} = ${makePlaceholder(driver, paramIdx++)}`
 
   const whereClauses: string[] = []
-  for (const [pkCol, pkVal] of Object.entries(primaryKeys)) {
+  for (const [pkCol, pkVal] of pkEntries) {
     const quotedPk = quoteIdentForDialect(pkCol, driver)
-    if (pkVal === null || pkVal === undefined) {
+    if (pkVal === null) {
       whereClauses.push(`${quotedPk} IS NULL`)
     } else {
       whereClauses.push(`${quotedPk} = ${makePlaceholder(driver, paramIdx++)}`)
@@ -195,7 +260,7 @@ export function buildUpdateSql(options: BuildUpdateOptions): BuildUpdateResult {
     }
   }
 
-  if (canBindOptimisticLockValue(originalValue, originalColumnType)) {
+  if (canBindOptimisticLockValue(originalValue, originalColumnType, driver)) {
     if (originalValue === null) {
       whereClauses.push(`${quotedCol} IS NULL`)
     } else {
@@ -231,8 +296,11 @@ export function buildSelectByPrimaryKeySql(
   for (const [pkCol, rawPkVal] of entries) {
     const effectivePkVal =
       editedColumn !== undefined && pkCol === editedColumn ? newValue : rawPkVal
+    if (effectivePkVal === undefined) {
+      return null
+    }
     const quotedPk = quoteIdentForDialect(pkCol, driver)
-    if (effectivePkVal === null || effectivePkVal === undefined) {
+    if (effectivePkVal === null) {
       whereParts.push(`${quotedPk} IS NULL`)
     } else {
       whereParts.push(`${quotedPk} = ${makePlaceholder(driver, paramIdx++)}`)
@@ -273,9 +341,17 @@ export function buildInsertStatement(options: BuildInsertOptions): Parameterized
   const entries = Object.entries(row || {}).filter(([, val]) => val !== undefined)
 
   if (entries.length === 0) {
-    const emptySql = BACKTICK_DIALECTS.has(driver)
-      ? `INSERT INTO ${quotedTable} () VALUES ()`
-      : `INSERT INTO ${quotedTable} DEFAULT VALUES`
+    if (driver === 'oracle') {
+      throw new Error(
+        'Oracle does not support empty INSERT statements without columns; provide at least one column value.'
+      )
+    }
+    const emptySql =
+      driver === 'clickhouse'
+        ? `INSERT INTO ${quotedTable} VALUES ()`
+        : BACKTICK_DIALECTS.has(driver)
+          ? `INSERT INTO ${quotedTable} () VALUES ()`
+          : `INSERT INTO ${quotedTable} DEFAULT VALUES`
     return {
       sql: emptySql,
       params: [],
@@ -310,12 +386,20 @@ export function buildDeleteStatement(options: BuildDeleteOptions): Parameterized
   if (!table || typeof table !== 'string') {
     throw new Error('Table name is required for buildDeleteStatement')
   }
-  const pkEntries = Object.entries(primaryKeys || {}).filter(([, val]) => val !== undefined)
-  if (pkEntries.length === 0) {
+  const rawPkEntries = Object.entries(primaryKeys || {})
+  if (rawPkEntries.length === 0) {
     throw new Error(
       'Cannot generate DELETE statement without primary key conditions (safety guard)'
     )
   }
+  for (const [pkCol, pkVal] of rawPkEntries) {
+    if (pkVal === undefined) {
+      throw new Error(
+        `Cannot generate DELETE statement with undefined primary key value for "${pkCol}" (safety guard)`
+      )
+    }
+  }
+  const pkEntries = rawPkEntries
 
   const quotedTable = quoteQualifiedTable(table, schema, driver)
   const params: unknown[] = []
@@ -365,7 +449,11 @@ export function projectDeleteRowsToPrimaryKeys(
     }
     const fallbackObj: Record<string, unknown> = {}
     for (const [k, v] of Object.entries(row)) {
-      if (v !== undefined && (v === null || typeof v !== 'object')) {
+      if (
+        v !== undefined &&
+        (v === null || typeof v !== 'object') &&
+        !(typeof v === 'string' && BLOB_PLACEHOLDER_REGEX.test(v.trim()))
+      ) {
         fallbackObj[k] = v
       }
     }
@@ -387,12 +475,20 @@ export function buildRowUpdateStatement(options: {
   if (!table || typeof table !== 'string') {
     throw new Error('Table name is required for buildRowUpdateStatement')
   }
-  const pkEntries = Object.entries(update.primaryKeys || {}).filter(([, val]) => val !== undefined)
-  if (pkEntries.length === 0) {
+  const rawPkEntries = Object.entries(update.primaryKeys || {})
+  if (rawPkEntries.length === 0) {
     throw new Error(
       'Cannot generate UPDATE statement without primary key conditions (safety guard)'
     )
   }
+  for (const [pkCol, pkVal] of rawPkEntries) {
+    if (pkVal === undefined) {
+      throw new Error(
+        `Cannot generate UPDATE statement with undefined primary key value for "${pkCol}" (safety guard)`
+      )
+    }
+  }
+  const pkEntries = rawPkEntries
 
   const changeEntries = Object.entries(update.changes || {}).filter(([, val]) => val !== undefined)
   if (changeEntries.length === 0) {
@@ -431,7 +527,7 @@ export function buildRowUpdateStatement(options: {
     for (const [col] of changeEntries) {
       if (!Object.prototype.hasOwnProperty.call(update.originalRow, col)) continue
       const origVal = update.originalRow[col]
-      if (!canBindOptimisticLockValue(origVal, columnTypes?.[col])) continue
+      if (!canBindOptimisticLockValue(origVal, columnTypes?.[col], driver)) continue
       const quotedCol = quoteIdentForDialect(col, driver)
       if (origVal === null) {
         whereClauses.push(`${quotedCol} IS NULL`)
@@ -468,6 +564,16 @@ export interface BatchStatementsResult {
 
 const MAX_CHUNKED_INSERT_ROWS = 250
 const MAX_CHUNKED_INSERT_PARAMS = 4000
+const D1_MAX_CHUNKED_INSERT_PARAMS = 100
+const SQLITE_MAX_CHUNKED_INSERT_PARAMS = 999
+const MSSQL_MAX_CHUNKED_INSERT_PARAMS = 2000
+
+function getMaxChunkInsertParams(driver: DriverType): number {
+  if (driver === 'd1') return D1_MAX_CHUNKED_INSERT_PARAMS
+  if (driver === 'sqlite' || driver === 'libsql') return SQLITE_MAX_CHUNKED_INSERT_PARAMS
+  if (driver === 'mssql') return MSSQL_MAX_CHUNKED_INSERT_PARAMS
+  return MAX_CHUNKED_INSERT_PARAMS
+}
 
 export function buildChunkedInsertStatements(options: {
   driver: DriverType
@@ -476,6 +582,9 @@ export function buildChunkedInsertStatements(options: {
   inserts: Record<string, unknown>[]
 }): ChunkedInsertStatement[] {
   const { driver, table, schema, inserts } = options
+  if (!table || typeof table !== 'string') {
+    throw new Error('Table name is required for buildChunkedInsertStatements')
+  }
   if (inserts.length === 0) return []
   const quotedTable = quoteQualifiedTable(table, schema, driver)
   const out: ChunkedInsertStatement[] = []
@@ -492,9 +601,8 @@ export function buildChunkedInsertStatements(options: {
     }
 
     const cols = firstEntries.map(([col]) => col)
-    const colSig = cols.join('\0')
     const colsSql = cols.map((col) => quoteIdentForDialect(col, driver)).join(', ')
-    const maxChunkParams = driver === 'mssql' ? 2000 : MAX_CHUNKED_INSERT_PARAMS
+    const maxChunkParams = getMaxChunkInsertParams(driver)
     const maxRows =
       driver === 'oracle'
         ? 1
@@ -509,13 +617,13 @@ export function buildChunkedInsertStatements(options: {
       const candidate = inserts[idx]
       const candEntries = Object.entries(candidate || {}).filter(([, val]) => val !== undefined)
       if (candEntries.length !== cols.length) break
-      const candSig = candEntries.map(([col]) => col).join('\0')
-      if (candSig !== colSig) break
+      const candMap = new Map<string, unknown>(candEntries)
+      if (candMap.size !== cols.length || !cols.every((col) => candMap.has(col))) break
 
       const rowPh: string[] = []
-      for (const [, val] of candEntries) {
+      for (const col of cols) {
         rowPh.push(makePlaceholder(driver, paramIdx++))
-        params.push(val)
+        params.push(candMap.get(col))
       }
       tuplePlaceholders.push(`(${rowPh.join(', ')})`)
       rowCount += 1
@@ -608,7 +716,11 @@ export function buildSelectPageSql(options: BuildSelectPageOptions): SelectPageQ
   const safePageSize = Number.isFinite(rawPageSize) && rawPageSize > 0 ? rawPageSize : 50
   const page = Math.max(1, Math.floor(safePage))
   const pageSize = Math.max(1, Math.min(10000, Math.floor(safePageSize)))
-  const offset = Math.max(0, (page - 1) * pageSize)
+  const rawOffset = (page - 1) * pageSize
+  const offset =
+    Number.isFinite(rawOffset) && rawOffset >= 0
+      ? Math.min(Number.MAX_SAFE_INTEGER, rawOffset)
+      : Number.MAX_SAFE_INTEGER
 
   const sanitizedWhere = sanitizeFilterClause(whereClause, driver)
   const sanitizedOrderBy = sanitizeFilterClause(orderByClause, driver)

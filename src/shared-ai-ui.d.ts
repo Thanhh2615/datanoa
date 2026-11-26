@@ -8,6 +8,8 @@ import type {
   AiRoleStatus,
   AiStatusSnapshot,
   AiStatusState,
+  ConnectionAiPolicy,
+  ConnectionColorTag,
 } from './protocol.js'
 
 export type AiStatusBadgeTone = 'neutral' | 'success' | 'warn' | 'danger'
@@ -76,6 +78,8 @@ export interface ExplainAiPanelState {
   dialect?: string
   destination?: 'none' | 'local' | 'remote'
   host?: string
+  colorTag?: ConnectionColorTag
+  aiPolicy?: ConnectionAiPolicy
   result?: AiExplainAnalysisResult | null
   error?: string | null
   collapsed?: boolean
@@ -107,6 +111,8 @@ export interface AiFixPanelState {
   dialect?: string
   destination?: 'none' | 'local' | 'remote'
   host?: string
+  colorTag?: ConnectionColorTag
+  aiPolicy?: ConnectionAiPolicy
   result?: AiFixQueryResult | null
   error?: string | null
 }

@@ -248,11 +248,22 @@ async function serializeOracleCell(value: unknown): Promise<unknown> {
   if (value === null || value === undefined) return null
   if (typeof value === 'bigint') return value.toString()
   if (value instanceof Date) return value.toISOString()
-  if (Buffer.isBuffer(value)) return sanitizeJsonPayload(value)
+  if (Buffer.isBuffer(value)) {
+    const bounded = value.byteLength > 1024 * 1024 ? value.subarray(0, 1024 * 1024) : value
+    return sanitizeJsonPayload(bounded)
+  }
   if (value instanceof Uint8Array || value instanceof ArrayBuffer) return sanitizeJsonPayload(value)
   if (isOracleLobLike(value)) {
-    const data = await value.getData()
-    return Buffer.isBuffer(data) ? sanitizeJsonPayload(data) : data
+    const lob = value as { getData: (offset?: number, amount?: number) => Promise<string | Buffer> }
+    const data = await lob.getData(1, 1024 * 1024)
+    if (Buffer.isBuffer(data)) {
+      const bounded = data.byteLength > 1024 * 1024 ? data.subarray(0, 1024 * 1024) : data
+      return sanitizeJsonPayload(bounded)
+    }
+    if (typeof data === 'string' && data.length > 1024 * 1024) {
+      return data.slice(0, 1024 * 1024)
+    }
+    return data
   }
   return sanitizeJsonPayload(value)
 }
@@ -562,8 +573,10 @@ export class OracleSession implements IDatabaseSession {
   private readonly conn: OracleConnectionLike
   readonly profile: ConnectionProfile
   private readonly defaultSchema: string
+  private readonly connectAttrs?: ConnectionAttributes
   private readonly tableDetailsCache = new TableDetailsCache()
   private readonly activeQueries = new Map<string, ActiveOracleQuery>()
+  private currentlyExecutingQueryId: string | null = null
 
   private isClosed = false
   private autoCommit = true
@@ -575,10 +588,11 @@ export class OracleSession implements IDatabaseSession {
   constructor(
     conn: OracleConnectionLike,
     profile: ConnectionProfile,
-    options?: { defaultSchema?: string }
+    options?: { defaultSchema?: string; connectAttrs?: ConnectionAttributes }
   ) {
     this.conn = conn
     this.profile = profile
+    this.connectAttrs = options?.connectAttrs
     this.defaultSchema = normalizeOracleSchemaIdentifier(
       options?.defaultSchema || profile.user,
       'SYSTEM'
@@ -634,7 +648,7 @@ export class OracleSession implements IDatabaseSession {
     }
   }
 
-  private readonly queryExecutor = async (
+  private readonly executeQueryUnlocked = async (
     sql: string,
     params?: unknown[]
   ): Promise<Record<string, unknown>[]> => {
@@ -652,12 +666,21 @@ export class OracleSession implements IDatabaseSession {
     return serialized
   }
 
+  private readonly queryExecutor = (
+    sql: string,
+    params?: unknown[]
+  ): Promise<Record<string, unknown>[]> =>
+    this.runExclusiveOp(() => this.executeQueryUnlocked(sql, params))
+
   async test(): Promise<{ ok: boolean; message?: string }> {
     if (this.isClosed) {
       return { ok: false, message: 'Session is closed' }
     }
     try {
-      await this.conn.execute('SELECT 1 AS ok FROM DUAL', {}, { outFormat: getOracleOutFormatObject() })
+      await this.runExclusiveOp(async () => {
+        this.assertOpen()
+        await this.conn.execute('SELECT 1 AS ok FROM DUAL', {}, { outFormat: getOracleOutFormatObject() })
+      })
       return { ok: true, message: 'Oracle connection valid' }
     } catch (err: unknown) {
       return {
@@ -764,9 +787,14 @@ export class OracleSession implements IDatabaseSession {
     this.assertOpen()
     const targetSchema = this.resolveSchema(params.schema)
 
-    return this.runExclusiveOp(async () => {
-      this.assertOpen()
-      const details = await this.getTableDetails(params.table, targetSchema)
+    const runWithExecutor = async (
+      exec: (sql: string, bindParams?: unknown[]) => Promise<Record<string, unknown>[]>
+    ): Promise<TableBrowseResult> => {
+      let details = this.tableDetailsCache.get(targetSchema, this.defaultSchema, params.table)
+      if (!details) {
+        details = await introspectOracleTableDetails(exec, params.table, targetSchema)
+        this.tableDetailsCache.set(targetSchema, this.defaultSchema, params.table, details)
+      }
       const { sql, countSql, params: queryParams } = buildSelectPageSql({
         driver: 'oracle',
         table: params.table,
@@ -780,8 +808,8 @@ export class OracleSession implements IDatabaseSession {
         orderByClause: params.orderByClause,
       })
 
-      const countRows = await this.queryExecutor(stripTrailingSemicolon(countSql))
-      const dataRows = await this.queryExecutor(stripTrailingSemicolon(sql), queryParams)
+      const countRows = await exec(stripTrailingSemicolon(countSql))
+      const dataRows = await exec(stripTrailingSemicolon(sql), queryParams)
 
       return assembleTableBrowseResult({
         tableDetails: details,
@@ -790,6 +818,36 @@ export class OracleSession implements IDatabaseSession {
         page: params.page,
         pageSize: params.pageSize,
       })
+    }
+
+    if (params.bypassTransaction && this.txActive && this.connectAttrs) {
+      const bypassConn = (await oracledb.getConnection(
+        this.connectAttrs
+      )) as unknown as OracleConnectionLike
+      try {
+        const bypassExec = async (
+          sql: string,
+          bindParams?: unknown[]
+        ): Promise<Record<string, unknown>[]> => {
+          const res = await bypassConn.execute(
+            stripTrailingSemicolon(sql),
+            toOracleBindObject(bindParams),
+            { outFormat: getOracleOutFormatObject(), autoCommit: true }
+          )
+          const rows = Array.isArray(res.rows) ? (res.rows as Record<string, unknown>[]) : []
+          const serialized: Record<string, unknown>[] = []
+          for (const r of rows) serialized.push(await serializeOracleRowRecord(r))
+          return serialized
+        }
+        return await runWithExecutor(bypassExec)
+      } finally {
+        await bypassConn.close().catch(() => {})
+      }
+    }
+
+    return this.runExclusiveOp(async () => {
+      this.assertOpen()
+      return runWithExecutor(this.executeQueryUnlocked)
     })
   }
 
@@ -1019,7 +1077,6 @@ export class OracleSession implements IDatabaseSession {
             batch.deletes.length + batch.updates.length + batch.chunkedInserts.length
         }
 
-        this.tableDetailsCache.clear()
         return {
           ok: true,
           inserted,
@@ -1064,6 +1121,7 @@ export class OracleSession implements IDatabaseSession {
         this.activeQueries.delete(queryId)
         throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'oracle')
       }
+      this.currentlyExecutingQueryId = queryId
       const startTime = performance.now()
 
       const collectedSets: QueryResultSet[] = []
@@ -1131,6 +1189,7 @@ export class OracleSession implements IDatabaseSession {
             res = await this.conn.execute(chunk.text, {}, {
               outFormat: getOracleOutFormatArray(),
               autoCommit: !this.txActive && this.autoCommit,
+              ...(maxRows > 0 ? { maxRows: maxRows + 1 } : {}),
             })
           } catch (err: unknown) {
             const { errorNum } = extractOracleErrorCode(err)
@@ -1226,6 +1285,9 @@ export class OracleSession implements IDatabaseSession {
               ...(collectedSets.length > 1 ? { resultSets: collectedSets } : {}),
             }
       } finally {
+        if (this.currentlyExecutingQueryId === queryId) {
+          this.currentlyExecutingQueryId = null
+        }
         if (containsDdlStatement(sql, 'oracle')) {
           this.tableDetailsCache.clear()
         }
@@ -1241,6 +1303,11 @@ export class OracleSession implements IDatabaseSession {
       return { ok: true }
     }
     active.cancelled = true
+    // Only send OCIBreak if this queryId is the one actively executing on the connection,
+    // never aborting an innocent earlier query while this one is still queued in opChain.
+    if (this.currentlyExecutingQueryId !== queryId) {
+      return { ok: true }
+    }
     try {
       await this.breakConnectionExecution()
       return { ok: true }
@@ -1356,8 +1423,13 @@ export class OracleDriver implements IDatabaseDriver {
         throw err
       }
 
+      if (profile.readOnly) {
+        await conn.execute('SET TRANSACTION READ ONLY', {}, { autoCommit: false }).catch(() => {})
+      }
+
       return new OracleSession(conn as unknown as OracleConnectionLike, profile, {
         defaultSchema: built.defaultSchema,
+        connectAttrs: built.attrs,
       })
     } catch (err: unknown) {
       throw scrubOracleError(err)

@@ -24,6 +24,9 @@ export interface ResultBannerState {
   isExplain?: boolean
   failedSql?: string
   fixTargetRange?: SqlFixTargetRange | null
+  source?: 'schema' | 'query' | 'table' | 'connection' | 'tls'
+  connectionId?: string | null
+  tlsRemedy?: boolean
 }
 
 export interface EditableSqlTargetMeta {
@@ -34,6 +37,9 @@ export interface EditableSqlTargetMeta {
   originTabId?: string
   originResultSetIndex?: number
   originConnectionId?: string
+  originDriver?: string
+  originSchema?: string
+  originTable?: string
 }
 
 export interface ResultSetTabRuntimeState {
@@ -71,6 +77,7 @@ export interface SqlConsoleTabState {
   executedSql?: string
   executedConnectionId?: string
   resultStates?: Record<number, ResultSetTabRuntimeState>
+  lastAccessedAt?: number
 }
 
 export interface PersistedConsoleTabsState {
@@ -80,6 +87,43 @@ export interface PersistedConsoleTabsState {
 
 const MAX_PERSISTED_TABS = 20
 const MAX_PERSISTED_SQL_LENGTH = 50_000
+const MAX_INACTIVE_RESULT_CACHE_BYTES = 24_000_000
+
+function estimateRowSampleBytes(rows: ReadonlyArray<unknown>): number {
+  const len = rows.length
+  if (len === 0) return 0
+  const sampleCount = Math.min(len, 16)
+  let sampleBytes = 0
+  for (let i = 0; i < sampleCount; i++) {
+    try {
+      sampleBytes += JSON.stringify(rows[i])?.length ?? 64
+    } catch {
+      sampleBytes += 128
+    }
+  }
+  return Math.ceil((sampleBytes / sampleCount) * len * 2)
+}
+
+function estimateTabResultCacheBytes(tab: SqlConsoleTabState): number {
+  let bytes = 0
+  if (tab.lastResult) {
+    if (Array.isArray(tab.lastResult.resultSets) && tab.lastResult.resultSets.length > 0) {
+      for (const rs of tab.lastResult.resultSets) {
+        if (Array.isArray(rs.rows)) bytes += estimateRowSampleBytes(rs.rows)
+      }
+    } else if (Array.isArray(tab.lastResult.rows)) {
+      bytes += estimateRowSampleBytes(tab.lastResult.rows)
+    }
+  }
+  if (tab.resultStates) {
+    for (const st of Object.values(tab.resultStates)) {
+      if (st?.gridSnapshot?.model?.rows) {
+        bytes += estimateRowSampleBytes(st.gridSnapshot.model.rows)
+      }
+    }
+  }
+  return bytes
+}
 
 function generateTabId(): string {
   return `tab_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
@@ -166,15 +210,54 @@ export class ConsoleTabsManager {
     return newTab
   }
 
+  private accessClock = 1
+
+  private touchTab(tab: SqlConsoleTabState): void {
+    tab.lastAccessedAt = ++this.accessClock
+  }
+
+  /**
+   * Evicts heavy cached grid snapshots/results on least-recently-used inactive tabs
+   * whenever inactive memory exceeds the LRU byte budget.
+   */
+  public evictInactiveResultsIfNeeded(budgetBytes = MAX_INACTIVE_RESULT_CACHE_BYTES): void {
+    const inactive = this.tabs
+      .filter((t) => t.id !== this.activeTabId)
+      .map((t) => ({ tab: t, bytes: estimateTabResultCacheBytes(t) }))
+      .filter((x) => x.bytes > 0)
+    let total = inactive.reduce((acc, x) => acc + x.bytes, 0)
+    if (total <= budgetBytes) return
+    inactive.sort((a, b) => (a.tab.lastAccessedAt ?? 0) - (b.tab.lastAccessedAt ?? 0))
+    for (const item of inactive) {
+      if (total <= budgetBytes) break
+      if (item.tab.resultStates) {
+        for (const st of Object.values(item.tab.resultStates)) {
+          if (st && st.gridSnapshot) {
+            st.gridSnapshot = null
+          }
+        }
+      }
+      const afterSnapBytes = estimateTabResultCacheBytes(item.tab)
+      total -= item.bytes - afterSnapBytes
+      if (total > budgetBytes && item.tab.lastResult) {
+        item.tab.lastResult = null
+        item.tab.resultStates = {}
+        total -= afterSnapBytes
+      }
+    }
+  }
+
   /**
    * Switches active tab to the specified ID.
    */
   switchTab(tabId: string): boolean {
-    const exists = this.tabs.some((t) => t.id === tabId)
-    if (!exists) {
+    const target = this.tabs.find((t) => t.id === tabId)
+    if (!target) {
       return false
     }
     this.activeTabId = tabId
+    this.touchTab(target)
+    this.evictInactiveResultsIfNeeded()
     return true
   }
 
@@ -269,6 +352,8 @@ export class ConsoleTabsManager {
         tab.executedConnectionId = executedConnectionId
       }
     }
+    this.touchTab(tab)
+    this.evictInactiveResultsIfNeeded()
   }
 
   /**
@@ -302,6 +387,8 @@ export class ConsoleTabsManager {
       }
       tab.resultStates = resultStates ? { ...resultStates } : {}
     }
+    this.touchTab(tab)
+    this.evictInactiveResultsIfNeeded()
     return true
   }
 
@@ -344,9 +431,16 @@ export class ConsoleTabsManager {
    * Serializes console tabs for storage persistence (bounded at 20 tabs, caps SQL length).
    */
   toPersistedState(): PersistedConsoleTabsState {
+    let selectedTabs = this.tabs.slice(0, MAX_PERSISTED_TABS)
+    if (!selectedTabs.some((t) => t.id === this.activeTabId)) {
+      const active = this.tabs.find((t) => t.id === this.activeTabId)
+      if (active) {
+        selectedTabs = [...selectedTabs.slice(0, MAX_PERSISTED_TABS - 1), active]
+      }
+    }
     return {
       activeTabId: this.activeTabId,
-      tabs: this.tabs.slice(0, MAX_PERSISTED_TABS).map((t) => ({
+      tabs: selectedTabs.map((t) => ({
         id: t.id,
         title: t.title,
         sql: t.sql.slice(0, MAX_PERSISTED_SQL_LENGTH),

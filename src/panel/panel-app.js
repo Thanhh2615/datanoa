@@ -20,6 +20,9 @@ import {
   countPanelStructChanges,
   getPanelCreateTableRowAriaLabels,
   resolvePanelFormDriver,
+  isActionableTlsErrorMessage,
+  formatConnectionScopedMessage,
+  summarizeSchemaErrors,
   scrubClientUrlCredentials,
 } from './panel-core.js'
 import {
@@ -76,6 +79,7 @@ const state = {
   activeConnectionId: null,
   schemaObjects: {},
   schemaLoading: new Set(),
+  schemaErrors: {},
   tableDetails: {},
   tableDetailsErrors: {},
   structDraftKey: null,
@@ -178,12 +182,14 @@ let dmlPreviewSeq = 0
 let lastLoadedPanelTableKey = null
 let refreshConnectionsPending = false
 const schemaRefreshPending = new Set()
+const schemaLoadSeqByConn = new Map()
 const tableDetailsSeqByKey = new Map()
 const orcaDisposables = []
 let pendingDeleteConnId = null
 let suppressSortClickUntil = 0
 let activeResizeCleanup = null
 let bannerDismissTimer = null
+let bannerActionContext = null
 let dataLoadStopTimer = null
 let saveViewStateTimer = null
 let findDebounceTimer = null
@@ -761,17 +767,37 @@ function clearStagedChanges() {
   renderStagingBar()
 }
 
-function showBanner(text, tone = 'neutral') {
+function showBanner(text, tone = 'neutral', opts = null) {
   if (tone === 'danger' && text) {
-    state.lastError = String(text)
+    const rawErr =
+      opts && typeof opts === 'object' && typeof opts.rawError === 'string' && opts.rawError.trim()
+        ? opts.rawError.trim()
+        : String(text)
+    state.lastError = rawErr
   }
   if (bannerDismissTimer !== null) {
     clearTimeout(bannerDismissTimer)
     bannerDismissTimer = null
   }
+  bannerActionContext = opts && typeof opts === 'object' ? opts : null
   const box = $('globalBanner')
   box.className = `banner ${tone}`
+  box.setAttribute('role', tone === 'danger' || tone === 'warn' ? 'alert' : 'status')
   $('globalBannerText').textContent = text
+  const actionsEl = $('globalBannerActions')
+  const retryBtn = $('globalBannerRetryBtn')
+  const editBtn = $('globalBannerEditBtn')
+  const hasRetry = typeof bannerActionContext?.onRetry === 'function'
+  const hasEdit = typeof bannerActionContext?.onEdit === 'function'
+  if (retryBtn) {
+    retryBtn.hidden = !hasRetry
+    retryBtn.textContent = bannerActionContext?.retryLabel || 'Retry'
+  }
+  if (editBtn) {
+    editBtn.hidden = !hasEdit
+    editBtn.textContent = bannerActionContext?.editLabel || 'Edit'
+  }
+  if (actionsEl) actionsEl.hidden = !hasRetry && !hasEdit
   box.hidden = false
   if (tone === 'success' || tone === 'neutral') {
     bannerDismissTimer = setTimeout(() => {
@@ -786,7 +812,86 @@ function hideBanner() {
     clearTimeout(bannerDismissTimer)
     bannerDismissTimer = null
   }
+  bannerActionContext = null
+  if ($('globalBannerActions')) $('globalBannerActions').hidden = true
+  if ($('globalBannerRetryBtn')) {
+    $('globalBannerRetryBtn').hidden = true
+    $('globalBannerRetryBtn').textContent = 'Retry'
+  }
+  if ($('globalBannerEditBtn')) {
+    $('globalBannerEditBtn').hidden = true
+    $('globalBannerEditBtn').textContent = 'Edit'
+  }
   $('globalBanner').hidden = true
+}
+
+function canEditConnection(conn) {
+  return Boolean(conn && !ENGINE_BY_ID[conn.driver]?.studioOnly)
+}
+
+function showConnectionBanner(connectionId, rawMessage, tone = 'danger', opts = {}) {
+  if (state.formOpen && opts?.source === 'schema' && !opts?.forceShowOverForm) {
+    return
+  }
+  const conn = getConnById(connectionId)
+  const rawError = String(rawMessage || '').trim() || opts.fallback || 'Connection error'
+  const text = formatConnectionScopedMessage(conn, rawError, opts.fallback)
+  const isErrorTone = tone === 'danger' || tone === 'warn'
+  const canEdit = isErrorTone && canEditConnection(conn)
+  const isTlsRemedy = isErrorTone && isActionableTlsErrorMessage(rawError)
+  showBanner(text, tone, {
+    ...opts,
+    rawError,
+    connectionId,
+    editLabel: opts.editLabel || (isTlsRemedy ? 'Change Encryption' : 'Edit'),
+    onEdit:
+      opts.onEdit ??
+      (canEdit
+        ? () => {
+            const latestConn = getConnById(connectionId)
+            if (canEditConnection(latestConn)) {
+              populateFormFromProfile(latestConn, 'edit', isTlsRemedy ? { focusSection: 'tls' } : undefined)
+            }
+          }
+        : undefined),
+  })
+}
+
+function syncSchemaErrorBanner(preferredConnId) {
+  const summary = summarizeSchemaErrors(state.connections, state.schemaErrors, preferredConnId)
+  if (!summary) {
+    if (bannerActionContext?.source === 'schema') {
+      hideBanner()
+    }
+    return
+  }
+  if (state.formOpen) {
+    return
+  }
+  const targetConn = getConnById(summary.connectionId)
+  const canEdit = canEditConnection(targetConn)
+  const targetConnId = summary.connectionId
+  const focusTls = Boolean(summary.tlsRemedy)
+  showBanner(summary.text, 'danger', {
+    source: 'schema',
+    rawError: summary.rawError,
+    connectionId: targetConnId,
+    retryLabel: summary.retryLabel,
+    editLabel: summary.editLabel,
+    onRetry: () => {
+      for (const cid of summary.failingIds) {
+        if (getConnById(cid)) void loadSchema(cid)
+      }
+    },
+    onEdit: canEdit
+      ? () => {
+          const latestConn = getConnById(targetConnId)
+          if (canEditConnection(latestConn)) {
+            populateFormFromProfile(latestConn, 'edit', focusTls ? { focusSection: 'tls' } : undefined)
+          }
+        }
+      : undefined,
+  })
 }
 
 function showFormNotice(text, tone = 'neutral') {
@@ -1062,6 +1167,7 @@ const structCtrl = createPanelStructureController({
   getActiveConn: () => getActiveConn(),
   getConnById: (id) => getConnById(id),
   showBanner: (...a) => showBanner(...a),
+  showConnectionBanner: (...a) => showConnectionBanner(...a),
   savePanelViewState: () => savePanelViewState(),
   loadSchema: (...a) => loadSchema(...a),
   loadTableDetails: (...a) => loadTableDetails(...a),
@@ -1091,6 +1197,7 @@ const explorerCtrl = createPanelExplorerController({
   loadSchema: (id) => loadSchema(id),
   selectTableAndOpen: (...a) => selectTableAndOpen(...a),
   showBanner: (...a) => showBanner(...a),
+  showConnectionBanner: (...a) => showConnectionBanner(...a),
   copyText: (...a) => copyText(...a),
   exportCurrentDataPage: (...a) => exportCurrentDataPage(...a),
   exportCurrentSqlResult: (...a) => exportCurrentSqlResult(...a),
@@ -1146,6 +1253,7 @@ const feedbackPaletteCtrl = createPanelFeedbackAndPaletteController({
   refreshConnections: () => refreshConnections(),
   copyText: (...a) => copyText(...a),
   showBanner: (...a) => showBanner(...a),
+  onThemeToggled: (isLight) => setSqlColorScheme(isLight),
 })
 const {
   closeFeedbackModal,
@@ -1183,6 +1291,14 @@ async function refreshConnections(options = {}) {
     ])
     const prevConnSignature = JSON.stringify(state.connections)
     state.connections = Array.isArray(list) ? list : []
+    for (const cid of Object.keys(state.schemaErrors)) {
+      if (!state.connections.some((c) => c.id === cid)) {
+        delete state.schemaErrors[cid]
+      }
+    }
+    if (bannerActionContext?.source === 'schema') {
+      syncSchemaErrorBanner()
+    }
     const connsChanged = prevConnSignature !== JSON.stringify(state.connections)
     state.initialBootLoading = false
     if (!state.hasRestoredViewState && sessionSnap?.viewState && typeof sessionSnap.viewState === 'object') {
@@ -1599,18 +1715,35 @@ async function prefetchPanelAutocompleteSchema(connectionId) {
   }
 }
 
-async function loadSchema(connectionId) {
+async function loadSchema(connectionId, loadOpts = {}) {
   if (!connectionId) return
-  if (state.schemaLoading.has(connectionId)) {
+  if (state.schemaLoading.has(connectionId) && !loadOpts?.force) {
     schemaRefreshPending.add(connectionId)
     return
   }
+  const loadSeq = (schemaLoadSeqByConn.get(connectionId) || 0) + 1
+  schemaLoadSeqByConn.set(connectionId, loadSeq)
   state.schemaLoading.add(connectionId)
   renderExplorer()
+  let releasedLoading = false
+  const releaseLoadingIfCurrent = () => {
+    if (releasedLoading) return
+    releasedLoading = true
+    if (schemaLoadSeqByConn.get(connectionId) === loadSeq) {
+      state.schemaLoading.delete(connectionId)
+      renderExplorer()
+    }
+  }
   try {
     const objects = await rpc('schema.listObjects', { connectionId }, { timeoutMs: QUERY_TIMEOUT_MS })
-    if (!getConnById(connectionId)) return
+    if (schemaLoadSeqByConn.get(connectionId) !== loadSeq || !getConnById(connectionId)) return
+    const hadSchemaError = Object.prototype.hasOwnProperty.call(state.schemaErrors, connectionId)
+    delete state.schemaErrors[connectionId]
     state.schemaObjects[connectionId] = Array.isArray(objects) ? objects : []
+    releaseLoadingIfCurrent()
+    if (hadSchemaError && bannerActionContext?.source === 'schema') {
+      syncSchemaErrorBanner()
+    }
     if (connectionId === state.activeConnectionId) {
       savePanelDataCache()
       const objs = state.schemaObjects[connectionId]
@@ -1672,13 +1805,16 @@ async function loadSchema(connectionId) {
       }
     }
   } catch (err) {
-    if (getConnById(connectionId)) {
-      showBanner(err?.message || 'Failed to inspect schema', 'danger')
+    if (schemaLoadSeqByConn.get(connectionId) !== loadSeq) return
+    const conn = getConnById(connectionId)
+    if (conn) {
+      const rawMsg = String(err?.message || '').trim() || 'Failed to inspect schema'
+      state.schemaErrors[connectionId] = rawMsg
+      syncSchemaErrorBanner(connectionId)
     }
   } finally {
-    state.schemaLoading.delete(connectionId)
-    renderExplorer()
-    if (schemaRefreshPending.has(connectionId)) {
+    releaseLoadingIfCurrent()
+    if (schemaLoadSeqByConn.get(connectionId) === loadSeq && schemaRefreshPending.has(connectionId)) {
       schemaRefreshPending.delete(connectionId)
       if (getConnById(connectionId)) {
         void loadSchema(connectionId)
@@ -1715,6 +1851,14 @@ function cancelPendingDataAndSchemaLoads() {
 function activateConnection(connectionId) {
   cancelPendingDataAndSchemaLoads()
   resetSqlSafetyBannerDismissal()
+  if (connectionId && state.schemaErrors[connectionId]) {
+    syncSchemaErrorBanner(connectionId)
+  } else if (
+    (bannerActionContext?.connectionId && bannerActionContext.connectionId !== connectionId) ||
+    bannerActionContext?.source === 'schema'
+  ) {
+    hideBanner()
+  }
   state.activeConnectionId = connectionId || null
   state.activeTable = null
   state.activeSchema = undefined
@@ -1818,6 +1962,10 @@ async function loadTableDetails(connectionId, table, schema) {
           renderDataGrid()
         }
       }
+    } else if (isActiveTarget()) {
+      state.structureLoading = false
+      state.structureError = null
+      renderStructure()
     }
   } catch (err) {
     if (tableDetailsSeqByKey.get(detailsKey) === reqSeq) {
@@ -1981,7 +2129,18 @@ async function loadTablePage(connectionId, table, page = 1, schema = state.activ
         if (footer) footer.hidden = true
       }
     }
-    showBanner(`Error loading ${table}: ${err?.message || err}`, 'danger')
+    showConnectionBanner(connectionId, `Error loading ${table}: ${err?.message || err}`, 'danger', {
+      onRetry: () => {
+        if (
+          state.activeConnectionId !== connectionId ||
+          state.activeTable !== table ||
+          (state.activeSchema || '') !== normSchema
+        ) {
+          return
+        }
+        void loadTablePage(connectionId, table, page, schema, opts)
+      },
+    })
   } finally {
     if (reqSeq === dataPageLoadSeq) {
       if (dataLoadStopTimer) {
@@ -2080,6 +2239,7 @@ function selectTableAndOpen(connectionId, tableName, schemaName, switchToData, o
     if ($('dataFindInput')) $('dataFindInput').value = ''
     if ($('dataRemoteChangeBanner')) $('dataRemoteChangeBanner').hidden = true
     if (dataGridSel) dataGridSel.clear(true)
+    clearStagedChanges()
   }
   state.activeTable = tableName
   state.activeSchema = schemaName
@@ -2144,6 +2304,12 @@ async function deleteConnectionById(id) {
     state.expandedConns.delete(id)
     schemaRefreshPending.delete(id)
     delete state.schemaObjects[id]
+    delete state.schemaErrors[id]
+    if (bannerActionContext?.source === 'schema') {
+      syncSchemaErrorBanner()
+    } else if (bannerActionContext?.connectionId === id) {
+      hideBanner()
+    }
     for (const mapObj of [
       state.tableDetails,
       state.tableDetailsErrors,
@@ -2173,7 +2339,7 @@ async function deleteConnectionById(id) {
     renderValueInspector()
     await refreshConnections()
   } catch (err) {
-    showBanner(err?.message || 'Delete failed', 'danger')
+    showConnectionBanner(id, err?.message || 'Delete failed', 'danger')
   }
 }
 
@@ -2445,7 +2611,7 @@ function openCreateTableModal() {
   const conn = getActiveConn()
   if (!conn || conn.driver === 'redis') return
   if (conn.readOnly) {
-    showBanner('Read-Only connection — cannot create tables or collections.', 'danger')
+    showConnectionBanner(conn.id, 'Read-Only connection — cannot create tables or collections.', 'danger')
     return
   }
   const isMongo = conn.driver === 'mongodb'
@@ -2487,7 +2653,7 @@ let pendingDangerTableOp = null
 function openDangerTableModal(action, conn, obj) {
   if (!conn || !obj || conn.driver === 'redis') return
   if (conn.readOnly) {
-    showBanner('Read-Only connection — destructive table operations are disabled.', 'danger')
+    showConnectionBanner(conn.id, 'Read-Only connection — destructive table operations are disabled.', 'danger')
     return
   }
   pendingDangerTableOp = { action, conn, obj }
@@ -2529,6 +2695,7 @@ dataGridSel = new PanelGridSelection({
   wrapEl: $('dataGridWrap'),
   tableEl: $('dataTable'),
   editable: true,
+  isTransposed: () => Boolean(state.transposed),
   getDimensions: () => ({
     rows: (dataVirt.active ? dataVirt.allRows : getAllDisplayRows()).length,
     cols: (dataVirt.active ? dataVirt.visCols : getOrderedVisibleColumns()).length,
@@ -2814,6 +2981,14 @@ $('closeFormBtn').addEventListener('click', () => {
   if (!state.formBusy) setFormOpen(false)
 })
 $('globalBannerClose').addEventListener('click', hideBanner)
+$('globalBannerRetryBtn')?.addEventListener('click', () => {
+  const fn = bannerActionContext?.onRetry
+  if (typeof fn === 'function') void fn()
+})
+$('globalBannerEditBtn')?.addEventListener('click', () => {
+  const fn = bannerActionContext?.onEdit
+  if (typeof fn === 'function') fn()
+})
 $('formNoticeClose')?.addEventListener('click', clearFormNotice)
 $('sqlProdBannerClose')?.addEventListener('click', dismissSqlSafetyBanner)
 $('refreshBtn').addEventListener('click', () => void refreshConnections({ forceLive: true }))
@@ -2957,7 +3132,11 @@ $('saveFormBtn').addEventListener('click', async () => {
       state.activeConnectionId = savedId
       void persistActiveConnectionId(savedId)
       state.expandedConns.add(savedId)
+      schemaLoadSeqByConn.set(savedId, (schemaLoadSeqByConn.get(savedId) || 0) + 1)
+      state.schemaLoading.delete(savedId)
+      schemaRefreshPending.delete(savedId)
       delete state.schemaObjects[savedId]
+      delete state.schemaErrors[savedId]
       state.activeTable = null
       state.activeSchema = undefined
       state.pageData = null
@@ -2967,7 +3146,9 @@ $('saveFormBtn').addEventListener('click', async () => {
       clearStagedChanges()
       savePanelViewState()
       await refreshConnections()
-      showBanner(`Connected to ${sub.profile.name}`, 'success')
+      if (!state.schemaErrors[savedId] && bannerActionContext?.source !== 'schema') {
+        showBanner(`Connected to ${sub.profile.name}`, 'success')
+      }
     } else {
       showFormNotice('Failed to save connection.', 'danger')
     }
@@ -2999,11 +3180,15 @@ $('testActiveBtn').addEventListener('click', async () => {
   try {
     const res = await rpc('connection.test', { profile: active }, { timeoutMs: QUERY_TIMEOUT_MS })
     if (state.activeConnectionId === targetConnId) {
-      showBanner(res?.message || (res?.ok ? 'Connected' : 'Failed'), res?.ok ? 'success' : 'danger')
+      showConnectionBanner(
+        targetConnId,
+        res?.message || (res?.ok ? 'Connected' : 'Failed'),
+        res?.ok ? 'success' : 'danger'
+      )
     }
   } catch (err) {
     if (state.activeConnectionId === targetConnId) {
-      showBanner(err?.message || 'Test failed', 'danger')
+      showConnectionBanner(targetConnId, err?.message || 'Test failed', 'danger')
     }
   } finally {
     stopTimer()
@@ -3265,7 +3450,7 @@ $('dangerTableExecuteBtn')?.addEventListener('click', async () => {
   const op = pendingDangerTableOp
   if (!op || state.runningDangerTableOp) return
   if (op.conn.readOnly) {
-    showBanner('Read-Only connection — blocked.', 'danger')
+    showConnectionBanner(op.conn.id, 'Read-Only connection — blocked.', 'danger')
     return
   }
   if ($('dangerTableConfirmInput').value.trim() !== op.obj.name) return
@@ -3628,7 +3813,7 @@ $('dmlPreviewBtn').addEventListener('click', async () => {
     $('dmlPreviewDrawer').hidden = false
   } catch (err) {
     if (reqSeq === dmlPreviewSeq) {
-      showBanner(err?.message || 'Failed to preview DML', 'danger')
+      showConnectionBanner(targetConnId, err?.message || 'Failed to preview DML', 'danger')
     }
   } finally {
     if (reqSeq === dmlPreviewSeq) {
@@ -3661,6 +3846,9 @@ async function submitStagedChanges() {
   try {
     const res = await rpc('data.applyChanges', buildDataChangesPayload(), { timeoutMs: QUERY_TIMEOUT_MS })
     if (res?.ok) {
+      // Clear staged edits IMMEDIATELY after DB commit succeeds so a failed post-commit reload
+      // can never trigger a duplicate INSERT/UPDATE/DELETE on retry.
+      clearStagedChanges()
       showBanner(`Committed: +${res.inserted || 0} / ~${res.updated || 0} / -${res.deleted || 0}`, 'success')
       if (
         state.activeConnectionId === targetConnId &&
@@ -3670,10 +3858,10 @@ async function submitStagedChanges() {
         await loadTablePage(targetConnId, targetTable, targetPage, targetSchema)
       }
     } else {
-      showBanner('Batch commit rejected', 'danger')
+      showConnectionBanner(targetConnId, 'Batch commit rejected', 'danger')
     }
   } catch (err) {
-    showBanner(`Commit failed: ${err?.message || err}`, 'danger')
+    showConnectionBanner(targetConnId, `Commit failed: ${err?.message || err}`, 'danger')
   } finally {
     submittingChanges = false
     setButtonLoading(submitBtn, false)
@@ -4064,8 +4252,74 @@ window.addEventListener('blur', () => {
   }
 })
 
-// Capture-phase Escape: dismiss overlays/popovers/modals before PanelGridSelection clears cell selection
+const PANEL_MODAL_FOCUS_TRAP_IDS = [
+  'bulkFillModal',
+  'createTableModal',
+  'feedbackModal',
+  'cmdPaletteModal',
+  'shortcutsModal',
+  'dangerSqlModal',
+  'dangerTableModal',
+  'confirmMigrationModal',
+  'confirmDeleteModal',
+]
+const MODAL_FOCUSABLE_SELECTOR =
+  'button:not(:disabled), [href], input:not(:disabled):not([type="hidden"]), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'
+
+function isElementVisibleForFocusTrap(el, boundaryEl) {
+  const isHtmlEl =
+    typeof HTMLElement === 'function'
+      ? el instanceof HTMLElement
+      : Boolean(el && typeof el === 'object' && typeof el.focus === 'function')
+  if (!isHtmlEl || el.hidden) return false
+  let node = el
+  while (node && node !== boundaryEl) {
+    if (node.hidden) return false
+    if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
+      const style = window.getComputedStyle(node)
+      if (style.display === 'none' || style.visibility === 'hidden') return false
+    } else if (node.style?.display === 'none' || node.style?.visibility === 'hidden') {
+      return false
+    }
+    node = node.parentElement
+  }
+  return true
+}
+
+function getActivePanelModalEl() {
+  for (const id of PANEL_MODAL_FOCUS_TRAP_IDS) {
+    const el = $(id)
+    if (el && !el.hidden) return el
+  }
+  return null
+}
+
+// Capture-phase Tab trap & Escape dismissal for overlays/popovers/modals
 document.addEventListener('keydown', (e) => {
+  if (e.key === 'Tab') {
+    if (document.querySelector('.datanoa-ai-backdrop') || document.querySelector('.panel-fp-backdrop')) {
+      return
+    }
+    const activeModal = getActivePanelModalEl()
+    if (!activeModal) return
+    const focusables = Array.from(activeModal.querySelectorAll(MODAL_FOCUSABLE_SELECTOR)).filter((el) =>
+      isElementVisibleForFocusTrap(el, activeModal)
+    )
+    if (focusables.length === 0) return
+    const first = focusables[0]
+    const last = focusables[focusables.length - 1]
+    const active = document.activeElement
+    if (e.shiftKey) {
+      if (active === first || !activeModal.contains(active)) {
+        e.preventDefault()
+        last.focus()
+      }
+    } else if (active === last || !activeModal.contains(active)) {
+      e.preventDefault()
+      first.focus()
+    }
+    return
+  }
   if (e.key !== 'Escape') return
   const aiBackdrop = document.querySelector('.datanoa-ai-backdrop')
   if (aiBackdrop) {

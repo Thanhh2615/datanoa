@@ -52,7 +52,20 @@ function escapeDelimitedField(text: string, delimiter: ',' | '\t'): string {
 }
 
 function escapeMarkdownCell(text: string): string {
-  return text.replace(/\|/g, '\\|').replace(/\r\n|\r|\n/g, '<br>')
+  return text.replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/\r\n|\r|\n/g, '<br>')
+}
+
+function assignSafeJsonProp(target: Record<string, unknown>, key: string, value: unknown): void {
+  if (key === '__proto__') {
+    Object.defineProperty(target, key, {
+      value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    })
+  } else {
+    target[key] = value
+  }
 }
 
 function projectRow(columns: string[], row: Record<string, unknown>): Record<string, unknown> {
@@ -61,7 +74,7 @@ function projectRow(columns: string[], row: Record<string, unknown>): Record<str
   }
   const out: Record<string, unknown> = {}
   for (const col of columns) {
-    out[col] = normalizeJsonValue(row[col])
+    assignSafeJsonProp(out, col, normalizeJsonValue(row[col]))
   }
   return out
 }
@@ -122,6 +135,9 @@ function formatSqlUpdateRows(
     const whereSql = effectiveWhereCols
       .map((pk) => {
         const qPk = quoteIdentForDialect(pk, dialect)
+        if (hasExplicitPk && !Object.prototype.hasOwnProperty.call(row, pk)) {
+          throw new Error(`Missing primary key column "${pk}" in row for SQL UPDATE export.`)
+        }
         const pkVal = row[pk]
         if (pkVal === null || pkVal === undefined) {
           return `${qPk} IS NULL`
@@ -249,7 +265,7 @@ export function formatCellMatrixExport(
       const colCount = Math.max(headers.length, row.length)
       for (let i = 0; i < colCount; i++) {
         const key = headers[i] && headers[i].length > 0 ? headers[i] : `col_${i + 1}`
-        obj[key] = normalizeJsonValue(row[i])
+        assignSafeJsonProp(obj, key, normalizeJsonValue(row[i]))
       }
       return obj
     })

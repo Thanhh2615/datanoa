@@ -36,17 +36,186 @@ export interface SelectionSummary {
   avg: number | null
   min: number | null
   max: number | null
+  sumFormatted?: string | null
+  avgFormatted?: string | null
+  minFormatted?: string | null
+  maxFormatted?: string | null
   mode: SelectionMode
   focus: CellCoord | null
   isTruncatedScan: boolean
 }
+
+export interface ExactDecimal {
+  mantissa: bigint
+  scale: number
+}
+
+export const EXACT_DECIMAL_MAX_EXPONENT = 400
 
 interface ClosedInterval {
   start: number
   end: number
 }
 
-const STRICT_NUMERIC_STRING_REGEX = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i
+const EXACT_DECIMAL_REGEX = /^([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/
+
+function normalizeExactDecimal(mantissa: bigint, scale: number): ExactDecimal {
+  if (mantissa === 0n) {
+    return { mantissa: 0n, scale: 0 }
+  }
+  let m = mantissa
+  let s = scale
+  while (s > 0 && m % 10n === 0n) {
+    m /= 10n
+    s--
+  }
+  return { mantissa: m, scale: s }
+}
+
+/**
+ * Pure-JS exact decimal parser (BigInt mantissa + scale)
+ * with MaxExponent = 400 DoS guard. Rejects NaN, Infinity, and excessive exponents.
+ */
+export function parseExactDecimal(value: unknown): ExactDecimal | null {
+  if (typeof value === 'bigint') {
+    const absStr = value < 0n ? (-value).toString() : value.toString()
+    if (absStr.length > EXACT_DECIMAL_MAX_EXPONENT + 1) {
+      return null
+    }
+    return { mantissa: value, scale: 0 }
+  }
+  let raw: string
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null
+    raw = value === 0 ? '0' : String(value)
+  } else if (typeof value === 'string') {
+    raw = value.trim()
+    if (!raw) return null
+  } else {
+    return null
+  }
+
+  const m = EXACT_DECIMAL_REGEX.exec(raw)
+  if (!m) return null
+  const sign = m[1] === '-' ? -1n : 1n
+  const intPart = m[2] ?? ''
+  const fracPart = m[3] ?? m[4] ?? ''
+  const expStr = m[5]
+
+  let exp = 0
+  if (expStr !== undefined) {
+    const parsedExp = Number(expStr)
+    if (!Number.isSafeInteger(parsedExp) || Math.abs(parsedExp) > EXACT_DECIMAL_MAX_EXPONENT) {
+      return null
+    }
+    exp = parsedExp
+  }
+
+  const combined = `${intPart}${fracPart}`
+  const trimmedLeading = combined.replace(/^0+/, '')
+  if (!trimmedLeading) {
+    return { mantissa: 0n, scale: 0 }
+  }
+
+  const rawScale = fracPart.length - exp
+  if (rawScale < 0) {
+    const zerosToAppend = -rawScale
+    if (
+      zerosToAppend > EXACT_DECIMAL_MAX_EXPONENT ||
+      trimmedLeading.length + zerosToAppend > EXACT_DECIMAL_MAX_EXPONENT * 2
+    ) {
+      return null
+    }
+    const mantissa = sign * BigInt(trimmedLeading) * 10n ** BigInt(zerosToAppend)
+    return { mantissa, scale: 0 }
+  }
+
+  if (rawScale > EXACT_DECIMAL_MAX_EXPONENT * 2) {
+    return null
+  }
+  return normalizeExactDecimal(sign * BigInt(trimmedLeading), rawScale)
+}
+
+export function addExactDecimal(a: ExactDecimal, b: ExactDecimal): ExactDecimal {
+  if (a.scale === b.scale) {
+    return normalizeExactDecimal(a.mantissa + b.mantissa, a.scale)
+  }
+  if (a.scale > b.scale) {
+    const diff = a.scale - b.scale
+    return normalizeExactDecimal(a.mantissa + b.mantissa * 10n ** BigInt(diff), a.scale)
+  }
+  const diff = b.scale - a.scale
+  return normalizeExactDecimal(a.mantissa * 10n ** BigInt(diff) + b.mantissa, b.scale)
+}
+
+export function compareExactDecimal(a: ExactDecimal, b: ExactDecimal): -1 | 0 | 1 {
+  let ma = a.mantissa
+  let mb = b.mantissa
+  if (a.scale > b.scale) {
+    mb *= 10n ** BigInt(a.scale - b.scale)
+  } else if (b.scale > a.scale) {
+    ma *= 10n ** BigInt(b.scale - a.scale)
+  }
+  if (ma < mb) return -1
+  if (ma > mb) return 1
+  return 0
+}
+
+export function formatExactDecimal(val: ExactDecimal): string {
+  const norm = normalizeExactDecimal(val.mantissa, val.scale)
+  if (norm.mantissa === 0n) return '0'
+  const neg = norm.mantissa < 0n
+  const digits = (neg ? -norm.mantissa : norm.mantissa).toString()
+  if (norm.scale === 0) {
+    return neg ? `-${digits}` : digits
+  }
+  if (digits.length <= norm.scale) {
+    const padded = '0'.repeat(norm.scale - digits.length) + digits
+    return `${neg ? '-' : ''}0.${padded}`
+  }
+  const splitIdx = digits.length - norm.scale
+  return `${neg ? '-' : ''}${digits.slice(0, splitIdx)}.${digits.slice(splitIdx)}`
+}
+
+export function formatExactAverage(sum: ExactDecimal, count: number, maxExtraDecimals = 4): string {
+  if (!Number.isSafeInteger(count) || count <= 0) return '0'
+  if (sum.mantissa === 0n) return '0'
+  const divisor = BigInt(count)
+  const neg = sum.mantissa < 0n
+  const absMantissa = neg ? -sum.mantissa : sum.mantissa
+
+  // Compute exact rounded quotient to targetScale; extend precision if small non-zero would round to 0
+  const baseScale = Math.max(sum.scale, maxExtraDecimals)
+  const tryFormatAtScale = (targetScale: number): { text: string; isZero: boolean } => {
+    const extraScale = targetScale - sum.scale
+    const scaledNum = extraScale > 0 ? absMantissa * 10n ** BigInt(extraScale) : absMantissa
+    const quotient = scaledNum / divisor
+    const remainder = scaledNum % divisor
+    const rounded = remainder * 2n >= divisor ? quotient + 1n : quotient
+    if (rounded === 0n) {
+      return { text: '0', isZero: true }
+    }
+    return {
+      text: formatExactDecimal({ mantissa: neg ? -rounded : rounded, scale: targetScale }),
+      isZero: false,
+    }
+  }
+
+  const first = tryFormatAtScale(baseScale)
+  if (!first.isZero) return first.text
+  // Non-zero average smaller than 10^(-baseScale): expand up to 12 decimals so we never render "0"
+  for (const probeScale of [baseScale + 4, baseScale + 8, Math.min(EXACT_DECIMAL_MAX_EXPONENT, baseScale + 16)]) {
+    const attempt = tryFormatAtScale(probeScale)
+    if (!attempt.isZero) return attempt.text
+  }
+  const approx = Number(formatExactDecimal(sum)) / count
+  return Number.isFinite(approx) && approx !== 0 ? approx.toPrecision(4) : first.text
+}
+
+function exactDecimalToFiniteNumber(val: ExactDecimal): number | null {
+  const num = Number(formatExactDecimal(val))
+  return Number.isFinite(num) ? num : null
+}
 
 function normalizeRange(r1: number, c1: number, r2: number, c2: number): CellRange {
   return {
@@ -127,21 +296,6 @@ function intervalsCoverFullSpan(intervals: ClosedInterval[], start: number, end:
   if (start > end || intervals.length === 0) return false
   const merged = mergeClosedIntervals(intervals)
   return merged.some((iv) => iv.start <= start && iv.end >= end)
-}
-
-function parseFiniteNumericValue(value: unknown): number | null {
-  if (typeof value === 'number') {
-    return Number.isFinite(value) ? value : null
-  }
-  if (typeof value === 'string') {
-    const trimmed = value.trim()
-    if (!trimmed || !STRICT_NUMERIC_STRING_REGEX.test(trimmed)) {
-      return null
-    }
-    const coerced = Number(trimmed)
-    return Number.isFinite(coerced) ? coerced : null
-  }
-  return null
 }
 
 /**
@@ -580,10 +734,25 @@ export class GridSelectionModel {
     let scannedCount = 0
     let nonNullCount = 0
     let numericCount = 0
-    let sum = 0
-    let min = Number.POSITIVE_INFINITY
-    let max = Number.NEGATIVE_INFINITY
+    let sumExact: ExactDecimal | null = null
+    let minExact: ExactDecimal | null = null
+    let maxExact: ExactDecimal | null = null
     let isTruncatedScan = false
+
+    const accumulateValue = (value: unknown): void => {
+      if (value === null || value === undefined) return
+      nonNullCount++
+      const dec = parseExactDecimal(value)
+      if (dec === null) return
+      numericCount++
+      sumExact = sumExact === null ? dec : addExactDecimal(sumExact, dec)
+      if (minExact === null || compareExactDecimal(dec, minExact) < 0) {
+        minExact = dec
+      }
+      if (maxExact === null || compareExactDecimal(dec, maxExact) > 0) {
+        maxExact = dec
+      }
+    }
 
     if (clampedRanges.length === 1) {
       const rg = clampedRanges[0]
@@ -595,17 +764,7 @@ export class GridSelectionModel {
             break outerSingle
           }
           scannedCount++
-          const value = getValue(r, c)
-          if (value !== null && value !== undefined) {
-            nonNullCount++
-            const num = parseFiniteNumericValue(value)
-            if (num !== null) {
-              numericCount++
-              sum += num
-              if (num < min) min = num
-              if (num > max) max = num
-            }
-          }
+          accumulateValue(getValue(r, c))
         }
       }
     } else {
@@ -626,22 +785,18 @@ export class GridSelectionModel {
                 break
               }
               scannedCount++
-              const value = getValue(r, c)
-              if (value !== null && value !== undefined) {
-                nonNullCount++
-                const num = parseFiniteNumericValue(value)
-                if (num !== null) {
-                  numericCount++
-                  sum += num
-                  if (num < min) min = num
-                  if (num > max) max = num
-                }
-              }
+              accumulateValue(getValue(r, c))
             }
           }
         }
       }
     }
+
+    const sumFormatted = numericCount > 0 && sumExact ? formatExactDecimal(sumExact) : null
+    const avgFormatted = numericCount > 0 && sumExact ? formatExactAverage(sumExact, numericCount) : null
+    const minFormatted = numericCount > 0 && minExact ? formatExactDecimal(minExact) : null
+    const maxFormatted = numericCount > 0 && maxExact ? formatExactDecimal(maxExact) : null
+    const avgNumeric = avgFormatted !== null ? Number(avgFormatted) : null
 
     return {
       rowCount: distinctRowCount,
@@ -649,10 +804,14 @@ export class GridSelectionModel {
       cellCount,
       nonNullCount,
       numericCount,
-      sum: numericCount > 0 ? sum : null,
-      avg: numericCount > 0 ? sum / numericCount : null,
-      min: numericCount > 0 ? min : null,
-      max: numericCount > 0 ? max : null,
+      sum: sumExact ? exactDecimalToFiniteNumber(sumExact) : null,
+      avg: avgNumeric !== null && Number.isFinite(avgNumeric) ? avgNumeric : null,
+      min: minExact ? exactDecimalToFiniteNumber(minExact) : null,
+      max: maxExact ? exactDecimalToFiniteNumber(maxExact) : null,
+      sumFormatted,
+      avgFormatted,
+      minFormatted,
+      maxFormatted,
       mode: this.mode,
       focus: this.focus ? { row: this.focus.row, col: this.focus.col } : null,
       isTruncatedScan,

@@ -268,8 +268,14 @@ export function createPanelConnectionFormController(ctx) {
     const pkg = BYOD_NPM_PKGS[driverId] || ''
     const installStep = pkg ? ` && npm install --ignore-scripts ${pkg}` : ''
     if (byodHostPlatform === 'win32') {
-      const safeWin = cleanDir.replace(/"/g, '').replace(/%/g, '%%')
-      return `mkdir "${safeWin}" 2>nul & cd /d "${safeWin}" && npm init -y && npm pkg set type=module main=index.mjs${installStep}`
+      const psQuoted = `'${cleanDir.replace(/'/g, "''")}'`
+      const psInstall = pkg ? `; if ($?) { npm install --ignore-scripts ${pkg} }` : ''
+      return (
+        `New-Item -ItemType Directory -Force -Path ${psQuoted} | Out-Null; ` +
+        `Set-Location -LiteralPath ${psQuoted}; ` +
+        `if ($?) { npm init -y }; ` +
+        `if ($?) { npm pkg set type=module main=index.mjs }${psInstall}`
+      )
     }
     const posixQuoted = cleanDir.startsWith('$HOME/')
       ? `"$HOME/${cleanDir.slice('$HOME/'.length).replace(/(["$`\\])/g, '\\$1')}"`
@@ -462,17 +468,56 @@ export function createPanelConnectionFormController(ctx) {
     }
   }
 
+  function isProdTagValue(tag) {
+    const norm = String(tag || '').trim().toLowerCase()
+    return norm === 'prod' || norm === 'production'
+  }
+
+  function syncAiPolicyHint() {
+    const hintEl = $('formAiPolicyHint')
+    if (!hintEl) return
+    const isProd = isProdTagValue(state.formColorTag)
+    const policy = $('formAiPolicy')?.value || ''
+    hintEl.hidden = !isProd
+    if (isProd) {
+      hintEl.textContent =
+        policy === 'allow'
+          ? 'Production tag active — AI access is explicitly allowed for this connection.'
+          : policy === 'never'
+            ? 'Production tag active — AI access is blocked for this connection.'
+            : 'Production connections default to ask/fail-closed protection for remote AI unless explicitly overridden.'
+    }
+  }
+
+  function clearStoredSecretFlags() {
+    state.formHadPassword = false
+    state.formHadAuthToken = false
+    state.sourceSecretConnId = null
+    if ($('formPassword') && !$('formPassword').value) {
+      $('formPassword').placeholder = 'Optional'
+    }
+    if ($('formAuthToken') && !$('formAuthToken').value) {
+      $('formAuthToken').placeholder = 'Optional Bearer token'
+    }
+  }
+
   function setFormColorTag(tag) {
-    state.formColorTag = ['dev', 'staging', 'prod'].includes(tag) ? tag : 'none'
+    const norm = String(tag || '').trim().toLowerCase()
+    const mapped = norm === 'production' ? 'prod' : norm
+    state.formColorTag = ['dev', 'staging', 'prod'].includes(mapped) ? mapped : 'none'
     document.querySelectorAll('.env-pill').forEach((p) => {
       p.classList.toggle('active', p.dataset.env === state.formColorTag)
     })
+    syncAiPolicyHint()
     savePanelViewState?.()
   }
 
   function setFormDriver(driver, applyDefaults = true) {
     const prevDriver = state.formDriver
     const valid = ENGINE_BY_ID[driver] && !ENGINE_BY_ID[driver].studioOnly ? driver : 'sqlite'
+    if (applyDefaults && prevDriver && prevDriver !== valid) {
+      clearStoredSecretFlags()
+    }
     state.formDriver = valid
     document.querySelectorAll('.engine-tile').forEach((tile) => {
       tile.classList.toggle('active', tile.dataset.driver === valid)
@@ -895,7 +940,15 @@ export function createPanelConnectionFormController(ctx) {
       'formSsl',
       'formSslVerify',
       'formReadOnly',
+      'formAiPolicy',
     ]
+    const secretTargetInputIds = new Set([
+      'formHost',
+      'formPort',
+      'formUser',
+      'formClickhouseUrl',
+      'formLibsqlUrl',
+    ])
     for (const id of trackedInputIds) {
       const el = $(id)
       if (!el) continue
@@ -905,6 +958,12 @@ export function createPanelConnectionFormController(ctx) {
       const isCheckbox = el.type === 'checkbox'
       const evName = isSelect || isCheckbox ? 'change' : 'input'
       el.addEventListener(evName, () => {
+        if (secretTargetInputIds.has(id)) {
+          clearStoredSecretFlags()
+        }
+        if (id === 'formAiPolicy') {
+          syncAiPolicyHint()
+        }
         if (id === 'formWorkspaceScope') {
           state.pendingWorkspaceScope = null
         }
@@ -985,6 +1044,10 @@ export function createPanelConnectionFormController(ctx) {
     $('formSsl').checked = false
     syncSslVerifyUi()
     $('formReadOnly').checked = false
+    if ($('formAiPolicy')) {
+      $('formAiPolicy').value = ''
+      syncSelectTooltip($('formAiPolicy'))
+    }
     if ($('formFolder')) $('formFolder').value = ''
     state.pendingWorkspaceScope = ''
     if ($('formWorkspaceScope')) {
@@ -1008,7 +1071,7 @@ export function createPanelConnectionFormController(ctx) {
     savePanelViewState?.()
   }
 
-  function populateFormFromProfile(profile, mode = 'edit') {
+  function populateFormFromProfile(profile, mode = 'edit', opts = {}) {
     if (!profile?.driver || !ENGINE_BY_ID[profile.driver] || ENGINE_BY_ID[profile.driver].studioOnly) {
       showBanner(
         `"${String(profile?.driver || 'This')}" connections are configured in Fullscreen Studio — click Studio to edit or duplicate.`,
@@ -1039,6 +1102,15 @@ export function createPanelConnectionFormController(ctx) {
     setFormDriver(driver, false)
     setFormColorTag(profile.colorTag || 'none')
     $('formReadOnly').checked = Boolean(profile.readOnly)
+    if ($('formAiPolicy')) {
+      const pPolicy =
+        profile.aiPolicy === 'allow' || profile.aiPolicy === 'ask' || profile.aiPolicy === 'never'
+          ? profile.aiPolicy
+          : ''
+      $('formAiPolicy').value = pPolicy
+      syncSelectTooltip($('formAiPolicy'))
+    }
+    syncAiPolicyHint()
     if ($('formFolder')) $('formFolder').value = profile.folder || ''
     state.pendingWorkspaceScope = profile.workspaceScope || ''
     if ($('formWorkspaceScope')) {
@@ -1080,7 +1152,8 @@ export function createPanelConnectionFormController(ctx) {
       const hasExplicitTlsMode =
         profile.sslMode === 'require' ||
         profile.sslMode === 'verify-ca' ||
-        profile.sslMode === 'verify-full'
+        profile.sslMode === 'verify-full' ||
+        Boolean(profile.sslCaPath || profile.sslCertPath || profile.sslKeyPath)
       const effectiveSsl =
         profile.sslMode === 'disable'
           ? false
@@ -1101,9 +1174,9 @@ export function createPanelConnectionFormController(ctx) {
         $('formClickhouseUrl').value = profile.url ? scrubPanelNetworkFormUrl(profile.url) : ''
       }
       if (isPanelOptionsDriver(driver)) {
-        const opts = typeof profile.options === 'string' ? profile.options : ''
-        state.formOptions = opts
-        if ($('formOptions')) $('formOptions').value = opts
+        const optsVal = typeof profile.options === 'string' ? profile.options : ''
+        state.formOptions = optsVal
+        if ($('formOptions')) $('formOptions').value = optsVal
       }
       if (profile.hasPassword && (mode === 'edit' || mode === 'duplicate')) {
         $('formPassword').placeholder = 'Stored password preserved (type to replace)'
@@ -1111,6 +1184,11 @@ export function createPanelConnectionFormController(ctx) {
     }
 
     setFormOpen(true)
+    if (opts?.focusSection === 'tls') {
+      const targetEl = $('formSslVerify') && !$('sslVerifyRow')?.hidden ? $('formSslVerify') : $('formSsl')
+      targetEl?.scrollIntoView?.({ block: 'center' })
+      targetEl?.focus?.()
+    }
   }
 
   function buildFormSubmission(id) {
@@ -1118,6 +1196,11 @@ export function createPanelConnectionFormController(ctx) {
     const name = $('formName').value.trim()
     const readOnly = Boolean($('formReadOnly').checked)
     const colorTag = state.formColorTag
+    const rawAiPolicy = $('formAiPolicy')?.value || ''
+    const aiPolicy =
+      rawAiPolicy === 'allow' || rawAiPolicy === 'ask' || rawAiPolicy === 'never'
+        ? rawAiPolicy
+        : undefined
     const folder = ($('formFolder') ? $('formFolder').value : '').trim().slice(0, 64)
     const workspaceScope = ($('formWorkspaceScope') ? $('formWorkspaceScope').value : '').trim().slice(0, 260)
 
@@ -1134,6 +1217,7 @@ export function createPanelConnectionFormController(ctx) {
           filePath,
           readOnly,
           colorTag,
+          ...(aiPolicy ? { aiPolicy } : {}),
           folder,
           workspaceScope,
         },
@@ -1158,6 +1242,7 @@ export function createPanelConnectionFormController(ctx) {
           ssl: /^(?:https|libsql|wss):\/\//i.test(url) || !/^http:\/\//i.test(url),
           readOnly,
           colorTag,
+          ...(aiPolicy ? { aiPolicy } : {}),
           hasAuthToken: Boolean(authToken) || keepStoredToken,
           folder,
           workspaceScope,
@@ -1194,6 +1279,7 @@ export function createPanelConnectionFormController(ctx) {
       ssl,
       readOnly,
       colorTag,
+      ...(aiPolicy ? { aiPolicy } : {}),
       hasPassword: Boolean(password) || keepStoredPassword,
       folder,
       workspaceScope,
@@ -1209,6 +1295,7 @@ export function createPanelConnectionFormController(ctx) {
       if (pgOptions) profile.options = pgOptions
     }
 
+    let urlForcedSsl = null
     if (driver === 'mongodb') {
       const mongoUrl = scrubPanelNetworkFormUrl($('formClickhouseUrl')?.value || '')
       if (mongoUrl) {
@@ -1223,8 +1310,13 @@ export function createPanelConnectionFormController(ctx) {
             }
           }
           const mongoTls = parsedMongo.searchParams.get('tls') || parsedMongo.searchParams.get('ssl')
-          if (mongoTls === 'true') profile.ssl = true
-          else if (mongoTls === 'false') profile.ssl = false
+          if (mongoTls === 'true') {
+            profile.ssl = true
+            urlForcedSsl = true
+          } else if (mongoTls === 'false') {
+            profile.ssl = false
+            urlForcedSsl = false
+          }
         } catch {}
       }
     }
@@ -1251,8 +1343,13 @@ export function createPanelConnectionFormController(ctx) {
           } else if (parsedCh.protocol === 'http:') {
             profile.port = 8123
           }
-          if (parsedCh.protocol === 'https:') profile.ssl = true
-          else if (parsedCh.protocol === 'http:') profile.ssl = false
+          if (parsedCh.protocol === 'https:') {
+            profile.ssl = true
+            urlForcedSsl = true
+          } else if (parsedCh.protocol === 'http:') {
+            profile.ssl = false
+            urlForcedSsl = false
+          }
         } catch {}
       } else {
         profile.url = generatedUrl
@@ -1268,6 +1365,11 @@ export function createPanelConnectionFormController(ctx) {
     ) {
       profile.sslMode = state.formSslMode
     }
+    if (urlForcedSsl === false) {
+      profile.sslMode = 'disable'
+    } else if (urlForcedSsl === true && profile.sslMode === 'disable') {
+      profile.sslMode = 'auto'
+    }
     if (typeof state.formSslRejectUnauthorized === 'boolean') {
       profile.sslRejectUnauthorized = state.formSslRejectUnauthorized
       if (
@@ -1281,35 +1383,35 @@ export function createPanelConnectionFormController(ctx) {
       profile.sslRejectUnauthorized = true
     }
 
-    if (state.editingId === id && Array.isArray(state.connections)) {
-      const existing = state.connections.find((c) => c && c.id === id)
-      if (existing) {
-        if (existing.driver === driver) {
-          const extendedKeys = [
-            'sslMode',
-            'sslCaPath',
-            'sslCertPath',
-            'sslKeyPath',
-            'hasSslKeyPassphrase',
-            'sslRejectUnauthorized',
-            'sshEnabled',
-            'sshHost',
-            'sshPort',
-            'sshUser',
-            'sshAuthMethod',
-            'sshPrivateKeyPath',
-            'hasSshPassphrase',
-            'hasSshPassword',
-            'd1AccountId',
-            'd1DatabaseId',
-          ]
-          for (const key of extendedKeys) {
-            if (state.formSslTouched && (key === 'sslMode' || key === 'sslRejectUnauthorized')) {
-              continue
-            }
-            if (existing[key] !== undefined && profile[key] === undefined) {
-              profile[key] = existing[key]
-            }
+    const preserveSourceId =
+      state.editingId === id ? id : state.sourceSecretConnId || null
+    if (preserveSourceId && Array.isArray(state.connections)) {
+      const existing = state.connections.find((c) => c && c.id === preserveSourceId)
+      if (existing && existing.driver === driver) {
+        const extendedKeys = [
+          'sslMode',
+          'sslCaPath',
+          'sslCertPath',
+          'sslKeyPath',
+          'hasSslKeyPassphrase',
+          'sslRejectUnauthorized',
+          'sshEnabled',
+          'sshHost',
+          'sshPort',
+          'sshUser',
+          'sshAuthMethod',
+          'sshPrivateKeyPath',
+          'hasSshPassphrase',
+          'hasSshPassword',
+          'd1AccountId',
+          'd1DatabaseId',
+        ]
+        for (const key of extendedKeys) {
+          if (state.formSslTouched && (key === 'sslMode' || key === 'sslRejectUnauthorized')) {
+            continue
+          }
+          if (existing[key] !== undefined && profile[key] === undefined) {
+            profile[key] = existing[key]
           }
         }
       }
@@ -1639,6 +1741,9 @@ export function createPanelConnectionFormController(ctx) {
       activeAutoCandidateId = item.candidateId || null
       activeAutoRawUri = item.candidateId ? null : item.url
       activeAutoDisplayUri = maskedUrl
+      state.lastParsedUri = item.candidateId ? '' : item.url
+      lastParsedCandidateId = item.candidateId || ''
+      lastParsedDisplayUri = maskedUrl
     } else {
       $('uriInput').value = ''
     }

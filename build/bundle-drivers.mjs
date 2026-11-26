@@ -41,6 +41,10 @@ const PINNED_VENDOR_VERSIONS = {
   '@lezer/highlight': '1.2.5',
   'node-sql-parser': '5.4.0',
   'big-integer': '1.6.52',
+  ssh2: '1.17.0',
+  asn1: '0.2.6',
+  'bcrypt-pbkdf': '1.0.2',
+  tweetnacl: '0.14.5',
 }
 
 function assertInstalledVersion(pkgName, expectedVersion = PINNED_VENDOR_VERSIONS[pkgName]) {
@@ -444,7 +448,9 @@ async function bundleIconvLite() {
     charset: 'utf8',
     treeShaking: true,
     legalComments: 'none',
-    banner: nodeEsmBanner,
+    banner: {
+      js: `import { createRequire as __createRequire } from "node:module";\nimport { fileURLToPath as __fileURLToPath } from "node:url";\nimport { dirname as __pathDirname } from "node:path";\nconst require = __createRequire(import.meta.url);\nconst __filename = __fileURLToPath(import.meta.url);\nconst __dirname = __pathDirname(__filename);`,
+    },
   })
 
   validateBundle(outfile, 'vendor/iconv-lite.js', { rejectEscapedRuns: true })
@@ -510,7 +516,9 @@ export default pg;
     charset: 'utf8',
     treeShaking: true,
     legalComments: 'none',
-    banner: nodeEsmBanner,
+    banner: {
+      js: `import { createRequire as __createRequire } from "node:module";\nimport { fileURLToPath as __fileURLToPath } from "node:url";\nimport { dirname as __pathDirname } from "node:path";\nconst require = __createRequire(import.meta.url);\nconst __filename = __fileURLToPath(import.meta.url);\nconst __dirname = __pathDirname(__filename);`,
+    },
   })
 
   validateBundle(outfile, 'vendor/pg.js', { rejectEscapedRuns: true })
@@ -646,7 +654,9 @@ export default mysql;
     charset: 'utf8',
     treeShaking: true,
     legalComments: 'none',
-    banner: nodeEsmBanner,
+    banner: {
+      js: `import { createRequire as __createRequire } from "node:module";\nimport { fileURLToPath as __fileURLToPath } from "node:url";\nimport { dirname as __pathDirname } from "node:path";\nconst require = __createRequire(import.meta.url);\nconst __filename = __fileURLToPath(import.meta.url);\nconst __dirname = __pathDirname(__filename);`,
+    },
   })
 
   validateBundle(outfile, 'vendor/mysql2.js', { rejectEscapedRuns: true })
@@ -826,7 +836,9 @@ export default mongodb;
     charset: 'utf8',
     treeShaking: true,
     legalComments: 'none',
-    banner: nodeEsmBanner,
+    banner: {
+      js: `import { createRequire as __createRequire } from "node:module";\nimport { fileURLToPath as __fileURLToPath } from "node:url";\nimport { dirname as __pathDirname } from "node:path";\nconst require = __createRequire(import.meta.url);\nconst __filename = __fileURLToPath(import.meta.url);\nconst __dirname = __pathDirname(__filename);`,
+    },
   })
 
   validateBundle(outfile, 'vendor/mongodb.js', { rejectEscapedRuns: true })
@@ -954,7 +966,9 @@ export default mssql;
     charset: 'utf8',
     treeShaking: true,
     legalComments: 'none',
-    banner: nodeEsmBanner,
+    banner: {
+      js: `import { createRequire as __createRequire } from "node:module";\nimport { fileURLToPath as __fileURLToPath } from "node:url";\nimport { dirname as __pathDirname } from "node:path";\nconst require = __createRequire(import.meta.url);\nconst __filename = __fileURLToPath(import.meta.url);\nconst __dirname = __pathDirname(__filename);`,
+    },
   })
 
   validateBundle(outfile, 'vendor/mssql.js', { rejectEscapedRuns: true })
@@ -1168,7 +1182,9 @@ export default oracledb;
     charset: 'utf8',
     treeShaking: true,
     legalComments: 'none',
-    banner: nodeEsmBanner,
+    banner: {
+      js: `import { createRequire as __createRequire } from "node:module";\nimport { fileURLToPath as __fileURLToPath } from "node:url";\nimport { dirname as __pathDirname } from "node:path";\nconst require = __createRequire(import.meta.url);\nconst __filename = __fileURLToPath(import.meta.url);\nconst __dirname = __pathDirname(__filename);`,
+    },
   })
 
   validateBundle(outfile, 'vendor/oracledb.js', { rejectEscapedRuns: true })
@@ -1343,6 +1359,196 @@ export const MssqlParser = tsql.Parser;
   })
 }
 
+const SSH2_NODE_FS_COMPAT = 'node_modules/ssh2/lib/protocol/node-fs-compat.js'
+const SSH2_NODE_FS_COMPAT_ANCHOR = "    return new Function('return 2n ** 32n')();"
+const SSH2_NODE_FS_COMPAT_PATCH = '    return 2n ** 32n;'
+const SSH2_AGENT_PATH = 'node_modules/ssh2/lib/agent.js'
+const SSH2_AGENT_ANCHOR = "const { execFile, spawn } = require('child_process');"
+const SSH2_AGENT_PATCH =
+  "const execFile = (_f, _a, _o, cb) => { const fn = typeof _o === 'function' ? _o : cb; if (typeof fn === 'function') fn(new Error('External SSH agent process execution is disabled')); };\nconst spawn = () => { throw new Error('External SSH agent process execution is disabled'); };"
+
+function createSsh2CleanPlugin(state) {
+  const expectedFsCompatPath = path.resolve(projectRoot, SSH2_NODE_FS_COMPAT)
+  const expectedAgentPath = path.resolve(projectRoot, SSH2_AGENT_PATH)
+  return {
+    name: 'ssh2-clean',
+    setup(build) {
+      build.onResolve({ filter: /^(?:cpu-features|.*\.node)$/ }, args => {
+        state.nativeStubs += 1
+        return { path: args.path, namespace: 'ssh2-native-stub' }
+      })
+      build.onLoad({ filter: /.*/, namespace: 'ssh2-native-stub' }, () => ({
+        contents: 'module.exports = undefined;',
+        loader: 'js',
+      }))
+      build.onLoad(
+        { filter: /[\\/]ssh2[\\/]lib[\\/]protocol[\\/]node-fs-compat\.js$/ },
+        args => {
+          if (path.resolve(args.path) !== expectedFsCompatPath) {
+            throw new Error(
+              `[bundle-drivers] ssh2-clean matched unexpected node-fs-compat: ${args.path}`
+            )
+          }
+          const source = fs.readFileSync(args.path, 'utf8')
+          const count = source.split(SSH2_NODE_FS_COMPAT_ANCHOR).length - 1
+          if (count !== 1) {
+            throw new Error(
+              `[bundle-drivers] ssh2-clean expected 1 new Function anchor in ${SSH2_NODE_FS_COMPAT}; found ${count}`
+            )
+          }
+          state.nodeFsCompatReplacements += 1
+          return {
+            contents: source.replace(SSH2_NODE_FS_COMPAT_ANCHOR, SSH2_NODE_FS_COMPAT_PATCH),
+            loader: 'js',
+          }
+        }
+      )
+      build.onLoad({ filter: /[\\/]ssh2[\\/]lib[\\/]agent\.js$/ }, args => {
+        if (path.resolve(args.path) !== expectedAgentPath) {
+          throw new Error(
+            `[bundle-drivers] ssh2-clean matched unexpected agent.js: ${args.path}`
+          )
+        }
+        const source = fs.readFileSync(args.path, 'utf8')
+        const count = source.split(SSH2_AGENT_ANCHOR).length - 1
+        if (count !== 1) {
+          throw new Error(
+            `[bundle-drivers] ssh2-clean expected 1 child_process anchor in ${SSH2_AGENT_PATH}; found ${count}`
+          )
+        }
+        state.agentChildProcessReplacements += 1
+        return {
+          contents: source.replace(SSH2_AGENT_ANCHOR, SSH2_AGENT_PATCH),
+          loader: 'js',
+        }
+      })
+    },
+  }
+}
+
+async function bundleSsh2() {
+  assertInstalledVersion('ssh2')
+  assertInstalledVersion('asn1')
+  assertInstalledVersion('bcrypt-pbkdf')
+  assertInstalledVersion('tweetnacl')
+
+  const outfile = path.join(vendorDir, 'ssh2.js')
+  const state = {
+    nativeStubs: 0,
+    nodeFsCompatReplacements: 0,
+    agentChildProcessReplacements: 0,
+  }
+  const code = `
+import Client from 'ssh2/lib/client.js';
+import { parseKey } from 'ssh2/lib/protocol/keyParser.js';
+
+export { Client, parseKey };
+export default { Client, parseKey };
+`
+
+  await esbuild.build({
+    stdin: { contents: code, resolveDir: projectRoot, loader: 'js' },
+    bundle: true,
+    platform: 'node',
+    format: 'esm',
+    target: ['node22', 'es2022'],
+    outfile,
+    minify: true,
+    charset: 'utf8',
+    treeShaking: true,
+    legalComments: 'none',
+    banner: {
+      js: `import { createRequire as __createRequire } from "node:module";\nimport { fileURLToPath as __fileURLToPath } from "node:url";\nimport { dirname as __pathDirname } from "node:path";\nconst require = __createRequire(import.meta.url);\nconst __filename = __fileURLToPath(import.meta.url);\nconst __dirname = __pathDirname(__filename);`,
+    },
+    plugins: [createSsh2CleanPlugin(state)],
+  })
+
+  if (state.nodeFsCompatReplacements !== 1 || state.agentChildProcessReplacements !== 1) {
+    throw new Error(
+      `[bundle-drivers] ssh2-clean expected 1 node-fs-compat and 1 agent replacement; got ${JSON.stringify(state)}`
+    )
+  }
+
+  validateBundle(outfile, 'vendor/ssh2.js', { rejectEscapedRuns: true })
+
+  const dts = `import type { Duplex } from 'node:stream'
+
+export interface Ssh2ConnectConfig {
+  host?: string
+  port?: number
+  username?: string
+  password?: string
+  privateKey?: Buffer | string
+  passphrase?: string
+  agent?: string
+  tryKeyboard?: boolean
+  readyTimeout?: number
+  keepaliveInterval?: number
+  keepaliveCountMax?: number
+  hostHash?: 'sha256' | 'md5'
+  hostVerifier?: (key: Buffer | string, verify?: (valid: boolean) => void) => boolean | void
+}
+
+export interface Ssh2ClientChannel extends Duplex {
+  close(): void
+}
+
+export interface Ssh2KeyboardInteractivePrompt {
+  prompt: string
+  echo?: boolean
+}
+
+export declare class Client {
+  constructor()
+  connect(config: Ssh2ConnectConfig): this
+  forwardOut(
+    srcIP: string,
+    srcPort: number,
+    dstIP: string,
+    dstPort: number,
+    callback: (err: Error | undefined, channel: Ssh2ClientChannel) => void
+  ): this
+  end(): this
+  destroy(): this
+  on(event: 'ready' | 'close' | 'end', listener: () => void): this
+  on(event: 'error', listener: (err: Error & { level?: string; code?: string }) => void): this
+  on(
+    event: 'keyboard-interactive',
+    listener: (
+      name: string,
+      instructions: string,
+      instructionsLang: string,
+      prompts: Ssh2KeyboardInteractivePrompt[],
+      finish: (responses: string[]) => void
+    ) => void
+  ): this
+  on(event: string, listener: (...args: unknown[]) => void): this
+  once(event: 'ready' | 'close' | 'end', listener: () => void): this
+  once(event: 'error', listener: (err: Error & { level?: string; code?: string }) => void): this
+  once(event: string, listener: (...args: unknown[]) => void): this
+  removeAllListeners(event?: string): this
+}
+
+export interface Ssh2ParsedKey {
+  type: string
+  comment: string
+  getPublicSSH(): Buffer
+}
+
+export declare function parseKey(
+  data: Buffer | string,
+  passphrase?: string
+): Ssh2ParsedKey | Ssh2ParsedKey[] | Error
+
+declare const _default: {
+  Client: typeof Client
+  parseKey: typeof parseKey
+}
+export default _default
+`
+  fs.writeFileSync(path.join(vendorDir, 'ssh2.d.ts'), dts, 'utf8')
+}
+
 async function main() {
   console.log('[bundle-drivers] Starting vendor drivers bundling...')
   const startTime = Date.now()
@@ -1356,6 +1562,7 @@ async function main() {
     await bundleOracleDB()
     await bundleCodeMirror()
     await bundleSqlParsers()
+    await bundleSsh2()
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2)
     console.log(`[bundle-drivers] All vendor bundles built successfully in ${elapsed}s!`)

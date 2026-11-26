@@ -5,7 +5,7 @@ import type { DatabaseDriverType } from '../../protocol'
 
 export type EngineTransport = 'local-file' | 'tcp' | 'http'
 export type EnginePackaging = 'native' | 'pure-ts-http' | 'pure-ts-tcp' | 'bundled'
-export type EngineQuoteStyle = 'double' | 'backtick' | 'none'
+export type EngineQuoteStyle = 'double' | 'backtick' | 'bracket' | 'none'
 
 export interface EngineCatalogEntry {
   readonly id: DatabaseDriverType
@@ -149,7 +149,7 @@ export const BUILTIN_ENGINE_CATALOG: readonly EngineCatalogEntry[] = [
     supportsTlsConfig: true,
     supportsSshTunnel: true,
     isSql: true,
-    quoteStyle: 'double',
+    quoteStyle: 'bracket',
   },
   {
     id: 'oracle',

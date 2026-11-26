@@ -5,6 +5,9 @@ import * as path from 'node:path'
 import type { OrcaWorkerApi } from 'orca/worker'
 import type { ConnectionProfile, DatabaseDriverType } from '../protocol'
 import { parseConnectionUri } from '../drivers/common/connection-uri'
+import { readRegularFileBounded } from '../drivers/common/tls-and-tunnel'
+
+const MAX_ENV_FILE_BYTES = 1024 * 1024
 
 export interface DiscoveredSqliteFile {
   filePath: string
@@ -599,11 +602,23 @@ export async function detectWorkspaceEnvConnections(
     }
     seenDirs.add(dirNorm)
 
+    let realDir: string
+    try {
+      realDir = await fs.promises.realpath(resolvedDir)
+    } catch {
+      continue
+    }
+
     for (const fileName of ENV_FILENAMES) {
       const filePath = path.join(resolvedDir, fileName)
       let content: string
       try {
-        content = await fs.promises.readFile(filePath, 'utf8')
+        const realFile = await fs.promises.realpath(filePath)
+        const rel = path.relative(realDir, realFile)
+        if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+          continue
+        }
+        content = (await readRegularFileBounded(realFile, MAX_ENV_FILE_BYTES, '.env file')).toString('utf8')
       } catch {
         continue
       }

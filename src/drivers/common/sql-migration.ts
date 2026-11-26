@@ -17,12 +17,187 @@ import {
 } from './sql-lexer.js'
 import {
   FORBIDDEN_DEFAULT_TOKENS,
+  FORBIDDEN_SUBQUERY_VERBS,
   analyzeSqliteTriggerReferences,
   normalizeSqlDefaultExpression,
   validateColumnTypeSpec,
 } from '../../shared-sql-core.js'
 
 export { normalizeSqlDefaultExpression, validateColumnTypeSpec }
+
+const MYSQL_TIMESTAMP_ON_UPDATE_DEFAULT_RE =
+  /^CURRENT_TIMESTAMP(?:\(\d*\))?(?:\s+ON\s+UPDATE\s+CURRENT_TIMESTAMP(?:\(\d*\))?)?$/i
+const MYSQL_BIT_LITERAL_DEFAULT_RE = /^b'[01]+'$/i
+const MSSQL_NATIVE_DEFAULT_FUNC_RE =
+  /^(?:GETDATE|GETUTCDATE|SYSDATETIME|SYSUTCDATETIME|SYSDATETIMEOFFSET|NEWSEQUENTIALID)\(\)$/i
+const ORACLE_NATIVE_DEFAULT_EXPR_RE = /^(?:SYSDATE|SYSTIMESTAMP|SYS_GUID\(\))$/i
+const SQLITE_NON_CONSTANT_DEFAULT_RE =
+  /^(?:CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME)\b|\bON\s+UPDATE\b/i
+
+function isSafeDdlIdentifierValue(raw: string): boolean {
+  return !FORBIDDEN_DEFAULT_TOKENS.test(raw) && !raw.includes('\0')
+}
+
+function validateRawDdlExpression(
+  rawExpr: string,
+  label: string,
+  options?: { requireCheckWrapper?: boolean }
+): string {
+  const trimmed = (rawExpr || '').trim()
+  if (!trimmed) {
+    throw new Error(`${label} cannot be empty.`)
+  }
+  if (trimmed.includes('\0') || trimmed.includes('\r') || trimmed.includes('\n')) {
+    throw new Error(`${label} contains invalid control characters.`)
+  }
+
+  let unquotedText = ''
+  for (const allowBs of [false, true]) {
+    let i = 0
+    const len = trimmed.length
+    let depth = 0
+    const parts: string[] = []
+    while (i < len) {
+      const ch = trimmed[i]
+      if (ch === "'" || ch === '"' || ch === '`') {
+        const seg = scanQuotedSegmentEnd(trimmed, i, ch, ch === "'" ? allowBs : false)
+        if (!seg.closed) {
+          throw new Error(`${label} contains an unterminated quote.`)
+        }
+        parts.push(' ')
+        i = seg.end
+        continue
+      }
+      if (ch === '[') {
+        const closeIdx = trimmed.indexOf(']', i + 1)
+        if (closeIdx === -1) {
+          throw new Error(`${label} contains an unterminated bracket identifier.`)
+        }
+        parts.push(' ')
+        i = closeIdx + 1
+        continue
+      }
+      if (ch === ';' || ch === '#') {
+        throw new Error(`${label} contains forbidden SQL delimiter or comment token.`)
+      }
+      if (ch === '-' && i + 1 < len && trimmed[i + 1] === '-') {
+        throw new Error(`${label} contains forbidden SQL line comment.`)
+      }
+      if (ch === '/' && i + 1 < len && (trimmed[i + 1] === '*' || trimmed[i + 1] === '/')) {
+        throw new Error(`${label} contains forbidden SQL comment.`)
+      }
+      if (ch === '*' && i + 1 < len && trimmed[i + 1] === '/') {
+        throw new Error(`${label} contains forbidden SQL comment terminator.`)
+      }
+      if (ch === '(') {
+        depth++
+      } else if (ch === ')') {
+        depth--
+        if (depth < 0) {
+          throw new Error(`${label} has unbalanced parentheses.`)
+        }
+      }
+      parts.push(ch)
+      i++
+    }
+    if (depth !== 0) {
+      throw new Error(`${label} has unbalanced parentheses.`)
+    }
+    if (!allowBs) {
+      unquotedText = parts.join('')
+    }
+  }
+
+  if (FORBIDDEN_SUBQUERY_VERBS.test(unquotedText)) {
+    throw new Error(`${label} cannot contain SQL query or DDL/DML statements.`)
+  }
+
+  if (options?.requireCheckWrapper) {
+    const checkHeader =
+      /^(?:CONSTRAINT\s+(?:"(?:[^"]|"")+"|`(?:[^`]|``)+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$]*)\s+)?CHECK\s*\(/i.exec(
+        trimmed
+      )
+    if (!checkHeader) {
+      throw new Error(`${label} must be a valid CHECK (...) constraint.`)
+    }
+    const openParenIdx = checkHeader[0].length - 1
+    let depth = 0
+    let i = openParenIdx
+    while (i < trimmed.length) {
+      const ch = trimmed[i]
+      if (ch === "'" || ch === '"' || ch === '`') {
+        i = scanQuotedSegmentEnd(trimmed, i, ch, false).end
+        continue
+      }
+      if (ch === '(') depth++
+      else if (ch === ')') {
+        depth--
+        if (depth === 0 && i < trimmed.length - 1) {
+          throw new Error(`${label} has unexpected trailing tokens after CHECK (...).`)
+        }
+      }
+      i++
+    }
+  }
+
+  return trimmed
+}
+
+function normalizeMigrationDefaultExpression(
+  rawDefault: string,
+  dataType = 'TEXT',
+  dialect?: DatabaseDriverType
+): string {
+  const trimmed = (rawDefault ?? '').trim()
+  if (!trimmed) return ''
+  if (FORBIDDEN_DEFAULT_TOKENS.test(trimmed) || trimmed.includes('\0')) {
+    throw new Error('Default value contains invalid SQL tokens (semicolons or comments).')
+  }
+  if (dialect === 'mysql' || dialect === 'mariadb') {
+    if (MYSQL_TIMESTAMP_ON_UPDATE_DEFAULT_RE.test(trimmed) || MYSQL_BIT_LITERAL_DEFAULT_RE.test(trimmed)) {
+      return trimmed
+    }
+  }
+  if (dialect === 'mssql' && MSSQL_NATIVE_DEFAULT_FUNC_RE.test(trimmed)) {
+    return trimmed
+  }
+  if (dialect === 'oracle' && ORACLE_NATIVE_DEFAULT_EXPR_RE.test(trimmed)) {
+    return trimmed
+  }
+  return normalizeSqlDefaultExpression(trimmed, dataType)
+}
+
+function areDefaultsEquivalent(
+  origDef: string,
+  curDef: string,
+  curType: string,
+  dialect?: DatabaseDriverType
+): boolean {
+  const cleanOrig = (origDef ?? '').trim()
+  const cleanCur = (curDef ?? '').trim()
+  if (cleanOrig === cleanCur) return true
+  if (cleanCur.length === 0) return false
+  try {
+    const normCur = normalizeMigrationDefaultExpression(cleanCur, curType, dialect)
+    if (normCur === cleanOrig) return true
+    if (cleanOrig.length > 0) {
+      const normOrig = normalizeMigrationDefaultExpression(cleanOrig, curType, dialect)
+      return normCur === normOrig
+    }
+  } catch {
+    return false
+  }
+  return false
+}
+
+function isSqliteNonConstantDefault(rawDefault: string): boolean {
+  const trimmed = (rawDefault ?? '').trim()
+  if (!trimmed) return false
+  if (SQLITE_NON_CONSTANT_DEFAULT_RE.test(trimmed)) return true
+  if (trimmed.startsWith('(') && trimmed.endsWith(')')) return true
+  if (/^[A-Za-z_][A-Za-z0-9_]*\s*\(/.test(trimmed)) return true
+  return false
+}
 
 export const SQLITE_FK_VIOLATION_SENTINEL = '__datanoa_fk_violation__'
 export const SQLITE_FK_CHECK_ABORT_SQL = `SELECT json_extract('{}', '${SQLITE_FK_VIOLATION_SENTINEL}') FROM pragma_foreign_key_check LIMIT 1;`
@@ -60,11 +235,11 @@ function formatSqliteIndexColumnSpec(
 }
 
 function buildQualifiedTableForDdl(
-  schema: string,
+  schema: string | undefined,
   name: string,
   dialect: DatabaseDriverType
 ): string {
-  const trimmedSchema = schema.trim()
+  const trimmedSchema = typeof schema === 'string' ? schema.trim() : ''
   const omitSchema =
     !trimmedSchema ||
     ((dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1') && trimmedSchema.toLowerCase() === 'main')
@@ -171,10 +346,23 @@ function formatGroupedForeignKeyLines(
       g.constraintName || forceConstraintName || g.cols.length > 1
         ? `CONSTRAINT ${quoteIdentForDialect(effectiveName, dialect)} `
         : ''
-    const onDeleteClause =
-      g.onDelete && g.onDelete !== 'NO ACTION' ? ` ON DELETE ${g.onDelete}` : ''
-    const onUpdateClause =
-      g.onUpdate && g.onUpdate !== 'NO ACTION' ? ` ON UPDATE ${g.onUpdate}` : ''
+    const effectiveOnDelete =
+      g.onDelete &&
+      g.onDelete !== 'NO ACTION' &&
+      !((dialect === 'oracle' || dialect === 'mssql') && g.onDelete === 'RESTRICT') &&
+      !(dialect === 'oracle' && g.onDelete === 'SET DEFAULT')
+        ? g.onDelete
+        : undefined
+    const effectiveOnUpdate =
+      dialect === 'oracle'
+        ? undefined
+        : g.onUpdate &&
+            g.onUpdate !== 'NO ACTION' &&
+            !(dialect === 'mssql' && g.onUpdate === 'RESTRICT')
+          ? g.onUpdate
+          : undefined
+    const onDeleteClause = effectiveOnDelete ? ` ON DELETE ${effectiveOnDelete}` : ''
+    const onUpdateClause = effectiveOnUpdate ? ` ON UPDATE ${effectiveOnUpdate}` : ''
     return `${indent}${constraintPrefix}FOREIGN KEY (${localColsSql}) REFERENCES ${refTableSql} (${targetColsSql})${onDeleteClause}${onUpdateClause}`
   })
 }
@@ -382,9 +570,17 @@ export function reconstructTableDdl(details: TableDetails, dialect: DatabaseDriv
       isSqliteDialect && typeof idx.whereClause === 'string' && idx.whereClause.trim().length > 0
         ? ` WHERE ${idx.whereClause.trim()}`
         : ''
-    statements.push(
-      `CREATE ${uniqueKw}INDEX ${quoteIdentForDialect(idx.name, dialect)} ON ${qualifiedTable} (${idxCols})${whereSuffix};`
-    )
+    if (isSqliteDialect) {
+      const qualifiedIdx = buildQualifiedTableForDdl(details.schema, idx.name, dialect)
+      const bareTable = quoteIdentForDialect(details.name, dialect)
+      statements.push(
+        `CREATE ${uniqueKw}INDEX ${qualifiedIdx} ON ${bareTable} (${idxCols})${whereSuffix};`
+      )
+    } else {
+      statements.push(
+        `CREATE ${uniqueKw}INDEX ${quoteIdentForDialect(idx.name, dialect)} ON ${qualifiedTable} (${idxCols})${whereSuffix};`
+      )
+    }
   }
 
   if (Array.isArray(details.triggers)) {
@@ -422,6 +618,8 @@ export type AlterTableAction =
       table: string
       schema?: string
       columnName: string
+      previousDefaultValue?: string | null
+      defaultDropSeq?: number
     }
   | {
       kind: 'renameTable'
@@ -436,6 +634,8 @@ export type AlterTableAction =
       columnName: string
       dataType?: string
       nullable?: boolean
+      previousNullable?: boolean
+      isAutoIncrement?: boolean
       defaultValue?: string | null
       previousDefaultValue?: string | null
       defaultDropSeq?: number
@@ -621,14 +821,15 @@ function qualifyAlterTarget(
   dialect: DatabaseDriverType
 ): string {
   const quotedTable = quoteIdentForDialect(table.trim(), dialect)
+  const trimmedSchema = (schema ?? '').trim()
+  const lowerSchema = trimmedSchema.toLowerCase()
+  const isSqliteFamily = dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1'
   if (
-    schema &&
-    schema.trim().length > 0 &&
-    !((dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1') && schema === 'main') &&
-    schema !== 'public' &&
+    trimmedSchema.length > 0 &&
+    !(isSqliteFamily && (lowerSchema === 'main' || lowerSchema === 'public')) &&
     dialect !== 'redis'
   ) {
-    return `${quoteIdentForDialect(schema.trim(), dialect)}.${quotedTable}`
+    return `${quoteIdentForDialect(trimmedSchema, dialect)}.${quotedTable}`
   }
   return quotedTable
 }
@@ -688,7 +889,7 @@ export function buildAlterTableSql(
       const rawDef = (action.defaultValue ?? '').trim()
       let defaultClause = ''
       if (rawDef.length > 0) {
-        const normalizedDef = normalizeSqlDefaultExpression(rawDef, rawType)
+        const normalizedDef = normalizeMigrationDefaultExpression(rawDef, rawType, dialect)
         defaultClause = ` DEFAULT ${normalizedDef}`
       } else if (!isNullable && (dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1')) {
         // SQLite requires a DEFAULT value when adding a NOT NULL column to an existing table
@@ -719,7 +920,9 @@ export function buildAlterTableSql(
           ? `${quoteIdentForDialect(action.schema.trim(), 'mssql')}.`
           : ''
         const fullOldCol = `${schemaPrefix}${quoteIdentForDialect(tableName, 'mssql')}.${quoteIdentForDialect(oldCol, 'mssql')}`
-        return `EXEC sp_rename '${fullOldCol.replace(/'/g, "''")}', '${newCol.replace(/'/g, "''")}', 'COLUMN';`
+        const oldPrefix = /[^\x00-\x7F]/.test(fullOldCol) ? 'N' : ''
+        const newPrefix = /[^\x00-\x7F]/.test(newCol) ? 'N' : ''
+        return `EXEC sp_rename ${oldPrefix}'${fullOldCol.replace(/'/g, "''")}', ${newPrefix}'${newCol.replace(/'/g, "''")}', 'COLUMN';`
       }
       return `ALTER TABLE ${qualifiedTable} RENAME COLUMN ${quoteIdentForDialect(oldCol, dialect)} TO ${quoteIdentForDialect(newCol, dialect)};`
     }
@@ -728,7 +931,19 @@ export function buildAlterTableSql(
       if (!colName) {
         throw new Error('Column name is required to drop a column.')
       }
-      return `ALTER TABLE ${qualifiedTable} DROP COLUMN ${quoteIdentForDialect(colName, dialect)};`
+      const dropStmt = `ALTER TABLE ${qualifiedTable} DROP COLUMN ${quoteIdentForDialect(colName, dialect)};`
+      if (dialect === 'mssql') {
+        const prevDef = (action.previousDefaultValue ?? '').trim()
+        if (action.previousDefaultValue === undefined || prevDef.length > 0) {
+          const dropDefaultSql = buildMssqlDropDefaultConstraintSql(
+            qualifiedTable,
+            colName,
+            action.defaultDropSeq
+          )
+          return `${dropDefaultSql}\n${dropStmt}`
+        }
+      }
+      return dropStmt
     }
     case 'renameTable': {
       const newTbl = (action.newTableName || '').trim()
@@ -743,7 +958,9 @@ export function buildAlterTableSql(
         return `RENAME TABLE ${qualifiedTable} TO ${qualifiedNew};`
       }
       if (dialect === 'mssql') {
-        return `EXEC sp_rename '${qualifiedTable.replace(/'/g, "''")}', '${newTbl.replace(/'/g, "''")}';`
+        const oldPrefix = /[^\x00-\x7F]/.test(qualifiedTable) ? 'N' : ''
+        const newPrefix = /[^\x00-\x7F]/.test(newTbl) ? 'N' : ''
+        return `EXEC sp_rename ${oldPrefix}'${qualifiedTable.replace(/'/g, "''")}', ${newPrefix}'${newTbl.replace(/'/g, "''")}';`
       }
       return buildRenameTableStatements(tableName, newTbl, action.schema, dialect).join('\n')
     }
@@ -768,7 +985,7 @@ export function buildAlterTableSql(
         if (hasDefaultChange) {
           if (rawDef.length > 0) {
             clauses.push(
-              `ALTER COLUMN ${quotedCol} SET DEFAULT ${normalizeSqlDefaultExpression(rawDef, rawType || 'TEXT')}`
+              `ALTER COLUMN ${quotedCol} SET DEFAULT ${normalizeMigrationDefaultExpression(rawDef, rawType || 'TEXT', dialect)}`
             )
           } else {
             clauses.push(`ALTER COLUMN ${quotedCol} DROP DEFAULT`)
@@ -782,14 +999,17 @@ export function buildAlterTableSql(
 
       if (dialect === 'mysql' || dialect === 'mariadb') {
         const effectiveType = rawType || 'VARCHAR(255)'
-        const nullClause = action.nullable === false ? ' NOT NULL' : ' NULL'
-        const defClause =
-          rawDef.length > 0
-            ? ` DEFAULT ${normalizeSqlDefaultExpression(rawDef, effectiveType)}`
+        const isAutoInc = Boolean(action.isAutoIncrement)
+        const nullClause = action.nullable === false || isAutoInc ? ' NOT NULL' : ' NULL'
+        const defClause = isAutoInc
+          ? ''
+          : rawDef.length > 0
+            ? ` DEFAULT ${normalizeMigrationDefaultExpression(rawDef, effectiveType, dialect)}`
             : action.nullable !== false
               ? ' DEFAULT NULL'
               : ''
-        return `ALTER TABLE ${qualifiedTable} MODIFY COLUMN ${quotedCol} ${effectiveType}${nullClause}${defClause};`
+        const autoIncClause = isAutoInc ? ' AUTO_INCREMENT' : ''
+        return `ALTER TABLE ${qualifiedTable} MODIFY COLUMN ${quotedCol} ${effectiveType}${nullClause}${defClause}${autoIncClause};`
       }
 
       if (dialect === 'mssql') {
@@ -797,17 +1017,26 @@ export function buildAlterTableSql(
         const nullClause =
           action.nullable !== undefined ? (action.nullable ? ' NULL' : ' NOT NULL') : ''
         const prevDef = (action.previousDefaultValue ?? '').trim()
+        const altersColDef = Boolean(rawType || action.nullable !== undefined)
+        const shouldDropDefault =
+          (hasDefaultChange && (rawDef.length === 0 || prevDef.length > 0)) ||
+          (altersColDef && prevDef.length > 0)
+        const defaultToAdd = hasDefaultChange
+          ? rawDef
+          : altersColDef && prevDef.length > 0
+            ? prevDef
+            : ''
         const stmts: string[] = []
-        if (rawType || action.nullable !== undefined) {
-          stmts.push(`ALTER TABLE ${qualifiedTable} ALTER COLUMN ${quotedCol} ${effectiveType}${nullClause};`)
-        }
-        if (hasDefaultChange && (rawDef.length === 0 || prevDef.length > 0)) {
+        if (shouldDropDefault) {
           stmts.push(buildMssqlDropDefaultConstraintSql(qualifiedTable, colName, action.defaultDropSeq))
         }
-        if (hasDefaultChange && rawDef.length > 0) {
+        if (altersColDef) {
+          stmts.push(`ALTER TABLE ${qualifiedTable} ALTER COLUMN ${quotedCol} ${effectiveType}${nullClause};`)
+        }
+        if (defaultToAdd.length > 0) {
           const defConstraintName = buildMssqlDefaultConstraintName(tableName, colName)
           stmts.push(
-            `ALTER TABLE ${qualifiedTable} ADD CONSTRAINT ${defConstraintName} DEFAULT ${normalizeSqlDefaultExpression(rawDef, effectiveType)} FOR ${quotedCol};`
+            `ALTER TABLE ${qualifiedTable} ADD CONSTRAINT ${defConstraintName} DEFAULT ${normalizeMigrationDefaultExpression(defaultToAdd, effectiveType, dialect)} FOR ${quotedCol};`
           )
         }
         if (stmts.length === 0) {
@@ -820,13 +1049,22 @@ export function buildAlterTableSql(
         const parts: string[] = [quotedCol]
         if (rawType) parts.push(rawType)
         if (hasDefaultChange) {
-          parts.push(
-            rawDef.length > 0
-              ? `DEFAULT ${normalizeSqlDefaultExpression(rawDef, rawType || 'VARCHAR2(255)')}`
-              : 'DEFAULT NULL'
-          )
+          if (rawDef.length > 0) {
+            parts.push(
+              `DEFAULT ${normalizeMigrationDefaultExpression(rawDef, rawType || 'VARCHAR2(255)', dialect)}`
+            )
+          } else if (
+            action.previousDefaultValue === undefined ||
+            (action.previousDefaultValue !== null &&
+              action.previousDefaultValue.trim().length > 0)
+          ) {
+            parts.push('DEFAULT NULL')
+          }
         }
-        if (action.nullable !== undefined) {
+        if (
+          action.nullable !== undefined &&
+          (action.previousNullable === undefined || action.previousNullable !== action.nullable)
+        ) {
           parts.push(action.nullable ? 'NULL' : 'NOT NULL')
         }
         if (parts.length <= 1) {
@@ -838,7 +1076,9 @@ export function buildAlterTableSql(
       if (dialect === 'clickhouse') {
         const effectiveType = rawType || 'String'
         const defClause =
-          rawDef.length > 0 ? ` DEFAULT ${normalizeSqlDefaultExpression(rawDef, effectiveType)}` : ''
+          rawDef.length > 0
+            ? ` DEFAULT ${normalizeMigrationDefaultExpression(rawDef, effectiveType, dialect)}`
+            : ''
         return `ALTER TABLE ${qualifiedTable} MODIFY COLUMN ${quotedCol} ${effectiveType}${defClause};`
       }
 
@@ -904,8 +1144,20 @@ export function buildAlterTableSql(
       const onDelete = sanitizeReferentialAction(action.onDelete)
       const onUpdate = sanitizeReferentialAction(action.onUpdate)
       const qualifiedRef = qualifyAlterTarget(refTable, action.foreignSchema || action.schema, dialect)
-      const onDeleteClause = onDelete !== 'NO ACTION' ? ` ON DELETE ${onDelete}` : ''
-      const onUpdateClause = onUpdate !== 'NO ACTION' ? ` ON UPDATE ${onUpdate}` : ''
+      const effectiveOnDelete =
+        onDelete !== 'NO ACTION' &&
+        !((dialect === 'oracle' || dialect === 'mssql') && onDelete === 'RESTRICT') &&
+        !(dialect === 'oracle' && onDelete === 'SET DEFAULT')
+          ? onDelete
+          : undefined
+      const effectiveOnUpdate =
+        dialect === 'oracle'
+          ? undefined
+          : onUpdate !== 'NO ACTION' && !(dialect === 'mssql' && onUpdate === 'RESTRICT')
+            ? onUpdate
+            : undefined
+      const onDeleteClause = effectiveOnDelete ? ` ON DELETE ${effectiveOnDelete}` : ''
+      const onUpdateClause = effectiveOnUpdate ? ` ON UPDATE ${effectiveOnUpdate}` : ''
       return `ALTER TABLE ${qualifiedTable} ADD CONSTRAINT ${quoteIdentForDialect(fkName, dialect)} FOREIGN KEY (${quoteIdentForDialect(col, dialect)}) REFERENCES ${qualifiedRef} (${quoteIdentForDialect(refCol, dialect)})${onDeleteClause}${onUpdateClause};`
     }
     case 'dropForeignKey': {
@@ -976,6 +1228,7 @@ export function createInitialTableDraft(details: TableDetails): TableStructureDr
         constraintName: fk.constraintName || `fk_${details.name}_${fk.column}`,
         column: fk.column,
         foreignTable: refTable,
+        ...(fk.referencedSchema ? { foreignSchema: fk.referencedSchema } : {}),
         foreignColumn: refCol,
         onDelete: sanitizeReferentialAction(fk.onDelete),
         onUpdate: sanitizeReferentialAction(fk.onUpdate),
@@ -1011,16 +1264,11 @@ export function isDraftColumnDirty(col: DraftColumnItem): boolean {
   const curName = (col.name ?? '').trim()
   const origType = (col.originalDataType ?? 'TEXT').trim().toUpperCase()
   const curType = (col.dataType ?? 'TEXT').trim().toUpperCase()
-  const origDef = (col.originalDefaultValue ?? '').trim()
-  const curDef = (col.defaultValue ?? '').trim()
-  let isDefEqual = origDef === curDef
-  if (!isDefEqual && curDef.length > 0) {
-    try {
-      isDefEqual = normalizeSqlDefaultExpression(curDef, curType) === origDef
-    } catch {
-      isDefEqual = false
-    }
-  }
+  const isDefEqual = areDefaultsEquivalent(
+    col.originalDefaultValue ?? '',
+    col.defaultValue ?? '',
+    curType
+  )
   return (
     origName !== curName ||
     origType !== curType ||
@@ -1035,49 +1283,89 @@ export function requiresSqliteTableRebuild(draft: TableStructureDraft): boolean 
     if (col.status !== 'existing') return false
     const origType = (col.originalDataType ?? 'TEXT').trim().toUpperCase()
     const curType = (col.dataType ?? 'TEXT').trim().toUpperCase()
-    const origDef = (col.originalDefaultValue ?? '').trim()
+    const isDefEqual = areDefaultsEquivalent(
+      col.originalDefaultValue ?? '',
+      col.defaultValue ?? '',
+      curType,
+      'sqlite'
+    )
     const curDef = (col.defaultValue ?? '').trim()
-    let isDefEqual = origDef === curDef
-    if (!isDefEqual && curDef.length > 0) {
-      try {
-        isDefEqual = normalizeSqlDefaultExpression(curDef, curType) === origDef
-      } catch {
-        isDefEqual = false
-      }
-    }
+    const hasIncompatibleDefaultEdit = !isDefEqual && /\bON\s+UPDATE\b/i.test(curDef)
     return (
       origType !== curType ||
       Boolean(col.originalNullable) !== Boolean(col.nullable) ||
       Boolean(col.originalIsPrimaryKey) !== Boolean(col.isPrimaryKey) ||
-      !isDefEqual
+      !isDefEqual ||
+      hasIncompatibleDefaultEdit
     )
   })
-  const hasNewPkColumn = draft.columns.some((col) => col.status === 'new' && col.isPrimaryKey)
-  const droppedColNames = new Set(
-    draft.columns
-      .filter((col) => col.status === 'deleted')
-      .map((col) => (col.originalName || col.name).trim())
-      .filter(Boolean)
+  const hasNewRebuildCol = draft.columns.some(
+    (col) =>
+      col.status === 'new' &&
+      (col.isPrimaryKey ||
+        col.isAutoIncrement ||
+        col.isGenerated ||
+        isSqliteNonConstantDefault(col.defaultValue ?? ''))
   )
+  const droppedColMap = new Map<string, string>()
+  for (const col of draft.columns) {
+    if (col.status === 'deleted') {
+      const name = (col.originalName || col.name).trim()
+      if (name) droppedColMap.set(name.toLowerCase(), name)
+    }
+  }
   const hasDroppedPkColumn = draft.columns.some(
     (col) => col.status === 'deleted' && col.originalIsPrimaryKey
   )
-  const hasDroppedColInSurvivingIndex = draft.indexes.some(
-    (idx) => idx.status !== 'deleted' && (idx.columns || []).some((c) => droppedColNames.has(c))
-  )
+  const hasDroppedColInSurvivingIndex = draft.indexes.some((idx) => {
+    if (idx.status === 'deleted') return false
+    const colNames = [
+      ...(idx.columns || []),
+      ...(Array.isArray(idx.columnSpecs) ? idx.columnSpecs.map((s) => s.name) : []),
+    ]
+    if (colNames.some((c) => droppedColMap.has((c || '').trim().toLowerCase()))) {
+      return true
+    }
+    if (
+      droppedColMap.size > 0 &&
+      idx.whereClause &&
+      findReferencedSqliteColumns(idx.whereClause, droppedColMap).length > 0
+    ) {
+      return true
+    }
+    return false
+  })
   const hasDroppedUniqueAutoIndex = draft.indexes.some(
     (idx) =>
       idx.status === 'deleted' &&
       (idx.origin === 'u' || /^sqlite_autoindex_/i.test(idx.name))
   )
+  const hasDroppedColInCheckOrGenerated =
+    droppedColMap.size > 0 &&
+    ((Array.isArray(draft.checkConstraints) &&
+      draft.checkConstraints.some(
+        (chk) => Boolean(chk?.trim()) && findReferencedSqliteColumns(chk, droppedColMap).length > 0
+      )) ||
+      draft.columns.some(
+        (c) =>
+          c.status !== 'deleted' &&
+          c.isGenerated &&
+          Boolean(c.generatedExpression?.trim()) &&
+          findReferencedSqliteColumns(c.generatedExpression ?? '', droppedColMap).length > 0
+      ))
   const hasFkChanges = draft.foreignKeys.some((fk) => fk.status === 'new' || fk.status === 'deleted')
+  const hasDroppedColInActiveFk = draft.foreignKeys.some(
+    (fk) => fk.status !== 'deleted' && droppedColMap.has((fk.column || '').trim().toLowerCase())
+  )
   return (
     hasColumnDefinitionChange ||
-    hasNewPkColumn ||
+    hasNewRebuildCol ||
     hasDroppedPkColumn ||
     hasDroppedColInSurvivingIndex ||
     hasDroppedUniqueAutoIndex ||
-    hasFkChanges
+    hasDroppedColInCheckOrGenerated ||
+    hasFkChanges ||
+    hasDroppedColInActiveFk
   )
 }
 
@@ -1525,6 +1813,13 @@ function buildSqliteTableRebuildStatements(
   if (!origTable || !finalTable) {
     throw new Error('Table name is required for table migration.')
   }
+  if (!isSafeDdlIdentifierValue(origTable) || !isSafeDdlIdentifierValue(finalTable)) {
+    throw new Error('Table name contains invalid characters.')
+  }
+  const cleanSchema = (draft.schema ?? '').trim()
+  if (cleanSchema && !isSafeDdlIdentifierValue(cleanSchema)) {
+    throw new Error('Schema name contains invalid characters.')
+  }
 
   const activeCols = draft.columns.filter((c) => c.status !== 'deleted')
   if (activeCols.length === 0) {
@@ -1536,6 +1831,9 @@ function buildSqliteTableRebuildStatements(
     const cleanName = col.name.trim()
     if (!cleanName) {
       throw new Error('Every column must have a valid non-empty name.')
+    }
+    if (!isSafeDdlIdentifierValue(cleanName)) {
+      throw new Error(`Column "${cleanName}" contains invalid SQL characters.`)
     }
     const lower = cleanName.toLowerCase()
     if (seenNames.has(lower)) {
@@ -1552,11 +1850,11 @@ function buildSqliteTableRebuildStatements(
   const colRenameMap = new Map<string, string>()
   for (const col of activeCols) {
     const nextName = col.name.trim()
-    colRenameMap.set(nextName, nextName)
+    colRenameMap.set(nextName.toLowerCase(), nextName)
   }
   for (const col of activeCols) {
     if (col.status === 'existing' && col.originalName) {
-      colRenameMap.set(col.originalName.trim(), col.name.trim())
+      colRenameMap.set(col.originalName.trim().toLowerCase(), col.name.trim())
     }
   }
 
@@ -1568,7 +1866,10 @@ function buildSqliteTableRebuildStatements(
     const quotedCol = quoteIdentForDialect(col.name.trim(), dialect)
     const cleanType = validateColumnTypeSpec(col.dataType || 'TEXT')
     if (col.isGenerated) {
-      const genExpr = (col.generatedExpression || '').trim()
+      const genExpr = validateRawDdlExpression(
+        col.generatedExpression || '',
+        `Generated column "${col.name}" expression`
+      )
       const genStorage = col.generatedStorage === 'STORED' ? 'STORED' : 'VIRTUAL'
       let def = `${quotedCol} ${cleanType} GENERATED ALWAYS AS (${genExpr}) ${genStorage}`
       if (!col.nullable) {
@@ -1580,19 +1881,38 @@ function buildSqliteTableRebuildStatements(
       colDefs.push(def)
       continue
     }
-    let def = `${quotedCol} ${cleanType}`
+    const useSqliteAutoInc = Boolean(
+      singleInlinePk &&
+        col.isPrimaryKey &&
+        col.isAutoIncrement &&
+        !draft.withoutRowid &&
+        /INT/i.test(cleanType)
+    )
+    const effectiveType = useSqliteAutoInc ? 'INTEGER' : cleanType
+    let def = `${quotedCol} ${effectiveType}`
     if (singleInlinePk && col.isPrimaryKey) {
       def += ' PRIMARY KEY'
-      if (col.isAutoIncrement && /INT/i.test(cleanType)) {
+      if (useSqliteAutoInc) {
         def += ' AUTOINCREMENT'
       }
     }
-    if (!col.nullable && !(singleInlinePk && col.isPrimaryKey)) {
+    // Only `INTEGER PRIMARY KEY` on a rowid table is implicitly NOT NULL in SQLite.
+    // Non-INTEGER PKs (TEXT/BLOB/BIGINT) and WITHOUT ROWID PKs must retain explicit NOT NULL.
+    const isImplicitNotNullRowidPk =
+      singleInlinePk &&
+      col.isPrimaryKey &&
+      !draft.withoutRowid &&
+      effectiveType.trim().toUpperCase() === 'INTEGER'
+    if (!col.nullable && !isImplicitNotNullRowidPk) {
       def += ' NOT NULL'
     }
     const rawDef = (col.defaultValue ?? '').trim()
     if (rawDef.length > 0) {
-      def += ` DEFAULT ${normalizeSqlDefaultExpression(rawDef, cleanType)}`
+      def += ` DEFAULT ${normalizeMigrationDefaultExpression(rawDef, effectiveType, dialect)}`
+    } else if (col.status === 'new' && !col.nullable && !useSqliteAutoInc) {
+      def += /INT|REAL|FLOAT|NUMERIC|DECIMAL|BOOL/i.test(effectiveType)
+        ? ' DEFAULT 0'
+        : " DEFAULT ''"
     }
     if (col.collate) {
       def += formatSqliteCollationClause(col.collate, dialect)
@@ -1621,7 +1941,8 @@ function buildSqliteTableRebuildStatements(
       .map((spec) => {
         const trimmed = (spec.name || '').trim()
         const mappedName =
-          colRenameMap.get(trimmed) || (seenNames.has(trimmed.toLowerCase()) ? trimmed : '')
+          colRenameMap.get(trimmed.toLowerCase()) ||
+          (seenNames.has(trimmed.toLowerCase()) ? trimmed : '')
         if (!mappedName) return null
         return {
           name: mappedName,
@@ -1648,37 +1969,64 @@ function buildSqliteTableRebuildStatements(
   }
 
   const activeFks = draft.foreignKeys.filter((fk) => fk.status !== 'deleted')
+  const remappedFks: GroupedForeignKeyInput[] = []
+  const origTableLower = origTable.toLowerCase()
+  const draftSchemaLower = cleanSchema.toLowerCase()
   for (const fk of activeFks) {
-    const col = fk.column.trim()
-    const refTable = fk.foreignTable.trim()
-    const refCol = fk.foreignColumn.trim()
-    if (!col || !refTable || !refCol) {
+    const rawCol = (fk.column || '').trim()
+    const rawRefTable = (fk.foreignTable || '').trim()
+    const rawRefCol = (fk.foreignColumn || '').trim()
+    const rawCname = (fk.constraintName || '').trim()
+    const rawRefSchema = (fk.foreignSchema || '').trim()
+    if (!rawCol || !rawRefTable || !rawRefCol) {
       throw new Error('Foreign key requires local column, target table, and target column.')
     }
+    if (
+      (rawCname && !isSafeDdlIdentifierValue(rawCname)) ||
+      !isSafeDdlIdentifierValue(rawCol) ||
+      !isSafeDdlIdentifierValue(rawRefTable) ||
+      !isSafeDdlIdentifierValue(rawRefCol) ||
+      (rawRefSchema && !isSafeDdlIdentifierValue(rawRefSchema))
+    ) {
+      throw new Error('Foreign key contains invalid SQL identifier characters.')
+    }
+    const mappedLocalCol = colRenameMap.get(rawCol.toLowerCase())
+    if (!mappedLocalCol) {
+      throw new Error(
+        `Foreign key "${rawCname || rawCol}" references dropped or missing column "${rawCol}".`
+      )
+    }
+    const isSameSchemaSelfRef =
+      rawRefTable.toLowerCase() === origTableLower &&
+      (!rawRefSchema || rawRefSchema.toLowerCase() === draftSchemaLower)
+    const mappedRefTable = isSameSchemaSelfRef ? finalTable : rawRefTable
+    const mappedRefCol = isSameSchemaSelfRef
+      ? colRenameMap.get(rawRefCol.toLowerCase())
+      : rawRefCol
+    if (!mappedRefCol) {
+      throw new Error(
+        `Self-referencing foreign key "${rawCname || rawCol}" references dropped column "${rawRefCol}".`
+      )
+    }
+    remappedFks.push({
+      constraintName: fk.constraintName,
+      column: mappedLocalCol,
+      referencedTable: mappedRefTable,
+      referencedSchema: fk.foreignSchema,
+      referencedColumn: mappedRefCol,
+      onDelete: fk.onDelete,
+      onUpdate: fk.onUpdate,
+    })
   }
-  colDefs.push(
-    ...formatGroupedForeignKeyLines(
-      activeFks.map((fk) => ({
-        constraintName: fk.constraintName,
-        column: fk.column,
-        referencedTable: fk.foreignTable,
-        referencedSchema: fk.foreignSchema,
-        referencedColumn: fk.foreignColumn,
-        onDelete: fk.onDelete,
-        onUpdate: fk.onUpdate,
-      })),
-      dialect,
-      finalTable,
-      '',
-      true
-    )
-  )
+  colDefs.push(...formatGroupedForeignKeyLines(remappedFks, dialect, finalTable, '', true))
 
   if (Array.isArray(draft.checkConstraints)) {
     for (const chk of draft.checkConstraints) {
       const trimmedChk = (chk || '').trim()
       if (trimmedChk) {
-        colDefs.push(trimmedChk)
+        colDefs.push(
+          validateRawDdlExpression(trimmedChk, 'CHECK constraint', { requireCheckWrapper: true })
+        )
       }
     }
   }
@@ -1754,7 +2102,8 @@ function buildSqliteTableRebuildStatements(
       .map((spec) => {
         const trimmed = (spec.name || '').trim()
         const mappedName =
-          colRenameMap.get(trimmed) || (seenNames.has(trimmed.toLowerCase()) ? trimmed : '')
+          colRenameMap.get(trimmed.toLowerCase()) ||
+          (seenNames.has(trimmed.toLowerCase()) ? trimmed : '')
         if (!mappedName) return null
         return {
           name: mappedName,
@@ -1767,6 +2116,9 @@ function buildSqliteTableRebuildStatements(
     const idxName =
       (idx.name || '').trim() ||
       `idx_${finalTable}_${mappedSpecs.map((s) => s.name).join('_')}`.replace(/[^A-Za-z0-9_]/g, '_')
+    if (!isSafeDdlIdentifierValue(idxName)) {
+      throw new Error(`Index "${idxName}" contains invalid SQL identifier characters.`)
+    }
     const uniqueKw = idx.unique ? 'UNIQUE ' : ''
     const quotedCols = mappedSpecs
       .map((s) => formatSqliteIndexColumnSpec(s, dialect))
@@ -1774,7 +2126,7 @@ function buildSqliteTableRebuildStatements(
     const qualifiedIdx = qualifyAlterTarget(idxName, draft.schema, dialect)
     const whereSuffix =
       typeof idx.whereClause === 'string' && idx.whereClause.trim().length > 0
-        ? ` WHERE ${idx.whereClause.trim()}`
+        ? ` WHERE ${validateRawDdlExpression(idx.whereClause, `Partial index "${idxName}" WHERE clause`)}`
         : ''
     stmts.push(
       `CREATE ${uniqueKw}INDEX IF NOT EXISTS ${qualifiedIdx} ON ${quotedFinal} (${quotedCols})${whereSuffix};`
@@ -1890,9 +2242,51 @@ export function buildTableMigrationSql(
     }
   }
 
+  const pkMembershipChanged =
+    draft.columns.some((col) => col.status === 'new' && col.isPrimaryKey) ||
+    draft.columns.some((col) => col.status === 'deleted' && col.originalIsPrimaryKey) ||
+    draft.columns.some(
+      (col) => col.status === 'existing' && Boolean(col.isPrimaryKey) !== Boolean(col.originalIsPrimaryKey)
+    )
+  const hadOrigPk = draft.columns.some((c) => c.status !== 'new' && c.originalIsPrimaryKey)
+
+  if (pkMembershipChanged && dialect === 'clickhouse') {
+    throw new Error('Modifying PRIMARY KEY columns in place is not supported on ClickHouse.')
+  }
+
+  // 2.5 Drop existing Primary Key BEFORE dropping columns (avoids MSSQL Msg 5074 / Oracle ORA-12991)
+  if (pkMembershipChanged && hadOrigPk) {
+    const qTbl = qualifyAlterTarget(workingTable, draft.schema, dialect)
+    if (dialect === 'postgres' || dialect === 'cockroachdb') {
+      const pkIdx = draft.indexes.find((i) => i.isPrimary)
+      const pkConstraint = pkIdx?.name || `${workingTable}_pkey`
+      stmts.push(
+        `ALTER TABLE ${qTbl} DROP CONSTRAINT IF EXISTS ${quoteIdentForDialect(pkConstraint, dialect)};`
+      )
+    } else if (dialect === 'mysql' || dialect === 'mariadb') {
+      stmts.push(`ALTER TABLE ${qTbl} DROP PRIMARY KEY;`)
+    } else if (dialect === 'mssql') {
+      const pkIdx = draft.indexes.find((i) => i.isPrimary)
+      const pkConstraint = pkIdx?.name || `PK_${workingTable}`
+      stmts.push(
+        `ALTER TABLE ${qTbl} DROP CONSTRAINT ${quoteIdentForDialect(pkConstraint, dialect)};`
+      )
+    } else if (dialect === 'oracle') {
+      const pkIdx = draft.indexes.find((i) => i.isPrimary)
+      const pkConstraint = pkIdx?.name
+      stmts.push(
+        pkConstraint
+          ? `ALTER TABLE ${qTbl} DROP CONSTRAINT ${quoteIdentForDialect(pkConstraint, dialect)};`
+          : `ALTER TABLE ${qTbl} DROP PRIMARY KEY;`
+      )
+    }
+  }
+
   // 3. Drop removed Columns
+  let mssqlDefaultDropSeq = 0
   for (const col of draft.columns) {
     if (col.status === 'deleted' && (col.originalName || col.name)) {
+      const origDef = (col.originalDefaultValue ?? '').trim()
       stmts.push(
         buildAlterTableSql(
           {
@@ -1900,6 +2294,12 @@ export function buildTableMigrationSql(
             table: workingTable,
             schema: draft.schema,
             columnName: col.originalName || col.name,
+            ...(dialect === 'mssql'
+              ? {
+                  previousDefaultValue: origDef,
+                  defaultDropSeq: ++mssqlDefaultDropSeq,
+                }
+              : {}),
           },
           dialect
         )
@@ -1907,15 +2307,9 @@ export function buildTableMigrationSql(
     }
   }
 
-  // 4. Rename & Alter Existing Columns
-  let pkMembershipChanged = false
-  let mssqlDefaultDropSeq = 0
+  // 4a. Rename Existing Columns in safe dependency order (chains & cycles never collide)
+  const pendingRenames: Array<{ oldName: string; newName: string }> = []
   for (const col of draft.columns) {
-    if (col.status === 'new' && col.isPrimaryKey) pkMembershipChanged = true
-    if (col.status === 'deleted' && col.originalIsPrimaryKey) pkMembershipChanged = true
-    if (col.status === 'existing' && Boolean(col.isPrimaryKey) !== Boolean(col.originalIsPrimaryKey)) {
-      pkMembershipChanged = true
-    }
     if (col.status !== 'existing') continue
     const oldName = (col.originalName || col.name).trim()
     const newName = col.name.trim()
@@ -1923,27 +2317,78 @@ export function buildTableMigrationSql(
       throw new Error('Column name cannot be empty.')
     }
     if (oldName !== newName) {
-      stmts.push(
-        buildAlterTableSql(
-          {
-            kind: 'renameColumn',
-            table: workingTable,
-            schema: draft.schema,
-            oldColumnName: oldName,
-            newColumnName: newName,
-          },
-          dialect
-        )
-      )
+      pendingRenames.push({ oldName, newName })
     }
+  }
+  if (pendingRenames.length > 0) {
+    const remaining = [...pendingRenames]
+    const occupied = new Set<string>(
+      draft.columns
+        .filter((c) => c.status === 'existing')
+        .map((c) => (c.originalName || c.name).trim().toLowerCase())
+    )
+    let tmpCounter = 0
+    while (remaining.length > 0) {
+      let progressed = false
+      for (let idx = 0; idx < remaining.length; idx++) {
+        const pair = remaining[idx]
+        const targetLower = pair.newName.toLowerCase()
+        const oldLower = pair.oldName.toLowerCase()
+        if (!occupied.has(targetLower) || targetLower === oldLower) {
+          stmts.push(
+            buildAlterTableSql(
+              {
+                kind: 'renameColumn',
+                table: workingTable,
+                schema: draft.schema,
+                oldColumnName: pair.oldName,
+                newColumnName: pair.newName,
+              },
+              dialect
+            )
+          )
+          occupied.delete(oldLower)
+          occupied.add(targetLower)
+          remaining.splice(idx, 1)
+          progressed = true
+          break
+        }
+      }
+      if (!progressed) {
+        // Break rename cycle using a unique temporary column name
+        const first = remaining[0]
+        let tmpName = `__datanoa_tmp_col_${++tmpCounter}`
+        while (occupied.has(tmpName.toLowerCase())) {
+          tmpName = `__datanoa_tmp_col_${++tmpCounter}`
+        }
+        stmts.push(
+          buildAlterTableSql(
+            {
+              kind: 'renameColumn',
+              table: workingTable,
+              schema: draft.schema,
+              oldColumnName: first.oldName,
+              newColumnName: tmpName,
+            },
+            dialect
+          )
+        )
+        occupied.delete(first.oldName.toLowerCase())
+        occupied.add(tmpName.toLowerCase())
+        first.oldName = tmpName
+      }
+    }
+  }
 
+  // 4b. Alter Existing Columns
+  for (const col of draft.columns) {
+    if (col.status !== 'existing') continue
+    const newName = col.name.trim()
     const origType = (col.originalDataType ?? 'TEXT').trim().toUpperCase()
     const curType = validateColumnTypeSpec(col.dataType || 'TEXT').toUpperCase()
     const origDef = (col.originalDefaultValue ?? '').trim()
     const curDef = (col.defaultValue ?? '').trim()
-    const isDefEqual =
-      origDef === curDef ||
-      (curDef.length > 0 && normalizeSqlDefaultExpression(curDef, curType) === origDef)
+    const isDefEqual = areDefaultsEquivalent(origDef, curDef, curType, dialect)
     const typeChanged = origType !== curType
     const nullChanged = Boolean(col.originalNullable) !== Boolean(col.nullable)
     const defChanged = !isDefEqual
@@ -1954,6 +2399,8 @@ export function buildTableMigrationSql(
         dialect === 'mariadb' ||
         dialect === 'clickhouse'
       const mssqlTypeOrNull = dialect === 'mssql' && (typeChanged || nullChanged)
+      const needsMssqlDefaultDrop =
+        dialect === 'mssql' && (defChanged || (origDef.length > 0 && typeChanged))
       stmts.push(
         buildAlterTableSql(
           {
@@ -1967,10 +2414,16 @@ export function buildTableMigrationSql(
                 : undefined,
             nullable:
               nullChanged || requiresFullColumnType || mssqlTypeOrNull ? col.nullable : undefined,
-            defaultValue: defChanged || requiresFullColumnType ? curDef : undefined,
-            ...(dialect === 'mssql' && defChanged
-              ? { previousDefaultValue: origDef, defaultDropSeq: ++mssqlDefaultDropSeq }
+            ...(dialect === 'oracle' ? { previousNullable: Boolean(col.originalNullable) } : {}),
+            ...(dialect === 'mysql' || dialect === 'mariadb'
+              ? { isAutoIncrement: Boolean(col.isAutoIncrement) }
               : {}),
+            defaultValue: defChanged || requiresFullColumnType ? curDef : undefined,
+            ...(needsMssqlDefaultDrop
+              ? { previousDefaultValue: origDef, defaultDropSeq: ++mssqlDefaultDropSeq }
+              : dialect === 'oracle' && defChanged
+                ? { previousDefaultValue: origDef }
+                : {}),
           },
           dialect
         )
@@ -1998,58 +2451,15 @@ export function buildTableMigrationSql(
     }
   }
 
-  // 6. Primary Key constraint change for Postgres / CockroachDB / MySQL / MariaDB
-  if (pkMembershipChanged && dialect !== 'clickhouse') {
+  // 6. Add new Primary Key constraint (after DROP PK, DROP COLUMN, ALTER COLUMN, ADD COLUMN)
+  if (pkMembershipChanged) {
     const nextPkCols = activeCols
       .filter((c) => c.isPrimaryKey)
       .map((c) => quoteIdentForDialect(c.name.trim(), dialect))
-    const hadOrigPk = draft.columns.some((c) => c.status !== 'new' && c.originalIsPrimaryKey)
-    const qTbl = qualifyAlterTarget(workingTable, draft.schema, dialect)
-    if (dialect === 'postgres' || dialect === 'cockroachdb') {
-      if (hadOrigPk) {
-        const pkIdx = draft.indexes.find((i) => i.isPrimary)
-        const pkConstraint = pkIdx?.name || `${workingTable}_pkey`
-        stmts.push(
-          `ALTER TABLE ${qTbl} DROP CONSTRAINT IF EXISTS ${quoteIdentForDialect(pkConstraint, dialect)};`
-        )
-      }
-      if (nextPkCols.length > 0) {
-        stmts.push(`ALTER TABLE ${qTbl} ADD PRIMARY KEY (${nextPkCols.join(', ')});`)
-      }
-    } else if (dialect === 'mysql' || dialect === 'mariadb') {
-      if (hadOrigPk) {
-        stmts.push(`ALTER TABLE ${qTbl} DROP PRIMARY KEY;`)
-      }
-      if (nextPkCols.length > 0) {
-        stmts.push(`ALTER TABLE ${qTbl} ADD PRIMARY KEY (${nextPkCols.join(', ')});`)
-      }
-    } else if (dialect === 'mssql') {
-      if (hadOrigPk) {
-        const pkIdx = draft.indexes.find((i) => i.isPrimary)
-        const pkConstraint = pkIdx?.name || `PK_${workingTable}`
-        stmts.push(
-          `ALTER TABLE ${qTbl} DROP CONSTRAINT ${quoteIdentForDialect(pkConstraint, dialect)};`
-        )
-      }
-      if (nextPkCols.length > 0) {
-        stmts.push(`ALTER TABLE ${qTbl} ADD PRIMARY KEY (${nextPkCols.join(', ')});`)
-      }
-    } else if (dialect === 'oracle') {
-      if (hadOrigPk) {
-        const pkIdx = draft.indexes.find((i) => i.isPrimary)
-        const pkConstraint = pkIdx?.name
-        stmts.push(
-          pkConstraint
-            ? `ALTER TABLE ${qTbl} DROP CONSTRAINT ${quoteIdentForDialect(pkConstraint, dialect)};`
-            : `ALTER TABLE ${qTbl} DROP PRIMARY KEY;`
-        )
-      }
-      if (nextPkCols.length > 0) {
-        stmts.push(`ALTER TABLE ${qTbl} ADD PRIMARY KEY (${nextPkCols.join(', ')});`)
-      }
+    if (nextPkCols.length > 0) {
+      const qTbl = qualifyAlterTarget(workingTable, draft.schema, dialect)
+      stmts.push(`ALTER TABLE ${qTbl} ADD PRIMARY KEY (${nextPkCols.join(', ')});`)
     }
-  } else if (pkMembershipChanged && dialect === 'clickhouse') {
-    throw new Error('Modifying PRIMARY KEY columns in place is not supported on ClickHouse.')
   }
 
   // 7. Add New Indexes
@@ -2128,9 +2538,13 @@ export function validateTableStructureDraft(
 
   const origTable = (draft.originalTableName || '').trim()
   const nextTable = (draft.tableName || '').trim()
+  const schemaName = (draft.schema ?? '').trim()
+  if (schemaName && !isSafeDdlIdentifierValue(schemaName)) {
+    errors.push('Schema name contains invalid characters.')
+  }
   if (!nextTable) {
     errors.push('Table name cannot be empty.')
-  } else if (FORBIDDEN_DEFAULT_TOKENS.test(nextTable) || nextTable.includes('\0')) {
+  } else if (!isSafeDdlIdentifierValue(nextTable)) {
     errors.push('Table name contains invalid characters.')
   } else if (nextTable !== origTable) {
     changeSummaries.push(`Rename table: "${origTable}" -> "${nextTable}"`)
@@ -2155,7 +2569,7 @@ export function validateTableStructureDraft(
     const cleanName = (col.name || '').trim()
     if (!cleanName) {
       errors.push('Column name cannot be empty.')
-    } else if (FORBIDDEN_DEFAULT_TOKENS.test(cleanName)) {
+    } else if (!isSafeDdlIdentifierValue(cleanName)) {
       errors.push(`Column "${cleanName}" contains invalid SQL characters.`)
     } else {
       const key = cleanName.toLowerCase()
@@ -2172,6 +2586,16 @@ export function validateTableStructureDraft(
       errors.push(err instanceof Error ? err.message : `Invalid type on column "${colLabel}".`)
     }
 
+    if (col.isGenerated && col.generatedExpression?.trim()) {
+      try {
+        validateRawDdlExpression(col.generatedExpression, `Generated column "${colLabel}" expression`)
+      } catch (err: unknown) {
+        errors.push(
+          err instanceof Error ? err.message : `Invalid generated expression on column "${colLabel}".`
+        )
+      }
+    }
+
     const rawDef = (col.defaultValue ?? '').trim()
     const origDef = (col.originalDefaultValue ?? '').trim()
     const isUntouchedExistingDefault =
@@ -2180,7 +2604,7 @@ export function validateTableStructureDraft(
       (col.dataType ?? '').trim().toUpperCase() === (col.originalDataType ?? '').trim().toUpperCase()
     if (rawDef.length > 0 && !isUntouchedExistingDefault) {
       try {
-        normalizeSqlDefaultExpression(rawDef, col.dataType || 'TEXT')
+        normalizeMigrationDefaultExpression(rawDef, col.dataType || 'TEXT', dialect)
       } catch (err: unknown) {
         errors.push(err instanceof Error ? err.message : `Invalid default on column "${colLabel}".`)
       }
@@ -2211,15 +2635,34 @@ export function validateTableStructureDraft(
           warnings.push(`Setting "${cleanName}" to NOT NULL without a default fails if existing rows contain NULL.`)
         }
       }
-      const origDef = (col.originalDefaultValue ?? '').trim()
-      if (origDef !== rawDef) {
+      if (!areDefaultsEquivalent(origDef, rawDef, col.dataType || 'TEXT', dialect)) {
         diffs.push(`default ${origDef || 'NULL'} -> ${rawDef || 'NULL'}`)
       }
       changeSummaries.push(`~ Modify column "${cleanName || origName}": ${diffs.join(', ')}`)
     }
   }
 
+  if (Array.isArray(draft.checkConstraints)) {
+    for (const chk of draft.checkConstraints) {
+      const trimmedChk = (chk || '').trim()
+      if (!trimmedChk) continue
+      try {
+        validateRawDdlExpression(trimmedChk, 'CHECK constraint', { requireCheckWrapper: true })
+      } catch (err: unknown) {
+        errors.push(err instanceof Error ? err.message : 'Invalid CHECK constraint.')
+      }
+    }
+  }
+
   const activeColSet = new Set(activeCols.map((c) => c.name.trim()).filter(Boolean))
+  const activeColOrOrigLowerSet = new Set<string>()
+  for (const col of activeCols) {
+    const cur = (col.name || '').trim()
+    if (cur) activeColOrOrigLowerSet.add(cur.toLowerCase())
+    if (col.status === 'existing' && col.originalName?.trim()) {
+      activeColOrOrigLowerSet.add(col.originalName.trim().toLowerCase())
+    }
+  }
   const seenIdx = new Map<string, number>()
   for (const idx of draft.indexes) {
     const idxName = (idx.name || '').trim()
@@ -2227,6 +2670,16 @@ export function validateTableStructureDraft(
       changeSummaries.push(`- Drop index "${idx.originalName || idxName}"`)
       warnings.push(`Dropping index "${idx.originalName || idxName}" removes query index optimization / uniqueness check.`)
       continue
+    }
+    if (idxName && !isSafeDdlIdentifierValue(idxName)) {
+      errors.push(`Index name "${idxName}" contains invalid SQL characters.`)
+    }
+    if (typeof idx.whereClause === 'string' && idx.whereClause.trim().length > 0) {
+      try {
+        validateRawDdlExpression(idx.whereClause, `Index "${idxName || 'partial'}" WHERE clause`)
+      } catch (err: unknown) {
+        errors.push(err instanceof Error ? err.message : `Invalid WHERE clause on index "${idxName}".`)
+      }
     }
     const count = (seenIdx.get(idxName.toLowerCase()) ?? 0) + 1
     seenIdx.set(idxName.toLowerCase(), count)
@@ -2257,10 +2710,39 @@ export function validateTableStructureDraft(
       warnings.push(`Dropping Foreign Key "${fk.constraintName || fk.column}" disables referential integrity checking.`)
       continue
     }
+    const col = (fk.column || '').trim()
+    const refTbl = (fk.foreignTable || '').trim()
+    const refCol = (fk.foreignColumn || '').trim()
+    const cname = (fk.constraintName || '').trim()
+    const refSchema = (fk.foreignSchema || '').trim()
+    if (
+      (cname && !isSafeDdlIdentifierValue(cname)) ||
+      (col && !isSafeDdlIdentifierValue(col)) ||
+      (refTbl && !isSafeDdlIdentifierValue(refTbl)) ||
+      (refCol && !isSafeDdlIdentifierValue(refCol)) ||
+      (refSchema && !isSafeDdlIdentifierValue(refSchema))
+    ) {
+      errors.push(`Foreign Key "${cname || col || '(unnamed)'}" contains invalid SQL characters.`)
+    }
+    if (fk.status === 'existing') {
+      if (col && !activeColOrOrigLowerSet.has(col.toLowerCase())) {
+        errors.push(
+          `Foreign Key "${cname || col}" references dropped column "${col}". Delete the Foreign Key before dropping this column.`
+        )
+      }
+      if (
+        origTable &&
+        refTbl.toLowerCase() === origTable.toLowerCase() &&
+        refCol &&
+        !activeColOrOrigLowerSet.has(refCol.toLowerCase())
+      ) {
+        errors.push(
+          `Self-referencing Foreign Key "${cname || col}" references dropped column "${refCol}".`
+        )
+      }
+      continue
+    }
     if (fk.status === 'new') {
-      const col = (fk.column || '').trim()
-      const refTbl = (fk.foreignTable || '').trim()
-      const refCol = (fk.foreignColumn || '').trim()
       if (!col || !activeColSet.has(col)) {
         errors.push(`Foreign Key local column "${col || '(none)'}" does not exist among active columns.`)
       }
@@ -2416,6 +2898,10 @@ export function buildCreateTableSql(
     const effectiveType = useSqliteAutoInc ? 'INTEGER' : col.dataType
     const parts: string[] = [quoteIdentForDialect(col.name, dialect), effectiveType]
 
+    const emitsIdentity =
+      ((isPg || isOracle) && col.isAutoIncrement && !/serial|identity/i.test(effectiveType)) ||
+      (isMssql && col.isAutoIncrement && !/identity/i.test(effectiveType))
+
     if (useSqliteAutoInc) {
       parts.push('PRIMARY KEY AUTOINCREMENT')
       inlinePkHandled = true
@@ -2425,7 +2911,7 @@ export function buildCreateTableSql(
       parts.push('IDENTITY(1,1)')
     }
 
-    if (isOracle && col.defaultValue.length > 0) {
+    if (isOracle && !emitsIdentity && col.defaultValue.length > 0) {
       parts.push(`DEFAULT ${col.defaultValue}`)
     }
 
@@ -2433,7 +2919,7 @@ export function buildCreateTableSql(
       parts.push('NOT NULL')
     }
 
-    if (!isOracle && col.defaultValue.length > 0) {
+    if (!isOracle && !emitsIdentity && col.defaultValue.length > 0) {
       parts.push(`DEFAULT ${col.defaultValue}`)
     }
 

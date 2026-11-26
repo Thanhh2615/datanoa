@@ -6,6 +6,7 @@ import {
   isIdentContChar,
   isIdentStartChar,
   scanBlockCommentEnd,
+  scanBracketIdentEnd,
   scanLineCommentEnd,
   scanQuotedSegmentEnd,
   splitMssqlBatches,
@@ -56,7 +57,17 @@ const MSSQL_BLOCKED_KEYWORDS = new Set([
   'OPENROWSET',
   'OPENDATASOURCE',
   'OPENQUERY',
+  'OPENXML',
   'RECEIVE',
+  'COMMIT',
+  'ROLLBACK',
+  'SAVE',
+  'BCP',
+  'XP_CMDSHELL',
+  'SP_EXECUTESQL',
+  'SP_CONFIGURE',
+  'SP_OACREATE',
+  'GO',
 ])
 
 const MSSQL_SAFE_SET_TOGGLE_OPTIONS = new Set([
@@ -108,11 +119,15 @@ const MSSQL_STMT_START_KEYWORDS = new Set([
   'DBCC',
 ])
 
-function tokenizeMssqlForGuard(sql: string): MssqlGuardToken[] {
+function tokenizeMssqlForGuard(sql: string): {
+  tokens: MssqlGuardToken[]
+  hasUnclosed: boolean
+} {
   const tokens: MssqlGuardToken[] = []
   const len = sql.length
   let depth = 0
   let i = 0
+  let hasUnclosed = false
 
   while (i < len) {
     const ch = sql[i]
@@ -128,7 +143,11 @@ function tokenizeMssqlForGuard(sql: string): MssqlGuardToken[] {
     }
 
     if (ch === '/' && i + 1 < len && sql[i + 1] === '*') {
-      i = scanBlockCommentEnd(sql, i, true)
+      const end = scanBlockCommentEnd(sql, i, true)
+      if (end < i + 4 || sql[end - 2] !== '*' || sql[end - 1] !== '/') {
+        hasUnclosed = true
+      }
+      i = end
       continue
     }
 
@@ -139,6 +158,7 @@ function tokenizeMssqlForGuard(sql: string): MssqlGuardToken[] {
       (i === 0 || !isIdentContChar(sql.charCodeAt(i - 1)))
     ) {
       const seg = scanQuotedSegmentEnd(sql, i + 1, "'", false)
+      if (!seg.closed) hasUnclosed = true
       tokens.push({ kind: 'string', text: "''", upper: '', depth })
       i = seg.end
       continue
@@ -146,6 +166,7 @@ function tokenizeMssqlForGuard(sql: string): MssqlGuardToken[] {
 
     if (ch === "'") {
       const seg = scanQuotedSegmentEnd(sql, i, "'", false)
+      if (!seg.closed) hasUnclosed = true
       tokens.push({ kind: 'string', text: "''", upper: '', depth })
       i = seg.end
       continue
@@ -153,6 +174,7 @@ function tokenizeMssqlForGuard(sql: string): MssqlGuardToken[] {
 
     if (ch === '"') {
       const seg = scanQuotedSegmentEnd(sql, i, '"', false)
+      if (!seg.closed) hasUnclosed = true
       const raw = sql.slice(i + 1, seg.closed ? seg.end - 1 : seg.end).replace(/""/g, '"')
       tokens.push({ kind: 'quoted', text: raw, upper: raw.toUpperCase(), depth })
       i = seg.end
@@ -160,20 +182,11 @@ function tokenizeMssqlForGuard(sql: string): MssqlGuardToken[] {
     }
 
     if (ch === '[') {
-      let j = i + 1
-      while (j < len) {
-        if (sql[j] === ']') {
-          if (j + 1 < len && sql[j + 1] === ']') {
-            j += 2
-            continue
-          }
-          break
-        }
-        j++
-      }
-      const raw = sql.slice(i + 1, j).replace(/]]/g, ']')
+      const seg = scanBracketIdentEnd(sql, i, true)
+      if (!seg.closed) hasUnclosed = true
+      const raw = sql.slice(i + 1, seg.closed ? seg.end - 1 : seg.end).replace(/]]/g, ']')
       tokens.push({ kind: 'quoted', text: raw, upper: raw.toUpperCase(), depth })
-      i = j < len ? j + 1 : len
+      i = seg.end
       continue
     }
 
@@ -256,7 +269,7 @@ function tokenizeMssqlForGuard(sql: string): MssqlGuardToken[] {
     i++
   }
 
-  return tokens
+  return { tokens, hasUnclosed }
 }
 
 function isSafeMssqlSetStatement(tokens: MssqlGuardToken[], setIdx: number): boolean {
@@ -337,7 +350,8 @@ function isSafeMssqlSetStatement(tokens: MssqlGuardToken[], setIdx: number): boo
 }
 
 function isMssqlChunkReadOnlyBlocked(chunkSql: string): boolean {
-  const tokens = tokenizeMssqlForGuard(chunkSql)
+  const { tokens, hasUnclosed } = tokenizeMssqlForGuard(chunkSql)
+  if (hasUnclosed) return true
   if (tokens.length === 0) return false
 
   let firstIdx = 0
@@ -366,6 +380,16 @@ function isMssqlChunkReadOnlyBlocked(chunkSql: string): boolean {
       return true
     }
 
+    if (
+      tok.upper === 'NEXT' &&
+      tokens[i + 1]?.kind === 'word' &&
+      tokens[i + 1].upper === 'VALUE' &&
+      tokens[i + 2]?.kind === 'word' &&
+      tokens[i + 2].upper === 'FOR'
+    ) {
+      return true
+    }
+
     if (tok.upper === 'CASE') {
       caseDepth++
       continue
@@ -387,7 +411,10 @@ function isMssqlChunkReadOnlyBlocked(chunkSql: string): boolean {
       const next = tokens[i + 1]
       if (
         next?.kind === 'word' &&
-        (next.upper === 'DIALOG' ||
+        (next.upper === 'TRAN' ||
+          next.upper === 'TRANSACTION' ||
+          next.upper === 'DISTRIBUTED' ||
+          next.upper === 'DIALOG' ||
           (next.upper === 'CONVERSATION' &&
             tokens[i + 2]?.kind === 'word' &&
             tokens[i + 2].upper === 'TIMER'))
@@ -497,7 +524,7 @@ export function hasMssqlSemicolonlessTxControl(sql: string): {
     const stmts = splitSqlStatements(batch, 'mssql')
     const list = stmts.length > 0 ? stmts.map((s) => s.text) : [batch]
     for (const stmt of list) {
-      const tokens = tokenizeMssqlForGuard(stmt)
+      const { tokens } = tokenizeMssqlForGuard(stmt)
       for (let i = 0; i < tokens.length; i++) {
         const tok = tokens[i]
         if (tok.depth !== 0 || tok.kind !== 'word') continue

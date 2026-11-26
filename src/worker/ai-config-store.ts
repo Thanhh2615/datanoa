@@ -201,6 +201,7 @@ export class AiConfigStore {
   private readonly sessionManager: SessionManager
   private readonly pinReady: Promise<void>
   private pendingMigrationWrite: Promise<void> = Promise.resolve()
+  private keyWriteQueue: Promise<void> = Promise.resolve()
 
   constructor({ orca, sessionManager }: AiConfigStoreDeps) {
     this.orca = orca
@@ -438,47 +439,60 @@ export class AiConfigStore {
     key?: unknown
     baseUrl?: unknown
     role?: unknown
+    clearSynced?: unknown
   } | undefined): Promise<{ hasKey: boolean; role: AiRole }> {
-    const role = parseAiRole(input?.role)
-    const { secretKey, addressKey, urlSettingKey } = keySlotFor(role)
-    const trimmed = typeof input?.key === 'string' ? input.key.trim() : ''
-    if (trimmed) {
-      await this.sessionManager.assertSecureSecretStorage()
-      const baseUrl =
-        input?.baseUrl !== undefined
-          ? String(input.baseUrl).trim()
-          : String((await this.orca.settings.get(urlSettingKey)) ?? '').trim()
-      const checked = validateAiBaseUrl(baseUrl, { hasApiKey: true })
-      if (!checked.ok) {
-        throw createHostError('invalid_params', checked.error)
-      }
-      await this.orca.secrets.set(secretKey, trimmed)
-      await this.orca.storage.set(addressKey, checked.url)
-    } else {
-      await this.orca.secrets.delete(secretKey)
-      await this.orca.storage.delete(addressKey)
-      if (role === 'autocomplete') {
+    const run = async (): Promise<{ hasKey: boolean; role: AiRole }> => {
+      await this.pinReady
+      const role = parseAiRole(input?.role)
+      const { secretKey, addressKey, urlSettingKey } = keySlotFor(role)
+      const trimmed = typeof input?.key === 'string' ? input.key.trim() : ''
+      if (trimmed) {
+        await this.sessionManager.assertSecureSecretStorage()
+        const baseUrl =
+          input?.baseUrl !== undefined
+            ? String(input.baseUrl).trim()
+            : String((await this.orca.settings.get(urlSettingKey)) ?? '').trim()
+        const checked = validateAiBaseUrl(baseUrl, { hasApiKey: true })
+        if (!checked.ok) {
+          throw createHostError('invalid_params', checked.error)
+        }
+        await this.orca.secrets.set(secretKey, trimmed)
+        await this.orca.storage.set(addressKey, checked.url)
+      } else {
+        await this.orca.secrets.delete(secretKey)
+        await this.orca.storage.delete(addressKey)
         const settings = await this.orca.settings.get()
         const sync = settings.aiSync === undefined ? true : settings.aiSync === true
-        if (sync) {
-          await this.pinReady
+        const shouldClearSibling = sync || input?.clearSynced === true
+        if (shouldClearSibling) {
+          const siblingRole: AiRole = role === 'autocomplete' ? 'explain' : 'autocomplete'
+          const sibling = keySlotFor(siblingRole)
+          const savedOwnUrl = String(settings[urlSettingKey] ?? DEFAULT_AI_BASE_URL).trim()
           const savedAutoUrl = String(settings.aiBaseUrl ?? DEFAULT_AI_BASE_URL).trim()
           const inputUrl = typeof input?.baseUrl === 'string' ? input.baseUrl.trim() : ''
-          const explainPinned = await this.orca.storage.get(AI_EXPLAIN_KEY_ADDRESS_STORAGE)
+          const siblingPinned = await this.orca.storage.get(sibling.addressKey)
           if (
-            typeof explainPinned === 'string' &&
-            explainPinned.trim() &&
-            ((inputUrl && sameAddress(explainPinned, inputUrl)) ||
-              (savedAutoUrl && sameAddress(explainPinned, savedAutoUrl)))
+            typeof siblingPinned === 'string' &&
+            siblingPinned.trim() &&
+            ((inputUrl && sameAddress(siblingPinned, inputUrl)) ||
+              (savedOwnUrl && sameAddress(siblingPinned, savedOwnUrl)) ||
+              (savedAutoUrl && sameAddress(siblingPinned, savedAutoUrl)))
           ) {
-            await this.orca.secrets.delete(AI_EXPLAIN_SECRET_KEY)
-            await this.orca.storage.delete(AI_EXPLAIN_KEY_ADDRESS_STORAGE)
+            await this.orca.secrets.delete(sibling.secretKey)
+            await this.orca.storage.delete(sibling.addressKey)
           }
         }
       }
+      await this.markDualRoleMigrated()
+      return { hasKey: Boolean(trimmed), role }
     }
-    await this.markDualRoleMigrated()
-    return { hasKey: Boolean(trimmed), role }
+
+    const resultPromise = this.keyWriteQueue.then(run, run)
+    this.keyWriteQueue = resultPromise.then(
+      () => undefined,
+      () => undefined
+    )
+    return await resultPromise
   }
 
   async keyForListing(

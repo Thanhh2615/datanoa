@@ -5,7 +5,21 @@ import type {
   DatabaseDriverType,
 } from '../protocol'
 import { detectRecognizableSqlCredential } from '../drivers/common/sql-credentials'
-import { isSensitiveUriParamKey, scrubSensitiveText } from '../shared-sql-safety.js'
+import {
+  getDialectLexerRules,
+  isPostgresEscapeStringStart,
+  matchDollarQuoteTag,
+  scanBlockCommentEnd,
+  scanBracketIdentEnd,
+  scanLineCommentEnd,
+  scanOracleQuoteEnd,
+  scanQuotedSegmentEnd,
+} from '../shared-sql-core.js'
+import {
+  findCredentialAuthorityAtIndex,
+  isSensitiveUriParamKey,
+  scrubSensitiveText,
+} from '../shared-sql-safety.js'
 import { doesInsertionIntroduceGrammarError } from './sql-grammar'
 
 export type AiDialect = DatabaseDriverType
@@ -101,7 +115,9 @@ export function isQwenCoderModel(model: string): boolean {
 export function sameAddress(a: string, b: string): boolean {
   const norm = (url: string): string => {
     try {
-      return new URL(url.trim()).href.replace(/\/+$/, '').toLowerCase()
+      const parsed = new URL(url.trim())
+      const pathname = parsed.pathname.replace(/\/+$/, '')
+      return `${parsed.origin.toLowerCase()}${pathname}${parsed.search}`
     } catch {
       return ''
     }
@@ -122,11 +138,11 @@ export function presetById(id: string): AiPreset {
 
 export function withV1(base: string): string {
   const root = base.trim().replace(/\/+$/, '')
-  return root.endsWith('/v1') ? root : `${root}/v1`
+  return /\/v1$/i.test(root) ? root : `${root}/v1`
 }
 
 export function withoutV1(base: string): string {
-  return base.trim().replace(/\/+$/, '').replace(/\/v1$/, '')
+  return base.trim().replace(/\/+$/, '').replace(/\/v1$/i, '')
 }
 
 function joinUrl(base: string, path: string): string {
@@ -337,7 +353,10 @@ export function buildCompletionRequest(
     const schemaDdl = typeof req.fimSchemaDdl === 'string' ? req.fimSchemaDdl.trim() : ''
     const historySql = typeof req.fimHistorySql === 'string' ? req.fimHistorySql.trim() : ''
     const priorTabSql = typeof req.fimPriorSql === 'string' ? req.fimPriorSql.trim() : ''
-    if (isQwenCoderModel(provider.model) && (schemaDdl.length > 0 || historySql.length > 0)) {
+    if (
+      isQwenCoderModel(provider.model) &&
+      (schemaDdl.length > 0 || historySql.length > 0 || priorTabSql.length > 0)
+    ) {
       const rawPrefix = req.prefix.slice(-AI_PREFIX_CHARS)
       const repoName = req.dialect || 'sql'
       const schemaBlock = schemaDdl ? `<|file_sep|>schema.sql\n${schemaDdl}\n` : ''
@@ -357,7 +376,7 @@ export function buildCompletionRequest(
         stream,
         keep_alive: OLLAMA_KEEP_ALIVE,
         options: {
-          num_ctx: OLLAMA_NUM_CTX,
+          num_ctx: resolveOllamaChatNumCtx('', rawPrompt, provider.maxTokens, extraBody),
           num_predict: provider.maxTokens,
           temperature: FIM_TEMPERATURE,
           ...(hasStop ? { stop: stopList } : {}),
@@ -371,7 +390,7 @@ export function buildCompletionRequest(
       stream,
       keep_alive: OLLAMA_KEEP_ALIVE,
       options: {
-        num_ctx: OLLAMA_NUM_CTX,
+        num_ctx: resolveOllamaChatNumCtx(prefix, effectiveSuffix, provider.maxTokens, extraBody),
         num_predict: provider.maxTokens,
         temperature: FIM_TEMPERATURE,
         ...(hasStop ? { stop: stopList } : {}),
@@ -455,10 +474,24 @@ const SECRET_RULES: readonly { kind: string; pattern: RegExp }[] = [
 ]
 
 const ASSIGNED_SECRET_RE =
-  /(?:pass(?:word|wd)?|(?<![a-zA-Z])pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token|private[_-]?key|token)["']?\s*[:=]\s*["']([^"'\s]{16,})["']/gi
+  /(?:[a-zA-Z0-9_.-]*(?:pass(?:word|wd)?|secret|api[_-]?key|access[_-]?key|auth[_-]?token|private[_-]?key|token)|(?<![a-zA-Z])pwd)["']?\s*[:=]\s*["']([^"'\r\n\s]{6,})(?:["']|$)/gi
 
-const SHORT_PWD_ASSIGN_RE =
-  /(?<![a-zA-Z])pwd["']?\s*[:=]\s*["']([^"'\s]{6,})["']/gi
+const SQL_KEY_VALUE_SECRET_TUPLE_RE =
+  /["'](?:[a-zA-Z0-9_.-]*(?:pass(?:word|wd)?|secret|api[_-]?key|access[_-]?key|auth[_-]?token|private[_-]?key|token))["']\s*,\s*["']([^"'\r\n\s]{6,})(?:["']|$)/gi
+
+const UNQUOTED_CONN_PASSWORD_RE =
+  /(?:^|[\s;'",(])(?:password|passwd|pwd)\s*=\s*([^\s;'")}\]]{4,})/gi
+
+const ORACLE_DBLINK_CRED_RE =
+  /\bCREATE\s+(?:SHARED\s+)?(?:PUBLIC\s+)?DATABASE\s+LINK\b[\s\S]{0,160}?\bIDENTIFIED\s+BY\s+(?:["']([^"'\r\n]+)(?:["']|$)|([^\s;,'")]+))/gi
+
+const ORACLE_EASY_CONNECT_CRED_RE =
+  /(?:^|[\s'"(,;])([A-Za-z][A-Za-z0-9_$#]{0,63})\/([^\s@/'",;()]{4,})@(?:\/\/)?(?:\[[0-9a-fA-F:]+\]|[A-Za-z0-9_.-]+):(\d{1,5})\/[A-Za-z0-9_.$#-]+/g
+
+const UNCLOSED_SQL_CRED_TAIL_RE =
+  /\b(?:(?:CREATE|ALTER)\s+(?:USER|ROLE|LOGIN)\b[\s\S]{0,160}?\b(?:PASSWORD\s*=?\s*|IDENTIFIED\s+BY\s+)|SET\s+PASSWORD\b[\s\S]{0,80}?=\s*)(?:N)?(['"])([^'"\r\n]{4,})$/i
+
+const SQL_CRED_CLAUSE_START_RE = /\b(?:CREATE|ALTER|SET\s+PASSWORD|GRANT)\b/gi
 
 const MONGO_USER_AUTH_CALL_RE =
   /\b(?:changeUserPassword|auth)\s*\(\s*["'][^"']+["']\s*,\s*["']([^"'\s]{4,})["']/gi
@@ -475,12 +508,74 @@ const BEARER_PROSE_WORD_RE =
 const STANDALONE_BASIC_RE =
   /\bBasic[ \t]+([A-Za-z0-9+/]{8,}={0,2})(?=$|[\s,;'"`}\])<>])/g
 
-const URI_WITH_QUERY_RE =
-  /\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s'"`<>}\]]+\?([^\s#'"`<>}\]]+)/gi
+const URI_SCHEME_SCAN_RE = /\b([a-z][a-z0-9+.-]{0,31}:\/\/)/gi
+
+const URI_WITH_QUERY_OR_FRAG_RE =
+  /\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s'"`<>}\]]+([?#][^\s'"`<>}\]]+)/gi
+
+const SAFE_ASSIGNED_LITERAL_RE = /^(?:true|false|null|none|empty|default|unknown|active|inactive|pending|disabled|enabled)$/i
+
+function isLikelyAssignedSecretValue(val: string): boolean {
+  if (!val || val.length < 6) return false
+  if (val === '[REDACTED]' || val === '***') return false
+  if (PLACEHOLDER_RE.test(val) || SAFE_ASSIGNED_LITERAL_RE.test(val)) return false
+  if (val.startsWith('/') || /^[A-Za-z]:\\/.test(val)) return false
+  if (val.length < 16) {
+    // Reject obvious placeholder words/identifiers without digit/symbol/mixed-case entropy
+    const hasDigit = /\d/.test(val)
+    const hasSymbol = /[^A-Za-z0-9]/.test(val)
+    const hasMixedCase = /[A-Z]/.test(val) && /[a-z]/.test(val)
+    if (!hasDigit && !hasSymbol && !hasMixedCase) return false
+  }
+  return true
+}
+
+function hasSensitiveKvParams(segment: string): boolean {
+  for (const pair of segment.split('&')) {
+    const eqIdx = pair.indexOf('=')
+    if (eqIdx <= 0) continue
+    const rawKey = pair.slice(0, eqIdx)
+    const rawVal = pair.slice(eqIdx + 1)
+    let val = rawVal
+    try {
+      val = decodeURIComponent(rawVal)
+    } catch {
+      // Keep rawVal when percent-encoding is partial
+    }
+    if (
+      isSensitiveUriParamKey(rawKey) &&
+      val.length >= 4 &&
+      !PLACEHOLDER_RE.test(val) &&
+      val !== '***' &&
+      val !== '[REDACTED]'
+    ) {
+      return true
+    }
+  }
+  return false
+}
 
 function scanTextForSecret(text: string, dialect?: AiDialect): string | null {
   for (const { kind, pattern } of SECRET_RULES) {
     if (pattern.test(text)) return kind
+  }
+  // Catch URI passwords even when password contains `/` or `@` via shared authority parser
+  for (const match of text.matchAll(URI_SCHEME_SCAN_RE)) {
+    const scheme = match[1]
+    const idx = match.index ?? 0
+    const restStart = idx + scheme.length
+    const tailEnd = text.slice(restStart).search(/[\s'"`<>}\])]/)
+    const body = tailEnd === -1 ? text.slice(restStart) : text.slice(restStart, restStart + tailEnd)
+    const colonIdx = body.indexOf(':')
+    if (colonIdx > 0) {
+      const atIdx = findCredentialAuthorityAtIndex(scheme, body, colonIdx)
+      if (atIdx > colonIdx) {
+        const pw = body.slice(colonIdx + 1, atIdx)
+        if (pw.length >= 3 && pw !== '***' && pw !== '[REDACTED]' && !PLACEHOLDER_RE.test(pw)) {
+          return 'password in a URL'
+        }
+      }
+    }
   }
   for (const match of text.matchAll(AUTH_HEADER_SECRET_RE)) {
     const val = match[1]
@@ -508,40 +603,65 @@ function scanTextForSecret(text: string, dialect?: AiDialect): string | null {
       return 'Basic auth credential'
     }
   }
-  for (const match of text.matchAll(URI_WITH_QUERY_RE)) {
-    const query = match[1]
-    for (const pair of query.split('&')) {
-      const eqIdx = pair.indexOf('=')
-      if (eqIdx <= 0) continue
-      const rawKey = pair.slice(0, eqIdx)
-      const rawVal = pair.slice(eqIdx + 1)
-      let val = rawVal
-      try {
-        val = decodeURIComponent(rawVal)
-      } catch {
-        // Keep rawVal when percent-encoding is partial
-      }
-      if (
-        isSensitiveUriParamKey(rawKey) &&
-        val.length >= 4 &&
-        !PLACEHOLDER_RE.test(val) &&
-        val !== '***' &&
-        val !== '[REDACTED]'
-      ) {
-        return 'sensitive URI query parameter'
-      }
+  for (const match of text.matchAll(URI_WITH_QUERY_OR_FRAG_RE)) {
+    const tail = match[1]
+    const hashIdx = tail.indexOf('#')
+    const queryPart = tail.startsWith('?')
+      ? hashIdx >= 0
+        ? tail.slice(1, hashIdx)
+        : tail.slice(1)
+      : ''
+    const fragPart = hashIdx >= 0 ? tail.slice(hashIdx + 1) : ''
+    if (queryPart && hasSensitiveKvParams(queryPart)) {
+      return 'sensitive URI query parameter'
+    }
+    if (fragPart && hasSensitiveKvParams(fragPart)) {
+      return 'sensitive URI fragment parameter'
     }
   }
   for (const match of text.matchAll(ASSIGNED_SECRET_RE)) {
-    if (!PLACEHOLDER_RE.test(match[1])) {
+    if (isLikelyAssignedSecretValue(match[1])) {
       return 'secret assigned in code'
     }
   }
-  for (const match of text.matchAll(SHORT_PWD_ASSIGN_RE)) {
-    const val = match[1]
-    if (!PLACEHOLDER_RE.test(val) && !val.startsWith('/') && !/^[A-Za-z]:\\/.test(val)) {
+  for (const match of text.matchAll(SQL_KEY_VALUE_SECRET_TUPLE_RE)) {
+    if (isLikelyAssignedSecretValue(match[1])) {
       return 'secret assigned in code'
     }
+  }
+  for (const match of text.matchAll(UNQUOTED_CONN_PASSWORD_RE)) {
+    const val = match[1]
+    if (
+      val !== '[REDACTED]' &&
+      val !== '***' &&
+      !val.startsWith(':') &&
+      !val.startsWith('$') &&
+      !val.startsWith('@') &&
+      !val.startsWith('?') &&
+      !PLACEHOLDER_RE.test(val) &&
+      !SAFE_ASSIGNED_LITERAL_RE.test(val) &&
+      !val.startsWith('/') &&
+      !/^[A-Za-z]:\\/.test(val) &&
+      (/[0-9]/.test(val) || /[^A-Za-z0-9_]/.test(val) || (/[A-Z]/.test(val) && /[a-z]/.test(val)) || val.length >= 12)
+    ) {
+      return 'connection string password'
+    }
+  }
+  for (const match of text.matchAll(ORACLE_DBLINK_CRED_RE)) {
+    const val = match[1] ?? match[2] ?? ''
+    if (val && !PLACEHOLDER_RE.test(val) && !/^[:?$@]/.test(val)) {
+      return 'sql-auth-literal'
+    }
+  }
+  for (const match of text.matchAll(ORACLE_EASY_CONNECT_CRED_RE)) {
+    const pw = match[2]
+    if (pw && !PLACEHOLDER_RE.test(pw)) {
+      return 'Oracle Easy Connect credential'
+    }
+  }
+  const unclosedCred = UNCLOSED_SQL_CRED_TAIL_RE.exec(text)
+  if (unclosedCred && !PLACEHOLDER_RE.test(unclosedCred[2])) {
+    return 'sql-auth-literal'
   }
   for (const match of text.matchAll(MONGO_USER_AUTH_CALL_RE)) {
     if (!PLACEHOLDER_RE.test(match[1])) {
@@ -550,6 +670,18 @@ function scanTextForSecret(text: string, dialect?: AiDialect): string | null {
   }
   const sqlCred = detectRecognizableSqlCredential(text, dialect)
   if (sqlCred) return sqlCred
+  // Scan SQL credential statement slices so prompt prefixes ("Broken SQL query:\nCREATE USER ...") cannot mask DDL credentials
+  for (const match of text.matchAll(SQL_CRED_CLAUSE_START_RE)) {
+    const startIdx = match.index ?? 0
+    if (startIdx === 0) continue
+    const slice = text.slice(startIdx)
+    const nestedCred = detectRecognizableSqlCredential(slice, dialect)
+    if (nestedCred) return nestedCred
+    const unclosedNested = UNCLOSED_SQL_CRED_TAIL_RE.exec(slice)
+    if (unclosedNested && !PLACEHOLDER_RE.test(unclosedNested[2])) {
+      return 'sql-auth-literal'
+    }
+  }
   return null
 }
 
@@ -1285,62 +1417,99 @@ interface SqlBoundaryState {
 }
 
 function scanSqlBoundaryState(prefix: string, dialect?: AiDialect): SqlBoundaryState {
-  let state: 'normal' | 'single' | 'double' | 'backtick' | 'line_comment' | 'block_comment' = 'normal'
-  for (let i = 0; i < prefix.length; i += 1) {
+  const rules = getDialectLexerRules(dialect)
+  let i = 0
+  const len = prefix.length
+  while (i < len) {
     const ch = prefix[i]
     const next = prefix[i + 1]
-    if (state === 'single' || state === 'double' || state === 'backtick') {
-      const q = state === 'single' ? "'" : state === 'double' ? '"' : '`'
-      if (state !== 'backtick' && ch === '\\' && (next === q || next === '\\')) {
-        i += 1
+    if (rules.lineCommentDash && ch === '-' && next === '-') {
+      const end = scanLineCommentEnd(prefix, i)
+      if (end >= len && prefix[len - 1] !== '\n' && prefix[len - 1] !== '\r') {
+        return { inQuote: null, inComment: true }
+      }
+      i = end
+      continue
+    }
+    if (rules.lineCommentHash && ch === '#') {
+      const end = scanLineCommentEnd(prefix, i - 1)
+      if (end >= len && prefix[len - 1] !== '\n' && prefix[len - 1] !== '\r') {
+        return { inQuote: null, inComment: true }
+      }
+      i = end
+      continue
+    }
+    if (rules.lineCommentSlash && ch === '/' && next === '/') {
+      const end = scanLineCommentEnd(prefix, i)
+      if (end >= len && prefix[len - 1] !== '\n' && prefix[len - 1] !== '\r') {
+        return { inQuote: null, inComment: true }
+      }
+      i = end
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      const end = scanBlockCommentEnd(prefix, i, rules.nestedBlockComments)
+      if (end >= len && !prefix.slice(i + 2).endsWith('*/')) {
+        return { inQuote: null, inComment: true }
+      }
+      i = end
+      continue
+    }
+    if (rules.oracleQQuote) {
+      const oq = scanOracleQuoteEnd(prefix, i, dialect)
+      if (oq) {
+        if (!oq.closed) return { inQuote: "'", inComment: false }
+        i = oq.end
         continue
       }
-      if (ch === q) {
-        if (next === q) {
-          i += 1
-          continue
-        }
-        state = 'normal'
+    }
+    if (rules.dollarQuoting && ch === '$') {
+      const tag = matchDollarQuoteTag(prefix, i)
+      if (tag) {
+        const closeAt = prefix.indexOf(tag, i + tag.length)
+        if (closeAt === -1) return { inQuote: "'", inComment: false }
+        i = closeAt + tag.length
+        continue
       }
+    }
+    if (rules.postgresEscapeString && (ch === 'E' || ch === 'e') && next === "'" && isPostgresEscapeStringStart(prefix, i, dialect)) {
+      const seg = scanQuotedSegmentEnd(prefix, i + 1, "'", true)
+      if (!seg.closed) return { inQuote: "'", inComment: false }
+      i = seg.end
       continue
     }
-    if (state === 'line_comment') {
-      if (ch === '\n') state = 'normal'
+    if (ch === "'") {
+      const seg = scanQuotedSegmentEnd(prefix, i, "'", rules.backslashEscapesSingleQuote)
+      if (!seg.closed) return { inQuote: "'", inComment: false }
+      i = seg.end
       continue
     }
-    if (state === 'block_comment') {
-      if (ch === '*' && next === '/') {
-        state = 'normal'
-        i += 1
-      }
+    if (ch === '"' && rules.doubleQuoteIdentifiers) {
+      const seg = scanQuotedSegmentEnd(prefix, i, '"', rules.backslashEscapesDoubleQuote)
+      if (!seg.closed) return { inQuote: '"', inComment: false }
+      i = seg.end
       continue
     }
-    if (ch === '-' && next === '-') {
-      state = 'line_comment'
-      i += 1
-    } else if (ch === '#' && dialect !== 'mssql' && dialect !== 'oracle') {
-      state = 'line_comment'
-    } else if (ch === '/' && next === '*') {
-      state = 'block_comment'
-      i += 1
-    } else if (ch === "'") {
-      state = 'single'
-    } else if (ch === '"') {
-      state = 'double'
-    } else if (ch === '`') {
-      state = 'backtick'
+    if (ch === '`' && rules.backtickIdentifiers) {
+      const seg = scanQuotedSegmentEnd(prefix, i, '`', false)
+      if (!seg.closed) return { inQuote: '`', inComment: false }
+      i = seg.end
+      continue
     }
+    if (ch === '[' && rules.bracketIdentifiers !== 'none') {
+      const seg = scanBracketIdentEnd(prefix, i, rules.bracketIdentifiers === 'doubling')
+      if (!seg.closed) return { inQuote: null, inComment: false }
+      i = seg.end
+      continue
+    }
+    i += 1
   }
-  if (state === 'single') return { inQuote: "'", inComment: false }
-  if (state === 'double') return { inQuote: '"', inComment: false }
-  if (state === 'backtick') return { inQuote: '`', inComment: false }
-  return { inQuote: null, inComment: state === 'line_comment' || state === 'block_comment' }
+  return { inQuote: null, inComment: false }
 }
 
 export function damerauLevenshtein(a: string, b: string): number {
   const m = a.length
   const n = b.length
-  if (Math.abs(m - n) > 2) return Math.abs(m - n)
   if (m === 0) return n
   if (n === 0) return m
   const dp: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0))
@@ -1403,13 +1572,36 @@ function collectIdentifierCandidates(knownIdentifiers?: Iterable<string>): strin
 }
 
 function isAtSqlStatementStart(before: string, dialect?: AiDialect): boolean {
+  const rules = getDialectLexerRules(dialect)
   const lastSemi = before.lastIndexOf(';')
   const segment = lastSemi >= 0 ? before.slice(lastSemi + 1) : before
-  let stripped = segment.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\r\n]*/g, ' ')
-  if (dialect !== 'mssql' && dialect !== 'oracle') {
-    stripped = stripped.replace(/#[^\r\n]*/g, ' ')
+  let i = 0
+  while (i < segment.length) {
+    const ch = segment[i]
+    const next = segment[i + 1]
+    if (/\s/.test(ch)) {
+      i += 1
+      continue
+    }
+    if (rules.lineCommentDash && ch === '-' && next === '-') {
+      i = scanLineCommentEnd(segment, i)
+      continue
+    }
+    if (rules.lineCommentHash && ch === '#') {
+      i = scanLineCommentEnd(segment, i - 1)
+      continue
+    }
+    if (rules.lineCommentSlash && ch === '/' && next === '/') {
+      i = scanLineCommentEnd(segment, i)
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      i = scanBlockCommentEnd(segment, i, rules.nestedBlockComments)
+      continue
+    }
+    return false
   }
-  return stripped.trim().length === 0
+  return true
 }
 
 export function formatCorrectedKeyword(keywordUpper: string, rawWord: string): string {
@@ -1749,7 +1941,7 @@ function matchIndentNormalizedMultiLineEcho(suggestion: string, tailLines: strin
   const restWord = /^([A-Za-z0-9_]+)/.exec(rest)?.[1]
   if (tailWord && restWord) {
     const matchedTail = suggestion.slice(cutOffset - tailWord.length, cutOffset)
-    return matchKeywordTailCasing(matchedTail, restWord, matchedTail + restWord) + rest.slice(restWord.length)
+    return matchKeywordTailCasing(tailWord, restWord, matchedTail + restWord) + rest.slice(restWord.length)
   }
   return rest
 }
@@ -1760,8 +1952,8 @@ function matchKeywordTailCasing(
   fullWord: string
 ): string {
   if (!remainderWord || !SQL_KEYWORDS.has(fullWord.toUpperCase())) return remainderWord
-  if (/^[A-Z]+$/.test(prefixWord) && /^[a-z]+$/.test(fullWord)) return remainderWord.toUpperCase()
-  if (/^[a-z]+$/.test(prefixWord) && /^[A-Z]+$/.test(fullWord)) return remainderWord.toLowerCase()
+  if (/^[A-Z]+$/.test(prefixWord) && /[a-z]/.test(remainderWord)) return remainderWord.toUpperCase()
+  if (/^[a-z]+$/.test(prefixWord) && /[A-Z]/.test(remainderWord)) return remainderWord.toLowerCase()
   return remainderWord
 }
 
@@ -1963,43 +2155,40 @@ function isSqlIdentChar(ch: string | undefined): boolean {
 }
 
 function skipCommentOrQuotedSpan(sql: string, i: number, dialect?: AiDialect): number | null {
+  const rules = getDialectLexerRules(dialect)
   const ch = sql[i]
   const next = sql[i + 1]
-  if (ch === '-' && next === '-') {
-    const nl = sql.indexOf('\n', i + 2)
-    return nl === -1 ? sql.length : nl + 1
+  if (rules.lineCommentDash && ch === '-' && next === '-') {
+    return scanLineCommentEnd(sql, i)
   }
-  if (ch === '#' && dialect !== 'mssql' && dialect !== 'oracle') {
-    const nl = sql.indexOf('\n', i + 1)
-    return nl === -1 ? sql.length : nl + 1
+  if (rules.lineCommentHash && ch === '#') {
+    return scanLineCommentEnd(sql, i - 1)
+  }
+  if (rules.lineCommentSlash && ch === '/' && next === '/') {
+    return scanLineCommentEnd(sql, i)
   }
   if (ch === '/' && next === '*') {
-    const close = sql.indexOf('*/', i + 2)
-    return close === -1 ? sql.length : close + 2
+    return scanBlockCommentEnd(sql, i, rules.nestedBlockComments)
   }
-  if (ch === '"' || ch === '`') {
-    const allowBackslash = ch !== '`' && dialect !== 'mssql' && dialect !== 'oracle'
-    let j = i + 1
-    while (j < sql.length) {
-      const c = sql[j]
-      if (allowBackslash && c === '\\' && j + 1 < sql.length) {
-        j += 2
-        continue
-      }
-      if (c === ch) {
-        if (sql[j + 1] === ch) {
-          j += 2
-          continue
-        }
-        return j + 1
-      }
-      j += 1
+  if (rules.oracleQQuote) {
+    const oq = scanOracleQuoteEnd(sql, i, dialect)
+    if (oq) return oq.end
+  }
+  if (rules.dollarQuoting && ch === '$') {
+    const tag = matchDollarQuoteTag(sql, i)
+    if (tag) {
+      const closeAt = sql.indexOf(tag, i + tag.length)
+      return closeAt === -1 ? sql.length : closeAt + tag.length
     }
-    return sql.length
   }
-  if (dialect === 'mssql' && ch === '[') {
-    const close = sql.indexOf(']', i + 1)
-    return close === -1 ? sql.length : close + 1
+  if (ch === '"' && rules.doubleQuoteIdentifiers) {
+    return scanQuotedSegmentEnd(sql, i, '"', rules.backslashEscapesDoubleQuote).end
+  }
+  if (ch === '`' && rules.backtickIdentifiers) {
+    return scanQuotedSegmentEnd(sql, i, '`', false).end
+  }
+  if (ch === '[' && rules.bracketIdentifiers !== 'none') {
+    return scanBracketIdentEnd(sql, i, rules.bracketIdentifiers === 'doubling').end
   }
   return null
 }
@@ -2009,7 +2198,13 @@ function scanSingleQuotedLiteral(
   start: number,
   dialect?: AiDialect
 ): { lit: ScannedSqlLiteral; nextIndex: number } {
-  const allowBackslash = dialect !== 'mssql' && dialect !== 'oracle'
+  const rules = getDialectLexerRules(dialect)
+  const isPgEscape =
+    rules.postgresEscapeString &&
+    start > 0 &&
+    (sql[start - 1] === 'E' || sql[start - 1] === 'e') &&
+    isPostgresEscapeStringStart(sql, start - 1, dialect)
+  const allowBackslash = rules.backslashEscapesSingleQuote || isPgEscape
   let value = ''
   let j = start + 1
   while (j < sql.length) {
@@ -2361,9 +2556,21 @@ export function trimSingleLineSuffixOverlap(
   if (!suffixLine) return suggestion
   const maxLen = Math.min(suggestion.length, suffixLine.length)
   for (let len = maxLen; len >= 2; len -= 1) {
-    if (suggestion.endsWith(suffixLine.slice(0, len))) {
-      return suggestion.slice(0, suggestion.length - len)
+    const overlap = suffixLine.slice(0, len)
+    if (!suggestion.endsWith(overlap)) continue
+    const cutStart = suggestion.length - len
+    // Do not split mid-identifier across overlap boundaries (e.g. `user_id` + `id_parent`, `login` + `in (1,2)`)
+    const charBeforeCut = cutStart > 0 ? suggestion[cutStart - 1] : ''
+    const firstOverlapChar = overlap[0]
+    if (charBeforeCut && /[A-Za-z0-9_]/.test(charBeforeCut) && /[A-Za-z0-9_]/.test(firstOverlapChar)) {
+      continue
     }
+    const lastOverlapChar = overlap[overlap.length - 1]
+    const charAfterSuffixOverlap = suffixLine[len] ?? ''
+    if (charAfterSuffixOverlap && /[A-Za-z0-9_]/.test(lastOverlapChar) && /[A-Za-z0-9_]/.test(charAfterSuffixOverlap)) {
+      continue
+    }
+    return suggestion.slice(0, cutStart)
   }
   const firstSuf = suffixLine[0]
   if (suggestion.endsWith(firstSuf)) {
@@ -2387,40 +2594,56 @@ export function matchCompletionBrackets(
   suffix = ''
 ): string {
   if (!suggestion || dialect === 'redis') return suggestion
-  const skipSquare = dialect === 'mssql'
+  const rules = getDialectLexerRules(dialect)
+  const skipSquare = rules.bracketIdentifiers !== 'none'
   const prefixOpen = { '(': 0, '[': 0, '{': 0 }
 
   const scanText = (
     text: string,
     mode: 'prefix' | 'suffix' | 'suggestion',
     stack: Array<')' | ']' | '}'>,
-    initState = { inQuote: null as string | null, inLineComment: false, inBlockComment: false }
+    initState = {
+      inQuote: null as string | null,
+      escapeQuote: false,
+      inLineComment: false,
+      blockDepth: 0,
+    }
   ): {
     out: string
     inQuote: string | null
+    escapeQuote: boolean
     inLineComment: boolean
-    inBlockComment: boolean
+    blockDepth: number
     suffixUnmatched: { '(': number; '[': number; '{': number }
   } => {
-    let { inQuote, inLineComment, inBlockComment } = initState
+    let { inQuote, escapeQuote, inLineComment, blockDepth } = initState
     const localSuffixOpen = { '(': 0, '[': 0, '{': 0 }
     const suffixUnmatched = { '(': 0, '[': 0, '{': 0 }
     for (let i = 0; i < text.length; i += 1) {
       const ch = text[i]
       const next = text[i + 1]
       if (inLineComment) {
-        if (ch === '\n') inLineComment = false
+        if (ch === '\n' || ch === '\r') inLineComment = false
         continue
       }
-      if (inBlockComment) {
-        if (ch === '*' && next === '/') {
-          inBlockComment = false
+      if (blockDepth > 0) {
+        if (rules.nestedBlockComments && ch === '/' && next === '*') {
+          blockDepth += 1
+          i += 1
+        } else if (ch === '*' && next === '/') {
+          blockDepth -= 1
           i += 1
         }
         continue
       }
       if (inQuote) {
-        if (ch === '\\' && inQuote !== '`' && dialect !== 'mssql' && dialect !== 'oracle') {
+        const allowBackslash =
+          inQuote === "'"
+            ? rules.backslashEscapesSingleQuote || escapeQuote
+            : inQuote === '"'
+              ? rules.backslashEscapesDoubleQuote
+              : false
+        if (allowBackslash && ch === '\\' && i + 1 < text.length) {
           i += 1
           continue
         }
@@ -2430,25 +2653,58 @@ export function matchCompletionBrackets(
             continue
           }
           inQuote = null
+          escapeQuote = false
         }
         continue
       }
-      if (ch === '-' && next === '-') {
+      if (rules.lineCommentDash && ch === '-' && next === '-') {
         inLineComment = true
         i += 1
         continue
       }
-      if (ch === '#' && dialect !== 'mssql' && dialect !== 'oracle') {
+      if (rules.lineCommentHash && ch === '#') {
         inLineComment = true
+        continue
+      }
+      if (rules.lineCommentSlash && ch === '/' && next === '/') {
+        inLineComment = true
+        i += 1
         continue
       }
       if (ch === '/' && next === '*') {
-        inBlockComment = true
+        blockDepth = 1
         i += 1
         continue
       }
-      if (ch === "'" || ch === '"' || ch === '`') {
+      if (rules.oracleQQuote) {
+        const oq = scanOracleQuoteEnd(text, i, dialect)
+        if (oq) {
+          i = oq.end - 1
+          continue
+        }
+      }
+      if (rules.dollarQuoting && ch === '$') {
+        const tag = matchDollarQuoteTag(text, i)
+        if (tag) {
+          const closeAt = text.indexOf(tag, i + tag.length)
+          i = closeAt === -1 ? text.length - 1 : closeAt + tag.length - 1
+          continue
+        }
+      }
+      if (
+        rules.postgresEscapeString &&
+        (ch === 'E' || ch === 'e') &&
+        next === "'" &&
+        isPostgresEscapeStringStart(text, i, dialect)
+      ) {
+        inQuote = "'"
+        escapeQuote = true
+        i += 1
+        continue
+      }
+      if (ch === "'" || (ch === '"' && rules.doubleQuoteIdentifiers) || (ch === '`' && rules.backtickIdentifiers)) {
         inQuote = ch
+        escapeQuote = false
         continue
       }
       if (ch === '(' || (ch === '[' && !skipSquare) || ch === '{') {
@@ -2475,19 +2731,20 @@ export function matchCompletionBrackets(
             return {
               out: text.slice(0, i).trimEnd(),
               inQuote,
+              escapeQuote,
               inLineComment,
-              inBlockComment,
+              blockDepth,
               suffixUnmatched,
             }
           }
         }
       }
     }
-    return { out: text, inQuote, inLineComment, inBlockComment, suffixUnmatched }
+    return { out: text, inQuote, escapeQuote, inLineComment, blockDepth, suffixUnmatched }
   }
 
   const prefixRes = scanText(prefix, 'prefix', [])
-  if (suffix && prefixRes.inQuote === null && !prefixRes.inLineComment && !prefixRes.inBlockComment) {
+  if (suffix && prefixRes.inQuote === null && !prefixRes.inLineComment && prefixRes.blockDepth === 0) {
     const sufRes = scanText(suffix, 'suffix', [])
     prefixOpen['('] = Math.max(0, prefixOpen['('] - sufRes.suffixUnmatched['('])
     prefixOpen['['] = Math.max(0, prefixOpen['['] - sufRes.suffixUnmatched['['])
@@ -2496,8 +2753,9 @@ export function matchCompletionBrackets(
   const stack: Array<')' | ']' | '}'> = []
   return scanText(suggestion, 'suggestion', stack, {
     inQuote: prefixRes.inQuote,
+    escapeQuote: prefixRes.escapeQuote,
     inLineComment: prefixRes.inLineComment,
-    inBlockComment: prefixRes.inBlockComment,
+    blockDepth: prefixRes.blockDepth,
   }).out
 }
 
@@ -2517,7 +2775,7 @@ export function trimSuffixOverlap(suggestion: string, suffix: string): string {
 }
 
 const PROSE_PHRASE_RE =
-  /(?:^|[\s.;:!?—–-])(?:depends|provide|please|sorry|here is|here are|here's|sure,|you can|you could|you should|you might|you may|you want|you need|you'll|you're|i can|i think|i believe|i would|i'd|i'll|i'm|we can|we should|let me|let's|it looks like|it seems|it appears|looks like (?:you|we|the|a|an|this|that|it|there)|seems like|appears to be|maybe|perhaps|clarify|cursor intent|for example|e\.g\.:|want to|trying to|need to|in order to|to do this|based on (?:the|your|this|that|what|existing)|assuming (?:you|the|that|this|a)|this query|the query (?:is|will|should|needs?|seems?|looks?)|the user (?:wants?|is|seems?))(?=$|[\s.;:!?—–,-])|(?:^|[.!?]\s+)to\s+(?:filter|sort|group|select|query|get|find|update|delete|insert|join|limit|check|count|retrieve)(?=$|[\s.;:!?—–,-])/i
+  /(?:^|[\s.;:!?—–-])(?:depends on|provide|please|sorry|here is|here are|here's|sure,|you can|you could|you should|you might|you may|you want|you need|you'll|you're|i can|i think|i believe|i would|i'd|i'll|i'm|we can|we should|let me|let's|it looks like|it seems|it appears|looks like (?:you|we|the|a|an|this|that|it|there)|seems like|appears to be|maybe|perhaps|clarify|cursor intent|for example|e\.g\.:|want to|trying to|need to|in order to|to do this|based on (?:the|your|this|that|what|existing)|assuming (?:you|the|that|this|a)|this query|the query (?:is|will|should|needs?|seems?|looks?)|the user (?:wants?|is|seems?))(?=$|[\s.;:!?—–,-])|(?:^|[.!?]\s+)to\s+(?:filter|sort|group|select|query|get|find|update|delete|insert|join|limit|check|count|retrieve)(?=$|[\s.;:!?—–,-])/i
 const PROSE_LABEL_RE = /(?:^|[.\n!?]\s+)(?:note|explanation)\s*:/i
 const PROSE_INDICATOR_WORD_RE =
   /\b(?:you|your|yours|i|we|our|they|their|this|that|these|those|there|here|the|an|should|would|could|might|must|will|want|need|looks|seems|appears|means|helps|allows|returns|selects|filters)\b/i
@@ -2536,7 +2794,7 @@ export function isProseExplanation(text: string): boolean {
   if (PROSE_PHRASE_RE.test(stripped) || PROSE_LABEL_RE.test(stripped)) return true
   const proseQuestion = /[A-Za-z]{2,}\?(?=\s|$)/.test(stripped) || /[A-Za-z]{2,}!(?=\s|$)/.test(stripped)
   const hasEmDash = /[—–]/.test(stripped)
-  const sentenceBreaks = (stripped.match(/[.!?](?=\s|$)/g) ?? []).length
+  const sentenceBreaks = (stripped.match(/[A-Za-z]{2,}[.!?](?=\s|$)/g) ?? []).length
   if (proseQuestion || hasEmDash || sentenceBreaks >= 2) return true
   if (sentenceBreaks === 1 && /(?:^|\s)[A-Za-z]{2,}\.(?=\s|$)/.test(stripped)) {
     const words = stripped.match(/\b[A-Za-z]+\b/g) ?? []
@@ -2640,11 +2898,40 @@ export function isReasoningExhausted(format: AiProviderFormat, json: unknown): b
 interface SqlFetchResult {
   json?: unknown
   text?: string
+  sawReasoning?: boolean
+  finishReason?: string | null
 }
 
 interface StreamDelta {
   delta: string
   done: boolean
+  finishReason: string | null
+  sawReasoning: boolean
+  error: string | null
+}
+
+function extractStreamErrorMessage(obj: unknown): string | null {
+  if (!isRecord(obj)) return null
+  if (obj.type === 'error') {
+    if (isRecord(obj.error) && typeof obj.error.message === 'string' && obj.error.message.trim()) {
+      return obj.error.message.trim()
+    }
+    if (typeof obj.message === 'string' && obj.message.trim()) return obj.message.trim()
+    return 'Provider reported a streaming error.'
+  }
+  if (isRecord(obj.error)) {
+    if (typeof obj.error.message === 'string' && obj.error.message.trim()) {
+      return obj.error.message.trim()
+    }
+    if (typeof obj.error.type === 'string' && obj.error.type.trim()) {
+      return obj.error.type.trim()
+    }
+    return 'Provider reported a streaming error.'
+  }
+  if (typeof obj.error === 'string' && obj.error.trim()) {
+    return obj.error.trim()
+  }
+  return null
 }
 
 function extractStreamDelta(format: AiProviderFormat, obj: unknown): string {
@@ -2673,17 +2960,70 @@ function extractStreamDelta(format: AiProviderFormat, obj: unknown): string {
 }
 
 function parseStreamLine(format: AiProviderFormat, rawLine: string): StreamDelta {
+  const empty: StreamDelta = { delta: '', done: false, finishReason: null, sawReasoning: false, error: null }
   let line = rawLine.trim()
-  if (!line) return { delta: '', done: false }
+  if (!line) return empty
   if (line.startsWith('data:')) line = line.slice(5).trim()
-  if (!line) return { delta: '', done: false }
-  if (line === '[DONE]') return { delta: '', done: true }
-  if (!line.startsWith('{')) return { delta: '', done: false }
+  if (!line) return empty
+  if (line === '[DONE]') return { ...empty, done: true }
+  if (!line.startsWith('{')) return empty
   try {
-    return { delta: extractStreamDelta(format, JSON.parse(line)), done: false }
+    const obj: unknown = JSON.parse(line)
+    const errMsg = extractStreamErrorMessage(obj)
+    if (errMsg) return { ...empty, error: errMsg }
+    const delta = extractStreamDelta(format, obj)
+    let done = false
+    let finishReason: string | null = null
+    let sawReasoning = false
+    if (isRecord(obj)) {
+      if (format === 'ollama') {
+        if (obj.done === true) done = true
+        if (typeof obj.done_reason === 'string' && obj.done_reason) finishReason = obj.done_reason
+        const msg = isRecord(obj.message) ? obj.message : null
+        if (
+          (typeof msg?.thinking === 'string' && msg.thinking.trim().length > 0) ||
+          (typeof obj.thinking === 'string' && obj.thinking.trim().length > 0)
+        ) {
+          sawReasoning = true
+        }
+      } else if (format === 'anthropic') {
+        if (obj.type === 'message_stop') done = true
+        const d = isRecord(obj.delta) ? obj.delta : null
+        if (typeof d?.stop_reason === 'string' && d.stop_reason) finishReason = d.stop_reason
+        if (d?.type === 'thinking_delta' || (typeof d?.thinking === 'string' && d.thinking.trim().length > 0)) {
+          sawReasoning = true
+        }
+      } else {
+        const choices = Array.isArray(obj.choices) ? obj.choices : []
+        const first = choices[0]
+        if (isRecord(first)) {
+          if (typeof first.finish_reason === 'string' && first.finish_reason) {
+            finishReason = first.finish_reason
+          }
+          const d = isRecord(first.delta) ? first.delta : null
+          if (
+            d &&
+            ((typeof d.reasoning_content === 'string' && d.reasoning_content.trim().length > 0) ||
+              (typeof d.reasoning === 'string' && d.reasoning.trim().length > 0))
+          ) {
+            sawReasoning = true
+          }
+        }
+      }
+    }
+    return { delta, done, finishReason, sawReasoning, error: null }
   } catch {
-    return { delta: '', done: false }
+    return empty
   }
+}
+
+function stripThinkForBoundary(text: string): { visible: string; unclosedThink: boolean } {
+  const withoutClosed = text.replace(/<think>[\s\S]*?<\/think>/gi, '')
+  const unclosedThink = /<think>/i.test(withoutClosed)
+  if (unclosedThink) {
+    return { visible: withoutClosed.replace(/<think>[\s\S]*$/gi, ''), unclosedThink: true }
+  }
+  return { visible: withoutClosed, unclosedThink: false }
 }
 
 function stripLeadingWrapperPrefix(text: string): string {
@@ -2715,42 +3055,104 @@ interface StreamBoundaryContext {
   initialQuote?: "'" | '"' | '`' | null
 }
 
-function findFirstUnquotedSemicolon(
+export function findFirstUnquotedSemicolon(
   text: string,
-  initialQuote: "'" | '"' | '`' | null = null
+  initialQuote: "'" | '"' | '`' | null = null,
+  dialect?: AiDialect
 ): number {
+  const rules = getDialectLexerRules(dialect)
   let inSingle = initialQuote === "'"
   let inDouble = initialQuote === '"'
   let inBacktick = initialQuote === '`'
-  for (let i = 0; i < text.length; i++) {
+  let escapeSingle = false
+  for (let i = 0; i < text.length; i += 1) {
     const ch = text[i]
+    const next = text[i + 1]
     if (inSingle) {
-      if (ch === '\\' && i + 1 < text.length) {
+      if ((rules.backslashEscapesSingleQuote || escapeSingle) && ch === '\\' && i + 1 < text.length) {
         i += 1
       } else if (ch === "'") {
-        if (text[i + 1] === "'") i += 1
-        else inSingle = false
+        if (next === "'") i += 1
+        else {
+          inSingle = false
+          escapeSingle = false
+        }
       }
       continue
     }
     if (inDouble) {
-      if (ch === '"') {
-        if (text[i + 1] === '"') i += 1
+      if (rules.backslashEscapesDoubleQuote && ch === '\\' && i + 1 < text.length) {
+        i += 1
+      } else if (ch === '"') {
+        if (next === '"') i += 1
         else inDouble = false
       }
       continue
     }
     if (inBacktick) {
       if (ch === '`') {
-        if (text[i + 1] === '`') i += 1
+        if (next === '`') i += 1
         else inBacktick = false
       }
       continue
     }
-    if (ch === "'") inSingle = true
-    else if (ch === '"') inDouble = true
-    else if (ch === '`') inBacktick = true
-    else if (ch === ';') return i
+    if (rules.lineCommentDash && ch === '-' && next === '-') {
+      i = scanLineCommentEnd(text, i) - 1
+      continue
+    }
+    if (rules.lineCommentHash && ch === '#') {
+      i = scanLineCommentEnd(text, i - 1) - 1
+      continue
+    }
+    if (rules.lineCommentSlash && ch === '/' && next === '/') {
+      i = scanLineCommentEnd(text, i) - 1
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      i = scanBlockCommentEnd(text, i, rules.nestedBlockComments) - 1
+      continue
+    }
+    if (rules.oracleQQuote) {
+      const oq = scanOracleQuoteEnd(text, i, dialect)
+      if (oq) {
+        i = oq.end - 1
+        continue
+      }
+    }
+    if (rules.dollarQuoting && ch === '$') {
+      const tag = matchDollarQuoteTag(text, i)
+      if (tag) {
+        const closeAt = text.indexOf(tag, i + tag.length)
+        if (closeAt === -1) return -1
+        i = closeAt + tag.length - 1
+        continue
+      }
+    }
+    if (
+      rules.postgresEscapeString &&
+      (ch === 'E' || ch === 'e') &&
+      next === "'" &&
+      isPostgresEscapeStringStart(text, i, dialect)
+    ) {
+      inSingle = true
+      escapeSingle = true
+      i += 1
+      continue
+    }
+    if (ch === '[' && rules.bracketIdentifiers !== 'none') {
+      i = scanBracketIdentEnd(text, i, rules.bracketIdentifiers === 'doubling').end - 1
+      continue
+    }
+    if (ch === "'") {
+      inSingle = true
+      escapeSingle = false
+    } else if (ch === '"' && rules.doubleQuoteIdentifiers) {
+      inDouble = true
+    } else if (ch === '`' && rules.backtickIdentifiers) {
+      inBacktick = true
+    } else if (ch === ';') {
+      return i
+    }
   }
   return -1
 }
@@ -2761,23 +3163,26 @@ function statementEnded(
   suffix = '',
   boundaryCtx?: StreamBoundaryContext
 ): boolean {
-  if (/<\/COMPLETION>/i.test(text)) return true
-  if (suffixOverlapStopIndex(text, suffix) > 0) return true
+  const { visible, unclosedThink } = stripThinkForBoundary(text)
+  if (unclosedThink) return false
+  if (!visible) return false
+  if (/<\/COMPLETION>/i.test(visible)) return true
+  if (suffixOverlapStopIndex(visible, suffix) > 0) return true
   if (!multiline) {
-    const content = stripLeadingWrapperPrefix(text)
+    const content = stripLeadingWrapperPrefix(visible)
     if (content.includes('\n')) return true
-    if (text.trimStart().startsWith('```') && !content && text.includes('\n')) {
+    if (visible.trimStart().startsWith('```') && !content && visible.includes('\n')) {
       return false
     }
   }
-  if (findBlankLineAfterContent(text) >= 0) return true
-  const lines = text.split('\n')
+  if (findBlankLineAfterContent(visible) >= 0) return true
+  const lines = visible.split('\n')
   const nonEmpty = collectNonEmptyIndices(lines)
   if (nonEmpty.length >= 3 && findTrailingLineCycleKeepEnd(lines, nonEmpty) !== null) {
     return true
   }
   if (boundaryCtx?.dialect === 'redis') return false
-  return findFirstUnquotedSemicolon(text, boundaryCtx?.initialQuote ?? null) >= 0
+  return findFirstUnquotedSemicolon(visible, boundaryCtx?.initialQuote ?? null, boundaryCtx?.dialect) >= 0
 }
 
 function applyBoundary(
@@ -2786,8 +3191,10 @@ function applyBoundary(
   suffix = '',
   boundaryCtx?: StreamBoundaryContext
 ): { text: string; done: boolean } {
-  if (!statementEnded(text, multiline, suffix, boundaryCtx)) return { text, done: false }
-  let out = text
+  const { visible, unclosedThink } = stripThinkForBoundary(text)
+  if (unclosedThink) return { text, done: false }
+  if (!statementEnded(visible, multiline, suffix, boundaryCtx)) return { text: visible, done: false }
+  let out = visible
   const closeIdx = out.search(/<\/COMPLETION>/i)
   if (closeIdx !== -1) {
     out = out.slice(0, closeIdx)
@@ -2797,7 +3204,7 @@ function applyBoundary(
     out = out.slice(0, suffixOverlapAt)
   }
   if (boundaryCtx?.dialect !== 'redis') {
-    const firstSemi = findFirstUnquotedSemicolon(out, boundaryCtx?.initialQuote ?? null)
+    const firstSemi = findFirstUnquotedSemicolon(out, boundaryCtx?.initialQuote ?? null, boundaryCtx?.dialect)
     if (firstSemi >= 0) {
       out = out.slice(0, firstSemi + 1)
     }
@@ -2891,20 +3298,30 @@ async function readStreamBody(
   signal?: AbortSignal,
   onDelta?: (accumulatedText: string) => void,
   boundaryCtx?: StreamBoundaryContext
-): Promise<string> {
+): Promise<{ text: string; sawReasoning: boolean; finishReason: string | null }> {
   const reader = body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
   let text = ''
   let totalBytes = 0
+  let sawReasoning = false
+  let finishReason: string | null = null
   try {
     for (;;) {
       let chunk: ReadableStreamReadResult<Uint8Array>
       try {
         chunk = await reader.read()
       } catch (err) {
-        if (text.trim().length > 0 && (isTimeoutAbortReason(err) || isTimeoutAbortReason(signal?.reason))) {
-          return applyBoundary(text, multiline, suffix, boundaryCtx).text
+        const visibleTrimmed = stripSpecialCompletionTokens(text).trim()
+        if (
+          visibleTrimmed.length > 0 &&
+          (isTimeoutAbortReason(err) || isTimeoutAbortReason(signal?.reason))
+        ) {
+          return {
+            text: applyBoundary(text, multiline, suffix, boundaryCtx).text,
+            sawReasoning,
+            finishReason,
+          }
         }
         throw err
       }
@@ -2922,11 +3339,13 @@ async function readStreamBody(
         const line = buffer.slice(0, newline)
         buffer = buffer.slice(newline + 1)
         const parsed = parseStreamLine(format, line)
-        if (parsed.done) {
+        if (parsed.error) {
           await reader.cancel().catch(() => undefined)
           onEarlyStop?.()
-          return applyBoundary(text, multiline, suffix, boundaryCtx).text
+          throw new Error(parsed.error)
         }
+        if (parsed.sawReasoning) sawReasoning = true
+        if (parsed.finishReason) finishReason = parsed.finishReason
         if (parsed.delta) {
           text += parsed.delta
           onDelta?.(text)
@@ -2934,16 +3353,31 @@ async function readStreamBody(
           if (boundary.done) {
             await reader.cancel().catch(() => undefined)
             onEarlyStop?.()
-            return boundary.text
+            return { text: boundary.text, sawReasoning, finishReason }
+          }
+        }
+        if (parsed.done) {
+          await reader.cancel().catch(() => undefined)
+          onEarlyStop?.()
+          return {
+            text: applyBoundary(text, multiline, suffix, boundaryCtx).text,
+            sawReasoning,
+            finishReason,
           }
         }
         newline = buffer.indexOf('\n')
       }
     }
-    const tail = parseStreamLine(format, buffer)
-    if (!tail.done && tail.delta) {
-      text += tail.delta
-      onDelta?.(text)
+    buffer += decoder.decode()
+    if (buffer.trim()) {
+      const tail = parseStreamLine(format, buffer)
+      if (tail.error) throw new Error(tail.error)
+      if (tail.sawReasoning) sawReasoning = true
+      if (tail.finishReason) finishReason = tail.finishReason
+      if (tail.delta) {
+        text += tail.delta
+        onDelta?.(text)
+      }
     }
   } finally {
     try {
@@ -2952,7 +3386,11 @@ async function readStreamBody(
       // reader already released/cancelled
     }
   }
-  return applyBoundary(text, multiline, suffix, boundaryCtx).text
+  return {
+    text: applyBoundary(text, multiline, suffix, boundaryCtx).text,
+    sawReasoning,
+    finishReason,
+  }
 }
 
 function parseStreamText(
@@ -2961,29 +3399,47 @@ function parseStreamText(
   multiline: boolean,
   suffix = '',
   boundaryCtx?: StreamBoundaryContext
-): string {
+): { text: string; sawReasoning: boolean; finishReason: string | null } {
   let text = ''
+  let sawReasoning = false
+  let finishReason: string | null = null
   for (const line of raw.split(/\r?\n/)) {
     const parsed = parseStreamLine(format, line)
-    if (parsed.done) break
+    if (parsed.error) throw new Error(parsed.error)
+    if (parsed.sawReasoning) sawReasoning = true
+    if (parsed.finishReason) finishReason = parsed.finishReason
     if (parsed.delta) {
       text += parsed.delta
       if (applyBoundary(text, multiline, suffix, boundaryCtx).done) break
     }
+    if (parsed.done) break
   }
-  return applyBoundary(text, multiline, suffix, boundaryCtx).text
+  return {
+    text: applyBoundary(text, multiline, suffix, boundaryCtx).text,
+    sawReasoning,
+    finishReason,
+  }
+}
+
+interface ChatReadResult {
+  text: string
+  sawReasoning: boolean
+  finishReason: string | null
+  json?: unknown
 }
 
 async function readChatStreamBody(
   format: AiProviderFormat,
   body: ReadableStream<Uint8Array>,
   maxBytes = AI_MAX_EXPLAIN_BODY_BYTES
-): Promise<string> {
+): Promise<ChatReadResult> {
   const reader = body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
   let text = ''
   let totalBytes = 0
+  let sawReasoning = false
+  let finishReason: string | null = null
   try {
     for (;;) {
       const { done, value } = await reader.read()
@@ -2999,12 +3455,18 @@ async function readChatStreamBody(
         const line = buffer.slice(0, newline)
         buffer = buffer.slice(newline + 1)
         const parsed = parseStreamLine(format, line)
-        if (parsed.done) {
+        if (parsed.error) {
           await reader.cancel().catch(() => undefined)
-          return text
+          throw new Error(parsed.error)
         }
+        if (parsed.sawReasoning) sawReasoning = true
+        if (parsed.finishReason) finishReason = parsed.finishReason
         if (parsed.delta) {
           text += parsed.delta
+        }
+        if (parsed.done) {
+          await reader.cancel().catch(() => undefined)
+          return { text, sawReasoning, finishReason }
         }
         newline = buffer.indexOf('\n')
       }
@@ -3012,7 +3474,10 @@ async function readChatStreamBody(
     buffer += decoder.decode()
     if (buffer.trim()) {
       const tail = parseStreamLine(format, buffer)
-      if (!tail.done && tail.delta) text += tail.delta
+      if (tail.error) throw new Error(tail.error)
+      if (tail.sawReasoning) sawReasoning = true
+      if (tail.finishReason) finishReason = tail.finishReason
+      if (tail.delta) text += tail.delta
     }
   } finally {
     try {
@@ -3021,24 +3486,29 @@ async function readChatStreamBody(
       // reader already released/cancelled
     }
   }
-  return text
+  return { text, sawReasoning, finishReason }
 }
 
-function parseChatStreamText(format: AiProviderFormat, raw: string): string {
+function parseChatStreamText(format: AiProviderFormat, raw: string): ChatReadResult {
   let text = ''
+  let sawReasoning = false
+  let finishReason: string | null = null
   for (const line of raw.split(/\r?\n/)) {
     const parsed = parseStreamLine(format, line)
-    if (parsed.done) break
+    if (parsed.error) throw new Error(parsed.error)
+    if (parsed.sawReasoning) sawReasoning = true
+    if (parsed.finishReason) finishReason = parsed.finishReason
     if (parsed.delta) text += parsed.delta
+    if (parsed.done) break
   }
-  return text
+  return { text, sawReasoning, finishReason }
 }
 
 async function readChatResult(
   format: AiProviderFormat,
   response: Awaited<ReturnType<FetchPostLike>>,
   maxBytes = AI_MAX_EXPLAIN_BODY_BYTES
-): Promise<string> {
+): Promise<ChatReadResult> {
   const rawLength = response.headers?.get('content-length')
   if (rawLength !== null && rawLength !== undefined && rawLength.trim() !== '') {
     const declared = Number(rawLength)
@@ -3053,13 +3523,25 @@ async function readChatResult(
     return await readChatStreamBody(format, response.body, maxBytes)
   }
   if (!response.body) {
-    return extractChatText(format, await readJsonBounded(response, maxBytes))
+    const json = await readJsonBounded(response, maxBytes)
+    return {
+      text: extractChatText(format, json),
+      sawReasoning: false,
+      finishReason: extractFinishReasonFromJson(format, json),
+      json,
+    }
   }
   const raw = await readBodyAll(response.body, maxBytes)
   const trimmed = raw.trimStart()
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
     try {
-      return extractChatText(format, JSON.parse(raw))
+      const json: unknown = JSON.parse(raw)
+      return {
+        text: extractChatText(format, json),
+        sawReasoning: false,
+        finishReason: extractFinishReasonFromJson(format, json),
+        json,
+      }
     } catch {
       // Fall through to SSE/NDJSON line parsing when a proxy omits stream content-type
     }
@@ -3129,18 +3611,21 @@ async function readCompletionResult(
   const contentType = (response.headers?.get('content-type') ?? '').toLowerCase()
   const isStreamType = /text\/event-stream|x-ndjson/.test(contentType)
   if (isStreamType && response.body) {
+    const streamed = await readStreamBody(
+      format,
+      response.body,
+      multiline,
+      onEarlyStop,
+      AI_MAX_COMPLETION_BODY_BYTES,
+      suffix,
+      signal,
+      onDelta,
+      boundaryCtx
+    )
     return {
-      text: await readStreamBody(
-        format,
-        response.body,
-        multiline,
-        onEarlyStop,
-        AI_MAX_COMPLETION_BODY_BYTES,
-        suffix,
-        signal,
-        onDelta,
-        boundaryCtx
-      ),
+      text: streamed.text,
+      sawReasoning: streamed.sawReasoning,
+      finishReason: streamed.finishReason,
     }
   }
   if (!response.body) {
@@ -3155,7 +3640,12 @@ async function readCompletionResult(
       // fall through to stream parsing
     }
   }
-  return { text: parseStreamText(format, raw, multiline, suffix, boundaryCtx) }
+  const parsed = parseStreamText(format, raw, multiline, suffix, boundaryCtx)
+  return {
+    text: parsed.text,
+    sawReasoning: parsed.sawReasoning,
+    finishReason: parsed.finishReason,
+  }
 }
 
 function resultText(format: AiProviderFormat, result: SqlFetchResult): string {
@@ -3163,7 +3653,12 @@ function resultText(format: AiProviderFormat, result: SqlFetchResult): string {
 }
 
 function resultExhausted(format: AiProviderFormat, result: SqlFetchResult): boolean {
-  return result.json !== undefined && isReasoningExhausted(format, result.json)
+  if (result.json !== undefined && isReasoningExhausted(format, result.json)) return true
+  return Boolean(
+    result.sawReasoning &&
+      !(result.text ?? '').trim() &&
+      (result.finishReason === 'length' || result.finishReason === 'max_tokens')
+  )
 }
 
 function buildHealedCompletionRequest(
@@ -3294,35 +3789,44 @@ export async function completeSqlWithMeta(
     tokens: number,
     allowStop: boolean
   ): Promise<SqlFetchResult> => {
-    const allowEffort = isEffortAllowed()
-    const allowTemperature = isTemperatureAllowed()
-    try {
-      return await attempt(tokens, allowEffort, allowTemperature, allowStop)
-    } catch (err) {
-      if (
-        (allowEffort || allowTemperature || allowStop) &&
-        err instanceof ProviderHttpError &&
-        (err.status === 400 || err.status === 422)
-      ) {
-        if (allowEffort) {
-          effortDisabled = true
-          if (adaptiveOpts && !Object.isFrozen(adaptiveOpts)) {
-            adaptiveOpts.skipEffort = true
+    let curEffort = isEffortAllowed()
+    let curTemperature = isTemperatureAllowed()
+    let curStop = allowStop
+    for (;;) {
+      try {
+        return await attempt(tokens, curEffort, curTemperature, curStop)
+      } catch (err) {
+        if (
+          err instanceof ProviderHttpError &&
+          (err.status === 400 || err.status === 422)
+        ) {
+          if (curEffort) {
+            curEffort = false
+            effortDisabled = true
+            if (adaptiveOpts && !Object.isFrozen(adaptiveOpts)) {
+              adaptiveOpts.skipEffort = true
+            }
+            adaptiveOpts?.markEffortUnsupported?.(provider.model)
+            adaptiveOpts?.onEffortRejected?.()
+            continue
           }
-          adaptiveOpts?.markEffortUnsupported?.(provider.model)
-          adaptiveOpts?.onEffortRejected?.()
-        }
-        if (allowTemperature) {
-          temperatureDisabled = true
-          if (adaptiveOpts && !Object.isFrozen(adaptiveOpts)) {
-            adaptiveOpts.skipTemperature = true
+          if (curTemperature) {
+            curTemperature = false
+            temperatureDisabled = true
+            if (adaptiveOpts && !Object.isFrozen(adaptiveOpts)) {
+              adaptiveOpts.skipTemperature = true
+            }
+            adaptiveOpts?.markTemperatureUnsupported?.(provider.model)
+            adaptiveOpts?.onTemperatureRejected?.()
+            continue
           }
-          adaptiveOpts?.markTemperatureUnsupported?.(provider.model)
-          adaptiveOpts?.onTemperatureRejected?.()
+          if (curStop) {
+            curStop = false
+            continue
+          }
         }
-        return await attempt(tokens, false, false, false)
+        throw err
       }
-      throw err
     }
   }
 
@@ -3350,7 +3854,11 @@ export async function completeSqlWithMeta(
   const cleaned =
     effectiveReq.dialect !== 'redis'
       ? (() => {
-          const semiAt = findFirstUnquotedSemicolon(unfenced, boundaryCtx.initialQuote ?? null)
+          const semiAt = findFirstUnquotedSemicolon(
+            unfenced,
+            boundaryCtx.initialQuote ?? null,
+            effectiveReq.dialect
+          )
           return semiAt >= 0 ? unfenced.slice(0, semiAt + 1) : unfenced
         })()
       : unfenced
@@ -3474,52 +3982,17 @@ interface ParsedEditStreamMeta {
   done: boolean
   finishReason: string | null
   sawReasoning: boolean
+  error: string | null
 }
 
 function parseStatementEditStreamLine(format: AiProviderFormat, rawLine: string): ParsedEditStreamMeta {
-  let line = rawLine.trim()
-  if (!line) return { delta: '', done: false, finishReason: null, sawReasoning: false }
-  if (line.startsWith('data:')) line = line.slice(5).trim()
-  if (!line) return { delta: '', done: false, finishReason: null, sawReasoning: false }
-  if (line === '[DONE]') return { delta: '', done: true, finishReason: null, sawReasoning: false }
-  if (!line.startsWith('{')) return { delta: '', done: false, finishReason: null, sawReasoning: false }
-  try {
-    const obj: unknown = JSON.parse(line)
-    const delta = extractStreamDelta(format, obj)
-    let finishReason: string | null = null
-    let sawReasoning = false
-    let done = false
-    if (isRecord(obj)) {
-      if (format === 'ollama') {
-        if (typeof obj.done_reason === 'string' && obj.done_reason) finishReason = obj.done_reason
-        if (obj.done === true) done = true
-        const msg = isRecord(obj.message) ? obj.message : null
-        if (typeof msg?.thinking === 'string' && msg.thinking.trim().length > 0) sawReasoning = true
-      } else if (format === 'anthropic') {
-        const d = isRecord(obj.delta) ? obj.delta : null
-        if (typeof d?.stop_reason === 'string' && d.stop_reason) finishReason = d.stop_reason
-        if (obj.type === 'message_stop') done = true
-      } else {
-        const choices = Array.isArray(obj.choices) ? obj.choices : []
-        const first = choices[0]
-        if (isRecord(first)) {
-          if (typeof first.finish_reason === 'string' && first.finish_reason) {
-            finishReason = first.finish_reason
-          }
-          const d = isRecord(first.delta) ? first.delta : null
-          if (
-            d &&
-            ((typeof d.reasoning_content === 'string' && d.reasoning_content.trim().length > 0) ||
-              (typeof d.reasoning === 'string' && d.reasoning.trim().length > 0))
-          ) {
-            sawReasoning = true
-          }
-        }
-      }
-    }
-    return { delta, done, finishReason, sawReasoning }
-  } catch {
-    return { delta: '', done: false, finishReason: null, sawReasoning: false }
+  const parsed = parseStreamLine(format, rawLine)
+  return {
+    delta: parsed.delta,
+    done: parsed.done,
+    finishReason: parsed.finishReason,
+    sawReasoning: parsed.sawReasoning,
+    error: parsed.error,
   }
 }
 
@@ -3533,8 +4006,10 @@ function extractFinishReasonFromJson(format: AiProviderFormat, json: unknown): s
 }
 
 function shouldStopEditStreamText(text: string): boolean {
-  if (/<\/REWRITE>/i.test(text)) return true
-  const withoutOpen = text.replace(/<REWRITE>/i, '')
+  const { visible, unclosedThink } = stripThinkForBoundary(text)
+  if (unclosedThink) return false
+  if (/<\/REWRITE>/i.test(visible)) return true
+  const withoutOpen = visible.replace(/<REWRITE>/i, '')
   const openFence = /^\s*```[^\n]*\r?\n/.exec(withoutOpen)
   if (openFence) {
     const rest = withoutOpen.slice(openFence[0].length)
@@ -3573,6 +4048,11 @@ async function readStatementEditStreamBody(
         const line = buffer.slice(0, newline)
         buffer = buffer.slice(newline + 1)
         const parsed = parseStatementEditStreamLine(format, line)
+        if (parsed.error) {
+          await reader.cancel().catch(() => undefined)
+          onEarlyStop?.()
+          throw new Error(parsed.error)
+        }
         if (parsed.finishReason) finishReason = parsed.finishReason
         if (parsed.sawReasoning) sawReasoning = true
         if (parsed.delta) {
@@ -3594,6 +4074,7 @@ async function readStatementEditStreamBody(
     buffer += decoder.decode()
     if (buffer.trim()) {
       const tail = parseStatementEditStreamLine(format, buffer)
+      if (tail.error) throw new Error(tail.error)
       if (tail.finishReason) finishReason = tail.finishReason
       if (tail.sawReasoning) sawReasoning = true
       if (tail.delta) text += tail.delta
@@ -3636,6 +4117,7 @@ export async function completeSqlStatementEdit(
     !adaptiveOpts?.skipEffort &&
     !(adaptiveOpts?.isEffortUnsupported?.(provider.model) ?? false)
   const isTemperatureAllowed = (): boolean =>
+    (provider.format === 'openai' || provider.format === 'anthropic' || provider.format === 'ollama') &&
     !temperatureDisabled &&
     !adaptiveOpts?.skipTemperature &&
     !(adaptiveOpts?.isTemperatureUnsupported?.(provider.model) ?? false)
@@ -3754,31 +4236,40 @@ export async function completeSqlStatementEdit(
     tokens: number,
     allowStop: boolean
   ): Promise<{ raw: string; finishReason: string | null; sawReasoning: boolean; json?: unknown }> => {
-    const allowEffort = isEffortAllowed()
-    const allowTemperature = isTemperatureAllowed()
-    try {
-      return await attempt(tokens, allowEffort, allowTemperature, allowStop)
-    } catch (err) {
-      if (
-        (allowEffort || allowTemperature || allowStop) &&
-        err instanceof ProviderHttpError &&
-        (err.status === 400 || err.status === 422)
-      ) {
-        if (allowEffort) {
-          effortDisabled = true
-          if (adaptiveOpts && !Object.isFrozen(adaptiveOpts)) adaptiveOpts.skipEffort = true
-          adaptiveOpts?.markEffortUnsupported?.(provider.model)
-          adaptiveOpts?.onEffortRejected?.()
+    let curEffort = isEffortAllowed()
+    let curTemperature = isTemperatureAllowed()
+    let curStop = allowStop
+    for (;;) {
+      try {
+        return await attempt(tokens, curEffort, curTemperature, curStop)
+      } catch (err) {
+        if (
+          err instanceof ProviderHttpError &&
+          (err.status === 400 || err.status === 422)
+        ) {
+          if (curEffort) {
+            curEffort = false
+            effortDisabled = true
+            if (adaptiveOpts && !Object.isFrozen(adaptiveOpts)) adaptiveOpts.skipEffort = true
+            adaptiveOpts?.markEffortUnsupported?.(provider.model)
+            adaptiveOpts?.onEffortRejected?.()
+            continue
+          }
+          if (curTemperature) {
+            curTemperature = false
+            temperatureDisabled = true
+            if (adaptiveOpts && !Object.isFrozen(adaptiveOpts)) adaptiveOpts.skipTemperature = true
+            adaptiveOpts?.markTemperatureUnsupported?.(provider.model)
+            adaptiveOpts?.onTemperatureRejected?.()
+            continue
+          }
+          if (curStop) {
+            curStop = false
+            continue
+          }
         }
-        if (allowTemperature) {
-          temperatureDisabled = true
-          if (adaptiveOpts && !Object.isFrozen(adaptiveOpts)) adaptiveOpts.skipTemperature = true
-          adaptiveOpts?.markTemperatureUnsupported?.(provider.model)
-          adaptiveOpts?.onTemperatureRejected?.()
-        }
-        return await attempt(tokens, false, false, false)
+        throw err
       }
-      throw err
     }
   }
 
@@ -3834,9 +4325,17 @@ export async function completeChat(
       if (!response.ok) {
         throw new ProviderHttpError(response.status)
       }
-      const raw = await readChatResult(provider.format, response, AI_MAX_EXPLAIN_BODY_BYTES)
-      if (looksInjected(raw)) return ''
-      return raw
+      const chatResult = await readChatResult(provider.format, response, AI_MAX_EXPLAIN_BODY_BYTES)
+      const exhausted =
+        (chatResult.json !== undefined && isReasoningExhausted(provider.format, chatResult.json)) ||
+        (chatResult.sawReasoning &&
+          !chatResult.text.trim() &&
+          (chatResult.finishReason === 'length' || chatResult.finishReason === 'max_tokens'))
+      if (exhausted) {
+        throw new ReasoningExhaustedError()
+      }
+      if (looksInjected(chatResult.text)) return ''
+      return chatResult.text
     } catch (err) {
       if (err instanceof ProviderHttpError && (err.status === 400 || err.status === 422)) {
         if (useEffort) {
@@ -3933,7 +4432,7 @@ export function isFast(speed: AiSpeed | undefined, limitMs: number): boolean {
 function speedTier(speed: AiSpeed | undefined, limitMs: number): number {
   if (isFast(speed, limitMs)) return 0
   if (speed?.ok) return 1
-  return speed ? 2 : 3
+  return !speed ? 2 : 3
 }
 
 const LIKELY_FAST_RE = /haiku|mini|flash|lite|nano|small|instant|turbo|codestral|devstral|coder|\b([1-9]|1[0-4])b\b/i
@@ -3983,6 +4482,7 @@ export function isExpectedSqlBenchAnswer(suggestion: string): boolean {
 }
 
 export function median(samples: readonly number[]): number {
+  if (samples.length === 0) return 0
   const sorted = [...samples].sort((x, y) => x - y)
   const mid = Math.floor(sorted.length / 2)
   return sorted.length % 2 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2)
@@ -4096,14 +4596,78 @@ export function isLoopbackHost(host: string): boolean {
   if (expectIpv6 || bare.includes(':')) {
     return isIpv6Loopback(bare)
   }
-  if (LOCALHOST_NAME_RE.test(bare)) return true
-  const v4 = parseStrictIpv4Octets(bare)
+  const normalizedName = bare.endsWith('.') ? bare.slice(0, -1) : bare
+  if (LOCALHOST_NAME_RE.test(normalizedName)) return true
+  const v4 = parseStrictIpv4Octets(normalizedName)
   return v4 !== null && v4[0] === 127
+}
+
+const BLOCKED_METADATA_HOSTS: ReadonlySet<string> = new Set([
+  'metadata.google.internal',
+  'metadata.goog',
+  'metadata',
+  'instance-data',
+])
+
+function isBlockedIpv4Address(v4: readonly [number, number, number, number]): boolean {
+  // 0.0.0.0/8 (unspecified), 169.254.0.0/16 (link-local / cloud IMDS), 100.100.100.200 (Alibaba IMDS)
+  if (v4[0] === 0) return true
+  if (v4[0] === 169 && v4[1] === 254) return true
+  if (v4[0] === 100 && v4[1] === 100 && v4[2] === 100 && v4[3] === 200) return true
+  return false
+}
+
+function isBlockedMetadataOrUnspecifiedHost(rawHost: string): boolean {
+  const trimmed = typeof rawHost === 'string' ? rawHost.trim() : ''
+  if (!trimmed) return true
+  let bare = trimmed
+  if (bare.startsWith('[') && bare.endsWith(']')) {
+    bare = bare.slice(1, -1)
+  }
+  const normalized = (bare.endsWith('.') ? bare.slice(0, -1) : bare).toLowerCase()
+  if (BLOCKED_METADATA_HOSTS.has(normalized)) return true
+  for (const h of BLOCKED_METADATA_HOSTS) {
+    if (normalized.endsWith(`.${h}`)) return true
+  }
+  if (normalized.includes(':')) {
+    const h = parseIpv6Hextets(normalized)
+    if (!h) return false
+    // Unspecified ::
+    if (h.every((part) => part === 0)) return true
+    // Link-local fe80::/10
+    if ((h[0] & 0xffc0) === 0xfe80) return true
+    // AWS IPv6 IMDS fd00:ec2::254
+    if (
+      h[0] === 0xfd00 &&
+      h[1] === 0x0ec2 &&
+      h[2] === 0 &&
+      h[3] === 0 &&
+      h[4] === 0 &&
+      h[5] === 0 &&
+      h[6] === 0 &&
+      h[7] === 0x0254
+    ) {
+      return true
+    }
+    // IPv4-mapped IPv6 ::ffff:a.b.c.d
+    if (h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0xffff) {
+      const v4: [number, number, number, number] = [
+        (h[6] >> 8) & 0xff,
+        h[6] & 0xff,
+        (h[7] >> 8) & 0xff,
+        h[7] & 0xff,
+      ]
+      return isBlockedIpv4Address(v4)
+    }
+    return false
+  }
+  const v4 = parseStrictIpv4Octets(normalized)
+  return v4 !== null && isBlockedIpv4Address(v4)
 }
 
 export function validateAiBaseUrl(
   rawUrl: string,
-  options?: { hasApiKey?: boolean }
+  _options?: { hasApiKey?: boolean }
 ): { ok: true; url: string } | { ok: false; error: string } {
   const trimmed = typeof rawUrl === 'string' ? rawUrl.trim() : ''
   if (!trimmed) {
@@ -4137,11 +4701,18 @@ export function validateAiBaseUrl(
       error: 'Base URL must not include query parameters or fragments.',
     }
   }
-  if (parsed.protocol === 'http:' && !isLoopbackHost(parsed.hostname) && options?.hasApiKey) {
+  if (isBlockedMetadataOrUnspecifiedHost(parsed.hostname)) {
     return {
       ok: false,
       error:
-        'API keys cannot be sent over unencrypted http:// to non-loopback hosts. Use https:// or a local loopback endpoint.',
+        'Base URL targets a blocked link-local, unspecified, or cloud metadata address.',
+    }
+  }
+  if (parsed.protocol === 'http:' && !isLoopbackHost(parsed.hostname)) {
+    return {
+      ok: false,
+      error:
+        'Unencrypted http:// is only allowed for local loopback hosts. Use https:// for remote endpoints.',
     }
   }
   const pathname = parsed.pathname.replace(/\/+$/, '')

@@ -26,10 +26,15 @@ import type {
 import {
   DatabaseDriverError,
   attachFailedStatementMeta,
+  copyFailedStatementMeta,
   runDriverConnectionTest,
 } from '../common/driver'
 import type { DriverTlsOptions } from '../common/tls-and-tunnel'
-import { buildDefaultTlsOptions, resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
+import {
+  appendActionableTlsErrorHint,
+  buildDefaultTlsOptions,
+  resolveEffectiveTlsOptions,
+} from '../common/tls-and-tunnel'
 import {
   assembleTableBrowseResult,
   buildBatchStatements,
@@ -313,10 +318,35 @@ export function formatPostgresError(
     return `Database Password is required for ${driverType === 'cockroachdb' ? 'CockroachDB' : 'PostgreSQL'} SCRAM authentication${hostLabel}. Replace placeholders like [YOUR-PASSWORD] or [YOUR-DATABASE-PASSWORD] and enter your Database Password.${supabaseHint}`
   }
 
-  return (
+  const base =
     rawMsg ||
     `Failed to connect to ${driverType === 'cockroachdb' ? 'CockroachDB' : 'PostgreSQL'}`
+  return appendActionableTlsErrorHint(base, extractErrorCode(err))
+}
+
+export function normalizePostgresOperationError(
+  err: unknown,
+  driverType: PostgresEngineType,
+  profile: ConnectionProfile
+): unknown {
+  const rawMsg = extractErrorMessage(err)
+  if (!rawMsg) return err
+  const code = extractErrorCode(err)
+  const formatted = appendActionableTlsErrorHint(
+    formatPostgresError(err, driverType, profile),
+    code
   )
+  if (formatted === rawMsg) return err
+  const wrapped = new DatabaseDriverError(formatted, code || 'CONNECTION_ERROR', driverType, err)
+  if (err && typeof err === 'object') {
+    for (const key of ['position', 'detail', 'hint', 'severity', 'schema', 'table', 'column', 'constraint'] as const) {
+      const val = Reflect.get(err, key)
+      if (val !== undefined) {
+        Reflect.set(wrapped, key, val)
+      }
+    }
+  }
+  return copyFailedStatementMeta(err, wrapped)
 }
 
 export class PostgresSession implements IDatabaseSession {
@@ -510,10 +540,14 @@ export class PostgresSession implements IDatabaseSession {
       return await operation(this.pool)
     } catch (err) {
       if (!this.isClosed && this.isSupabaseDirectNetworkFailure(err)) {
-        const fallbackPool = await this.activateSupabasePoolerFallback()
-        return await operation(fallbackPool)
+        try {
+          const fallbackPool = await this.activateSupabasePoolerFallback()
+          return await operation(fallbackPool)
+        } catch (fallbackErr) {
+          throw normalizePostgresOperationError(fallbackErr, this.driverType, this.profile)
+        }
       }
-      throw err
+      throw normalizePostgresOperationError(err, this.driverType, this.profile)
     }
   }
 
@@ -918,7 +952,6 @@ export class PostgresSession implements IDatabaseSession {
         }
         await client.query('RELEASE SAVEPOINT datanoa_update_cell;')
         this.statementCount++
-        this.tableDetailsCache.clear()
         return {
           ok: true,
           affectedRows,
@@ -956,8 +989,6 @@ export class PostgresSession implements IDatabaseSession {
         this.driverType
       )
     }
-
-    this.tableDetailsCache.clear()
 
     return {
       ok: true,
@@ -1020,6 +1051,12 @@ export class PostgresSession implements IDatabaseSession {
         const table = typeof row.table_name === 'string' ? row.table_name : ''
         if (schema && table) {
           const resolved = { schema, table }
+          if (this.oidTableCache.size >= 512) {
+            const oldestOid = this.oidTableCache.keys().next().value
+            if (oldestOid !== undefined) {
+              this.oidTableCache.delete(oldestOid)
+            }
+          }
           this.oidTableCache.set(oid, resolved)
           return resolved
         }
@@ -1109,7 +1146,6 @@ export class PostgresSession implements IDatabaseSession {
 
         await client.query('RELEASE SAVEPOINT datanoa_apply_changes')
         this.statementCount += batch.deletes.length + batch.updates.length + batch.chunkedInserts.length
-        this.tableDetailsCache.clear()
         return {
           ok: true,
           inserted,
@@ -1201,7 +1237,6 @@ export class PostgresSession implements IDatabaseSession {
       // later close keeps the provider result instead of aborting a committed batch.
       batchEntry.commitSent = true
       await client.query('COMMIT')
-      this.tableDetailsCache.clear()
       return {
         ok: true,
         inserted,
@@ -1300,10 +1335,57 @@ export class PostgresSession implements IDatabaseSession {
             this.pinTxClient(lease)
           }
 
-          const res = (await client.query({
-            text: stmtSql,
-            rowMode: 'array',
-          })) as unknown as PgRawResult
+          const canUseCursor =
+            maxRows > 0 &&
+            execList.length === 1 &&
+            /^(?:SELECT|WITH|VALUES|TABLE|SHOW|EXPLAIN)\b/i.test(normalizedStmt) &&
+            typeof (client as unknown as { connection?: unknown }).connection === 'object'
+          let res: PgRawResult
+          if (canUseCursor) {
+            const { Cursor } = await loadPgVendor()
+            const cursor = client.query(
+              new Cursor(stmtSql, [], { rowMode: 'array' })
+            ) as unknown as {
+              read: (
+                count: number,
+                cb: (
+                  err: Error | null,
+                  rows: Array<unknown[] | Record<string, unknown>>,
+                  result?: PgRawResult
+                ) => void
+              ) => void
+              close: (cb?: (err?: Error | null) => void) => void
+            }
+            try {
+              res = await new Promise<PgRawResult>((resolve, reject) => {
+                cursor.read(maxRows + 1, (err, rows, rawResult) => {
+                  if (err) {
+                    reject(err)
+                    return
+                  }
+                  resolve({
+                    command: rawResult?.command ?? 'SELECT',
+                    fields: rawResult?.fields ?? [],
+                    rows: rows ?? [],
+                    rowCount: rows?.length ?? 0,
+                  })
+                })
+              })
+            } finally {
+              await new Promise<void>((resolve) => {
+                try {
+                  cursor.close(() => resolve())
+                } catch {
+                  resolve()
+                }
+              })
+            }
+          } else {
+            res = (await client.query({
+              text: stmtSql,
+              rowMode: 'array',
+            })) as unknown as PgRawResult
+          }
           if (this.isClosed && this.txClient !== client) {
             shouldDestroyClient = true
             throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)

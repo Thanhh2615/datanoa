@@ -81,7 +81,7 @@
   --cm-number: #ffb070;
   --cm-function: #7cc4ff;
   --cm-type: #f2cc7e;
-  --cm-comment: #6b7280;
+  --cm-comment: #7d8590;
   --cm-operator: #9ca3af;
   --cm-ident: #7dd3fc;
   --cm-sel-match-bg: rgba(255, 255, 255, 0.14);
@@ -166,6 +166,40 @@ html.light, body.light {
   --cm-ident: #0284c7;
   --cm-sel-match-bg: rgba(37, 99, 235, 0.14);
   color-scheme: light;
+}
+
+/* Explicit Command Palette theme override stays legible even when host --orca-* tokens use the opposite scheme */
+html[data-theme-override="light"] {
+  --bg: #ffffff;
+  --fg: #0f172a;
+  --t1: #0f172a;
+  --t2: #475569;
+  --popover: #f8fafc;
+  --border: rgba(15, 23, 42, 0.14);
+  --primary: #0f172a;
+  --primary-fg: #ffffff;
+  --danger: #b91c1c;
+  --danger-fg: #ffffff;
+}
+
+html[data-theme-override="dark"] {
+  --bg: #0b0d10;
+  --fg: #e6e6e6;
+  --t1: #e6e6e6;
+  --t2: #9aa4b2;
+  --popover: #14181f;
+  --border: rgba(230, 230, 230, 0.12);
+  --primary: #e6e6e6;
+  --primary-fg: #0b0d10;
+  --danger: #f87171;
+  --danger-fg: #1a0606;
+}
+
+.field-hint {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--t3);
 }
 
 *, *::before, *::after {
@@ -689,10 +723,13 @@ body.light .btn-cancel:hover:not(:disabled) {
 /* Notices & Banners (strictly 1px border, no border-left>1px) */
 .banner {
   display: flex;
-  align-items: center;
+  flex-wrap: wrap;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
-  padding: 7px 10px;
+  padding: 8px 12px;
+  max-height: 160px;
+  overflow-y: auto;
   border-radius: var(--r-sm);
   border: 1px solid var(--border);
   background: var(--card);
@@ -749,16 +786,25 @@ body.light .banner.danger {
 }
 
 .banner-text {
-  flex: 1;
+  flex: 1 1 160px;
   min-width: 0;
+  align-self: center;
   word-break: break-word;
 }
 
 .banner-actions {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  flex-wrap: wrap;
+  gap: 4px;
   flex-shrink: 0;
+  max-width: 100%;
+}
+
+#globalBannerActions .btn-sm {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 12px;
 }
 
 #sqlErrorBanner {
@@ -766,8 +812,10 @@ body.light .banner.danger {
 }
 
 .banner .banner-close-btn {
-  width: 20px;
-  height: 20px;
+  width: 24px;
+  height: 24px;
+  margin-left: auto;
+  flex-shrink: 0;
   background: transparent;
   border-color: transparent;
   color: inherit;
@@ -904,7 +952,7 @@ body.light .banner.danger {
 
 .custom-select-popover {
   position: fixed;
-  z-index: 10080;
+  z-index: 9980;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -1675,7 +1723,7 @@ body.light .banner.danger {
 
 .struct-combo-popover {
   position: fixed;
-  z-index: 10060;
+  z-index: 9975;
   max-width: calc(100vw - 12px);
   max-height: 210px;
   overflow-y: auto;
@@ -1831,9 +1879,28 @@ button.file-chip.selected {
   font-weight: 600;
 }
 
+.tree-conn-item.has-error {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+}
+
 .tree-conn-item.active {
   background: color-mix(in srgb, var(--accent-ring) 14%, var(--bg));
   border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
+}
+
+.tree-conn-item.active.has-error {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border-strong));
+}
+
+.conn-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.conn-status-dot.error {
+  background: var(--danger);
 }
 
 .tree-folder-group {
@@ -1986,6 +2053,62 @@ button.file-chip.selected {
   font-size: 12px;
   color: var(--t3);
   font-family: var(--mono);
+}
+
+.tree-conn-error {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 4px 0;
+  padding: 8px;
+  border-radius: var(--r-sm);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface));
+  color: var(--t1);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+html.light .tree-conn-error,
+body.light .tree-conn-error {
+  background: color-mix(in srgb, var(--danger) 6%, var(--surface));
+}
+
+.tree-conn-error-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tree-conn-error-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  height: 16px;
+  color: var(--danger);
+}
+
+.tree-conn-error-msg {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: color-mix(in srgb, var(--danger) 74%, var(--t1));
+  word-break: break-word;
+}
+
+html.light .tree-conn-error-msg,
+body.light .tree-conn-error-msg {
+  color: color-mix(in srgb, var(--danger) 76%, var(--t1));
+}
+
+.tree-conn-error-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 24px;
 }
 
 /* Data Editor Toolbars & Table */
@@ -2454,8 +2577,8 @@ html.light .data-table tr.row-selected td.cell-match-active {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 4px 6px;
-  padding: 3px 7px;
+  gap: 4px 8px;
+  padding: 4px 8px;
   border-radius: var(--r-xs);
   border: 1px solid var(--border);
   background: var(--surface);
@@ -2498,7 +2621,7 @@ html.light .data-table tr.row-selected td.cell-match-active {
 
 .col-popover {
   position: fixed;
-  z-index: 10050;
+  z-index: 9970;
   width: 240px;
   max-width: calc(100vw - 16px);
   max-height: 280px;
@@ -3304,7 +3427,7 @@ body.light .modal-backdrop {
 
 /* In-app File & Folder Picker Modal */
 .panel-fp-backdrop {
-  z-index: 10020;
+  z-index: 10030;
 }
 
 .panel-fp-card {

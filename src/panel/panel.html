@@ -137,9 +137,13 @@
     </section>
 
     <!-- Global Notice Banner (pinned above scrollable viewport) -->
-    <div id="globalBanner" class="banner" hidden>
+    <div id="globalBanner" class="banner" role="status" hidden>
       <span id="globalBannerText" class="banner-text"></span>
-      <button id="globalBannerClose" class="btn btn-ghost btn-icon btn-sm" type="button" aria-label="Dismiss">&times;</button>
+      <div id="globalBannerActions" class="banner-actions" hidden>
+        <button id="globalBannerRetryBtn" class="btn btn-sm" type="button" hidden>Retry</button>
+        <button id="globalBannerEditBtn" class="btn btn-sm" type="button" hidden>Edit</button>
+      </div>
+      <button id="globalBannerClose" class="btn btn-ghost btn-icon btn-sm banner-close-btn" type="button" aria-label="Dismiss">&times;</button>
     </div>
 
     <!-- Viewport -->
@@ -371,6 +375,17 @@
         <label class="checkbox-row">
           <input id="formReadOnly" type="checkbox" />
           <span>Read-Only Mode (block INSERT / UPDATE / DELETE / DDL)</span>
+        </label>
+
+        <label class="field">
+          <span class="field-label">AI Access Policy</span>
+          <select id="formAiPolicy" class="select" aria-label="AI Access Policy">
+            <option value="">Default (Auto)</option>
+            <option value="allow">Allow</option>
+            <option value="ask">Ask before sending</option>
+            <option value="never">Never</option>
+          </select>
+          <span id="formAiPolicyHint" class="field-hint" hidden>Production connections default to fail-closed protection for remote AI unless explicitly overridden.</span>
         </label>
 
         <div class="input-group" style="justify-content: flex-end; flex-shrink: 0; padding-right: 34px;">

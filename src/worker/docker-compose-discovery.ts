@@ -4,10 +4,20 @@
 
 import { execFile } from 'node:child_process'
 import * as fs from 'node:fs'
+import * as net from 'node:net'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import type { DiscoveredDockerComposeConnection, DockerComposeDriverType } from '../protocol'
+import { readRegularFileBounded } from '../drivers/common/tls-and-tunnel'
 import { isBlockedScanRoot, normalizePathForCompare } from './discovery'
+
+function formatUrlHost(host: string): string {
+  const trimmed = host.trim()
+  if (trimmed.startsWith('[') && trimmed.endsWith(']')) return trimmed
+  const zoneIdx = trimmed.indexOf('%')
+  const bare = zoneIdx >= 0 ? trimmed.slice(0, zoneIdx) : trimmed
+  return net.isIP(bare) === 6 ? `[${trimmed}]` : trimmed
+}
 
 export interface DockerInspectContainer {
   Id?: string
@@ -438,13 +448,13 @@ function buildCredentialsForDriver(
       ...(password !== undefined ? { password } : {}),
       database,
       ssl: scheme === 'https',
-      url: `${scheme}://${host}:${port}`,
+      url: `${scheme}://${formatUrlHost(host)}:${port}`,
       ...(passwordFromFile ? { passwordFromFile } : {}),
     }
   }
 
   if (driver === 'libsql') {
-    const url = `http://${host}:${port}`
+    const url = `http://${formatUrlHost(host)}:${port}`
     return {
       database: 'main',
       url,
@@ -1086,22 +1096,40 @@ export function mergeDockerComposeDiscoveries(
   })
 }
 
-async function collectComposeFilePaths(workspaceDirs: readonly string[]): Promise<string[]> {
+function isRealPathWithinRoots(realPath: string, realRoots: readonly string[]): boolean {
+  const normPath = normalizePathForCompare(realPath)
+  for (const root of realRoots) {
+    const normRoot = normalizePathForCompare(root)
+    if (normPath === normRoot) return true
+    const rel = path.relative(normRoot, normPath)
+    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+      return true
+    }
+  }
+  return false
+}
+
+async function collectComposeFilePaths(
+  workspaceDirs: readonly string[],
+  realRoots: readonly string[]
+): Promise<string[]> {
   const found: string[] = []
   const seen = new Set<string>()
 
   const tryAddFile = async (filePath: string): Promise<void> => {
     if (found.length >= MAX_COMPOSE_FILES_PER_SCAN) return
-    const norm = normalizePathForCompare(filePath)
-    if (seen.has(norm)) return
     try {
-      const stat = await fs.promises.stat(filePath)
+      const realFile = await fs.promises.realpath(filePath)
+      if (!isRealPathWithinRoots(realFile, realRoots)) return
+      const norm = normalizePathForCompare(realFile)
+      if (seen.has(norm)) return
+      const stat = await fs.promises.stat(realFile)
       if (stat.isFile() && stat.size <= MAX_COMPOSE_FILE_BYTES) {
         seen.add(norm)
-        found.push(filePath)
+        found.push(realFile)
       }
     } catch {
-      // Missing compose file candidate
+      // Missing or escaped compose file candidate
     }
   }
 
@@ -1113,7 +1141,7 @@ async function collectComposeFilePaths(workspaceDirs: readonly string[]): Promis
     try {
       const rootEntries = await fs.promises.readdir(resolvedDir, { withFileTypes: true })
       for (const entry of rootEntries) {
-        if (!entry.isFile()) continue
+        if (!entry.isFile() && !entry.isSymbolicLink()) continue
         if (
           (EXACT_COMPOSE_NAMES as readonly string[]).includes(entry.name) ||
           COMPOSE_VARIANT_RE.test(entry.name)
@@ -1137,13 +1165,40 @@ async function collectComposeFilePaths(workspaceDirs: readonly string[]): Promis
   return found
 }
 
-function readEnvFileSyncBounded(filePath: string): ReadonlyMap<string, string> | null {
+function readEnvFileSyncBounded(
+  filePath: string,
+  allowedRealRoots: readonly string[]
+): ReadonlyMap<string, string> | null {
+  let fd: number | undefined
   try {
-    const stat = fs.statSync(filePath)
+    const realFile = fs.realpathSync(filePath)
+    if (!isRealPathWithinRoots(realFile, allowedRealRoots)) {
+      return null
+    }
+    const openFlags =
+      fs.constants.O_RDONLY | (typeof fs.constants.O_NONBLOCK === 'number' ? fs.constants.O_NONBLOCK : 0)
+    fd = fs.openSync(realFile, openFlags)
+    const stat = fs.fstatSync(fd)
     if (!stat.isFile() || stat.size > MAX_COMPOSE_FILE_BYTES) return null
-    return loadEnvMapFromText(fs.readFileSync(filePath, 'utf8'))
+    const buf = Buffer.allocUnsafe(MAX_COMPOSE_FILE_BYTES + 1)
+    let offset = 0
+    for (;;) {
+      const bytesRead = fs.readSync(fd, buf, offset, buf.length - offset, null)
+      if (bytesRead === 0) break
+      offset += bytesRead
+      if (offset > MAX_COMPOSE_FILE_BYTES) return null
+    }
+    return loadEnvMapFromText(buf.subarray(0, offset).toString('utf8'))
   } catch {
     return null
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd)
+      } catch {
+        // Ignore close error
+      }
+    }
   }
 }
 
@@ -1154,12 +1209,20 @@ export async function detectWorkspaceDockerComposeConnections(
   const safeDirs = workspaceDirs
     .filter((d) => Boolean(d) && !isBlockedScanRoot(d))
     .map((d) => path.resolve(d))
+  const realRoots: string[] = []
+  for (const dir of safeDirs) {
+    try {
+      realRoots.push(await fs.promises.realpath(dir))
+    } catch {
+      realRoots.push(dir)
+    }
+  }
 
   const [rawContainers, composeFiles] = await Promise.all([
     options.liveContainersOverride
       ? Promise.resolve(options.liveContainersOverride)
       : listLiveDockerContainers(),
-    collectComposeFilePaths(safeDirs),
+    collectComposeFilePaths(safeDirs, realRoots),
   ])
 
   let liveItems = parseDockerInspectContainers(rawContainers, safeDirs)
@@ -1171,7 +1234,7 @@ export async function detectWorkspaceDockerComposeConnections(
   const readEnvCached = (envPath: string): ReadonlyMap<string, string> | null => {
     const norm = normalizePathForCompare(envPath)
     if (!envCache.has(norm)) {
-      envCache.set(norm, readEnvFileSyncBounded(envPath))
+      envCache.set(norm, readEnvFileSyncBounded(envPath, realRoots))
     }
     return envCache.get(norm) ?? null
   }
@@ -1179,19 +1242,19 @@ export async function detectWorkspaceDockerComposeConnections(
   const staticItems: DiscoveredDockerComposeConnection[] = []
   for (const composeFile of composeFiles) {
     try {
-      const content = await fs.promises.readFile(composeFile, 'utf8')
+      const content = (
+        await readRegularFileBounded(composeFile, MAX_COMPOSE_FILE_BYTES, 'Docker Compose file')
+      ).toString('utf8')
       const dir = path.dirname(composeFile)
       const baseEnv = new Map<string, string>()
       for (const envName of ['.env', '.env.local']) {
         const loaded = readEnvCached(path.join(dir, envName))
         if (loaded) loaded.forEach((v, k) => baseEnv.set(k, v))
       }
-      if (dir !== safeDirs.find((s) => isSameOrParentDir(dir, [s]))) {
-        const wsRoot = safeDirs.find((s) => isSameOrParentDir(dir, [s]))
-        if (wsRoot) {
-          const rootEnv = readEnvCached(path.join(wsRoot, '.env'))
-          if (rootEnv) rootEnv.forEach((v, k) => { if (!baseEnv.has(k)) baseEnv.set(k, v) })
-        }
+      const wsRoot = realRoots.find((s) => isSameOrParentDir(dir, [s]))
+      if (wsRoot && dir !== wsRoot) {
+        const rootEnv = readEnvCached(path.join(wsRoot, '.env'))
+        if (rootEnv) rootEnv.forEach((v, k) => { if (!baseEnv.has(k)) baseEnv.set(k, v) })
       }
       const parsed = parseComposeFileContent(content, composeFile, baseEnv, true, readEnvCached)
       staticItems.push(...parsed)

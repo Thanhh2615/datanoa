@@ -550,7 +550,7 @@ export class SchemaInspectorView {
   public setDialect(dialect: DatabaseDriverType): void {
     const prevDialect = this.currentDialect
     this.currentDialect = dialect
-    if (this.currentDetails && (prevDialect === 'mongodb' || dialect === 'mongodb')) {
+    if (this.currentDetails && prevDialect !== dialect) {
       this.render()
       return
     }
@@ -695,8 +695,22 @@ export class SchemaInspectorView {
     }
   }
 
-  private async executeValidatedMigration(plan: TableMigrationPlan): Promise<void> {
-    if (this.isMigrating || !this.draft || !plan.valid || plan.statements.length === 0) return
+  private async executeValidatedMigration(
+    plan: TableMigrationPlan,
+    expectedTarget?: { draft: TableStructureDraft; dialect: DatabaseDriverType; table: string }
+  ): Promise<void> {
+    if (this.isMigrating || this.readOnly || !this.draft || !plan.valid || plan.statements.length === 0) {
+      return
+    }
+    if (
+      expectedTarget &&
+      (this.draft !== expectedTarget.draft ||
+        this.currentDialect !== expectedTarget.dialect ||
+        this.draft.originalTableName !== expectedTarget.table)
+    ) {
+      this.closeConfirmModal(true)
+      return
+    }
     if (
       (this.currentDialect === 'sqlite' ||
         this.currentDialect === 'libsql' ||
@@ -765,7 +779,10 @@ export class SchemaInspectorView {
   private static migrationConfirmTitleSeq = 0
 
   private openMigrationConfirmModal(): void {
-    if (!this.draft || this.isMigrating) return
+    if (!this.draft || this.isMigrating || this.readOnly) return
+    const originDraft = this.draft
+    const originDialect = this.currentDialect
+    const originTable = this.draft.originalTableName
     const count = countTableStructureChanges(this.draft)
     if (count === 0) return
 
@@ -916,7 +933,11 @@ export class SchemaInspectorView {
     confirmBtn.textContent = confirmLabel
     confirmBtn.disabled = !plan.valid || plan.statements.length === 0
     confirmBtn.addEventListener?.('click', () => {
-      void this.executeValidatedMigration(plan)
+      void this.executeValidatedMigration(plan, {
+        draft: originDraft,
+        dialect: originDialect,
+        table: originTable,
+      })
     })
 
     actions.appendChild(copyBtn)
@@ -1201,9 +1222,46 @@ export class SchemaInspectorView {
     }
   }
 
+  private pruneDeletedColumnRefsInDraft(draft: TableStructureDraft): void {
+    const activeCols = draft.columns.filter((c) => c.status !== 'deleted')
+    const activeIdSet = new Set(activeCols.map((c) => c.id))
+    const fallbackCol = activeCols[0]
+
+    for (const idx of draft.indexes) {
+      if (idx.status !== 'new') continue
+      const refs = this.indexColRefsById.get(idx.id)
+      if (!refs) continue
+      const kept = refs.filter((r) => !r.colId || activeIdSet.has(r.colId))
+      this.indexColRefsById.set(idx.id, kept)
+      idx.columns = this.resolveIndexColumnNames(draft, idx)
+    }
+
+    for (const fk of draft.foreignKeys) {
+      if (fk.status !== 'new') continue
+      const boundId = this.fkColIdById.get(fk.id)
+      if (boundId && !activeIdSet.has(boundId)) {
+        if (fallbackCol) {
+          this.fkColIdById.set(fk.id, fallbackCol.id)
+          fk.column = fallbackCol.name
+        } else {
+          this.fkColIdById.delete(fk.id)
+          fk.column = ''
+        }
+      } else if (!boundId && fk.column && !activeCols.some((c) => c.name === fk.column)) {
+        if (fallbackCol) {
+          this.fkColIdById.set(fk.id, fallbackCol.id)
+          fk.column = fallbackCol.name
+        } else {
+          fk.column = ''
+        }
+      }
+    }
+  }
+
   public render(): void {
     const prevScrollTop = this.scrollBodyEl ? this.scrollBodyEl.scrollTop : 0
     this.clearWheelListeners()
+    this.closeConfirmModal(true)
     this.closeComboPopover()
     this.scrollBodyEl = null
     this.container.innerHTML = ''
@@ -1397,10 +1455,16 @@ export class SchemaInspectorView {
       addColBtn.addEventListener?.('click', () => {
         if (!this.draft) return
         const nextNum = this.draft.columns.length + 1
+        const defaultNewColType =
+          this.currentDialect === 'oracle'
+            ? 'VARCHAR2(255)'
+            : this.currentDialect === 'mssql'
+              ? 'NVARCHAR(255)'
+              : 'TEXT'
         this.draft.columns.push({
           id: `new_col_${this.seqCounter++}`,
           name: `col_${nextNum}`,
-          dataType: 'TEXT',
+          dataType: defaultNewColType,
           nullable: true,
           defaultValue: '',
           isPrimaryKey: false,
@@ -2098,6 +2162,7 @@ export class SchemaInspectorView {
         actionBtn.addEventListener('click', () => {
           const pos = draft.columns.indexOf(col)
           if (pos !== -1) draft.columns.splice(pos, 1)
+          this.pruneDeletedColumnRefsInDraft(draft)
           this.render()
         })
       } else if (col.status === 'deleted') {
@@ -2110,6 +2175,7 @@ export class SchemaInspectorView {
         actionBtn.textContent = 'Drop'
         actionBtn.addEventListener('click', () => {
           col.status = 'deleted'
+          this.pruneDeletedColumnRefsInDraft(draft)
           this.render()
         })
       }

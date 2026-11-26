@@ -1,13 +1,19 @@
 import type { OrcaWorkerApi } from 'orca/worker'
 import {
   sanitizeJsonPayload,
+  type ConnectionProfile,
   type SchemaObject,
   type SchemaObjectKind,
   type TableBrowseResult,
   type TableDetails,
 } from '../protocol'
 import { sanitizeSchemaFileName } from '../drivers/common/schema'
-import { reconstructTableDdl, sanitizeFilterClause } from '../drivers/common/sql-tools'
+import {
+  isMutatingStatement,
+  reconstructTableDdl,
+  sanitizeFilterClause,
+  stripCommentsAndLiterals,
+} from '../drivers/common/sql-tools'
 import type { WorkerSchemaMetadataCache } from './ai-sql-context'
 import type { SessionManager } from './session-manager'
 import { TxOwnershipController } from './tx-ownership'
@@ -15,6 +21,7 @@ import {
   assertMutableConnection,
   assertNoCompactedPreviewOverwrite,
   createHostError,
+  READ_ONLY_MUTATION_ERROR,
   scrubAndEnhanceWorkerError,
   type WorkerRegisterHandler,
 } from './worker-utils'
@@ -37,6 +44,32 @@ const ALLOWED_SCHEMA_OBJECT_KINDS: readonly SchemaObjectKind[] = [
   'sequence',
   'type',
 ]
+
+const READ_ONLY_FILTER_FORBIDDEN_CALL_RE =
+  /\b(?:pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|pg_read_file|pg_read_binary_file|pg_ls_dir|pg_stat_file|lo_import|lo_export|lo_unlink|setval|nextval|xp_cmdshell|sp_configure|load_file|dbms_lock|utl_http|utl_file)\s*\(/i
+
+function assertReadOnlyFilterClauseSafe(
+  clause: string | undefined,
+  kind: 'where' | 'orderBy',
+  driver?: ConnectionProfile['driver']
+): void {
+  if (!clause) return
+  if (driver === 'redis' || driver === 'mongodb') {
+    return
+  }
+  const dialect = driver ?? 'postgres'
+  const probeSql = kind === 'where' ? `SELECT 1 FROM _t WHERE ${clause}` : `SELECT 1 FROM _t ORDER BY ${clause}`
+  if (isMutatingStatement(probeSql, dialect)) {
+    throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
+  }
+  const clean = stripCommentsAndLiterals(clause, dialect)
+  if (
+    READ_ONLY_FILTER_FORBIDDEN_CALL_RE.test(clean) ||
+    /\b(?:INTO\s+(?:OUTFILE|DUMPFILE)|FOR\s+(?:NO\s+KEY\s+)?UPDATE|NEXT\s+VALUE\s+FOR)\b/i.test(clean)
+  ) {
+    throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
+  }
+}
 
 export function registerDataAndSchemaHandlers({
   orca,
@@ -192,6 +225,10 @@ export function registerDataAndSchemaHandlers({
         const msg = err instanceof Error ? err.message : String(err)
         throw createHostError('invalid_params', msg)
       }
+      if (profile?.readOnly) {
+        assertReadOnlyFilterClauseSafe(whereClause, 'where', profile.driver)
+        assertReadOnlyFilterClauseSafe(orderByClause, 'orderBy', profile.driver)
+      }
 
       const rawPage = Number(input.page)
       const page = Number.isFinite(rawPage) && rawPage >= 1 ? Math.floor(rawPage) : 1
@@ -201,14 +238,31 @@ export function registerDataAndSchemaHandlers({
           ? Math.max(1, Math.min(10000, Math.floor(rawPageSize)))
           : 50
       const session = await sessionManager.getSession(input.connectionId)
-      const txState =
-        typeof session.getTransactionState === 'function' ? session.getTransactionState() : undefined
-      const bypassTransaction = tx.isForeignOwned(
-        input.connectionId,
-        session,
-        tx.getPanelId(ctx),
-        txState
-      )
+      const panelId = tx.getPanelId(ctx)
+      const fetchDecision = await tx.withLock(input.connectionId, async () => {
+        const txState =
+          typeof session.getTransactionState === 'function' ? session.getTransactionState() : undefined
+        const bypassTransaction = tx.isForeignOwned(input.connectionId, session, panelId, txState)
+        const needsSerializedRead = Boolean(!bypassTransaction && (txState?.active || txState?.autoCommit === false))
+        if (needsSerializedRead) {
+          const result = await session.fetchPage({
+            table: input.table,
+            schema: input.schema,
+            page,
+            pageSize,
+            sortColumn: input.sortColumn,
+            sortDirection: input.sortDirection,
+            whereClause,
+            orderByClause,
+            bypassTransaction,
+          })
+          return { executed: true as const, result }
+        }
+        return { executed: false as const, bypassTransaction }
+      })
+      if (fetchDecision.executed) {
+        return fetchDecision.result
+      }
       return await session.fetchPage({
         table: input.table,
         schema: input.schema,
@@ -218,7 +272,7 @@ export function registerDataAndSchemaHandlers({
         sortDirection: input.sortDirection,
         whereClause,
         orderByClause,
-        bypassTransaction,
+        bypassTransaction: fetchDecision.bypassTransaction,
       })
     }
   )

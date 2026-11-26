@@ -43,9 +43,105 @@ export interface ParsedImportDataset {
 }
 
 const CANDIDATE_DELIMITERS: readonly ImportDelimiter[] = ['\t', ',', ';', '|']
+const MAX_SNIFF_CHARS = 65_536
+const MAX_IMPORT_COLUMNS = 4096
 
 function stripLeadingBom(text: string): string {
   return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text
+}
+
+/**
+ * Parses JSON text while preserving BOTH unsafe >53-bit integers AND high-precision decimals
+ * (>15 significant digits) as strings so IEEE-754 parsing never rounds financial or ID values.
+ */
+export function parseImportJsonPreservingNumbers(raw: string): unknown {
+  const source = stripLeadingBom(raw)
+  if (!/\d{16}|\d+\.\d+/.test(source)) {
+    return parseJsonPreservingBigInts(source)
+  }
+
+  const chunks: string[] = []
+  let lastFlush = 0
+  let i = 0
+  const len = source.length
+
+  while (i < len) {
+    const ch = source[i]
+    if (ch === '"') {
+      i++
+      while (i < len) {
+        const sc = source[i]
+        if (sc === '\\') {
+          i += 2
+          continue
+        }
+        if (sc === '"') {
+          i++
+          break
+        }
+        i++
+      }
+      continue
+    }
+
+    const isMinusDigit = ch === '-' && i + 1 < len && source[i + 1] >= '0' && source[i + 1] <= '9'
+    const isDigit = ch >= '0' && ch <= '9'
+    if (isMinusDigit || isDigit) {
+      const start = i
+      if (ch === '-') i++
+      const intStart = i
+      while (i < len && source[i] >= '0' && source[i] <= '9') i++
+      const intEnd = i
+
+      let hasDot = false
+      let fracStart = -1
+      let fracEnd = -1
+      if (i < len && source[i] === '.') {
+        hasDot = true
+        i++
+        fracStart = i
+        while (i < len && source[i] >= '0' && source[i] <= '9') i++
+        fracEnd = i
+      }
+
+      let hasExp = false
+      let expStart = -1
+      let expEnd = -1
+      if (i < len && (source[i] === 'e' || source[i] === 'E')) {
+        hasExp = true
+        i++
+        if (i < len && (source[i] === '+' || source[i] === '-')) i++
+        expStart = i
+        while (i < len && source[i] >= '0' && source[i] <= '9') i++
+        expEnd = i
+      }
+
+      const validFrac = !hasDot || fracEnd > fracStart
+      const validExp = !hasExp || expEnd > expStart
+      const intPart = source.slice(intStart, intEnd)
+      const fracPart = hasDot && fracEnd > fracStart ? source.slice(fracStart, fracEnd) : ''
+      const hasLeadingZero = intPart.length > 1 && intPart[0] === '0'
+
+      if (!hasLeadingZero && validFrac && validExp) {
+        const fullToken = source.slice(start, i)
+        const sigDigits = `${intPart}${fracPart}`.replace(/^0+/, '').replace(/0+$/, '')
+        const isUnsafeInt = !hasDot && !hasExp && intPart.length >= 16 && !Number.isSafeInteger(Number(fullToken))
+        const isHighPrecisionDec = (hasDot || hasExp) && sigDigits.length > 15
+        if (isUnsafeInt || isHighPrecisionDec) {
+          chunks.push(source.slice(lastFlush, start), `"${fullToken}"`)
+          lastFlush = i
+        }
+      }
+      continue
+    }
+    i++
+  }
+
+  if (chunks.length === 0) {
+    return parseJsonPreservingBigInts(source)
+  }
+  chunks.push(source.slice(lastFlush))
+  return JSON.parse(chunks.join(''))
 }
 
 /**
@@ -134,7 +230,8 @@ export function detectImportFormat(text: string, fileName?: string): ResolvedImp
   if (ext === 'json') return 'json'
   if (ext === 'tsv' || ext === 'tab') return 'tsv'
 
-  const trimmed = stripLeadingBom(text).trim()
+  const sniffText = stripLeadingBom(text).slice(0, MAX_SNIFF_CHARS)
+  const trimmed = sniffText.trim()
   if (trimmed.startsWith('[')) {
     if (looksLikeNdjson(trimmed)) {
       return 'ndjson'
@@ -154,14 +251,14 @@ export function detectImportFormat(text: string, fileName?: string): ResolvedImp
   }
 
   if (ext === 'csv') return 'csv'
-  return detectImportDelimiter(text) === '\t' ? 'tsv' : 'csv'
+  return detectImportDelimiter(sniffText) === '\t' ? 'tsv' : 'csv'
 }
 
 /**
  * Quote-aware delimiter auto-detection across `,`, `\t`, `;`, and `|`.
  */
 export function detectImportDelimiter(text: string): ImportDelimiter {
-  const clean = stripLeadingBom(text)
+  const clean = stripLeadingBom(text).slice(0, MAX_SNIFF_CHARS)
   if (!clean) return ','
 
   const countsByDelim: Record<ImportDelimiter, number[]> = {
@@ -315,6 +412,9 @@ export function parseDelimitedImportText(text: string, delimiter: ImportDelimite
 
     if (ch === delimiter) {
       currentRow.push(field)
+      if (currentRow.length > MAX_IMPORT_COLUMNS) {
+        throw new Error(`Delimited import exceeds maximum supported column count (${MAX_IMPORT_COLUMNS}).`)
+      }
       field = ''
       atFieldStart = true
       i++
@@ -475,7 +575,7 @@ export function parseImportText(
   if (resolvedFormat === 'json') {
     let parsed: unknown
     try {
-      parsed = parseJsonPreservingBigInts(clean)
+      parsed = parseImportJsonPreservingNumbers(clean)
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err)
       throw new Error(`Invalid JSON syntax: ${msg}`)
@@ -502,13 +602,16 @@ export function parseImportText(
       const line = rawLines[idx].trim()
       if (!line) continue
       try {
-        parsedItems.push(parseJsonPreservingBigInts(line))
+        parsedItems.push(parseImportJsonPreservingNumbers(line))
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err)
         throw new Error(`Invalid NDJSON at line ${idx + 1}: ${msg}`)
       }
     }
-    const { headers, rows, warnings, hasNamedHeaders } = parseJsonValueToDataset(parsedItems, false)
+    const { headers, rows, warnings, hasNamedHeaders } = parseJsonValueToDataset(
+      parsedItems,
+      options.hasHeaderRow
+    )
     return {
       resolvedFormat,
       resolvedDelimiter: null,
@@ -608,6 +711,8 @@ export interface ImportCoercionOptions {
   nullHandling: ImportNullHandling
   trimValues: boolean
   skipEmptyRows?: boolean
+  sourceFormat?: ResolvedImportFormat
+  maxRows?: number
 }
 
 export interface BuildImportRowsResult {
@@ -783,7 +888,7 @@ function isNullToken(raw: string, nullHandling: ImportNullHandling): boolean {
 export function coerceImportCellValue(
   rawValue: unknown,
   targetColumn: ColumnInfo | undefined,
-  options: Pick<ImportCoercionOptions, 'nullHandling' | 'trimValues'>
+  options: Pick<ImportCoercionOptions, 'nullHandling' | 'trimValues' | 'sourceFormat'>
 ): unknown {
   if (rawValue === null || rawValue === undefined) {
     return null
@@ -812,12 +917,20 @@ export function coerceImportCellValue(
   }
 
   const str = options.trimValues ? String(rawValue).trim() : String(rawValue)
-  if (isNullToken(str, options.nullHandling)) {
+  const isJsonSource = options.sourceFormat === 'json' || options.sourceFormat === 'ndjson'
+  if (!isJsonSource && isNullToken(str, options.nullHandling)) {
     return null
   }
 
+  // Respect explicit nullHandling / JSON string literals: never let coerceCellInputValue
+  // silently turn "" or "NULL" into SQL NULL when isNullToken / JSON semantics preserved them.
+  const trimmedStr = str.trim()
+  if (trimmedStr === '' || trimmedStr.toUpperCase() === 'NULL') {
+    return str
+  }
+
   if (colType && BOOLEAN_COLUMN_TYPE_REGEX.test(colType)) {
-    const norm = str.trim().toLowerCase()
+    const norm = trimmedStr.toLowerCase()
     if (norm === 'true' || norm === 't' || norm === '1' || norm === 'yes' || norm === 'y') {
       return true
     }
@@ -826,7 +939,7 @@ export function coerceImportCellValue(
     }
   }
 
-  return coerceCellInputValue(str, '', colType || undefined)
+  return coerceCellInputValue(str, '', colType || undefined, false)
 }
 
 function isBlankSourceRow(row: unknown[]): boolean {
@@ -845,7 +958,7 @@ function isBlankSourceRow(row: unknown[]): boolean {
  * Builds plain INSERT records from parsed source rows using the active column mapping.
  */
 export function buildMappedImportRecords(
-  dataset: Pick<ParsedImportDataset, 'rows'>,
+  dataset: Pick<ParsedImportDataset, 'rows'> & { resolvedFormat?: ResolvedImportFormat },
   mapping: ColumnMappingEntry[],
   targetColumns: ColumnInfo[],
   options: ImportCoercionOptions
@@ -860,10 +973,20 @@ export function buildMappedImportRecords(
       typeof entry.targetColumn === 'string' && entry.targetColumn.length > 0
   )
   const skipEmptyRows = options.skipEmptyRows !== false
+  const effectiveOptions: Pick<ImportCoercionOptions, 'nullHandling' | 'trimValues' | 'sourceFormat'> = {
+    nullHandling: options.nullHandling,
+    trimValues: options.trimValues,
+    sourceFormat: options.sourceFormat ?? dataset.resolvedFormat,
+  }
+  const maxRows =
+    typeof options.maxRows === 'number' && Number.isFinite(options.maxRows) && options.maxRows >= 0
+      ? Math.floor(options.maxRows)
+      : Number.POSITIVE_INFINITY
   const rows: Record<string, unknown>[] = []
   let skippedEmptyRows = 0
 
   for (const srcRow of dataset.rows) {
+    if (rows.length >= maxRows) break
     if (skipEmptyRows && isBlankSourceRow(srcRow)) {
       skippedEmptyRows++
       continue
@@ -872,7 +995,7 @@ export function buildMappedImportRecords(
     for (const entry of activeMappings) {
       const targetCol = colByName.get(entry.targetColumn)
       const rawVal = entry.sourceIndex < srcRow.length ? srcRow[entry.sourceIndex] : undefined
-      record[entry.targetColumn] = coerceImportCellValue(rawVal, targetCol, options)
+      record[entry.targetColumn] = coerceImportCellValue(rawVal, targetCol, effectiveOptions)
     }
     rows.push(record)
   }

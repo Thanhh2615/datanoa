@@ -466,7 +466,7 @@ export const EDITOR_MODALS_STYLE = `
   .datanoa-modal-backdrop {
     position: fixed;
     inset: 0;
-    z-index: 10000;
+    z-index: 10100;
     background: rgba(0, 0, 0, 0.72);
     display: flex;
     align-items: center;
@@ -1376,8 +1376,10 @@ export const EDITOR_MODALS_STYLE = `
 
   .datanoa-modal-box.is-pinned,
   .datanoa-saved-notice.is-pinned {
-    margin: 10px 14px 0;
+    margin: 12px 16px 0;
     flex-shrink: 0;
+    max-height: 160px;
+    overflow-y: auto;
     font-size: 12px;
     line-height: 1.4;
     color: var(--text);
@@ -1395,6 +1397,73 @@ export const EDITOR_MODALS_STYLE = `
     align-items: flex-start;
     gap: 8px;
     padding: 12px;
+  }
+
+  .datanoa-sidebar-error {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 8px;
+    padding: 8px;
+    border-radius: var(--radius);
+    border: 1px solid var(--danger-border);
+    background: var(--danger-tint);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
+  .datanoa-sidebar-error-title {
+    font-weight: 500;
+    color: var(--danger);
+    word-break: break-word;
+  }
+
+  .datanoa-sidebar-error-msg {
+    font-family: var(--mono-font);
+    color: var(--text);
+    max-height: 120px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .datanoa-sidebar-error-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .datanoa-topbar-error-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    height: 24px;
+    padding: 0 8px;
+    border-radius: var(--radius-sm, 6px);
+    border: 1px solid var(--danger-border);
+    background: var(--danger-tint);
+    color: var(--danger);
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background-color 0.12s ease, border-color 0.12s ease;
+  }
+
+  .datanoa-topbar-error-pill:hover {
+    border-color: var(--danger);
+  }
+
+  .datanoa-topbar-error-pill:focus-visible {
+    outline: 2px solid var(--danger);
+    outline-offset: 1px;
+  }
+
+  .datanoa-topbar-count.has-error {
+    color: var(--danger);
+    font-variant-numeric: tabular-nums;
   }
 
   @media (max-width: 700px) {
@@ -1947,7 +2016,7 @@ export const EDITOR_MODALS_STYLE = `
 
   /* In-app File & Folder Picker Modal */
   .datanoa-fp-overlay {
-    z-index: 10020;
+    z-index: 10120;
   }
 
   .datanoa-fp-modal {

@@ -17,6 +17,10 @@ import {
 } from '../protocol'
 import type { IDatabaseDriver } from './common/driver'
 import { BUILTIN_ENGINE_CATALOG } from './common/engine-catalog'
+import { readRegularFileBounded } from './common/tls-and-tunnel'
+
+const MAX_BYOD_ENTRY_BYTES = 4 * 1024 * 1024
+const MAX_BYOD_PACKAGE_JSON_BYTES = 1024 * 1024
 
 export const BYOD_DRIVER_IDS = [
   'duckdb',
@@ -306,7 +310,12 @@ export class DriverManager {
       let mainField: unknown
       let exportsField: unknown
       try {
-        const parsed = JSON.parse(await fs.promises.readFile(packageJsonPath, 'utf8')) as unknown
+        const pkgBytes = await readRegularFileBounded(
+          packageJsonPath,
+          MAX_BYOD_PACKAGE_JSON_BYTES,
+          'package.json'
+        )
+        const parsed = JSON.parse(pkgBytes.toString('utf8')) as unknown
         mainField = isRecord(parsed) ? parsed.main : undefined
         exportsField = isRecord(parsed) ? parsed.exports : undefined
       } catch (err) {
@@ -381,12 +390,12 @@ export class DriverManager {
   }
 
   async computeFileSha256(filePath: string): Promise<string> {
-    const content = await fs.promises.readFile(filePath)
+    const content = await readRegularFileBounded(filePath, MAX_BYOD_ENTRY_BYTES, 'Local driver entry')
     return createHash('sha256').update(content).digest('hex').toLowerCase()
   }
 
   private async readAndHashEntry(filePath: string): Promise<{ bytes: Buffer; sha256: string }> {
-    const bytes = await fs.promises.readFile(filePath)
+    const bytes = await readRegularFileBounded(filePath, MAX_BYOD_ENTRY_BYTES, 'Local driver entry')
     const sha256 = createHash('sha256').update(bytes).digest('hex').toLowerCase()
     return { bytes, sha256 }
   }
@@ -467,43 +476,27 @@ export class DriverManager {
     ).registerHooks
 
     if (isCjs) {
-      const cjsRequire = moduleApi.createRequire(entryPath)
-      const resolvedPath = cjsRequire.resolve(entryPath)
-      const evictCache = (): void => {
-        if (cjsRequire.cache && resolvedPath in cjsRequire.cache) {
-          delete cjsRequire.cache[resolvedPath]
+      // Compile verified in-memory bytes directly via Node CommonJS Module._compile so the entry
+      // file is NEVER re-read from disk after SHA-256 verification (eliminates CJS TOCTOU even
+      // when module.registerHooks is unavailable).
+      const ModuleCtor = moduleApi.Module as unknown as {
+        new (id: string): {
+          id: string
+          filename: string
+          paths: string[]
+          loaded: boolean
+          exports: unknown
+          _compile: (content: string, filename: string) => void
         }
+        _nodeModulePaths: (from: string) => string[]
       }
-      evictCache()
-
-      if (typeof registerHooksFn === 'function') {
-        const normalizeFileUrl = (rawUrl: string): string => {
-          const stripped = rawUrl.split('?')[0].split('#')[0]
-          return process.platform === 'win32' ? stripped.toLowerCase() : stripped
-        }
-        const targetUrls = new Set<string>([
-          normalizeFileUrl(pathToFileURL(entryPath).href),
-          normalizeFileUrl(pathToFileURL(resolvedPath).href),
-        ])
-        const hook = registerHooksFn({
-          load(url, context, nextLoad) {
-            if (targetUrls.has(normalizeFileUrl(url))) {
-              return { format: 'commonjs', source: bytes, shortCircuit: true }
-            }
-            return nextLoad(url, context)
-          },
-        })
-        try {
-          const exported: unknown = cjsRequire(resolvedPath)
-          await this.verifyPostLoadSha256(entryPath, expectedSha256, evictCache)
-          return isRecord(exported) ? { default: exported, ...exported } : { default: exported }
-        } finally {
-          hook.deregister()
-        }
-      }
-
-      const exported: unknown = cjsRequire(resolvedPath)
-      await this.verifyPostLoadSha256(entryPath, expectedSha256, evictCache)
+      const cjsMod = new ModuleCtor(entryPath)
+      cjsMod.filename = entryPath
+      cjsMod.paths = ModuleCtor._nodeModulePaths(path.dirname(entryPath))
+      cjsMod._compile(sourceText, entryPath)
+      cjsMod.loaded = true
+      await this.verifyPostLoadSha256(entryPath, expectedSha256)
+      const exported: unknown = cjsMod.exports
       return isRecord(exported) ? { default: exported, ...exported } : { default: exported }
     }
 
@@ -526,17 +519,18 @@ export class DriverManager {
       }
     }
 
-    // Fallback when registerHooks is unavailable: verify digest immediately after import
-    const mod: unknown = await import(pinnedUrl)
-    await this.verifyPostLoadSha256(entryPath, expectedSha256)
-    return mod
+    // Fail closed: NEVER execute an unverified ESM file from disk without registerHooks
+    throw new Error(
+      'Cannot securely load ESM local BYOD driver because Node.js module.registerHooks is unavailable (fail-closed TOCTOU protection). Use a CommonJS (.cjs) driver entry or upgrade Node.js to >= 22.15.'
+    )
   }
 
   private async loadAdapter(
     driverId: string,
     entryPath: string,
     expectedSha256: string,
-    bypassCache = false
+    bypassCache = false,
+    preVerified?: { bytes: Buffer; sha256: string }
   ): Promise<IDatabaseDriver> {
     const normalizedExpected = normalizeSha256(expectedSha256)
     if (!normalizedExpected) {
@@ -545,7 +539,7 @@ export class DriverManager {
       )
     }
 
-    const { bytes, sha256 } = await this.readAndHashEntry(entryPath)
+    const { bytes, sha256 } = preVerified ?? (await this.readAndHashEntry(entryPath))
     if (sha256 !== normalizedExpected) {
       this.adapterCache.delete(driverId)
       throw new Error(
@@ -675,13 +669,14 @@ export class DriverManager {
     }
     return await this.runSerializedWrite(async () => {
       const resolvedEntry = await this.resolveEntryFile(input.localPath)
-      const sha256 = await this.computeFileSha256(resolvedEntry)
+      const verified = await this.readAndHashEntry(resolvedEntry)
+      const { sha256 } = verified
       if (sha256 !== trustedSha) {
         throw new Error(
           `Local driver "${id}" SHA-256 mismatch (expected ${trustedSha.slice(0, 12)}..., found ${sha256.slice(0, 12)}...). Re-inspect and confirm trust before loading.`
         )
       }
-      await this.loadAdapter(id, resolvedEntry, trustedSha, true)
+      await this.loadAdapter(id, resolvedEntry, trustedSha, true, verified)
 
       const config: PersistedLocalDriverConfig = {
         id,

@@ -371,7 +371,12 @@ export class MysqlSession implements IDatabaseSession {
     }
     const stream = conn.connection?.stream ?? conn.stream
     if (!stream || typeof stream.getPeerCertificate !== 'function') {
-      return
+      this.safeReleaseConn(conn, true)
+      throw new DatabaseDriverError(
+        `TLS verify-full failed for ${this.verifyIpIdentity}: underlying TLS stream is unavailable for peer certificate verification`,
+        'TLS_IDENTITY_MISMATCH',
+        this.driverType
+      )
     }
     const peerCert = stream.getPeerCertificate()
     if (!peerCert || Object.keys(peerCert).length === 0) {
@@ -1100,7 +1105,84 @@ export class MysqlSession implements IDatabaseSession {
           }
 
           currentExecIndex = execIndex
-          const [rows, fields] = await conn.query({ sql: stmtSql, rowsAsArray: true })
+          const rawUnderlyingConn = (
+            conn as unknown as {
+              connection?: {
+                query?: (
+                  opts: { sql: string; rowsAsArray: boolean }
+                ) => {
+                  on?: (event: string, cb: (...args: unknown[]) => void) => unknown
+                  stream?: () => NodeJS.ReadableStream & { destroy?: () => void }
+                }
+              }
+            }
+          ).connection
+          const canStreamSingleSelect =
+            maxRows > 0 &&
+            execList.length === 1 &&
+            /^(?:SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|TABLE)\b/i.test(normalizedStmt) &&
+            typeof rawUnderlyingConn?.query === 'function'
+
+          let rows: unknown
+          let fields: unknown
+          if (canStreamSingleSelect && rawUnderlyingConn && typeof rawUnderlyingConn.query === 'function') {
+            const rawQueryFn = rawUnderlyingConn.query.bind(rawUnderlyingConn)
+            const streamed = await new Promise<[unknown[], unknown[]] | null>((resolve, reject) => {
+              let queryObj: {
+                on?: (event: string, cb: (...args: unknown[]) => void) => unknown
+                stream?: () => NodeJS.ReadableStream & { destroy?: () => void }
+              }
+              try {
+                queryObj = rawQueryFn({ sql: stmtSql, rowsAsArray: true })
+              } catch {
+                resolve(null)
+                return
+              }
+              if (!queryObj || typeof queryObj.on !== 'function' || typeof queryObj.stream !== 'function') {
+                resolve(null)
+                return
+              }
+              let capturedFields: unknown[] = []
+              const collected: unknown[] = []
+              let settled = false
+              const finish = (err?: unknown): void => {
+                if (settled) return
+                settled = true
+                if (err) reject(err)
+                else resolve([collected, capturedFields])
+              }
+              queryObj.on('fields', (f: unknown) => {
+                if (Array.isArray(f)) capturedFields = f
+              })
+              const isPinnedTx = this.txConn === conn
+              const rowStream = queryObj.stream()
+              rowStream.on('data', (row: unknown) => {
+                if (collected.length <= maxRows) {
+                  collected.push(row)
+                }
+                if (collected.length > maxRows && !isPinnedTx) {
+                  shouldDestroy = true
+                  if (typeof rowStream.destroy === 'function') {
+                    rowStream.destroy()
+                  }
+                  finish()
+                }
+              })
+              rowStream.on('error', (err: unknown) => {
+                if (collected.length > maxRows && !isPinnedTx) finish()
+                else finish(err)
+              })
+              rowStream.on('end', () => finish())
+              rowStream.on('close', () => finish())
+            })
+            if (streamed !== null) {
+              ;[rows, fields] = streamed
+            } else {
+              ;[rows, fields] = await conn.query({ sql: stmtSql, rowsAsArray: true })
+            }
+          } else {
+            ;[rows, fields] = await conn.query({ sql: stmtSql, rowsAsArray: true })
+          }
           const serverStatus = extractServerStatus(rows)
           if (serverStatus !== undefined) {
             lastServerStatus = serverStatus
@@ -1435,6 +1517,7 @@ export class MysqlDriver implements IDatabaseDriver {
         // as the real remote hostname (with a tunnel stream factory) enforces verify-full over SSH.
         verifyIdentity:
           profile.sslMode === 'verify-full' ||
+          (profile.sslMode === 'require' && tlsOverride.rejectUnauthorized === true) ||
           ((profile.sslMode === undefined || profile.sslMode === 'auto') &&
             tlsOverride.rejectUnauthorized !== false),
       }
@@ -1480,6 +1563,10 @@ export class MysqlDriver implements IDatabaseDriver {
 
     const verifyIpIdentity =
       (profile.sslMode === 'verify-full' ||
+        (profile.sslMode === 'require' &&
+          tlsOverride !== undefined &&
+          tlsOverride !== false &&
+          tlsOverride.rejectUnauthorized === true) ||
         ((profile.sslMode === undefined || profile.sslMode === 'auto') &&
           ((tlsOverride !== undefined &&
             tlsOverride !== false &&

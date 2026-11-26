@@ -203,10 +203,206 @@ export function srgbLin(c) {
   return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4
 }
 
+export const EXACT_DECIMAL_MAX_EXPONENT = 400
+const EXACT_DECIMAL_RE = /^([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/
+
+function normalizeExactDecimal(mantissa, scale) {
+  if (mantissa === 0n) return { mantissa: 0n, scale: 0 }
+  let m = mantissa
+  let s = scale
+  while (s > 0 && m % 10n === 0n) {
+    m /= 10n
+    s--
+  }
+  return { mantissa: m, scale: s }
+}
+
+export function parseExactDecimal(value) {
+  if (typeof value === 'bigint') {
+    const absStr = value < 0n ? (-value).toString() : value.toString()
+    if (absStr.length > EXACT_DECIMAL_MAX_EXPONENT + 1) return null
+    return { mantissa: value, scale: 0 }
+  }
+  let raw
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null
+    raw = value === 0 ? '0' : String(value)
+  } else if (typeof value === 'string') {
+    raw = value.trim()
+    if (!raw) return null
+  } else {
+    return null
+  }
+  const m = EXACT_DECIMAL_RE.exec(raw)
+  if (!m) return null
+  const sign = m[1] === '-' ? -1n : 1n
+  const intPart = m[2] ?? ''
+  const fracPart = m[3] ?? m[4] ?? ''
+  const expStr = m[5]
+  let exp = 0
+  if (expStr !== undefined) {
+    const parsedExp = Number(expStr)
+    if (!Number.isSafeInteger(parsedExp) || Math.abs(parsedExp) > EXACT_DECIMAL_MAX_EXPONENT) {
+      return null
+    }
+    exp = parsedExp
+  }
+  const combined = `${intPart}${fracPart}`
+  const trimmedLeading = combined.replace(/^0+/, '')
+  if (!trimmedLeading) return { mantissa: 0n, scale: 0 }
+  const rawScale = fracPart.length - exp
+  if (rawScale < 0) {
+    const zerosToAppend = -rawScale
+    if (
+      zerosToAppend > EXACT_DECIMAL_MAX_EXPONENT ||
+      trimmedLeading.length + zerosToAppend > EXACT_DECIMAL_MAX_EXPONENT * 2
+    ) {
+      return null
+    }
+    return { mantissa: sign * BigInt(trimmedLeading) * 10n ** BigInt(zerosToAppend), scale: 0 }
+  }
+  if (rawScale > EXACT_DECIMAL_MAX_EXPONENT * 2) return null
+  return normalizeExactDecimal(sign * BigInt(trimmedLeading), rawScale)
+}
+
+export function addExactDecimal(a, b) {
+  if (a.scale === b.scale) {
+    return normalizeExactDecimal(a.mantissa + b.mantissa, a.scale)
+  }
+  if (a.scale > b.scale) {
+    return normalizeExactDecimal(a.mantissa + b.mantissa * 10n ** BigInt(a.scale - b.scale), a.scale)
+  }
+  return normalizeExactDecimal(a.mantissa * 10n ** BigInt(b.scale - a.scale) + b.mantissa, b.scale)
+}
+
+export function compareExactDecimal(a, b) {
+  let ma = a.mantissa
+  let mb = b.mantissa
+  if (a.scale > b.scale) mb *= 10n ** BigInt(a.scale - b.scale)
+  else if (b.scale > a.scale) ma *= 10n ** BigInt(b.scale - a.scale)
+  if (ma < mb) return -1
+  if (ma > mb) return 1
+  return 0
+}
+
+export function formatExactDecimal(val) {
+  const norm = normalizeExactDecimal(val.mantissa, val.scale)
+  if (norm.mantissa === 0n) return '0'
+  const neg = norm.mantissa < 0n
+  const digits = (neg ? -norm.mantissa : norm.mantissa).toString()
+  if (norm.scale === 0) return neg ? `-${digits}` : digits
+  if (digits.length <= norm.scale) {
+    return `${neg ? '-' : ''}0.${'0'.repeat(norm.scale - digits.length)}${digits}`
+  }
+  const splitIdx = digits.length - norm.scale
+  return `${neg ? '-' : ''}${digits.slice(0, splitIdx)}.${digits.slice(splitIdx)}`
+}
+
+export function formatExactAverage(sum, count, maxExtraDecimals = 4) {
+  if (!Number.isSafeInteger(count) || count <= 0) return '0'
+  if (sum.mantissa === 0n) return '0'
+  const divisor = BigInt(count)
+  const neg = sum.mantissa < 0n
+  const absMantissa = neg ? -sum.mantissa : sum.mantissa
+  const baseScale = Math.max(sum.scale, maxExtraDecimals)
+  const tryAtScale = (targetScale) => {
+    const extraScale = targetScale - sum.scale
+    const scaledNum = extraScale > 0 ? absMantissa * 10n ** BigInt(extraScale) : absMantissa
+    const quotient = scaledNum / divisor
+    const remainder = scaledNum % divisor
+    const rounded = remainder * 2n >= divisor ? quotient + 1n : quotient
+    if (rounded === 0n) return { text: '0', isZero: true }
+    return {
+      text: formatExactDecimal({ mantissa: neg ? -rounded : rounded, scale: targetScale }),
+      isZero: false,
+    }
+  }
+  const first = tryAtScale(baseScale)
+  if (!first.isZero) return first.text
+  for (const probeScale of [baseScale + 4, baseScale + 8, Math.min(EXACT_DECIMAL_MAX_EXPONENT, baseScale + 16)]) {
+    const attempt = tryAtScale(probeScale)
+    if (!attempt.isZero) return attempt.text
+  }
+  const approx = Number(formatExactDecimal(sum)) / count
+  return Number.isFinite(approx) && approx !== 0 ? approx.toPrecision(4) : first.text
+}
+
+function buildPanelSortKey(v) {
+  if (typeof v === 'boolean') return { rank: 0, boolVal: v ? 1 : 0 }
+  if (typeof v === 'number') {
+    if (Number.isNaN(v)) return { rank: 1, numSubRank: 3 }
+    if (v === Number.NEGATIVE_INFINITY) return { rank: 1, numSubRank: 0 }
+    if (v === Number.POSITIVE_INFINITY) return { rank: 1, numSubRank: 2 }
+    const dec = parseExactDecimal(v)
+    if (dec !== null) return { rank: 1, numSubRank: 1, decVal: dec }
+  }
+  if (typeof v === 'bigint') {
+    const dec = parseExactDecimal(v)
+    if (dec !== null) return { rank: 1, numSubRank: 1, decVal: dec }
+    const s = v.toString()
+    return { rank: 2, strLower: s, strRaw: s }
+  }
+  if (typeof v === 'string') {
+    const trimmed = v.trim()
+    if (trimmed !== '') {
+      const dec = parseExactDecimal(trimmed)
+      if (dec !== null) return { rank: 1, numSubRank: 1, decVal: dec }
+    }
+    return { rank: 2, strLower: v.toLowerCase(), strRaw: v }
+  }
+  let objStr
+  if (v instanceof Date) {
+    objStr = Number.isNaN(v.getTime()) ? 'Invalid Date' : v.toISOString()
+  } else {
+    try {
+      objStr = JSON.stringify(v) ?? String(v)
+    } catch {
+      objStr = String(v)
+    }
+  }
+  return { rank: 3, strLower: objStr.toLowerCase(), strRaw: objStr }
+}
+
+export function comparePanelCellValues(va, vb, dir = 1) {
+  const factor = dir < 0 ? -1 : 1
+  const aNull = va === null || va === undefined
+  const bNull = vb === null || vb === undefined
+  if (aNull && bNull) return 0
+  if (aNull) return 1
+  if (bNull) return -1
+  if (Object.is(va, vb)) return 0
+  const ka = buildPanelSortKey(va)
+  const kb = buildPanelSortKey(vb)
+  if (ka.rank !== kb.rank) return (ka.rank - kb.rank) * factor
+  if (ka.rank === 0) return (ka.boolVal - kb.boolVal) * factor
+  if (ka.rank === 1) {
+    if (ka.numSubRank !== kb.numSubRank) return (ka.numSubRank - kb.numSubRank) * factor
+    if (ka.numSubRank === 1 && ka.decVal && kb.decVal) {
+      return compareExactDecimal(ka.decVal, kb.decVal) * factor
+    }
+    return 0
+  }
+  if (ka.strLower < kb.strLower) return -1 * factor
+  if (ka.strLower > kb.strLower) return 1 * factor
+  if (ka.strRaw < kb.strRaw) return -1 * factor
+  if (ka.strRaw > kb.strRaw) return 1 * factor
+  return 0
+}
+
 export function formatAggNum(n) {
+  if (typeof n === 'string' && n.trim() !== '') {
+    const dec = parseExactDecimal(n)
+    if (dec !== null) return formatExactDecimal(dec)
+  }
   const num = Number(n)
-  if (!Number.isFinite(num)) return '0'
-  return Number.isInteger(num) ? String(num) : Number(num.toFixed(4)).toString()
+  if (Number.isNaN(num)) return '0'
+  if (!Number.isFinite(num)) return num > 0 ? 'Infinity' : '-Infinity'
+  if (num === 0) return '0'
+  if (Number.isInteger(num)) return String(num)
+  if (Math.abs(num) < 1e-4) {
+    return num.toPrecision(4).replace(/\.?0+(?=e|$)/, '')
+  }
+  return Number(num.toFixed(4)).toString()
 }
 
 export function formatRelativeTime(ts, nowMs = Date.now()) {
@@ -275,7 +471,16 @@ export function formatSqlLiteral(val, driver) {
   return sharedFormatSqlLiteral(val, driver || 'postgres')
 }
 
-export function buildPanelExportData({ columns, rows, format, tableName, schema, driver, primaryKeys }) {
+export function buildPanelExportData({
+  columns,
+  rows,
+  format,
+  tableName,
+  schema,
+  driver,
+  primaryKeys,
+  sourceRows,
+}) {
   const colNames = columns.map((c) => (typeof c === 'string' ? c : c.name))
   if (colNames.length === 0) return ''
   const qTable = quoteTableRef(tableName || 'table_name', schema, driver || 'postgres')
@@ -298,14 +503,24 @@ export function buildPanelExportData({ columns, rows, format, tableName, schema,
     const nonPkIndices = colNames.map((c, ci) => (!pkSet.has(c) ? ci : -1)).filter((ci) => ci >= 0)
     const setIndices = nonPkIndices.length > 0 ? nonPkIndices : colNames.map((_, ci) => ci)
     return rows
-      .map((row) => {
+      .map((row, ri) => {
+        const srcRow = Array.isArray(sourceRows) ? sourceRows[ri] : null
         const sets = setIndices
           .map((ci) => `${quoteIdent(colNames[ci], driver)} = ${formatSqlLiteral(readCell(row, ci), driver)}`)
           .join(', ')
         const wheres = pkCols
           .map((pk) => {
             const pkIdx = colNames.indexOf(pk)
-            const v = pkIdx >= 0 ? readCell(row, pkIdx) : Array.isArray(row) ? null : row[pk]
+            let v
+            if (srcRow && typeof srcRow === 'object' && !Array.isArray(srcRow) && pk in srcRow) {
+              v = srcRow[pk]
+            } else if (pkIdx >= 0) {
+              v = readCell(row, pkIdx)
+            } else if (row && typeof row === 'object' && !Array.isArray(row) && pk in row) {
+              v = row[pk]
+            } else {
+              v = null
+            }
             return v == null
               ? `${quoteIdent(pk, driver)} IS NULL`
               : `${quoteIdent(pk, driver)} = ${formatSqlLiteral(v, driver)}`
@@ -443,9 +658,11 @@ export function formatSelectionAsOutput(
   const projectedRows = rowSet.map((r) =>
     colSet.map((c) => (coordKeySet.has(`${r}:${c}`) ? readVal(r, c) : null))
   )
+  const sourceRows = rowSet.map((r) => rows[r])
   return buildPanelExportData({
     columns: selCols,
     rows: projectedRows,
+    sourceRows,
     format,
     tableName: tableName || 'table_name',
     schema,
@@ -2240,6 +2457,108 @@ export function resolvePanelFormDriver(candidate, fallback = 'sqlite') {
   if (typeof candidate !== 'string') return validFallback
   const entry = ENGINE_BY_ID[candidate]
   return entry && !entry.studioOnly ? candidate : validFallback
+}
+
+/**
+ * Detects whether an error message describes an actionable TLS/CA configuration error
+ * where opening the connection editor's TLS section can remediate it.
+ */
+export function isActionableTlsErrorMessage(message) {
+  const s = String(message || '').toLowerCase()
+  if (!s) return false
+  return (
+    s.includes('tls.ca_requires_verify') ||
+    s.includes('ca_requires_verify') ||
+    s.includes('verify-ca') ||
+    s.includes('verify-full') ||
+    s.includes('self_signed_cert') ||
+    s.includes('self-signed certificate') ||
+    s.includes('depth_zero_self_signed_cert') ||
+    s.includes('unable_to_verify_leaf_signature') ||
+    s.includes('unable to verify the first certificate') ||
+    s.includes('unable to get local issuer certificate') ||
+    s.includes('err_tls_cert_altname_invalid') ||
+    s.includes('hostname/ip does not match') ||
+    s.includes('cert_has_expired') ||
+    s.includes('certificate has expired') ||
+    s.includes('certificate verify failed') ||
+    s.includes('custom ca')
+  )
+}
+
+/**
+ * Formats a connection-scoped message so users always see which database connection failed.
+ */
+export function formatConnectionScopedMessage(conn, rawMessage, fallback = 'Connection error') {
+  const msg = String(rawMessage || '').trim() || fallback
+  const name = typeof conn?.name === 'string' ? conn.name.trim() : ''
+  if (!name) return msg
+  const driverLabel =
+    typeof conn?.driver === 'string' && conn.driver.trim()
+      ? ENGINE_BY_ID[conn.driver]?.label || conn.driver.trim()
+      : ''
+  const label = driverLabel ? `${name} (${driverLabel})` : name
+  if (
+    msg.startsWith(`${label}: `) ||
+    msg.startsWith(`${label} ·`) ||
+    (!driverLabel && (msg.startsWith(`${name}: `) || msg.startsWith(`${name} ·`)))
+  ) {
+    return msg
+  }
+  return `${label}: ${msg}`
+}
+
+/**
+ * Formats a concise global banner summary when one or more connections fail schema loading.
+ */
+export function summarizeSchemaErrors(connections, schemaErrors, latestConnId) {
+  const errMap = schemaErrors && typeof schemaErrors === 'object' ? schemaErrors : {}
+  const connById = new Map(
+    (Array.isArray(connections) ? connections : [])
+      .filter((c) => c && typeof c.id === 'string')
+      .map((c) => [c.id, c])
+  )
+  const entries = Object.entries(errMap).filter(
+    ([cid, msg]) => connById.has(cid) && typeof msg === 'string' && msg.trim().length > 0
+  )
+  if (entries.length === 0) return null
+  const preferredEntry =
+    (latestConnId && entries.find(([cid]) => cid === latestConnId)) || entries[entries.length - 1]
+  const [targetId, targetMsg] = preferredEntry
+  const targetConn = connById.get(targetId)
+  const rawError = String(targetMsg || '').trim() || 'Failed to inspect schema'
+  if (entries.length === 1) {
+    return {
+      connectionId: targetId,
+      rawError,
+      text: formatConnectionScopedMessage(targetConn, rawError, 'Failed to inspect schema'),
+      failingIds: [targetId],
+      retryLabel: 'Retry',
+      editLabel: isActionableTlsErrorMessage(rawError) ? 'Change Encryption' : 'Edit',
+      tlsRemedy: isActionableTlsErrorMessage(rawError),
+    }
+  }
+  const MAX_DISPLAY_NAMES = 2
+  const truncateName = (raw) => {
+    const s = String(raw || '').trim()
+    return s.length > 24 ? `${s.slice(0, 23)}…` : s
+  }
+  const allNames = entries.map(([cid]) => truncateName(connById.get(cid)?.name || cid))
+  const shownNames = allNames.slice(0, MAX_DISPLAY_NAMES)
+  const remaining = allNames.length - shownNames.length
+  const namesSummary =
+    remaining > 0 ? `${shownNames.join(', ')}, +${remaining} more` : shownNames.join(', ')
+  const targetName = targetConn?.name || targetId
+  const shortTarget = targetName.length > 16 ? `${targetName.slice(0, 15)}…` : targetName
+  return {
+    connectionId: targetId,
+    rawError,
+    text: `${entries.length} connections failed (${namesSummary}) — ${formatConnectionScopedMessage(targetConn, rawError, 'Failed to inspect schema')}`,
+    failingIds: entries.map(([cid]) => cid),
+    retryLabel: 'Retry All',
+    editLabel: `Edit ${shortTarget}`,
+    tlsRemedy: isActionableTlsErrorMessage(rawError),
+  }
 }
 
 export {

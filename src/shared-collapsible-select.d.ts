@@ -12,6 +12,7 @@ export interface CollapsibleSelectOptions {
 export interface CollapsibleSelectApi {
   refresh(options?: CollapsibleSelectOptions): void
   close(): void
+  destroy(): void
   triggerBtn: HTMLButtonElement
 }
 
@@ -83,6 +84,7 @@ export interface CollapsibleSelectController {
   enhance: (selectEl: HTMLSelectElement | null, options?: CollapsibleSelectOptions) => CollapsibleSelectApi | null
   isOpen: () => boolean
   closeActive: () => void
+  destroy: () => void
 }
 
 export declare function createCollapsibleSelectController(

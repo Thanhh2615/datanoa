@@ -96,7 +96,13 @@ function advancePanelBlockComment(stream, state) {
 function readPanelSqlDelimited(stream, closeChar) {
   while (!stream.eol()) {
     const ch = stream.next()
-    if (ch === closeChar && stream.next() !== closeChar) break
+    if (ch === closeChar) {
+      if (typeof stream.peek === 'function' && stream.peek() === closeChar) {
+        stream.next()
+        continue
+      }
+      break
+    }
   }
 }
 

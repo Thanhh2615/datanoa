@@ -1,7 +1,13 @@
 import type { JsonValue, OrcaWorkerApi } from 'orca/worker'
 import type { ConnectionProfile, DatabaseDriverType } from '../protocol'
 import { SAVED_CONNECTIONS_STORAGE_KEY, sanitizeJsonPayload } from '../protocol'
-import type { IDatabaseDriver, IDatabaseSession } from '../drivers/common/driver'
+import {
+  HealthPolicy,
+  type ConnectionHealthState,
+  type HealthPolicySnapshot,
+  type IDatabaseDriver,
+  type IDatabaseSession,
+} from '../drivers/common/driver'
 import { loadBuiltinDriver } from '../drivers/lazy-loader'
 import { getByodDefaultPort, isByodDriverId } from '../drivers/driver-manager'
 import type { DriverTlsOptions, SshTunnelHandle } from '../drivers/common/tls-and-tunnel'
@@ -103,13 +109,16 @@ function hasMultiHostMongoAuthority(rawUrl: string): boolean {
   return hostPortPart.includes(',')
 }
 
+const FILE_BASED_BYOD_DRIVERS: ReadonlySet<string> = new Set(['duckdb'])
+
 function parseOracleEasyConnectTarget(
   raw: string,
   ssl?: boolean
 ): { targetHost: string; targetPort: number; schemePrefix: string; tail: string } | null {
-  const slashIdx = raw.indexOf('/')
+  const withoutScheme = raw.replace(/^(?:tcps?:\/\/|\/\/)/i, '')
+  const slashIdx = withoutScheme.indexOf('/')
   if (slashIdx > 0) {
-    const beforeSlash = raw.startsWith('//') ? raw.slice(2, raw.indexOf('/', 2)) : raw.slice(0, slashIdx)
+    const beforeSlash = withoutScheme.slice(0, slashIdx)
     if (beforeSlash.includes(',')) {
       throw new Error(
         'SSH tunneling cannot be used with multi-host Oracle Easy Connect strings. Use a single host:port/service string or explicit Host/Port fields instead.'
@@ -366,11 +375,24 @@ export function buildTunnelProxiedProfile(
   return proxied
 }
 
+export function shouldProfileUseSshTunnel(profile: ConnectionProfile): boolean {
+  if (!profile.sshEnabled) return false
+  if (FILE_BASED_BYOD_DRIVERS.has(profile.driver.trim().toLowerCase())) {
+    const hasFile = typeof profile.filePath === 'string' && profile.filePath.trim().length > 0
+    const hasRemoteHost =
+      (typeof profile.host === 'string' && profile.host.trim().length > 0) ||
+      (typeof profile.url === 'string' && profile.url.trim().length > 0)
+    if (hasFile || !hasRemoteHost) return false
+  }
+  return SSH_TUNNEL_ENGINES.has(profile.driver) || isByodDriverId(profile.driver)
+}
+
 export class SessionManager {
   private readonly activeSessions = new Map<string, IDatabaseSession>()
   private readonly pendingSessions = new Map<string, Promise<IDatabaseSession>>()
   private readonly activeTunnels = new Set<SshTunnelHandle>()
   private readonly tunnelOwners = new Map<SshTunnelHandle, string>()
+  private readonly healthPolicies = new Map<string, HealthPolicy>()
   private readonly generations = new Map<string, number>()
   private globalGeneration = 0
   private readonly orca: SessionManagerHostApi
@@ -589,6 +611,36 @@ export class SessionManager {
     return list.find((c) => c.id === connectionId) ?? null
   }
 
+  private getOrCreateHealthPolicy(connectionId: string): HealthPolicy {
+    let policy = this.healthPolicies.get(connectionId)
+    if (!policy) {
+      policy = new HealthPolicy()
+      this.healthPolicies.set(connectionId, policy)
+    }
+    return policy
+  }
+
+  getHealthSnapshot(connectionId: string): HealthPolicySnapshot {
+    return this.getOrCreateHealthPolicy(connectionId).getSnapshot()
+  }
+
+  beginSessionReconnect(connectionId: string): {
+    allowed: boolean
+    backoffMs: number
+    state: ConnectionHealthState
+  } {
+    const session = this.activeSessions.get(connectionId)
+    const txState = session?.getTransactionState?.() as
+      | { active?: boolean; inTransaction?: boolean }
+      | undefined
+    const txActive = Boolean(txState?.active || txState?.inTransaction)
+    return this.getOrCreateHealthPolicy(connectionId).beginReconnect(txActive)
+  }
+
+  parkSession(connectionId: string): ConnectionHealthState {
+    return this.getOrCreateHealthPolicy(connectionId).park()
+  }
+
   /**
    * Returns an active database session for the connection ID, creating and caching it if needed.
    * Deduplicates concurrent in-flight creation requests for the same connectionId.
@@ -597,8 +649,10 @@ export class SessionManager {
     const existing = this.activeSessions.get(connectionId)
     if (existing) {
       if (typeof existing.isAlive !== 'function' || existing.isAlive()) {
+        this.getOrCreateHealthPolicy(connectionId).recordSuccess()
         return existing
       }
+      this.getOrCreateHealthPolicy(connectionId).recordFailure('Session is no longer alive')
       this.activeSessions.delete(connectionId)
       void existing.close().catch(() => {})
     }
@@ -610,30 +664,37 @@ export class SessionManager {
 
     const expectedGen = this.getGeneration(connectionId)
     const createPromise = (async () => {
-      const profile = await this.findProfile(connectionId)
-      if (!profile) {
-        const err = new Error(`Connection '${connectionId}' not found in storage`) as Error & {
-          code: string
+      try {
+        const profile = await this.findProfile(connectionId)
+        if (!profile) {
+          const err = new Error(`Connection '${connectionId}' not found in storage`) as Error & {
+            code: string
+          }
+          err.code = 'invalid_params'
+          throw err
         }
-        err.code = 'invalid_params'
+
+        const shouldFetchSecret =
+          profile.driver === 'libsql' || profile.driver === 'd1'
+            ? profile.hasAuthToken !== false
+            : Boolean(profile.hasPassword)
+        const secret = shouldFetchSecret
+          ? await this.getSecret(connectionId, profile.driver)
+          : undefined
+        const extraSecrets = await this.getExtendedSecrets(connectionId)
+        const session = await this.openSessionWithTunnel(profile, secret, extraSecrets)
+        if (this.getGeneration(connectionId) !== expectedGen) {
+          await session.close().catch(() => {})
+          throw new Error(`Session initialization for '${connectionId}' was superseded by close/update`)
+        }
+        this.activeSessions.set(connectionId, session)
+        this.getOrCreateHealthPolicy(connectionId).recordSuccess()
+        return session
+      } catch (err: unknown) {
+        const msg = scrubCredentialsInText(err instanceof Error ? err.message : String(err))
+        this.getOrCreateHealthPolicy(connectionId).recordFailure(msg)
         throw err
       }
-
-      const shouldFetchSecret =
-        profile.driver === 'libsql' || profile.driver === 'd1'
-          ? profile.hasAuthToken !== false
-          : Boolean(profile.hasPassword)
-      const secret = shouldFetchSecret
-        ? await this.getSecret(connectionId, profile.driver)
-        : undefined
-      const extraSecrets = await this.getExtendedSecrets(connectionId)
-      const session = await this.openSessionWithTunnel(profile, secret, extraSecrets)
-      if (this.getGeneration(connectionId) !== expectedGen) {
-        await session.close().catch(() => {})
-        throw new Error(`Session initialization for '${connectionId}' was superseded by close/update`)
-      }
-      this.activeSessions.set(connectionId, session)
-      return session
     })()
 
     this.pendingSessions.set(connectionId, createPromise)
@@ -648,13 +709,10 @@ export class SessionManager {
 
   /**
    * Resolves the SSH forwarding target and TLS override for a profile.
-   * SSH tunneling only applies to TCP engines; other profiles pass through untouched.
+   * SSH tunneling only applies to TCP engines; file-based drivers (including DuckDB BYOD) pass through untouched.
    */
   private shouldTunnel(profile: ConnectionProfile): boolean {
-    return (
-      Boolean(profile.sshEnabled) &&
-      (SSH_TUNNEL_ENGINES.has(profile.driver) || isByodDriverId(profile.driver))
-    )
+    return shouldProfileUseSshTunnel(profile)
   }
 
   private buildDriverTlsOptions(
@@ -691,7 +749,12 @@ export class SessionManager {
   private async releaseTunnel(tunnel: SshTunnelHandle): Promise<void> {
     this.activeTunnels.delete(tunnel)
     this.tunnelOwners.delete(tunnel)
-    await tunnel.close().catch(() => {})
+    try {
+      await tunnel.close()
+    } catch (e) {
+      const msg = scrubCredentialsInText(e instanceof Error ? e.message : String(e))
+      this.orca.log(`[SessionManager] Error closing SSH tunnel: ${msg}`)
+    }
   }
 
   /** Closes any tunnel already forwarding for a connection invalidated mid-`createSession` */
@@ -813,17 +876,33 @@ export class SessionManager {
     secret?: string,
     extraSecrets?: ExtendedSecrets
   ): Promise<{ ok: boolean; message?: string }> {
-    const driver = await this.resolveDriver(profile.driver)
-    const result = await this.withTunnel(profile, extraSecrets, async (target, tlsOptions) =>
-      await driver.testConnection(target, secret, tlsOptions)
-    )
-    if (!result.ok && typeof result.message === 'string') {
-      return {
-        ...result,
-        message: appendActionableTlsErrorHint(scrubCredentialsInText(result.message)),
+    try {
+      const driver = await this.resolveDriver(profile.driver)
+      const result = await this.withTunnel(profile, extraSecrets, async (target, tlsOptions) =>
+        await driver.testConnection(target, secret, tlsOptions)
+      )
+      if (profile.id) {
+        if (result.ok) {
+          this.getOrCreateHealthPolicy(profile.id).recordSuccess()
+        } else {
+          const msg = typeof result.message === 'string' ? scrubCredentialsInText(result.message) : 'Connection test failed'
+          this.getOrCreateHealthPolicy(profile.id).recordFailure(msg)
+        }
       }
+      if (!result.ok && typeof result.message === 'string') {
+        return {
+          ...result,
+          message: appendActionableTlsErrorHint(scrubCredentialsInText(result.message)),
+        }
+      }
+      return result
+    } catch (err: unknown) {
+      if (profile.id) {
+        const msg = scrubCredentialsInText(err instanceof Error ? err.message : String(err))
+        this.getOrCreateHealthPolicy(profile.id).recordFailure(msg)
+      }
+      throw err
     }
-    return result
   }
 
   hasActiveSession(connectionId: string): boolean {
@@ -835,23 +914,40 @@ export class SessionManager {
     return this.activeSessions
   }
 
+  private async closeWithGrace(fn: () => Promise<void>, graceMs = 5_000): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        fn(),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, graceMs)
+        }),
+      ])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }
+
   /**
    * Closes and unregisters a single cached session.
+   * Always closes the DB session gracefully BEFORE tearing down its SSH tunnel so
+   * clean protocol shutdown (e.g. PG Terminate / MySQL COM_QUIT / rollback) succeeds.
    */
   async closeSession(connectionId: string): Promise<void> {
     this.bumpGeneration(connectionId)
     this.pendingSessions.delete(connectionId)
-    await this.closeOwnedTunnels(connectionId)
+    this.healthPolicies.delete(connectionId)
     const session = this.activeSessions.get(connectionId)
     if (session) {
       this.activeSessions.delete(connectionId)
       try {
-        await session.close()
+        await this.closeWithGrace(() => session.close())
       } catch (e) {
         const msg = scrubCredentialsInText(e instanceof Error ? e.message : String(e))
         this.orca.log(`[SessionManager] Error closing session [${connectionId}]: ${msg}`)
       }
     }
+    await this.closeOwnedTunnels(connectionId)
   }
 
   /**
@@ -879,31 +975,36 @@ export class SessionManager {
   }
 
   /**
-   * Closes all active sessions on shutdown.
+   * Closes all active sessions on shutdown (DB sessions first with bounded grace, then SSH tunnels).
    */
   async closeAll(): Promise<void> {
     this.globalGeneration += 1
     this.pendingSessions.clear()
+    this.healthPolicies.clear()
+    const sessions = Array.from(this.activeSessions.values())
+    this.activeSessions.clear()
+    await Promise.all(
+      sessions.map(async (session) => {
+        try {
+          await this.closeWithGrace(() => session.close())
+        } catch (e) {
+          const msg = scrubCredentialsInText(e instanceof Error ? e.message : String(e))
+          this.orca.log(`[SessionManager] Error closing session on shutdown: ${msg}`)
+        }
+      })
+    )
     const tunnels = Array.from(this.activeTunnels)
     this.activeTunnels.clear()
     this.tunnelOwners.clear()
-    const closeTunnels = tunnels.map(async (tunnel) => {
-      try {
-        await tunnel.close()
-      } catch (e) {
-        const msg = scrubCredentialsInText(e instanceof Error ? e.message : String(e))
-        this.orca.log(`[SessionManager] Error closing SSH tunnel on shutdown: ${msg}`)
-      }
-    })
-    const closePromises = Array.from(this.activeSessions.values()).map(async (session) => {
-      try {
-        await session.close()
-      } catch (e) {
-        const msg = scrubCredentialsInText(e instanceof Error ? e.message : String(e))
-        this.orca.log(`[SessionManager] Error closing session on shutdown: ${msg}`)
-      }
-    })
-    this.activeSessions.clear()
-    await Promise.all([...closePromises, ...closeTunnels])
+    await Promise.all(
+      tunnels.map(async (tunnel) => {
+        try {
+          await tunnel.close()
+        } catch (e) {
+          const msg = scrubCredentialsInText(e instanceof Error ? e.message : String(e))
+          this.orca.log(`[SessionManager] Error closing SSH tunnel on shutdown: ${msg}`)
+        }
+      })
+    )
   }
 }

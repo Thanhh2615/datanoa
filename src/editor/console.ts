@@ -110,13 +110,18 @@ function advanceBlockComment(stream: { match: (re: RegExp | string) => unknown; 
   return true
 }
 
-function readSqlBracketOrQuoted(stream: { next: () => string | void; eol: () => boolean }, closeChar: string): void {
+function readSqlBracketOrQuoted(
+  stream: { next: () => string | void; peek?: () => string | void; eol: () => boolean },
+  closeChar: string
+): void {
   while (!stream.eol()) {
     const ch = stream.next()
     if (ch === closeChar) {
-      if (stream.next() !== closeChar) {
-        break
+      if (typeof stream.peek === 'function' && stream.peek() === closeChar) {
+        stream.next()
+        continue
       }
+      break
     }
   }
 }

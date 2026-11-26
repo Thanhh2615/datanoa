@@ -14,7 +14,7 @@ export interface OracleStatementChunk {
 }
 
 const ORACLE_PLSQL_HEADER_RE =
-  /^(?:DECLARE\b|BEGIN\b|CREATE\s+(?:OR\s+REPLACE\s+)?(?:EDITIONABLE\s+|NONEDITIONABLE\s+)?(?:PROCEDURE|FUNCTION|TRIGGER|PACKAGE(?:\s+BODY)?|TYPE(?:\s+BODY)?)\b)/i
+  /^(?:(?:<<[^>]+>>\s*)*(?:DECLARE|BEGIN)\b|WITH\s+(?:FUNCTION|PROCEDURE)\b|CREATE\s+(?:OR\s+REPLACE\s+)?(?:EDITIONABLE\s+|NONEDITIONABLE\s+)?(?:PROCEDURE|FUNCTION|TRIGGER|PACKAGE(?:\s+BODY)?|TYPE(?:\s+BODY)?)\b)/i
 
 const ORACLE_IMPLICIT_COMMIT_DDL_RE =
   /^(?:CREATE|ALTER|DROP|TRUNCATE|RENAME|GRANT|REVOKE|COMMENT|AUDIT|NOAUDIT|ANALYZE|PURGE|FLASHBACK)\b/i
@@ -75,9 +75,29 @@ export function splitOracleStatements(sql: string): OracleStatementChunk[] {
     if (atLineStart && atTopLevel) {
       let k = i
       while (k < len && (raw[k] === ' ' || raw[k] === '\t')) k++
-      if (k < len && raw[k] === '/') {
+      if (
+        k < len &&
+        raw[k] === '/' &&
+        (k + 1 >= len || (raw[k + 1] !== '/' && raw[k + 1] !== '*'))
+      ) {
         let after = k + 1
         while (after < len && (raw[after] === ' ' || raw[after] === '\t')) after++
+        if (after < len && raw[after] === '-' && after + 1 < len && raw[after + 1] === '-') {
+          const nl = raw.indexOf('\n', after + 2)
+          after = nl < 0 ? len : nl
+        } else if (
+          after > k + 1 &&
+          after + 1 < len &&
+          raw[after] === '/' &&
+          raw[after + 1] === '*'
+        ) {
+          const closeIdx = raw.indexOf('*/', after + 2)
+          const nlIdx = raw.indexOf('\n', after + 2)
+          if (closeIdx >= 0 && (nlIdx < 0 || closeIdx < nlIdx)) {
+            after = closeIdx + 2
+            while (after < len && (raw[after] === ' ' || raw[after] === '\t')) after++
+          }
+        }
         if (after === len || raw[after] === '\n') {
           flushChunk(i, true)
           i = after < len ? after + 1 : after

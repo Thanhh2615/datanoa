@@ -15,7 +15,8 @@ import {
 } from './shared-sql-diagnostics.js'
 
 const DEFAULT_DEBOUNCE_MS = 320
-const TOKEN_CHAR_RE = /[A-Za-z0-9_$]/
+const MAX_LINT_DOC_LENGTH = 100_000
+const TOKEN_CHAR_RE = /[\p{L}\p{N}_$]/u
 
 export const setSqlDiagnosticsEffect = StateEffect.define()
 export const setDbSqlErrorEffect = StateEffect.define()
@@ -150,12 +151,34 @@ export const sqlDiagnosticsField = StateField.define({
               : typeof dialectGetter === 'function'
                 ? dialectGetter() || ''
                 : ''
-          dbDiag = extractDbSyntaxErrorDiagnostic(
-            tr.newDoc.toString(),
-            payload.errorMessage,
-            payload.targetRange ?? null,
-            resolvedDialect
-          )
+          const docLen = tr.newDoc.length
+          const rawRange = payload.targetRange ?? null
+          if (rawRange && typeof rawRange.from === 'number' && typeof rawRange.to === 'number') {
+            const from = Math.max(0, Math.min(docLen, Math.trunc(rawRange.from)))
+            const to = Math.max(from, Math.min(docLen, Math.trunc(rawRange.to)))
+            if (to - from > MAX_LINT_DOC_LENGTH) {
+              dbDiag = null
+            } else {
+              const sliceDiag = extractDbSyntaxErrorDiagnostic(
+                tr.newDoc.sliceString(from, to),
+                payload.errorMessage,
+                null,
+                resolvedDialect
+              )
+              dbDiag = sliceDiag
+                ? { ...sliceDiag, from: from + sliceDiag.from, to: from + sliceDiag.to }
+                : null
+            }
+          } else if (docLen > MAX_LINT_DOC_LENGTH) {
+            dbDiag = null
+          } else {
+            dbDiag = extractDbSyntaxErrorDiagnostic(
+              tr.newDoc.toString(),
+              payload.errorMessage,
+              null,
+              resolvedDialect
+            )
+          }
         }
         changed = true
       }
@@ -165,7 +188,7 @@ export const sqlDiagnosticsField = StateField.define({
   },
 })
 
-function collectActiveDiagnostics(state) {
+export function collectActiveDiagnostics(state) {
   const field = state.field(sqlDiagnosticsField, false)
   if (!field) return []
   const docLen = state.doc.length
@@ -184,26 +207,28 @@ function collectActiveDiagnostics(state) {
     }
   }
 
+  // Prioritize errors over warnings so a wider warning NEVER suppresses an overlapping error
   staticCandidates.sort((a, b) => {
-    if (a.from !== b.from) return a.from - b.from
     const sevA = a.severity === 'error' ? 0 : 1
     const sevB = b.severity === 'error' ? 0 : 1
     if (sevA !== sevB) return sevA - sevB
+    if (a.from !== b.from) return a.from - b.from
     return a.to - b.to
   })
 
   const nonOverlapping = []
-  let lastTo = -1
   for (const diag of staticCandidates) {
-    if (diag.from < lastTo) continue
+    const overlapsExisting = nonOverlapping.some(
+      (accepted) => !(diag.to <= accepted.from || diag.from >= accepted.to)
+    )
+    if (overlapsExisting) continue
     nonOverlapping.push(diag)
-    lastTo = diag.to
   }
 
   if (dbDiag) {
     nonOverlapping.push(dbDiag)
-    nonOverlapping.sort((a, b) => a.from - b.from || a.to - b.to)
   }
+  nonOverlapping.sort((a, b) => a.from - b.from || a.to - b.to)
 
   return nonOverlapping
 }
@@ -357,10 +382,13 @@ export function createCmSqlLintExtension(options = {}) {
         if (this.destroyed) return
         const state = this.view.state
         const dialect = getDialect() || ''
-        const nextDiags = analyzeSqlDiagnostics(state.doc.toString(), {
-          dialect,
-          cursorOffset: state.selection.main.head,
-        })
+        const nextDiags =
+          state.doc.length > MAX_LINT_DOC_LENGTH
+            ? []
+            : analyzeSqlDiagnostics(state.doc.toString(), {
+                dialect,
+                cursorOffset: state.selection.main.head,
+              })
         const prevField = state.field(sqlDiagnosticsField, false)
         if (prevField && diagnosticsEqual(prevField.staticDiags, nextDiags)) {
           return

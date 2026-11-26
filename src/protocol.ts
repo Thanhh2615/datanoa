@@ -17,6 +17,9 @@ export type DatabaseDriverType =
 
 export type ConnectionColorTag = 'none' | 'dev' | 'staging' | 'prod'
 
+/** Per-connection AI policy controlling whether SQL/schema context may be sent to AI providers. */
+export type ConnectionAiPolicy = 'allow' | 'ask' | 'never'
+
 /** TLS negotiation mode for TCP engines (`auto` keeps legacy profile.ssl / cloud auto-SSL behaviour) */
 export type SslMode = 'auto' | 'disable' | 'require' | 'verify-ca' | 'verify-full'
 
@@ -64,6 +67,8 @@ export interface ConnectionProfile {
   sshPrivateKeyPath?: string
   hasSshPassphrase?: boolean
   hasSshPassword?: boolean
+  /** Optional per-connection AI policy override ('allow' | 'ask' | 'never'). */
+  aiPolicy?: ConnectionAiPolicy
 }
 
 export type SchemaObjectKind =
@@ -228,6 +233,8 @@ export interface TableBrowseResult {
   pageSize: number
   primaryKey: string[]
   canEdit: boolean
+  /** True when response compaction truncated rows or cell payloads to fit IPC limits. */
+  truncated?: boolean
 }
 
 export interface TransactionState {
@@ -854,13 +861,13 @@ interface DatanoaPluginPanelEvents {
 
 export type PluginPanelEvents = DatanoaPluginPanelEvents
 
-/**
- * Recursively converts any payload into a strict Orca JsonValue:
- * - Strips keys with `undefined` values from objects (Orca rejects `undefined` as invalid_params)
- * - Normalizes null-prototype objects from `node:sqlite` into standard plain objects
- * - Converts BigInt, Date, Uint8Array/Buffer, and non-finite numbers into safe JSON values
- */
-export function sanitizeJsonPayload<T>(value: T): T {
+export const MAX_SANITIZE_DEPTH = 64
+
+function sanitizeJsonPayloadInternal(
+  value: unknown,
+  depth: number,
+  ancestors: WeakSet<object>
+): unknown {
   if (value === undefined || value === null) {
     return value
   }
@@ -868,46 +875,68 @@ export function sanitizeJsonPayload<T>(value: T): T {
     return value
   }
   if (typeof value === 'number') {
-    return (Number.isFinite(value) ? value : null) as unknown as T
+    return Number.isFinite(value) ? value : null
   }
   if (typeof value === 'bigint') {
     const asNum = Number(value)
-    return (Number.isSafeInteger(asNum) ? asNum : value.toString()) as unknown as T
+    return Number.isSafeInteger(asNum) ? asNum : value.toString()
   }
   if (value instanceof Date) {
-    return (Number.isNaN(value.getTime()) ? null : value.toISOString()) as unknown as T
+    return Number.isNaN(value.getTime()) ? null : value.toISOString()
   }
   if (value instanceof ArrayBuffer) {
-    return `[BLOB ${value.byteLength} B]` as unknown as T
+    return `[BLOB ${value.byteLength} B]`
   }
   if (ArrayBuffer.isView(value)) {
-    return `[BLOB ${value.byteLength} B]` as unknown as T
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) =>
-      item === undefined ? null : sanitizeJsonPayload(item)
-    ) as unknown as T
+    return `[BLOB ${value.byteLength} B]`
   }
   if (typeof value === 'object') {
-    const out: Record<string, unknown> = {}
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (v !== undefined && typeof v !== 'function' && typeof v !== 'symbol') {
-        const sanitized = sanitizeJsonPayload(v)
-        if (k === '__proto__') {
-          Object.defineProperty(out, k, {
-            value: sanitized,
-            enumerable: true,
-            writable: true,
-            configurable: true,
-          })
-        } else {
-          out[k] = sanitized
+    if (ancestors.has(value)) {
+      return '[Circular]'
+    }
+    if (depth >= MAX_SANITIZE_DEPTH) {
+      return '[MaxDepth]'
+    }
+    ancestors.add(value)
+    try {
+      if (Array.isArray(value)) {
+        return value.map((item) =>
+          item === undefined ? null : sanitizeJsonPayloadInternal(item, depth + 1, ancestors)
+        )
+      }
+      const out: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+        if (v !== undefined && typeof v !== 'function' && typeof v !== 'symbol') {
+          const sanitized = sanitizeJsonPayloadInternal(v, depth + 1, ancestors)
+          if (k === '__proto__') {
+            Object.defineProperty(out, k, {
+              value: sanitized,
+              enumerable: true,
+              writable: true,
+              configurable: true,
+            })
+          } else {
+            out[k] = sanitized
+          }
         }
       }
+      return out
+    } finally {
+      ancestors.delete(value)
     }
-    return out as unknown as T
   }
-  return null as unknown as T
+  return null
+}
+
+/**
+ * Recursively converts any payload into a strict Orca JsonValue:
+ * - Strips keys with `undefined` values from objects (Orca rejects `undefined` as invalid_params)
+ * - Normalizes null-prototype objects from `node:sqlite` into standard plain objects
+ * - Converts BigInt, Date, Uint8Array/Buffer, and non-finite numbers into safe JSON values
+ * - Guards against circular references and excessive nesting depth (`MAX_SANITIZE_DEPTH = 64`)
+ */
+export function sanitizeJsonPayload<T>(value: T): T {
+  return sanitizeJsonPayloadInternal(value, 0, new WeakSet<object>()) as T
 }
 
 declare module 'orca' {

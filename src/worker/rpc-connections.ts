@@ -16,12 +16,14 @@ import {
   validateD1EndpointUrl,
   validateLibsqlEndpointUrl,
 } from '../drivers/common/connection-uri'
-import { isByodDriverId, type DriverManager } from '../drivers/driver-manager'
+import { getDefaultPortForDriver } from '../drivers/common/engine-catalog'
+import { getByodDefaultPort, isByodDriverId, type DriverManager } from '../drivers/driver-manager'
 import {
   detectWorkspaceEnvConnections,
   discoverWorkspaceSqliteFiles,
   formatByteSize,
   getLocalWorkspaceDirs,
+  normalizePathForCompare,
   scanDirectoryForSqliteFiles,
   type DiscoveredSqliteFile,
 } from './discovery'
@@ -72,6 +74,295 @@ interface DetectedCandidateSecret {
 
 const DETECTED_CANDIDATE_TTL_MS = 15 * 60 * 1000
 const DETECTED_CANDIDATE_MAX = 200
+
+export type StoredSecretKind = 'db' | 'ssh' | 'sslKey'
+
+function normalizeCanonicalHost(raw: string | undefined): string {
+  if (typeof raw !== 'string') return ''
+  const trimmed = raw.trim().toLowerCase()
+  if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+    return trimmed.slice(1, -1)
+  }
+  return trimmed
+}
+
+function normalizeCanonicalScheme(rawScheme: string, driver: string): string {
+  const s = rawScheme.trim().toLowerCase()
+  if (s === 'clickhouses:') return 'https:'
+  if (s === 'clickhouse:') return 'http:'
+  if (s === 'postgresql:' || s === 'postgres:') return 'postgres'
+  if (s === 'cockroach:' || s === 'cockroachdb:') return 'cockroachdb'
+  if (s === 'sqlserver:' || s === 'mssql:') return 'mssql'
+  if (s === 'oracledb:' || s === 'oracle:') return 'oracle'
+  if (s === 'mysql:') return 'mysql'
+  if (s === 'mariadb:') return 'mariadb'
+  if (s === 'mongodb:') return 'mongodb'
+  if (s === 'redis:') return 'redis'
+  return s || driver
+}
+
+interface CanonicalDbTarget {
+  driver: string
+  scheme: string
+  host: string
+  port: number
+  filePath: string
+  d1AccountId: string
+  rawFallback: string
+}
+
+function resolveCanonicalDbTarget(profile: ConnectionProfile): CanonicalDbTarget | null {
+  const driver = typeof profile.driver === 'string' ? profile.driver.trim().toLowerCase() : ''
+  if (!driver) return null
+
+  const defaultPort = isByodDriverId(driver)
+    ? getByodDefaultPort(driver)
+    : (SUPPORTED_DRIVERS as readonly string[]).includes(driver)
+      ? getDefaultPortForDriver(driver as ConnectionProfile['driver'])
+      : 0
+
+  if (driver === 'sqlite' || driver === 'duckdb') {
+    const rawFile = (profile.filePath || profile.database || '').trim()
+    const filePath =
+      rawFile.length === 0
+        ? ''
+        : rawFile === ':memory:'
+          ? ':memory:'
+          : normalizePathForCompare(path.resolve(rawFile))
+    return {
+      driver,
+      scheme: 'file',
+      host: '',
+      port: 0,
+      filePath,
+      d1AccountId: '',
+      rawFallback: '',
+    }
+  }
+
+  if (driver === 'd1') {
+    const rawUrl = typeof profile.url === 'string' ? profile.url.trim() : ''
+    const d1AccountId = (profile.d1AccountId || '').trim()
+    if (rawUrl) {
+      try {
+        const u = new URL(rawUrl)
+        const port = u.port ? Number(u.port) : u.protocol === 'https:' ? 443 : 80
+        return {
+          driver,
+          scheme: u.protocol.toLowerCase(),
+          host: normalizeCanonicalHost(u.hostname),
+          port: Number.isInteger(port) && port > 0 ? port : 443,
+          filePath: '',
+          d1AccountId,
+          rawFallback: u.pathname.replace(/\/+$/, ''),
+        }
+      } catch {
+        return null
+      }
+    }
+    return {
+      driver,
+      scheme: 'https:',
+      host: 'api.cloudflare.com',
+      port: 443,
+      filePath: '',
+      d1AccountId,
+      rawFallback: '',
+    }
+  }
+
+  if (driver === 'libsql') {
+    const candidateUrl = resolveLibsqlEndpointCandidate(profile)
+    if (!candidateUrl) {
+      return {
+        driver,
+        scheme: profile.ssl === false ? 'http:' : 'https:',
+        host: normalizeCanonicalHost(profile.host),
+        port:
+          typeof profile.port === 'number' && Number.isInteger(profile.port) && profile.port > 0
+            ? profile.port
+            : profile.ssl === false
+              ? 80
+              : 443,
+        filePath: '',
+        d1AccountId: '',
+        rawFallback: '',
+      }
+    }
+    try {
+      const u = new URL(candidateUrl)
+      const port = u.port ? Number(u.port) : u.protocol === 'https:' ? 443 : 80
+      return {
+        driver,
+        scheme: u.protocol.toLowerCase(),
+        host: normalizeCanonicalHost(u.hostname),
+        port: Number.isInteger(port) && port > 0 ? port : 443,
+        filePath: '',
+        d1AccountId: '',
+        rawFallback: u.pathname.replace(/\/+$/, ''),
+      }
+    } catch {
+      return null
+    }
+  }
+
+  const rawUrl = typeof profile.url === 'string' ? profile.url.trim() : ''
+  if (rawUrl) {
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(rawUrl)) {
+      try {
+        const u = new URL(rawUrl)
+        const rawScheme = u.protocol.toLowerCase()
+        const scheme = normalizeCanonicalScheme(rawScheme, driver)
+        const fallbackPort =
+          rawScheme === 'https:'
+            ? 443
+            : rawScheme === 'http:'
+              ? 80
+              : rawScheme === 'clickhouses:'
+                ? 8443
+                : defaultPort
+        const parsedPort = u.port ? Number(u.port) : fallbackPort
+        const schemeIdx = rawUrl.indexOf('://')
+        const rest = rawUrl.slice(schemeIdx + 3)
+        const delimIdx = rest.search(/[/?#]/)
+        const rawAuth = delimIdx >= 0 ? rest.slice(0, delimIdx) : rest
+        const atIdx = rawAuth.lastIndexOf('@')
+        const hostList = (atIdx >= 0 ? rawAuth.slice(atIdx + 1) : rawAuth).toLowerCase()
+        return {
+          driver,
+          scheme,
+          host: hostList.includes(',') ? hostList : normalizeCanonicalHost(u.hostname),
+          port: Number.isInteger(parsedPort) && parsedPort > 0 ? parsedPort : fallbackPort,
+          filePath: '',
+          d1AccountId: '',
+          rawFallback: '',
+        }
+      } catch {
+        return {
+          driver,
+          scheme: 'raw',
+          host: '',
+          port: 0,
+          filePath: '',
+          d1AccountId: '',
+          rawFallback: rawUrl.toLowerCase(),
+        }
+      }
+    }
+    return {
+      driver,
+      scheme: 'raw',
+      host: normalizeCanonicalHost(profile.host),
+      port:
+        typeof profile.port === 'number' && Number.isInteger(profile.port) && profile.port > 0
+          ? profile.port
+          : defaultPort,
+      filePath: '',
+      d1AccountId: '',
+      rawFallback: rawUrl.replace(/\s+/g, ' ').trim().toLowerCase(),
+    }
+  }
+
+  const host = normalizeCanonicalHost(profile.host) || 'localhost'
+  const port =
+    typeof profile.port === 'number' && Number.isInteger(profile.port) && profile.port > 0
+      ? profile.port
+      : driver === 'clickhouse' && profile.ssl
+        ? 8443
+        : defaultPort
+  const scheme =
+    driver === 'clickhouse'
+      ? profile.ssl
+        ? 'https:'
+        : 'http:'
+      : driver === 'redis' && profile.ssl
+        ? 'rediss:'
+        : driver
+  return {
+    driver,
+    scheme,
+    host,
+    port,
+    filePath: '',
+    d1AccountId: '',
+    rawFallback: '',
+  }
+}
+
+/**
+ * Pure fail-closed predicate verifying whether a stored OS-keyring secret belonging to `stored`
+ * may safely be reused when testing or saving `candidate`. Prevents SSRF secret-oracle exfiltration
+ * where a caller mutates host/port/url/driver/sshHost/sslKeyPath while referencing an existing ID.
+ */
+export function canReuseStoredSecretForTarget(
+  stored: ConnectionProfile | null | undefined,
+  candidate: ConnectionProfile | null | undefined,
+  kind: StoredSecretKind
+): boolean {
+  if (!stored || !candidate) return false
+
+  if (kind === 'sslKey') {
+    const storedKey = typeof stored.sslKeyPath === 'string' ? stored.sslKeyPath.trim() : ''
+    const candKey = typeof candidate.sslKeyPath === 'string' ? candidate.sslKeyPath.trim() : ''
+    if (!storedKey || !candKey) return false
+    return (
+      normalizePathForCompare(path.resolve(storedKey)) ===
+      normalizePathForCompare(path.resolve(candKey))
+    )
+  }
+
+  if (kind === 'ssh') {
+    const storedHost = normalizeCanonicalHost(stored.sshHost)
+    const candHost = normalizeCanonicalHost(candidate.sshHost)
+    if (!storedHost || !candHost || storedHost !== candHost) return false
+    const storedPort =
+      typeof stored.sshPort === 'number' && Number.isInteger(stored.sshPort) && stored.sshPort > 0
+        ? stored.sshPort
+        : 22
+    const candPort =
+      typeof candidate.sshPort === 'number' &&
+      Number.isInteger(candidate.sshPort) &&
+      candidate.sshPort > 0
+        ? candidate.sshPort
+        : 22
+    if (storedPort !== candPort) return false
+    const storedUser = typeof stored.sshUser === 'string' ? stored.sshUser.trim() : ''
+    const candUser = typeof candidate.sshUser === 'string' ? candidate.sshUser.trim() : ''
+    if (!storedUser || storedUser !== candUser) return false
+    const storedMethod = stored.sshAuthMethod ?? 'agent'
+    const candMethod = candidate.sshAuthMethod ?? 'agent'
+    if (storedMethod !== candMethod) return false
+    if (storedMethod === 'key') {
+      const storedKeyPath =
+        typeof stored.sshPrivateKeyPath === 'string' ? stored.sshPrivateKeyPath.trim() : ''
+      const candKeyPath =
+        typeof candidate.sshPrivateKeyPath === 'string' ? candidate.sshPrivateKeyPath.trim() : ''
+      if (storedKeyPath || candKeyPath) {
+        if (!storedKeyPath || !candKeyPath) return false
+        if (
+          normalizePathForCompare(path.resolve(storedKeyPath)) !==
+          normalizePathForCompare(path.resolve(candKeyPath))
+        ) {
+          return false
+        }
+      }
+    }
+    return true
+  }
+
+  const a = resolveCanonicalDbTarget(stored)
+  const b = resolveCanonicalDbTarget(candidate)
+  if (!a || !b) return false
+  return (
+    a.driver === b.driver &&
+    a.scheme === b.scheme &&
+    a.host === b.host &&
+    a.port === b.port &&
+    a.filePath === b.filePath &&
+    a.d1AccountId === b.d1AccountId &&
+    a.rawFallback === b.rawFallback
+  )
+}
 
 function resolveLibsqlEndpointCandidate(profile: ConnectionProfile): string {
   let raw = typeof profile.url === 'string' ? profile.url.trim() : ''
@@ -238,7 +529,7 @@ export function registerConnectionHandlers({
     const id =
       normalized.id && !normalized.id.startsWith('ws_')
         ? normalized.id
-        : `conn_${normalized.driver}_${Date.now()}`
+        : `conn_${normalized.driver}_${randomUUID()}`
     const d1HttpLoopback =
       normalized.driver === 'd1' &&
       typeof normalized.url === 'string' &&
@@ -292,33 +583,18 @@ export function registerConnectionHandlers({
         }
       }
 
-      if (input.sourceConnectionId) {
-        const copyPrefixes: string[] = []
-        if (input.password === undefined) copyPrefixes.push('pwd')
-        if (input.authToken === undefined) copyPrefixes.push('tok')
-        if (input.sslKeyPassphrase === undefined) copyPrefixes.push('sslkey')
-        if (input.sshPassphrase === undefined) copyPrefixes.push('sshpass')
-        if (input.sshPassword === undefined) copyPrefixes.push('sshpwd')
-        if (copyPrefixes.length > 0) {
-          await sessionManager.copySecret(input.sourceConnectionId, id, copyPrefixes)
-        }
-      }
-      await sessionManager.saveSecret(id, {
-        password: input.password,
-        authToken: input.authToken,
-        sslKeyPassphrase: input.sslKeyPassphrase,
-        sshPassphrase: input.sshPassphrase,
-        sshPassword: input.sshPassword,
-      })
-
       const list = await sessionManager.getStoredConnections()
       const idx = list.findIndex((c) => c.id === id)
       const existing = idx >= 0 ? list[idx] : undefined
+      const sourceProfile = input.sourceConnectionId
+        ? list.find((c) => c.id === input.sourceConnectionId)
+        : undefined
       const merged: ConnectionProfile = { ...normalized }
 
       if (existing) {
         if (!hasOwn('folder')) merged.folder = existing.folder
         if (!hasOwn('workspaceScope')) merged.workspaceScope = existing.workspaceScope
+        if (!hasOwn('aiPolicy')) merged.aiPolicy = existing.aiPolicy
         if (existing.driver === normalized.driver) {
           if (!hasOwn('sslMode')) merged.sslMode = existing.sslMode
           if (!hasOwn('sslCaPath')) merged.sslCaPath = existing.sslCaPath
@@ -345,21 +621,130 @@ export function registerConnectionHandlers({
         }
       }
 
-      const hasPassword =
-        input.password !== undefined ? Boolean(input.password) : Boolean(merged.hasPassword)
-      const hasAuthToken =
-        input.authToken !== undefined ? Boolean(input.authToken) : Boolean(merged.hasAuthToken)
-      const hasSslKeyPassphrase =
+      const copyPrefixes: string[] = []
+      if (input.sourceConnectionId) {
+        const allowCopyDb = canReuseStoredSecretForTarget(sourceProfile, merged, 'db')
+        const allowCopySslKey = canReuseStoredSecretForTarget(sourceProfile, merged, 'sslKey')
+        const allowCopySsh = canReuseStoredSecretForTarget(sourceProfile, merged, 'ssh')
+        const usesTokenSave = merged.driver === 'libsql' || merged.driver === 'd1'
+
+        if (!allowCopyDb) {
+          const wantsDbCopy = usesTokenSave
+            ? input.authToken === undefined && Boolean(merged.hasAuthToken)
+            : input.password === undefined && Boolean(merged.hasPassword)
+          if (wantsDbCopy) {
+            throw createHostError(
+              'not_permitted',
+              'Stored credentials cannot be copied after changing the target host, port, URL, or driver. Re-enter credentials before saving.'
+            )
+          }
+        } else {
+          if (input.password === undefined) copyPrefixes.push('pwd')
+          if (input.authToken === undefined) copyPrefixes.push('tok')
+        }
+
+        const effectiveAllowCopySslKey = allowCopyDb && allowCopySslKey
+        const effectiveAllowCopySsh = allowCopyDb && allowCopySsh
+
+        if (!effectiveAllowCopySslKey) {
+          if (
+            input.sslKeyPassphrase === undefined &&
+            Boolean(merged.hasSslKeyPassphrase) &&
+            Boolean(merged.sslKeyPath?.trim())
+          ) {
+            throw createHostError(
+              'not_permitted',
+              'Stored TLS key passphrase cannot be copied after changing the target endpoint or TLS key path. Re-enter the passphrase before saving.'
+            )
+          }
+        } else if (input.sslKeyPassphrase === undefined) {
+          copyPrefixes.push('sslkey')
+        }
+
+        if (!effectiveAllowCopySsh) {
+          if (
+            Boolean(merged.sshEnabled) &&
+            ((input.sshPassphrase === undefined && Boolean(merged.hasSshPassphrase)) ||
+              (input.sshPassword === undefined && Boolean(merged.hasSshPassword)))
+          ) {
+            throw createHostError(
+              'not_permitted',
+              'Stored SSH credentials cannot be copied after changing the target endpoint or SSH host, port, user, or auth method. Re-enter SSH credentials before saving.'
+            )
+          }
+        } else {
+          if (input.sshPassphrase === undefined) copyPrefixes.push('sshpass')
+          if (input.sshPassword === undefined) copyPrefixes.push('sshpwd')
+        }
+      }
+
+      // When updating an existing profile whose target endpoint changed without new credentials,
+      // purge stale keyring entries fail-closed so the next connect never leaks secrets to a new host.
+      const existingDbTargetChanged = Boolean(
+        existing && !canReuseStoredSecretForTarget(existing, merged, 'db')
+      )
+      const existingSshTargetChanged = Boolean(
+        existing &&
+          (existing.sshEnabled || merged.sshEnabled) &&
+          !canReuseStoredSecretForTarget(existing, merged, 'ssh')
+      )
+      const existingSslKeyTargetChanged = Boolean(
+        existing &&
+          (existing.sslKeyPath || merged.sslKeyPath) &&
+          !canReuseStoredSecretForTarget(existing, merged, 'sslKey')
+      )
+
+      const usesTokenSave = merged.driver === 'libsql' || merged.driver === 'd1'
+      const effectivePasswordInput =
+        input.password !== undefined
+          ? input.password
+          : existingDbTargetChanged || (existing && usesTokenSave && existing.driver !== merged.driver)
+            ? ''
+            : undefined
+      const effectiveAuthTokenInput =
+        input.authToken !== undefined
+          ? input.authToken
+          : existingDbTargetChanged || (existing && !usesTokenSave && existing.driver !== merged.driver)
+            ? ''
+            : undefined
+      const effectiveSslKeyPassphraseInput =
         input.sslKeyPassphrase !== undefined
-          ? Boolean(input.sslKeyPassphrase)
+          ? input.sslKeyPassphrase
+          : existingSslKeyTargetChanged
+            ? ''
+            : undefined
+      const effectiveSshPassphraseInput =
+        input.sshPassphrase !== undefined
+          ? input.sshPassphrase
+          : existingSshTargetChanged || sshExplicitlyDisabled
+            ? ''
+            : undefined
+      const effectiveSshPasswordInput =
+        input.sshPassword !== undefined
+          ? input.sshPassword
+          : existingSshTargetChanged || sshExplicitlyDisabled
+            ? ''
+            : undefined
+
+      const hasPassword =
+        effectivePasswordInput !== undefined
+          ? Boolean(effectivePasswordInput)
+          : Boolean(merged.hasPassword)
+      const hasAuthToken =
+        effectiveAuthTokenInput !== undefined
+          ? Boolean(effectiveAuthTokenInput)
+          : Boolean(merged.hasAuthToken)
+      const hasSslKeyPassphrase =
+        effectiveSslKeyPassphraseInput !== undefined
+          ? Boolean(effectiveSslKeyPassphraseInput)
           : Boolean(merged.hasSslKeyPassphrase)
       const hasSshPassphrase =
-        input.sshPassphrase !== undefined
-          ? Boolean(input.sshPassphrase)
+        effectiveSshPassphraseInput !== undefined
+          ? Boolean(effectiveSshPassphraseInput)
           : Boolean(merged.hasSshPassphrase)
       const hasSshPassword =
-        input.sshPassword !== undefined
-          ? Boolean(input.sshPassword)
+        effectiveSshPasswordInput !== undefined
+          ? Boolean(effectiveSshPasswordInput)
           : Boolean(merged.hasSshPassword)
 
       const profileToSave = sanitizeConnectionProfile({
@@ -372,13 +757,34 @@ export function registerConnectionHandlers({
         hasSshPassword: hasSshPassword || undefined,
       })
 
+      const prevList = list.slice()
       if (idx >= 0) {
         list[idx] = profileToSave
       } else {
         list.push(profileToSave)
       }
 
-      await sessionManager.saveStoredConnections(list)
+      if (input.sourceConnectionId && copyPrefixes.length > 0) {
+        await sessionManager.copySecret(input.sourceConnectionId, id, copyPrefixes)
+      }
+      await sessionManager.saveSecret(id, {
+        password: effectivePasswordInput,
+        authToken: effectiveAuthTokenInput,
+        sslKeyPassphrase: effectiveSslKeyPassphraseInput,
+        sshPassphrase: effectiveSshPassphraseInput,
+        sshPassword: effectiveSshPasswordInput,
+      })
+
+      try {
+        await sessionManager.saveStoredConnections(list)
+      } catch (storageErr) {
+        if (!existing) {
+          await sessionManager.deleteSecret(id).catch(() => {})
+        } else {
+          await sessionManager.saveStoredConnections(prevList).catch(() => {})
+        }
+        throw storageErr
+      }
       if (isLiveDesktopHost) {
         await writeHostConfigBackupPatch({ connections: list.map(sanitizeConnectionProfile) })
       }
@@ -464,17 +870,45 @@ export function registerConnectionHandlers({
     }
     const usesToken = normalized.driver === 'libsql' || normalized.driver === 'd1'
     let secret = usesToken ? input.authToken : input.password
+    if (normalized.driver === 'libsql') {
+      const libsqlTestCandidate = resolveLibsqlEndpointCandidate(normalized)
+      if (libsqlTestCandidate) {
+        const checked = validateLibsqlEndpointUrl(libsqlTestCandidate, {
+          hasAuthToken: Boolean(
+            (typeof secret === 'string' && secret.trim().length > 0) || normalized.hasAuthToken
+          ),
+        })
+        if (!checked.ok) {
+          throw createHostError('invalid_params', checked.error)
+        }
+      }
+    }
     const secretLookupId =
       normalized.id &&
       !normalized.id.startsWith('ws_') &&
       !normalized.id.startsWith('conn_test_')
         ? normalized.id
         : input.sourceConnectionId
+    const storedProfile =
+      secretLookupId && typeof sessionManager.findProfile === 'function'
+        ? await sessionManager.findProfile(secretLookupId)
+        : null
+    const allowDbSecret = canReuseStoredSecretForTarget(storedProfile, normalized, 'db')
+    const allowSslKeySecret = canReuseStoredSecretForTarget(storedProfile, normalized, 'sslKey')
+    const allowSshSecret = canReuseStoredSecretForTarget(storedProfile, normalized, 'ssh')
+
     if (secret === undefined && secretLookupId) {
       const hasStoredSecret = usesToken
-        ? normalized.hasAuthToken !== false
+        ? normalized.hasAuthToken === true ||
+          (normalized.hasAuthToken !== false && Boolean(storedProfile?.hasAuthToken))
         : Boolean(normalized.hasPassword)
       if (hasStoredSecret) {
+        if (!allowDbSecret) {
+          throw createHostError(
+            'not_permitted',
+            'Stored credentials cannot be reused after changing the target host, port, URL, or driver. Re-enter credentials to test this connection.'
+          )
+        }
         secret = await sessionManager.getSecret(secretLookupId, normalized.driver)
       }
     }
@@ -493,24 +927,54 @@ export function registerConnectionHandlers({
       }
     }
 
-    const storedSecrets = secretLookupId
-      ? await sessionManager.getExtendedSecrets(secretLookupId)
-      : {}
+    const effectiveAllowSslKey = allowDbSecret && allowSslKeySecret
+    const effectiveAllowSsh = allowDbSecret && allowSshSecret
+
+    if (
+      secretLookupId &&
+      input.sslKeyPassphrase === undefined &&
+      Boolean(normalized.hasSslKeyPassphrase) &&
+      Boolean(normalized.sslKeyPath?.trim()) &&
+      !effectiveAllowSslKey
+    ) {
+      throw createHostError(
+        'not_permitted',
+        'Stored TLS key passphrase cannot be reused after changing the target endpoint or TLS key path. Re-enter the passphrase to test this connection.'
+      )
+    }
+
+    if (
+      secretLookupId &&
+      Boolean(normalized.sshEnabled) &&
+      !effectiveAllowSsh &&
+      ((input.sshPassphrase === undefined && Boolean(normalized.hasSshPassphrase)) ||
+        (input.sshPassword === undefined && Boolean(normalized.hasSshPassword)))
+    ) {
+      throw createHostError(
+        'not_permitted',
+        'Stored SSH credentials cannot be reused after changing the target endpoint or SSH host, port, user, or auth method. Re-enter SSH credentials to test this connection.'
+      )
+    }
+
+    const storedSecrets =
+      secretLookupId && (effectiveAllowSslKey || effectiveAllowSsh)
+        ? await sessionManager.getExtendedSecrets(secretLookupId)
+        : {}
     const allowStoredExtended = Boolean(input.sourceConnectionId)
     const extraSecrets = {
       sslKeyPassphrase:
         input.sslKeyPassphrase ??
-        (allowStoredExtended || normalized.hasSslKeyPassphrase
+        (effectiveAllowSslKey && (allowStoredExtended || normalized.hasSslKeyPassphrase)
           ? storedSecrets.sslKeyPassphrase
           : undefined),
       sshPassphrase:
         input.sshPassphrase ??
-        (allowStoredExtended || normalized.hasSshPassphrase
+        (effectiveAllowSsh && (allowStoredExtended || normalized.hasSshPassphrase)
           ? storedSecrets.sshPassphrase
           : undefined),
       sshPassword:
         input.sshPassword ??
-        (allowStoredExtended || normalized.hasSshPassword
+        (effectiveAllowSsh && (allowStoredExtended || normalized.hasSshPassword)
           ? storedSecrets.sshPassword
           : undefined),
     }

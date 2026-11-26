@@ -51,6 +51,7 @@ export class ValueInspectorController {
   private selectedCell: SelectedCellInfo | null = null
   private openState = false
   private savingCell = false
+  private saveSeq = 0
   private userModified = false
   private initialDisplayText = ''
   private heightPx = DEFAULT_INSPECTOR_HEIGHT_PX
@@ -351,6 +352,7 @@ export class ValueInspectorController {
   }
 
   public clearSelection(): void {
+    this.saveSeq++
     this.selectedCell = null
     this.userModified = false
     this.initialDisplayText = ''
@@ -362,6 +364,9 @@ export class ValueInspectorController {
   public open(info?: SelectedCellInfo): void {
     const target = info ?? this.selectedCell
     if (!target) return
+    if (info && info !== this.selectedCell) {
+      this.saveSeq++
+    }
     this.selectedCell = target
     this.openState = true
     const btn = this.host.getInspectButton()
@@ -394,6 +399,7 @@ export class ValueInspectorController {
   }
 
   public handleSelectionChanged(info: SelectedCellInfo | null): void {
+    this.saveSeq++
     this.selectedCell = info
     const btn = this.host.getInspectButton()
     if (btn) {
@@ -497,6 +503,11 @@ export class ValueInspectorController {
 
     if (grid.isBatchMode() || grid.getStagedCount() > 0 || info.isInserted) {
       grid.stageCellEdit(info.rowIndex, info.colIndex, nextValue)
+      if (setNull) {
+        this.textEl.value = ''
+        this.textEl.placeholder = 'NULL (type to set text value)'
+      }
+      this.selectedCell = { ...info, value: nextValue }
       this.initialDisplayText = setNull ? '' : this.textEl.value
       this.userModified = false
       this.syncActionButtons()
@@ -520,6 +531,8 @@ export class ValueInspectorController {
       primaryKeys[pk] = Array.isArray(row) ? row[pkIdx] : rowRecord ? rowRecord[pk] : undefined
     })
 
+    const mySaveSeq = ++this.saveSeq
+    const submittedText = setNull ? '' : this.textEl.value
     this.savingCell = true
     const triggerBtn = setNull ? this.nullBtn : this.applyBtn
     if (this.applyBtn) this.applyBtn.disabled = true
@@ -534,9 +547,15 @@ export class ValueInspectorController {
         originalValue: info.value,
         rowIndex: info.rowIndex,
       })
-      if (res.ok) {
-        this.initialDisplayText = setNull ? '' : this.textEl.value
+      if (res.ok && mySaveSeq === this.saveSeq && this.selectedCell === info && this.textEl) {
+        if (setNull) {
+          this.textEl.value = ''
+          this.textEl.placeholder = 'NULL (type to set text value)'
+        }
+        this.selectedCell = { ...info, value: nextValue }
+        this.initialDisplayText = submittedText
         this.userModified = false
+        this.updateMeta(setNull)
       }
       const latest = this.host.getActiveTarget()
       if (

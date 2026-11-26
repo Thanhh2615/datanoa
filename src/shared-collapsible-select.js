@@ -34,11 +34,12 @@ function extractSelectModel(selectEl) {
  */
 export function createCollapsibleSelectController(adapter) {
   let activeClose = null
+  let docClickHandler = null
 
   if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
     const triggerSel = `.${adapter.classes.trigger.split(/\s+/)[0]}`
     const popoverSel = `.${adapter.classes.popover.split(/\s+/)[0]}`
-    document.addEventListener('click', (e) => {
+    docClickHandler = (e) => {
       if (!activeClose) return
       const tgt = e.target
       if (
@@ -50,7 +51,8 @@ export function createCollapsibleSelectController(adapter) {
       }
       activeClose()
       activeClose = null
-    })
+    }
+    document.addEventListener('click', docClickHandler)
   }
 
   function isOpen() {
@@ -61,6 +63,14 @@ export function createCollapsibleSelectController(adapter) {
     if (typeof activeClose === 'function') {
       activeClose()
       activeClose = null
+    }
+  }
+
+  function destroy() {
+    closeActive()
+    if (docClickHandler && typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+      document.removeEventListener('click', docClickHandler)
+      docClickHandler = null
     }
   }
 
@@ -454,13 +464,15 @@ export function createCollapsibleSelectController(adapter) {
       }
     }
 
-    triggerBtn.addEventListener('click', (e) => {
+    const onTriggerClick = (e) => {
       e.stopPropagation()
       openPopover()
-    })
-    selectEl.addEventListener('change', () => {
+    }
+    const onSelectChange = () => {
       syncTriggerDisplay()
-    })
+    }
+    triggerBtn.addEventListener('click', onTriggerClick)
+    selectEl.addEventListener('change', onSelectChange)
 
     const syncAll = (nextOpts) => {
       if (nextOpts && typeof nextOpts === 'object') {
@@ -481,6 +493,22 @@ export function createCollapsibleSelectController(adapter) {
         }
       },
       close: closePopover,
+      destroy: () => {
+        closePopover()
+        triggerBtn.removeEventListener('click', onTriggerClick)
+        selectEl.removeEventListener('change', onSelectChange)
+        triggerBtn.remove()
+        selectEl.classList.remove(c.srOnly)
+        if (adapter.apiProp && selectEl[adapter.apiProp] === api) {
+          delete selectEl[adapter.apiProp]
+        }
+        if (adapter.mountedProp) {
+          delete selectEl[adapter.mountedProp]
+        }
+        if (selectEl[adapter.syncProp] === syncAll) {
+          delete selectEl[adapter.syncProp]
+        }
+      },
       triggerBtn,
     }
     if (adapter.apiProp) {
@@ -490,5 +518,5 @@ export function createCollapsibleSelectController(adapter) {
     return api
   }
 
-  return { enhance, isOpen, closeActive }
+  return { enhance, isOpen, closeActive, destroy }
 }

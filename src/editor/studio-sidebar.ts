@@ -387,6 +387,8 @@ export interface RenderTopbarObjectsOptions {
   totalTableCount?: number
   filterQuery: string
   sidebarCollapsed: boolean
+  schemaError?: string | null
+  activeConnection?: ConnectionProfile | null
   topbarCountEl: HTMLElement | null
   topbarAllBtn: HTMLButtonElement | null
   topbarTrackEl: HTMLElement | null
@@ -394,6 +396,8 @@ export interface RenderTopbarObjectsOptions {
   onActivateObject: (item: SchemaObject) => void
   onOpenContextMenu: (clientX: number, clientY: number, item: SchemaObject) => void
   onScrollActiveIntoView: () => void
+  onRetrySchema?: () => void
+  onEditConnection?: (conn: ConnectionProfile) => void
 }
 
 export function renderStudioTopbarObjects(opts: RenderTopbarObjectsOptions): void {
@@ -402,6 +406,8 @@ export function renderStudioTopbarObjects(opts: RenderTopbarObjectsOptions): voi
     totalTableCount,
     filterQuery,
     sidebarCollapsed,
+    schemaError,
+    activeConnection,
     topbarCountEl,
     topbarAllBtn,
     topbarTrackEl,
@@ -409,6 +415,8 @@ export function renderStudioTopbarObjects(opts: RenderTopbarObjectsOptions): voi
     onActivateObject,
     onOpenContextMenu,
     onScrollActiveIntoView,
+    onRetrySchema,
+    onEditConnection,
   } = opts
 
   const filteredTables = filtered.filter((item) => item.kind === 'table')
@@ -422,7 +430,10 @@ export function renderStudioTopbarObjects(opts: RenderTopbarObjectsOptions): voi
       filterQuery && filteredTables.length !== effectiveTotalTables
         ? `${filteredTables.length}/${effectiveTotalTables}`
         : String(effectiveTotalTables)
-    topbarCountEl.title = `${filteredTables.length} table(s) shown in bar`
+    topbarCountEl.classList.toggle('has-error', Boolean(schemaError))
+    topbarCountEl.title = schemaError
+      ? `Schema error: ${schemaError}`
+      : `${filteredTables.length} table(s) shown in bar`
   }
   if (topbarAllBtn) {
     topbarAllBtn.textContent = `All (${filtered.length}) ▾`
@@ -430,7 +441,27 @@ export function renderStudioTopbarObjects(opts: RenderTopbarObjectsOptions): voi
   if (!topbarTrackEl) return
   topbarTrackEl.innerHTML = ''
 
+  if (schemaError) {
+    const errPill = document.createElement('button')
+    errPill.type = 'button'
+    errPill.className = 'datanoa-topbar-error-pill'
+    errPill.title = activeConnection
+      ? `Schema error (${activeConnection.name}): ${schemaError}`
+      : `Schema error: ${schemaError}`
+    errPill.setAttribute('aria-label', errPill.title)
+    errPill.textContent = 'Schema error · Retry'
+    errPill.addEventListener('click', () => {
+      if (onRetrySchema) {
+        onRetrySchema()
+      } else if (activeConnection && onEditConnection) {
+        onEditConnection(activeConnection)
+      }
+    })
+    topbarTrackEl.appendChild(errPill)
+  }
+
   if (filteredTables.length === 0) {
+    if (schemaError) return
     const empty = document.createElement('span')
     empty.className = 'datanoa-cell-null'
     empty.style.padding = '0 8px'
@@ -720,12 +751,15 @@ export function renderStudioTopbarObjectsPopover(
 export interface RenderSidebarObjectsOptions {
   sidebarListEl: HTMLElement | null
   schemaObjects: SchemaObject[]
+  schemaError?: string | null
   filterQuery: string
   activeConnectionId: string | null
   activeConnection: ConnectionProfile | undefined
   collapsedGroups: Set<SchemaObjectKind>
   isObjectActive: (name: string, schema: string | undefined, kind: SchemaObjectKind) => boolean
   onOpenConnectionModal: () => void
+  onEditConnection?: (conn: ConnectionProfile) => void
+  onRetrySchema?: () => void
   onOpenCreateTableModal: () => void
   onToggleGroup: (kind: SchemaObjectKind) => void
   onActivateObject: (item: SchemaObject) => void
@@ -765,12 +799,15 @@ export function renderStudioSidebarList(
 ): void {
   const {
     sidebarListEl,
+    schemaError,
     filterQuery,
     activeConnectionId,
     activeConnection,
     collapsedGroups,
     isObjectActive,
     onOpenConnectionModal,
+    onEditConnection,
+    onRetrySchema,
     onOpenCreateTableModal,
     onToggleGroup,
     onActivateObject,
@@ -800,6 +837,55 @@ export function renderStudioSidebarList(
     ...group,
     items: filtered.filter((o) => o.kind === group.kind),
   })).filter((group) => group.items.length > 0)
+
+  if (schemaError) {
+    const errWrap = document.createElement('div')
+    errWrap.className = 'datanoa-sidebar-error'
+    if (!filterQuery) {
+      errWrap.setAttribute('role', 'alert')
+    }
+
+    const errTitle = document.createElement('div')
+    errTitle.className = 'datanoa-sidebar-error-title'
+    errTitle.textContent = activeConnection
+      ? `Failed to load schema (${activeConnection.name})`
+      : 'Failed to load schema'
+
+    const errMsg = document.createElement('div')
+    errMsg.className = 'datanoa-sidebar-error-msg'
+    errMsg.textContent = schemaError
+
+    const errActions = document.createElement('div')
+    errActions.className = 'datanoa-sidebar-error-actions'
+
+    if (onRetrySchema) {
+      const retryBtn = document.createElement('button')
+      retryBtn.type = 'button'
+      retryBtn.className = 'datanoa-btn datanoa-btn-sm'
+      retryBtn.textContent = 'Retry'
+      retryBtn.addEventListener('click', onRetrySchema)
+      errActions.appendChild(retryBtn)
+    }
+    if (activeConnection && onEditConnection) {
+      const editBtn = document.createElement('button')
+      editBtn.type = 'button'
+      editBtn.className = 'datanoa-btn datanoa-btn-sm'
+      editBtn.textContent = 'Edit Connection'
+      editBtn.addEventListener('click', () => onEditConnection(activeConnection))
+      errActions.appendChild(editBtn)
+    }
+
+    errWrap.appendChild(errTitle)
+    errWrap.appendChild(errMsg)
+    if (errActions.childNodes.length > 0) {
+      errWrap.appendChild(errActions)
+    }
+    sidebarListEl.appendChild(errWrap)
+
+    if (nonEmptyGroups.length === 0) {
+      return
+    }
+  }
 
   if (nonEmptyGroups.length === 0) {
     const empty = document.createElement('div')

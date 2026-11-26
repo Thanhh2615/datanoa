@@ -293,8 +293,50 @@ function isMongoJsonCommandMutating(obj: Record<string, unknown>): boolean {
   return !MONGODB_READONLY_EXPLAIN_CMDS.has(cmd)
 }
 
+function stripMongoTrailingComments(raw: string): string {
+  let out = raw
+  let i = 0
+  const len = out.length
+  let lastCodeEnd = 0
+  while (i < len) {
+    const ch = out[i]
+    if (ch === "'" || ch === '"' || ch === '`') {
+      i++
+      while (i < len) {
+        if (out[i] === '\\') {
+          i += 2
+          continue
+        }
+        if (out[i] === ch) {
+          i++
+          break
+        }
+        i++
+      }
+      lastCodeEnd = i
+      continue
+    }
+    if (ch === '/' && out[i + 1] === '/') {
+      const nl = out.indexOf('\n', i + 2)
+      i = nl < 0 ? len : nl + 1
+      continue
+    }
+    if (ch === '/' && out[i + 1] === '*') {
+      const end = out.indexOf('*/', i + 2)
+      i = end < 0 ? len : end + 2
+      continue
+    }
+    if (!/\s/.test(ch)) {
+      lastCodeEnd = i + 1
+    }
+    i++
+  }
+  out = out.slice(0, lastCodeEnd).trim()
+  return out
+}
+
 function buildMongoExplainPlan(rawText: string, sqlBody: string, readOnly: boolean): ExplainPlanItem {
-  const cleanBody = stripMongoLeadingComments(sqlBody)
+  const cleanBody = stripMongoTrailingComments(stripMongoLeadingComments(sqlBody))
   if (!cleanBody) {
     throw createHostError('invalid_params', 'MongoDB command cannot be empty')
   }
@@ -357,12 +399,13 @@ function buildMongoExplainPlan(rawText: string, sqlBody: string, readOnly: boole
 
   const hasTrailingExplain = /\.explain\s*\(\s*([^)]*)\)\s*$/i.exec(cleanBody)
   if (hasTrailingExplain) {
-    const explainArg = hasTrailingExplain[1]
-    const runsExecutionStats = /executionStats|allPlansExecution/i.test(explainArg)
+    const explainArg = hasTrailingExplain[1].trim()
+    const runsExecutionStats =
+      /executionStats|allPlansExecution/i.test(explainArg) || /^true$/i.test(explainArg)
     if (isMutatingShell && (readOnly || runsExecutionStats)) {
       throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
     }
-    return { rawStmt: rawText.trim(), explainSql: sqlBody }
+    return { rawStmt: rawText.trim(), explainSql: cleanBody }
   }
 
   if (isMutatingShell) {
@@ -385,7 +428,7 @@ function buildMongoExplainPlan(rawText: string, sqlBody: string, readOnly: boole
     )
   }
 
-  const normalizedShell = sqlBody.replace(/\.toArray\s*\(\s*\)\s*$/i, '')
+  const normalizedShell = cleanBody.replace(/\.toArray\s*\(\s*\)\s*$/i, '')
   return {
     rawStmt: rawText.trim(),
     explainSql: `${normalizedShell}.explain("queryPlanner")`,
@@ -395,6 +438,75 @@ function buildMongoExplainPlan(rawText: string, sqlBody: string, readOnly: boole
 function hasStandaloneBatchGo(sqlBody: string): boolean {
   const clean = stripCommentsAndLiterals(sqlBody, 'mssql')
   return /(?:^|\r?\n)[ \t]*GO[ \t]*(?:;|$|\r?\n)/i.test(clean)
+}
+
+const BUILTIN_DRIVER_SET: ReadonlySet<string> = new Set([
+  'sqlite',
+  'postgres',
+  'cockroachdb',
+  'mysql',
+  'mariadb',
+  'clickhouse',
+  'redis',
+  'libsql',
+  'd1',
+  'mssql',
+  'oracle',
+  'mongodb',
+])
+
+const BYOD_READONLY_SQL_START_RE = /^(?:SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|VALUES|PRAGMA)\b/i
+const BYOD_MUTATING_KEYWORD_RE =
+  /\b(?:INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|CREATE|TRUNCATE|REPLACE|UPSERT|COPY|ATTACH|DETACH|PUT|GET|BATCH|CALL|EXEC|EXECUTE|GRANT|REVOKE|VACUUM|REINDEX|LOAD|SET|REMOVE|LOAD\s+CSV|FOREACH|DBMS_|UTL_)\b/i
+const BYOD_CYPHER_MUTATING_RE = /\b(?:CREATE|MERGE|DELETE|DETACH|SET|REMOVE|DROP|LOAD\s+CSV|FOREACH)\b/i
+
+/**
+ * Fail-closed read-only gate executed in the worker BEFORE dispatching any query to a
+ * BYOD adapter, ensuring custom/third-party drivers cannot bypass `profile.readOnly`.
+ */
+export function isByodStatementReadOnlyBlocked(statement: string, driver: string): boolean {
+  const trimmed = statement.trim()
+  if (!trimmed) return true
+  const normalizedDriver = driver.trim().toLowerCase()
+  if (normalizedDriver === 'neo4j') {
+    const stripped = stripCommentsAndLiterals(trimmed, 'postgres')
+    return BYOD_CYPHER_MUTATING_RE.test(stripped) || !/^(?:MATCH|OPTIONAL\s+MATCH|RETURN|WITH|UNWIND|EXPLAIN|PROFILE|SHOW|CALL\s+db\.labels\b)/i.test(stripped.trim())
+  }
+  if (normalizedDriver === 'elasticsearch') {
+    if (trimmed.startsWith('{')) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed)
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return true
+        const rec = parsed as Record<string, unknown>
+        if (
+          'doc' in rec ||
+          'script' in rec ||
+          'delete' in rec ||
+          'update' in rec ||
+          'upsert' in rec ||
+          rec.index_op === 'write' ||
+          (typeof rec.method === 'string' && !/^(?:GET|HEAD)$/i.test(rec.method))
+        ) {
+          return true
+        }
+        return false
+      } catch {
+        return true
+      }
+    }
+  }
+  if (isMutatingStatement(trimmed, 'postgres')) {
+    return true
+  }
+  const stmts = splitSqlStatements(trimmed, 'postgres')
+  const list = stmts.length > 0 ? stmts.map((s) => s.text) : [trimmed]
+  for (const stmt of list) {
+    const clean = stripCommentsAndLiterals(stmt, 'postgres').trim()
+    if (!clean) continue
+    if (!BYOD_READONLY_SQL_START_RE.test(clean)) return true
+    if (BYOD_MUTATING_KEYWORD_RE.test(clean)) return true
+  }
+  return false
 }
 
 /**
@@ -420,15 +532,45 @@ export function buildExplainPlanForStatement(
   }
 
   if (driver === 'mssql') {
-    const cleanMssql = stripCommentsAndLiterals(sqlBody, 'mssql')
     const batches = splitMssqlBatches(sqlBody)
     const checkBatches = batches.length > 0 ? batches : [sqlBody]
     if (readOnly && checkBatches.some((batch) => isMssqlReadOnlyBlocked(batch))) {
       throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
     }
-    if (/^SET\s+(?:SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+ON\b/i.test(leadingStripped)) {
-      return { rawStmt: rawText.trim(), explainSql: rawText.trim() }
+    // Strictly allow a 3-batch already-wrapped envelope:
+    // [SET SHOWPLAN_(ALL|TEXT|XML) ON, <single inner statement>, SET SHOWPLAN_(ALL|TEXT|XML) OFF]
+    const showplanOnRe = /^SET\s+(SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+ON\s*;?$/i
+    const showplanOffRe = /^SET\s+(SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+OFF\s*;?$/i
+    const firstLead = stripLeadingSqlComments(checkBatches[0] ?? '', 'mssql')
+      .replace(/;+\s*$/, '')
+      .trim()
+    const onMatch = showplanOnRe.exec(firstLead)
+    if (onMatch) {
+      const mode = onMatch[1].toUpperCase()
+      if (checkBatches.length === 3) {
+        const innerBatch = checkBatches[1]
+        const lastLead = stripLeadingSqlComments(checkBatches[2] ?? '', 'mssql')
+          .replace(/;+\s*$/, '')
+          .trim()
+        const offMatch = showplanOffRe.exec(lastLead)
+        const cleanInner = stripCommentsAndLiterals(innerBatch, 'mssql')
+        if (
+          offMatch &&
+          offMatch[1].toUpperCase() === mode &&
+          splitSqlStatements(innerBatch, 'mssql').length === 1 &&
+          !hasStandaloneBatchGo(innerBatch) &&
+          !/\bSET\s+(?:SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+(?:ON|OFF)\b/i.test(cleanInner) &&
+          (!readOnly || !isMssqlReadOnlyBlocked(innerBatch))
+        ) {
+          return { rawStmt: rawText.trim(), explainSql: rawText.trim() }
+        }
+      }
+      throw createHostError(
+        'invalid_params',
+        'Multi-statement SHOWPLAN is not supported for SQL Server; explain one statement at a time.'
+      )
     }
+    const cleanMssql = stripCommentsAndLiterals(sqlBody, 'mssql')
     if (
       splitSqlStatements(sqlBody, 'mssql').length > 1 ||
       hasStandaloneBatchGo(sqlBody) ||
@@ -633,8 +775,13 @@ export function registerQueryAndTxHandlers({
     if (!profile) {
       throw createHostError('invalid_params', `Connection '${input.connectionId}' not found in storage`)
     }
-    if (profile.readOnly && isMutatingStatement(trimmed, profile.driver)) {
-      throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
+    if (profile.readOnly) {
+      const blocked = BUILTIN_DRIVER_SET.has(profile.driver)
+        ? isMutatingStatement(trimmed, profile.driver)
+        : isByodStatementReadOnlyBlocked(trimmed, profile.driver)
+      if (blocked) {
+        throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
+      }
     }
 
     const settingMaxRows = Number(await orca.settings.get('maxRows'))
@@ -850,6 +997,11 @@ export function registerQueryAndTxHandlers({
     const profile = await sessionManager.findProfile(input.connectionId)
     if (!profile) {
       throw createHostError('invalid_params', `Connection '${input.connectionId}' not found in storage`)
+    }
+    if (profile.readOnly && !BUILTIN_DRIVER_SET.has(profile.driver)) {
+      if (isByodStatementReadOnlyBlocked(trimmed, profile.driver)) {
+        throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
+      }
     }
 
     if (profile.driver === 'redis') {

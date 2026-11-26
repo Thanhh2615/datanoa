@@ -86,11 +86,22 @@ export function coerceCellInputValue(
         return trimmed
       }
       if (DECIMAL_LITERAL_REGEX.test(trimmed)) {
-        const normalizedDigits = trimmed
-          .replace(/^[+-]?0+(?=\d)/, '')
+        const unsigned = trimmed.replace(/^[+-]/, '')
+        const significantDigits = unsigned
           .replace('.', '')
-          .replace(/^0+$/, '0')
-        if (normalizedDigits.length > 15) {
+          .replace(/^0+/, '')
+          .replace(/0+$/, '')
+        if (significantDigits.length > 15) {
+          return trimmed
+        }
+      } else if (/^[+-]?(?:\d+\.?\d*|\.\d+)[eE][+-]?\d+$/.test(trimmed)) {
+        const mantissaPart = trimmed.split(/[eE]/)[0] ?? ''
+        const significantDigits = mantissaPart
+          .replace(/^[+-]/, '')
+          .replace('.', '')
+          .replace(/^0+/, '')
+          .replace(/0+$/, '')
+        if (significantDigits.length > 15) {
           return trimmed
         }
       }
@@ -152,8 +163,10 @@ export function formatCellValue(value: unknown, type?: string): FormattedCell {
  * Calculates visible window indices for virtual scrolling (F16-03).
  */
 export function calculateVisibleWindow(scrollTop: number, viewportHeightPx = 440) {
-  const startIndex = Math.floor(scrollTop / ROW_HEIGHT_PX)
-  const visibleCount = Math.ceil(viewportHeightPx / ROW_HEIGHT_PX)
+  const safeScrollTop = Number.isFinite(scrollTop) ? Math.max(0, scrollTop) : 0
+  const safeViewport = Number.isFinite(viewportHeightPx) ? Math.max(0, viewportHeightPx) : 440
+  const startIndex = Math.floor(safeScrollTop / ROW_HEIGHT_PX)
+  const visibleCount = Math.ceil(safeViewport / ROW_HEIGHT_PX)
   const endIndex = startIndex + visibleCount
   return { startIndex, endIndex, visibleCount }
 }

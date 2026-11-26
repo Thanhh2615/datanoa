@@ -1,4 +1,5 @@
 import * as https from 'node:https'
+import * as net from 'node:net'
 import type * as tls from 'node:tls'
 import type {
   ApplyChangesParams,
@@ -28,7 +29,7 @@ import {
   runDriverConnectionTest,
 } from '../common/driver'
 import type { DriverTlsOptions } from '../common/tls-and-tunnel'
-import { resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
+import { buildDefaultTlsOptions, resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
 import {
   assembleTableBrowseResult,
   buildSelectPageSql,
@@ -43,10 +44,60 @@ import { stripCommentsAndLiterals, isMutatingStatement } from '../common/sql-lex
 import { compactSql, quoteIdentForDialect, reconstructTableDdl, splitSqlStatements } from '../common/sql-tools'
 
 const CLICKHOUSE_HTTP_TIMEOUT_MS = 30_000
+const MAX_CLICKHOUSE_RESPONSE_BYTES = 32 * 1024 * 1024
 const CLICKHOUSE_UNSUPPORTED_TX_REASON =
   'ClickHouse does not support interactive multi-statement transactions'
 const CLICKHOUSE_MAX_INSERT_ROWS_PER_STMT = 500
 const CLICKHOUSE_MAX_INSERT_SQL_BYTES = 256 * 1024
+
+function formatClickHouseHost(host: string): string {
+  const trimmed = host.trim()
+  if (trimmed.startsWith('[') && trimmed.endsWith(']')) return trimmed
+  const zoneIdx = trimmed.indexOf('%')
+  const bare = zoneIdx >= 0 ? trimmed.slice(0, zoneIdx) : trimmed
+  return net.isIP(bare) === 6 ? `[${trimmed}]` : trimmed
+}
+
+async function readBoundedClickHouseResponseText(
+  response: Response,
+  maxBytes: number
+): Promise<string> {
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    const text = await response.text()
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+      throw new DatabaseDriverError(
+        `ClickHouse response exceeded maximum size of ${maxBytes} bytes`,
+        'CLICKHOUSE_RESPONSE_TOO_LARGE',
+        'clickhouse'
+      )
+    }
+    return text
+  }
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value) {
+        total += value.byteLength
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {})
+          throw new DatabaseDriverError(
+            `ClickHouse response exceeded maximum size of ${maxBytes} bytes`,
+            'CLICKHOUSE_RESPONSE_TOO_LARGE',
+            'clickhouse'
+          )
+        }
+        chunks.push(value)
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  return Buffer.concat(chunks, total).toString('utf8')
+}
 
 interface ClickHouseJsonCompactResponse {
   meta?: Array<{ name: string; type: string }>
@@ -140,16 +191,36 @@ function sendHttpsRequest(
       url,
       { method: 'POST', headers, ...tlsOptions, agent: false, signal },
       (res) => {
-        res.setEncoding('utf8')
-        let text = ''
-        res.on('data', (chunk: string) => {
-          text += chunk
+        const chunks: Buffer[] = []
+        let total = 0
+        let abortedForSize = false
+        res.on('data', (chunk: Buffer | string) => {
+          if (abortedForSize) return
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8')
+          total += buf.byteLength
+          if (total > MAX_CLICKHOUSE_RESPONSE_BYTES) {
+            abortedForSize = true
+            res.destroy()
+            req.destroy()
+            reject(
+              new DatabaseDriverError(
+                `ClickHouse response exceeded maximum size of ${MAX_CLICKHOUSE_RESPONSE_BYTES} bytes`,
+                'CLICKHOUSE_RESPONSE_TOO_LARGE',
+                'clickhouse'
+              )
+            )
+            return
+          }
+          chunks.push(buf)
         })
-        res.on('error', reject)
+        res.on('error', (err) => {
+          if (!abortedForSize) reject(err)
+        })
         res.on('end', () => {
+          if (abortedForSize) return
           const summary = res.headers['x-clickhouse-summary']
           resolve({
-            text,
+            text: Buffer.concat(chunks, total).toString('utf8'),
             ok: (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300,
             status: res.statusCode ?? 0,
             summaryHeader: typeof summary === 'string' ? summary : null,
@@ -182,10 +253,10 @@ export function normalizeClickHouseBaseUrl(
     if (raw.length > 0) {
       return stripClickHouseUrlCredentials(raw.replace(/^https:\/\//i, 'http://'))
     }
-    return `http://${profile.host || 'localhost'}:${profile.port || 8123}`
+    return `http://${formatClickHouseHost(profile.host || 'localhost')}:${profile.port || 8123}`
   }
   if (tlsOverride) {
-    const host = profile.host || 'localhost'
+    const host = formatClickHouseHost(profile.host || 'localhost')
     const rawUrl = typeof profile.url === 'string' ? profile.url.trim() : ''
     if (rawUrl.length === 0) return `https://${host}:${profile.port || 8443}`
     // Custom CA / mTLS requires HTTPS: upgrade plain http:// URLs so https.request
@@ -213,7 +284,7 @@ function resolveClickHouseBaseUrl(profile: ConnectionProfile): string {
 
   const ssl = Boolean(profile.ssl)
   const proto = ssl ? 'https' : 'http'
-  const host = profile.host || 'localhost'
+  const host = formatClickHouseHost(profile.host || 'localhost')
   const port = profile.port || (ssl ? 8443 : 8123)
   return `${proto}://${host}:${port}`
 }
@@ -393,6 +464,7 @@ export class ClickHouseSession implements IDatabaseSession {
       allowPlainTextExplain?: boolean
       signal?: AbortSignal
       maxResultRows?: number
+      timeoutMs?: number
     },
     retryWithoutSettings = false
   ): Promise<{
@@ -415,12 +487,11 @@ export class ClickHouseSession implements IDatabaseSession {
       url.searchParams.set('readonly', '1')
       sentSettings = true
     }
-    if (options?.expectJsonCompact && !this.profile.readOnly && allowSettings) {
+    if (options?.expectJsonCompact && allowSettings) {
       url.searchParams.set('output_format_json_quote_denormals', '1')
       sentSettings = true
     }
     if (
-      !this.profile.readOnly &&
       allowSettings &&
       typeof options?.maxResultRows === 'number' &&
       Number.isFinite(options.maxResultRows) &&
@@ -433,7 +504,11 @@ export class ClickHouseSession implements IDatabaseSession {
 
     const bodySql = prepareClickHouseSql(sql, Boolean(options?.expectJsonCompact))
 
-    const combinedSignal = buildCombinedAbortSignal(CLICKHOUSE_HTTP_TIMEOUT_MS, options?.signal)
+    const effectiveTimeoutMs =
+      typeof options?.timeoutMs === 'number' && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+        ? options.timeoutMs
+        : CLICKHOUSE_HTTP_TIMEOUT_MS
+    const combinedSignal = buildCombinedAbortSignal(effectiveTimeoutMs, options?.signal)
     const headers = this.buildHeaders()
     try {
       if (this.tlsOptions === undefined) {
@@ -444,7 +519,10 @@ export class ClickHouseSession implements IDatabaseSession {
           redirect: 'error',
           signal: combinedSignal,
         })
-        const text = await response.text()
+        const text = await readBoundedClickHouseResponseText(
+          response,
+          MAX_CLICKHOUSE_RESPONSE_BYTES
+        )
         return finishClickHouseHttp(
           text,
           response.ok,
@@ -481,7 +559,7 @@ export class ClickHouseSession implements IDatabaseSession {
       }
       if (errName === 'TimeoutError' || errName === 'AbortError') {
         throw new DatabaseDriverError(
-          `ClickHouse HTTP request timed out after ${CLICKHOUSE_HTTP_TIMEOUT_MS}ms`,
+          `ClickHouse HTTP request timed out after ${effectiveTimeoutMs}ms`,
           'TIMEOUT',
           'clickhouse',
           err
@@ -1120,7 +1198,12 @@ export class ClickHouseSession implements IDatabaseSession {
     return reconstructTableDdl(details, 'clickhouse')
   }
 
-  async runQuery(queryId: string, sql: string, maxRows = 1000): Promise<QueryResult> {
+  async runQuery(
+    queryId: string,
+    sql: string,
+    maxRows = 1000,
+    timeoutMs?: number
+  ): Promise<QueryResult> {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'clickhouse')
     }
@@ -1128,14 +1211,6 @@ export class ClickHouseSession implements IDatabaseSession {
     if (!trimmed) {
       throw new DatabaseDriverError('SQL statement cannot be empty', 'invalid_params', 'clickhouse')
     }
-
-    const controller = new AbortController()
-    const active: ActiveClickHouseQuery = {
-      controller,
-      cancelled: false,
-      currentServerQueryId: queryId,
-    }
-    this.activeQueries.set(queryId, active)
 
     const start = performance.now()
     const stmts = splitSqlStatements(trimmed, 'clickhouse').map((s) => s.text)
@@ -1151,8 +1226,16 @@ export class ClickHouseSession implements IDatabaseSession {
       )
     }
 
+    const controller = new AbortController()
+    const active: ActiveClickHouseQuery = {
+      controller,
+      cancelled: false,
+      currentServerQueryId: queryId,
+    }
+
     let currentExecIndex = -1
     try {
+      this.activeQueries.set(queryId, active)
       let totalAffectedRows = 0
       let lastSelect: Omit<QueryResult, 'executionTimeMs'> | null = null
       const collectedSets: QueryResultSet[] = []
@@ -1176,6 +1259,7 @@ export class ClickHouseSession implements IDatabaseSession {
           allowPlainTextExplain: isPlainExplain,
           signal: controller.signal,
           maxResultRows: expectRows && !isCustomNonJsonCompact && maxRows > 0 ? maxRows + 1 : undefined,
+          timeoutMs,
         })
         if (!expectRows) {
           const affected = res.summaryAffectedRows ?? 0
@@ -1298,7 +1382,7 @@ export class ClickHouseSession implements IDatabaseSession {
 
     try {
       await this.executeHttp(
-        `KILL QUERY WHERE query_id = '${escapeClickHouseLiteralText(targetServerQueryId)}' SYNC`
+        `KILL QUERY WHERE query_id = '${escapeClickHouseLiteralText(targetServerQueryId)}' ASYNC`
       )
     } catch {
       // Best-effort server-side kill
@@ -1338,11 +1422,17 @@ export class ClickHouseDriver implements IDatabaseDriver {
     secret?: string,
     extraSecrets?: DriverTlsOptions
   ): Promise<IDatabaseSession> {
-    const tlsOverride = await resolveEffectiveTlsOptions(
+    let tlsOverride = await resolveEffectiveTlsOptions(
       profile,
       extraSecrets,
       extraSecrets?.tlsServername
     )
+    const wantsHttps =
+      profile.ssl === true ||
+      /^(?:https|clickhouses):\/\//i.test((profile.url || '').trim())
+    if (tlsOverride === undefined && wantsHttps && extraSecrets?.tlsServername) {
+      tlsOverride = buildDefaultTlsOptions(extraSecrets.tlsServername)
+    }
     return new ClickHouseSession(profile, secret, tlsOverride)
   }
 

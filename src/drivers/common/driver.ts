@@ -251,6 +251,112 @@ export function copyFailedStatementMeta<T extends Error>(source: unknown, target
   return target
 }
 
+export type ConnectionHealthState =
+  | 'Online'
+  | 'Degraded'
+  | 'Reconnecting'
+  | 'Offline'
+  | 'Parked'
+
+export interface HealthPolicyOptions {
+  baseBackoffMs?: number
+  maxBackoffMs?: number
+  maxConsecutiveFailuresBeforeOffline?: number
+  maxReconnectAttempts?: number
+}
+
+export interface HealthPolicySnapshot {
+  state: ConnectionHealthState
+  consecutiveFailures: number
+  reconnectAttempts: number
+  nextBackoffMs: number
+  lastError?: string
+}
+
+/**
+ * Pure deterministic connection health state machine (`Online` / `Degraded` /
+ * `Reconnecting` / `Offline` / `Parked`). Enforces bounded exponential backoff and
+ * strictly forbids automatic reconnect while a transaction is active.
+ */
+export class HealthPolicy {
+  private state: ConnectionHealthState = 'Online'
+  private consecutiveFailures = 0
+  private reconnectAttempts = 0
+  private lastError: string | undefined
+  private readonly baseBackoffMs: number
+  private readonly maxBackoffMs: number
+  private readonly maxFailuresBeforeOffline: number
+  private readonly maxReconnectAttempts: number
+
+  constructor(options: HealthPolicyOptions = {}) {
+    this.baseBackoffMs = Math.max(50, options.baseBackoffMs ?? 500)
+    this.maxBackoffMs = Math.max(this.baseBackoffMs, options.maxBackoffMs ?? 30_000)
+    this.maxFailuresBeforeOffline = Math.max(1, options.maxConsecutiveFailuresBeforeOffline ?? 3)
+    this.maxReconnectAttempts = Math.max(1, options.maxReconnectAttempts ?? 5)
+  }
+
+  getState(): ConnectionHealthState {
+    return this.state
+  }
+
+  getSnapshot(): HealthPolicySnapshot {
+    return {
+      state: this.state,
+      consecutiveFailures: this.consecutiveFailures,
+      reconnectAttempts: this.reconnectAttempts,
+      nextBackoffMs: this.computeBackoffMs(),
+      ...(this.lastError ? { lastError: this.lastError } : {}),
+    }
+  }
+
+  canAutoReconnect(txActive: boolean): boolean {
+    if (txActive) return false
+    if (this.state === 'Parked') return false
+    return this.reconnectAttempts < this.maxReconnectAttempts
+  }
+
+  computeBackoffMs(): number {
+    if (this.reconnectAttempts <= 0) return this.baseBackoffMs
+    const exp = Math.min(20, this.reconnectAttempts - 1)
+    return Math.min(this.maxBackoffMs, this.baseBackoffMs * Math.pow(2, exp))
+  }
+
+  recordSuccess(): ConnectionHealthState {
+    this.state = 'Online'
+    this.consecutiveFailures = 0
+    this.reconnectAttempts = 0
+    this.lastError = undefined
+    return this.state
+  }
+
+  recordFailure(errorMessage?: string): ConnectionHealthState {
+    if (this.state === 'Parked') return this.state
+    this.consecutiveFailures += 1
+    if (errorMessage) this.lastError = errorMessage
+    this.state =
+      this.consecutiveFailures >= this.maxFailuresBeforeOffline ? 'Offline' : 'Degraded'
+    return this.state
+  }
+
+  beginReconnect(txActive: boolean): { allowed: boolean; backoffMs: number; state: ConnectionHealthState } {
+    if (!this.canAutoReconnect(txActive)) {
+      return { allowed: false, backoffMs: 0, state: this.state }
+    }
+    this.reconnectAttempts += 1
+    this.state = 'Reconnecting'
+    return { allowed: true, backoffMs: this.computeBackoffMs(), state: this.state }
+  }
+
+  park(): ConnectionHealthState {
+    this.state = 'Parked'
+    return this.state
+  }
+
+  reset(): ConnectionHealthState {
+    return this.recordSuccess()
+  }
+}
+
 export interface IDatabaseSession {
   readonly driverType: DriverType
   readonly profile: ConnectionProfile
@@ -295,7 +401,12 @@ export interface IDatabaseSession {
   getDdl(table: string, schema?: string): Promise<string>
 
   /** Runs arbitrary SQL or engine command with execution timing and truncation */
-  runQuery(queryId: string, sql: string, maxRows?: number): Promise<QueryResult>
+  runQuery(
+    queryId: string,
+    sql: string,
+    maxRows?: number,
+    timeoutMs?: number
+  ): Promise<QueryResult>
 
   /** Cancels an actively running query by queryId */
   cancelQuery(queryId: string): Promise<{ ok: boolean }>

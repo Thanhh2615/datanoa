@@ -54,7 +54,7 @@ import {
 } from '../common/driver'
 import { TableDetailsCache } from '../common/schema'
 import type { DriverTlsOptions } from '../common/tls-and-tunnel'
-import { resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
+import { buildDefaultTlsOptions, resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
 
 export interface MongoCursorLike {
   sort(sort: Record<string, unknown>): MongoCursorLike
@@ -69,6 +69,8 @@ export interface MongoCursorLike {
 export interface MongoAggregateCursorLike {
   explain?: (verbosity?: string) => Promise<unknown>
   toArray(): Promise<Record<string, unknown>[]>
+  hasNext?: () => Promise<boolean>
+  next?: () => Promise<Record<string, unknown> | null>
   close?: () => Promise<void>
 }
 
@@ -802,9 +804,15 @@ export class MongoLiteralParser {
         }
         this.pos++ // skip ':'
         const val = this.parseValue()
-        if (key !== '__proto__' && key !== 'constructor' && key !== 'prototype') {
-          obj[key] = val
+        if (key === '__proto__') {
+          throw new Error('Disallowed property name "__proto__" in MongoDB object literal')
         }
+        Object.defineProperty(obj, key, {
+          value: val,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        })
         const next = this.peekChar()
         if (next === ',') {
           this.pos++
@@ -997,15 +1005,48 @@ function coerceIdCandidateIfNeeded(field: string, value: unknown): { isDual: boo
   return { isDual: false, single: value }
 }
 
+const MAX_MONGO_FILTER_DEPTH = 64
+
+function assertSafeMongoFilterField(col: string): void {
+  if (!col || col.trim().length === 0) {
+    throw new Error('Filter field name cannot be empty')
+  }
+  if (col.startsWith('$') || col.includes('.$')) {
+    throw new Error(`Disallowed MongoDB operator path in filter field "${col}"`)
+  }
+  const segments = col.split('.')
+  for (const seg of segments) {
+    if (seg === '__proto__' || seg === 'constructor' || seg === 'prototype') {
+      throw new Error(`Disallowed prototype property segment "${seg}" in filter field "${col}"`)
+    }
+    if (seg.startsWith('$')) {
+      throw new Error(`Disallowed MongoDB operator segment "${seg}" in filter field "${col}"`)
+    }
+  }
+}
+
 export function translateSqlFilterToMongoFilter(whereClause: string): Record<string, unknown> {
   const tokens = tokenizeSqlFilter(whereClause)
   if (tokens.length === 0) return {}
   let pos = 0
+  let depth = 0
 
   const peek = (): SqlFilterToken | undefined => tokens[pos]
   const next = (): SqlFilterToken => {
     if (pos >= tokens.length) throw new Error('Unexpected end of filter clause')
     return tokens[pos++]
+  }
+
+  const withDepth = <T>(fn: () => T): T => {
+    depth += 1
+    if (depth > MAX_MONGO_FILTER_DEPTH) {
+      throw new Error(`Filter expression exceeds maximum nesting depth (${MAX_MONGO_FILTER_DEPTH})`)
+    }
+    try {
+      return fn()
+    } finally {
+      depth -= 1
+    }
   }
 
   const parseScalarValue = (): unknown => {
@@ -1022,18 +1063,25 @@ export function translateSqlFilterToMongoFilter(whereClause: string): Record<str
   const parsePrimary = (): Record<string, unknown> => {
     const tok = peek()
     if (!tok) throw new Error('Unexpected end of filter clause')
+    if (tok.kind === 'kw' && tok.value === 'NOT') {
+      next()
+      return withDepth(() => ({ $nor: [parsePrimary()] }))
+    }
     if (tok.kind === 'lparen') {
       next()
-      const inner = parseOr()
-      const close = next()
-      if (close.kind !== 'rparen') throw new Error('Missing closing ")" in filter clause')
-      return inner
+      return withDepth(() => {
+        const inner = parseOr()
+        const close = next()
+        if (close.kind !== 'rparen') throw new Error('Missing closing ")" in filter clause')
+        return inner
+      })
     }
     const colTok = next()
     if (colTok.kind !== 'ident') {
       throw new Error('Expected column name in filter predicate')
     }
     const col = colTok.value
+    assertSafeMongoFilterField(col)
     const opTok = peek()
     if (!opTok) throw new Error(`Expected operator after "${col}"`)
 
@@ -1163,26 +1211,32 @@ export function translateSqlFilterToMongoFilter(whereClause: string): Record<str
   return result
 }
 
-function parseMongoOrderByClause(orderByClause: string): Record<string, 1 | -1> {
+export function parseMongoOrderByClause(orderByClause: string): Record<string, 1 | -1> {
   const trimmed = orderByClause.trim().replace(/^ORDER\s+BY\b\s*/i, '').trim()
-  if (!trimmed) return {}
+  if (!trimmed) return Object.create(null) as Record<string, 1 | -1>
   if (trimmed.startsWith('{')) {
     const parsed = parseRelaxedMongoObject(trimmed, 'orderByClause')
-    const out: Record<string, 1 | -1> = {}
+    const out = Object.create(null) as Record<string, 1 | -1>
     for (const [k, v] of Object.entries(parsed)) {
+      assertSafeMongoFilterField(k)
       out[k] = Number(v) < 0 ? -1 : 1
     }
     return out
   }
-  const out: Record<string, 1 | -1> = {}
+  const out = Object.create(null) as Record<string, 1 | -1>
   for (const part of trimmed.split(',')) {
     const item = part.trim()
     if (!item) continue
     const m = /^(?:"([^"]+)"|`([^`]+)`|\[([^\]]+)\]|([A-Za-z0-9_$.-]+))(?:\s+(ASC|DESC))?$/i.exec(item)
-    if (!m) continue
+    if (!m) {
+      throw new Error(`Invalid ORDER BY clause term "${item}"`)
+    }
     const col = m[1] || m[2] || m[3] || m[4]
     const dir = m[5]?.toUpperCase() === 'DESC' ? -1 : 1
-    if (col) out[col] = dir
+    if (col) {
+      assertSafeMongoFilterField(col)
+      out[col] = dir
+    }
   }
   return out
 }
@@ -1935,11 +1989,20 @@ export async function buildMongoConnectionConfig(
     if (profile.sslCaPath?.trim()) options.tlsCAFile = profile.sslCaPath.trim()
     if (tlsOverride.cert) options.cert = tlsOverride.cert
     if (tlsOverride.key) options.key = tlsOverride.key
-    const certKeyPath = profile.sslCertPath?.trim() || profile.sslKeyPath?.trim()
-    if (certKeyPath) options.tlsCertificateKeyFile = certKeyPath
+    const trimmedCertPath = profile.sslCertPath?.trim()
+    const trimmedKeyPath = profile.sslKeyPath?.trim()
+    // Only set tlsCertificateKeyFile when cert and key are a single combined PEM file;
+    // when distinct cert and key files are provided, pass tlsOverride.cert + tlsOverride.key directly.
+    if (trimmedCertPath && (!trimmedKeyPath || trimmedCertPath === trimmedKeyPath)) {
+      options.tlsCertificateKeyFile = trimmedCertPath
+    } else if (trimmedKeyPath && !trimmedCertPath) {
+      options.tlsCertificateKeyFile = trimmedKeyPath
+    }
     if (typeof tlsOverride.passphrase === 'string' && tlsOverride.passphrase.length > 0) {
       options.passphrase = tlsOverride.passphrase
-      options.tlsCertificateKeyFilePassword = tlsOverride.passphrase
+      if (options.tlsCertificateKeyFile) {
+        options.tlsCertificateKeyFilePassword = tlsOverride.passphrase
+      }
     }
     if (tlsOverride.servername) options.servername = tlsOverride.servername
     if (tlsOverride.checkServerIdentity) options.checkServerIdentity = tlsOverride.checkServerIdentity
@@ -1952,6 +2015,11 @@ export async function buildMongoConnectionConfig(
     }
   } else if (profile.ssl === true) {
     options.tls = true
+    if (extraSecrets?.tlsServername) {
+      const defTls = buildDefaultTlsOptions(extraSecrets.tlsServername)
+      if (defTls.servername) options.servername = defTls.servername
+      if (defTls.checkServerIdentity) options.checkServerIdentity = defTls.checkServerIdentity
+    }
   } else if (profile.ssl === false) {
     options.tls = false
   }
@@ -2388,14 +2456,22 @@ export class MongoSession implements IDatabaseSession {
       }
     }
 
-    let sort: Record<string, 1 | -1> = {}
-    if (typeof params.orderByClause === 'string' && params.orderByClause.trim().length > 0) {
-      sort = parseMongoOrderByClause(params.orderByClause)
-    } else if (typeof params.sortColumn === 'string' && params.sortColumn.trim().length > 0) {
-      sort = {
-        [params.sortColumn.trim()]:
-          String(params.sortDirection || 'ASC').toUpperCase() === 'DESC' ? -1 : 1,
+    let sort: Record<string, 1 | -1> = Object.create(null) as Record<string, 1 | -1>
+    try {
+      if (typeof params.orderByClause === 'string' && params.orderByClause.trim().length > 0) {
+        sort = parseMongoOrderByClause(params.orderByClause)
+      } else if (typeof params.sortColumn === 'string' && params.sortColumn.trim().length > 0) {
+        const sortCol = params.sortColumn.trim()
+        assertSafeMongoFilterField(sortCol)
+        sort[sortCol] = String(params.sortDirection || 'ASC').toUpperCase() === 'DESC' ? -1 : 1
       }
+    } catch (err: unknown) {
+      throw new DatabaseDriverError(
+        `Invalid MongoDB sort clause: ${err instanceof Error ? err.message : String(err)}`,
+        'invalid_params',
+        'mongodb',
+        err
+      )
     }
 
     return await this.runScrubbed('Failed to fetch MongoDB page', 'QUERY_ERROR', async () => {
@@ -3222,8 +3298,21 @@ export class MongoSession implements IDatabaseSession {
       const batch = cursor.firstBatch.filter((item): item is Record<string, unknown> =>
         isPlainRecord(item)
       )
+      const rawCursorId = cursor.id
+      const hasMoreCursor =
+        rawCursorId !== undefined &&
+        rawCursorId !== null &&
+        String(rawCursorId) !== '0'
+      if (hasMoreCursor) {
+        const ns = typeof cursor.ns === 'string' ? cursor.ns : ''
+        const dotIdx = ns.indexOf('.')
+        const colName = dotIdx >= 0 ? ns.slice(dotIdx + 1) : ''
+        if (colName) {
+          await db.command({ killCursors: colName, cursors: [rawCursorId] }, callOpts).catch(() => {})
+        }
+      }
       const limit = maxRows > 0 ? maxRows : batch.length
-      const truncated = batch.length > limit
+      const truncated = hasMoreCursor || batch.length > limit
       const sliced = batch.slice(0, limit)
       return { ...buildQueryResultFromDocs(sliced, truncated), mutates }
     }
@@ -3519,9 +3608,11 @@ export class MongoSession implements IDatabaseSession {
               break
             case 'explain':
               explainVerbosity =
-                typeof chain.args[0] === 'string' && chain.args[0].trim().length > 0
-                  ? chain.args[0].trim()
-                  : 'queryPlanner'
+                chain.args[0] === true
+                  ? 'executionStats'
+                  : typeof chain.args[0] === 'string' && chain.args[0].trim().length > 0
+                    ? chain.args[0].trim()
+                    : 'queryPlanner'
               break
             case 'toArray':
               break
@@ -3636,9 +3727,11 @@ export class MongoSession implements IDatabaseSession {
         const cursor = coll.aggregate(pipeline, { ...(aggOpts ?? {}), ...callOpts })
         if (explainChain) {
           const verbosity =
-            typeof explainChain.args[0] === 'string' && explainChain.args[0].trim().length > 0
-              ? explainChain.args[0].trim()
-              : 'queryPlanner'
+            explainChain.args[0] === true
+              ? 'executionStats'
+              : typeof explainChain.args[0] === 'string' && explainChain.args[0].trim().length > 0
+                ? explainChain.args[0].trim()
+                : 'queryPlanner'
           const explainDoc =
             typeof cursor.explain === 'function'
               ? await cursor.explain(verbosity)
@@ -3659,17 +3752,39 @@ export class MongoSession implements IDatabaseSession {
 
         active.activeCursor = cursor
         try {
-          const docs = await cursor.toArray()
-          const limit = maxRows > 0 ? maxRows : docs.length
-          const truncated = docs.length > limit
-          const sliced = truncated ? docs.slice(0, limit) : docs
+          const iterCursor = cursor as MongoAggregateCursorLike & {
+            hasNext?: () => Promise<boolean>
+            next?: () => Promise<Record<string, unknown> | null>
+          }
+          let docs: Record<string, unknown>[]
+          let truncated = false
+          if (maxRows > 0 && typeof iterCursor.hasNext === 'function' && typeof iterCursor.next === 'function') {
+            docs = []
+            while (await iterCursor.hasNext()) {
+              if (active.cancelled || active.controller.signal.aborted) break
+              const doc = await iterCursor.next()
+              if (doc !== null && doc !== undefined) {
+                if (docs.length >= maxRows) {
+                  truncated = true
+                  break
+                }
+                docs.push(doc)
+              }
+            }
+          } else {
+            const allDocs = await cursor.toArray()
+            const limit = maxRows > 0 ? maxRows : allDocs.length
+            truncated = allDocs.length > limit
+            docs = truncated ? allDocs.slice(0, limit) : allDocs
+          }
           return {
-            result: buildQueryResultFromDocs(sliced, truncated),
+            result: buildQueryResultFromDocs(docs, truncated),
             nextDbName: currentDbName,
             mutates: hasMongoWriteStage(pipeline),
           }
         } finally {
           active.activeCursor = undefined
+          await cursor.close?.().catch(() => {})
         }
       }
 
@@ -4096,124 +4211,127 @@ export class MongoSession implements IDatabaseSession {
       }
     }
 
-    if (!this.autoCommit && this.activeTxSession === null) {
-      await this.runScrubbed('Failed to start MongoDB transaction', 'TX_START_FAILED', async () => {
-        await this.runExclusiveTxOp(async () => {
+    const executeRun = async (): Promise<QueryResult> => {
+      if (!this.autoCommit && this.activeTxSession === null) {
+        await this.runScrubbed('Failed to start MongoDB transaction', 'TX_START_FAILED', async () => {
           if (!this.autoCommit && this.activeTxSession === null) {
             await this.beginTransactionLocked()
           }
         })
-      })
-    }
-
-    const activeEntry: ActiveMongoQuery = {
-      controller: new AbortController(),
-      cancelled: false,
-    }
-    this.activeQueries.set(queryId, activeEntry)
-    const startTime = performance.now()
-
-    let currentExecIdx = -1
-    try {
-      let currentDbName = this.dbName
-      let totalAffectedRows = 0
-      let lastSelect: Omit<QueryResult, 'executionTimeMs'> | null = null
-      let lastResult: Omit<QueryResult, 'executionTimeMs'> | null = null
-      const collectedSets: QueryResultSet[] = []
-      let mutatedAny = false
-
-      for (let idx = 0; idx < parsedStmts.length; idx++) {
-        if (activeEntry.cancelled || activeEntry.controller.signal.aborted || this.isClosed) {
-          throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'mongodb')
-        }
-        currentExecIdx = idx
-        const stmt = parsedStmts[idx]
-        const stmtStart = performance.now()
-        const { result, nextDbName, mutates } = await this.executeSingleMongoStatement(
-          stmt,
-          currentDbName,
-          activeEntry,
-          maxRows
-        )
-        currentDbName = nextDbName
-        if (mutates) mutatedAny = true
-        if (this.activeTxSession !== null) this.statementCount++
-
-        lastResult = result
-        if (result.isSelect) lastSelect = result
-        totalAffectedRows += result.affectedRows ?? 0
-
-        if (parsedStmts.length > 1) {
-          collectedSets.push({
-            index: idx,
-            sqlPreview: stmt.raw.replace(/\s+/g, ' ').slice(0, 80),
-            sql: stmt.raw,
-            executionTimeMs: Math.round(performance.now() - stmtStart),
-            columns: result.columns,
-            rows: result.rows,
-            rowCount: result.rowCount,
-            ...(result.affectedRows !== undefined ? { affectedRows: result.affectedRows } : {}),
-            truncated: result.truncated,
-            isSelect: result.isSelect,
-            ...(result.sourceTable ? { sourceTable: result.sourceTable } : {}),
-          })
-        }
       }
 
-      if (mutatedAny) {
-        this.tableDetailsCache.clear()
-        for (const s of parsedStmts) {
-          if (
-            (s.kind === 'db_method' && s.method === 'dropDatabase') ||
-            (s.kind === 'collection_method' &&
-              (s.method === 'drop' || s.method === 'renameCollection'))
-          ) {
-            this.knownColumnTypes.clear()
-            break
+      const activeEntry: ActiveMongoQuery = {
+        controller: new AbortController(),
+        cancelled: false,
+      }
+      this.activeQueries.set(queryId, activeEntry)
+      const startTime = performance.now()
+
+      let currentExecIdx = -1
+      try {
+        let currentDbName = this.dbName
+        let totalAffectedRows = 0
+        let lastSelect: Omit<QueryResult, 'executionTimeMs'> | null = null
+        let lastResult: Omit<QueryResult, 'executionTimeMs'> | null = null
+        const collectedSets: QueryResultSet[] = []
+        let mutatedAny = false
+
+        for (let idx = 0; idx < parsedStmts.length; idx++) {
+          if (activeEntry.cancelled || activeEntry.controller.signal.aborted || this.isClosed) {
+            throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'mongodb')
+          }
+          currentExecIdx = idx
+          const stmt = parsedStmts[idx]
+          const stmtStart = performance.now()
+          const { result, nextDbName, mutates } = await this.executeSingleMongoStatement(
+            stmt,
+            currentDbName,
+            activeEntry,
+            maxRows
+          )
+          currentDbName = nextDbName
+          if (mutates) mutatedAny = true
+          if (this.activeTxSession !== null) this.statementCount++
+
+          lastResult = result
+          if (result.isSelect) lastSelect = result
+          totalAffectedRows += result.affectedRows ?? 0
+
+          if (parsedStmts.length > 1) {
+            collectedSets.push({
+              index: idx,
+              sqlPreview: stmt.raw.replace(/\s+/g, ' ').slice(0, 80),
+              sql: stmt.raw,
+              executionTimeMs: Math.round(performance.now() - stmtStart),
+              columns: result.columns,
+              rows: result.rows,
+              rowCount: result.rowCount,
+              ...(result.affectedRows !== undefined ? { affectedRows: result.affectedRows } : {}),
+              truncated: result.truncated,
+              isSelect: result.isSelect,
+              ...(result.sourceTable ? { sourceTable: result.sourceTable } : {}),
+            })
           }
         }
-      }
 
-      const executionTimeMs = Math.round(performance.now() - startTime)
-      if (parsedStmts.length === 1 && lastResult) {
-        return { ...lastResult, executionTimeMs }
-      }
-      const primary = lastSelect ?? lastResult
-      if (!primary) {
-        return {
-          columns: [],
-          rows: [],
-          rowCount: 0,
-          affectedRows: totalAffectedRows,
-          executionTimeMs,
-          truncated: false,
-          isSelect: false,
+        if (mutatedAny) {
+          this.tableDetailsCache.clear()
+          for (const s of parsedStmts) {
+            if (
+              (s.kind === 'db_method' && s.method === 'dropDatabase') ||
+              (s.kind === 'collection_method' &&
+                (s.method === 'drop' || s.method === 'renameCollection'))
+            ) {
+              this.knownColumnTypes.clear()
+              break
+            }
+          }
         }
+
+        const executionTimeMs = Math.round(performance.now() - startTime)
+        if (parsedStmts.length === 1 && lastResult) {
+          return { ...lastResult, executionTimeMs }
+        }
+        const primary = lastSelect ?? lastResult
+        if (!primary) {
+          return {
+            columns: [],
+            rows: [],
+            rowCount: 0,
+            affectedRows: totalAffectedRows,
+            executionTimeMs,
+            truncated: false,
+            isSelect: false,
+          }
+        }
+        return {
+          ...primary,
+          affectedRows: totalAffectedRows,
+          resultSets: collectedSets,
+          executionTimeMs,
+        }
+      } catch (err: unknown) {
+        if (activeEntry.cancelled || activeEntry.controller.signal.aborted) {
+          throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'mongodb', err)
+        }
+        const scrubbed = scrubMongoError(err, 'MongoDB query failed', 'QUERY_ERROR')
+        if (
+          chunksAligned &&
+          currentExecIdx >= 0 &&
+          !this.isClosed &&
+          scrubbed.code !== 'cancelled' &&
+          scrubbed.code !== 'SESSION_CLOSED'
+        ) {
+          throw attachFailedStatementMeta(scrubbed, currentExecIdx, parsedStmts.length)
+        }
+        throw scrubbed
+      } finally {
+        this.activeQueries.delete(queryId)
       }
-      return {
-        ...primary,
-        affectedRows: totalAffectedRows,
-        resultSets: collectedSets,
-        executionTimeMs,
-      }
-    } catch (err: unknown) {
-      if (activeEntry.cancelled || activeEntry.controller.signal.aborted) {
-        throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'mongodb', err)
-      }
-      const scrubbed = scrubMongoError(err, 'MongoDB query failed', 'QUERY_ERROR')
-      if (
-        chunksAligned &&
-        currentExecIdx >= 0 &&
-        !this.isClosed &&
-        scrubbed.code !== 'cancelled' &&
-        scrubbed.code !== 'SESSION_CLOSED'
-      ) {
-        throw attachFailedStatementMeta(scrubbed, currentExecIdx, parsedStmts.length)
-      }
-      throw scrubbed
-    } finally {
-      this.activeQueries.delete(queryId)
     }
+
+    const needsTxLock = !this.autoCommit || this.activeTxSession !== null
+    return needsTxLock ? await this.runExclusiveTxOp(executeRun) : await executeRun()
   }
 
   async cancelQuery(queryId: string): Promise<{ ok: boolean }> {
@@ -4372,6 +4490,8 @@ function wrapAggregateCursor(cursor: AggregationCursor<Document>): MongoAggregat
   return {
     explain: (verbosity) => cursor.explain(verbosity || 'queryPlanner'),
     toArray: () => cursor.toArray(),
+    hasNext: () => cursor.hasNext(),
+    next: () => cursor.next(),
     close: () => cursor.close(),
   }
 }

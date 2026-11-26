@@ -8,7 +8,13 @@ import {
   formatDataExport,
   formatSqlInList,
 } from '../drivers/common/sql-tools.js'
-import type { CellCoord, GridSelectionModel } from './grid-selection.js'
+import {
+  compareExactDecimal,
+  parseExactDecimal,
+  type CellCoord,
+  type ExactDecimal,
+  type GridSelectionModel,
+} from './grid-selection.js'
 import type { ColumnHeaderFilterOp } from './sql-column-filter.js'
 import {
   formatCellValue,
@@ -304,26 +310,100 @@ export function computeGridFindMatches(
   return { matches, matchKeys }
 }
 
+interface CellSortKey {
+  rank: number
+  boolVal?: number
+  numSubRank?: number
+  decVal?: ExactDecimal
+  strLower?: string
+  strRaw?: string
+}
+
+function stringifySortObject(val: unknown): string {
+  if (val instanceof Date) {
+    const t = val.getTime()
+    return Number.isNaN(t) ? 'Invalid Date' : val.toISOString()
+  }
+  try {
+    const serialized = JSON.stringify(val)
+    if (typeof serialized === 'string') return serialized
+  } catch {
+    // Fall back to String() for circular structures
+  }
+  return String(val)
+}
+
+function buildCellSortKey(v: unknown): CellSortKey {
+  if (typeof v === 'boolean') {
+    return { rank: 0, boolVal: v ? 1 : 0 }
+  }
+  if (typeof v === 'number') {
+    if (Number.isNaN(v)) return { rank: 1, numSubRank: 3 }
+    if (v === Number.NEGATIVE_INFINITY) return { rank: 1, numSubRank: 0 }
+    if (v === Number.POSITIVE_INFINITY) return { rank: 1, numSubRank: 2 }
+    const dec = parseExactDecimal(v)
+    if (dec !== null) return { rank: 1, numSubRank: 1, decVal: dec }
+  }
+  if (typeof v === 'bigint') {
+    const dec = parseExactDecimal(v)
+    if (dec !== null) return { rank: 1, numSubRank: 1, decVal: dec }
+    const s = v.toString()
+    return { rank: 2, strLower: s, strRaw: s }
+  }
+  if (typeof v === 'string') {
+    const trimmed = v.trim()
+    if (trimmed !== '') {
+      const dec = parseExactDecimal(trimmed)
+      if (dec !== null) {
+        return { rank: 1, numSubRank: 1, decVal: dec }
+      }
+    }
+    return { rank: 2, strLower: v.toLowerCase(), strRaw: v }
+  }
+  const objStr = stringifySortObject(v)
+  return { rank: 3, strLower: objStr.toLowerCase(), strRaw: objStr }
+}
+
+/**
+ * Strict weak ordering comparator for grid sorting.
+ * Guarantees irreflexivity, antisymmetry, and transitivity across mixed types,
+ * BigInt / exact decimals, negative numeric strings (-10 < -2), and objects.
+ * NULL / undefined always sort last regardless of sort direction.
+ */
 export function compareGridCellValues(va: unknown, vb: unknown, factor: 1 | -1): number {
-  if (va === vb) return 0
-  if (va === null || va === undefined) return 1
-  if (vb === null || vb === undefined) return -1
-  if (typeof va === 'number' && typeof vb === 'number') {
-    return (va - vb) * factor
+  const aNull = va === null || va === undefined
+  const bNull = vb === null || vb === undefined
+  if (aNull && bNull) return 0
+  if (aNull) return 1
+  if (bNull) return -1
+  if (Object.is(va, vb)) return 0
+
+  const ka = buildCellSortKey(va)
+  const kb = buildCellSortKey(vb)
+  if (ka.rank !== kb.rank) {
+    return (ka.rank - kb.rank) * factor
   }
-  const na = Number(va)
-  const nb = Number(vb)
-  if (
-    !Number.isNaN(na) &&
-    !Number.isNaN(nb) &&
-    String(va).trim() !== '' &&
-    String(vb).trim() !== ''
-  ) {
-    return (na - nb) * factor
+  if (ka.rank === 0) {
+    return ((ka.boolVal ?? 0) - (kb.boolVal ?? 0)) * factor
   }
-  return (
-    String(va).localeCompare(String(vb), undefined, { numeric: true, sensitivity: 'base' }) * factor
-  )
+  if (ka.rank === 1) {
+    const sa = ka.numSubRank ?? 1
+    const sb = kb.numSubRank ?? 1
+    if (sa !== sb) return (sa - sb) * factor
+    if (sa === 1 && ka.decVal && kb.decVal) {
+      return compareExactDecimal(ka.decVal, kb.decVal) * factor
+    }
+    return 0
+  }
+  const la = ka.strLower ?? ''
+  const lb = kb.strLower ?? ''
+  if (la < lb) return -1 * factor
+  if (la > lb) return 1 * factor
+  const ra = ka.strRaw ?? ''
+  const rb = kb.strRaw ?? ''
+  if (ra < rb) return -1 * factor
+  if (ra > rb) return 1 * factor
+  return 0
 }
 
 export function buildGridSelectionSnapshot(opts: {

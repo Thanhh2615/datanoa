@@ -11,7 +11,17 @@ import {
   completionStatus,
   keymap,
 } from '../vendor/codemirror.js'
-import { isolateActiveSqlStatement } from './shared-sql-core.js'
+import {
+  getDialectLexerRules,
+  isPostgresEscapeStringStart,
+  isolateActiveSqlStatement,
+  matchDollarQuoteTag,
+  scanBlockCommentEnd,
+  scanBracketIdentEnd,
+  scanLineCommentEnd,
+  scanOracleQuoteEnd,
+  scanQuotedSegmentEnd,
+} from './shared-sql-core.js'
 import { analyzeSqlDiagnostics } from './shared-sql-diagnostics.js'
 import { containsSensitiveSqlText } from './shared-sql-safety.js'
 
@@ -132,71 +142,99 @@ export function remainder(offered, cursorOffset, typed) {
 }
 
 function scanQuoteCommentState(prefix, dialect) {
-  let state = 'normal'
-  const allowHash = dialect !== 'mssql' && dialect !== 'oracle' && dialect !== 'mongodb'
-  const allowDashDash = dialect !== 'mongodb'
-  const allowSlashSlash = dialect === 'mongodb'
-  for (let i = 0; i < prefix.length; i += 1) {
+  const rules = getDialectLexerRules(dialect)
+  let i = 0
+  const len = prefix.length
+  while (i < len) {
     const ch = prefix[i]
     const next = prefix[i + 1]
-    if (state === 'single' || state === 'double' || state === 'backtick') {
-      const q = state === 'single' ? "'" : state === 'double' ? '"' : '`'
-      if (state !== 'backtick' && ch === '\\' && (next === q || next === '\\')) {
-        i += 1
+    if (rules.lineCommentDash && ch === '-' && next === '-') {
+      const end = scanLineCommentEnd(prefix, i)
+      if (end >= len && prefix[len - 1] !== '\n' && prefix[len - 1] !== '\r') {
+        return 'line_comment'
+      }
+      i = end
+      continue
+    }
+    if (rules.lineCommentSlash && ch === '/' && next === '/') {
+      const end = scanLineCommentEnd(prefix, i)
+      if (end >= len && prefix[len - 1] !== '\n' && prefix[len - 1] !== '\r') {
+        return 'line_comment'
+      }
+      i = end
+      continue
+    }
+    if (rules.lineCommentHash && ch === '#') {
+      const end = scanLineCommentEnd(prefix, i - 1)
+      if (end >= len && prefix[len - 1] !== '\n' && prefix[len - 1] !== '\r') {
+        return 'line_comment'
+      }
+      i = end
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      const end = scanBlockCommentEnd(prefix, i, rules.nestedBlockComments)
+      if (end >= len && !prefix.slice(i + 2).endsWith('*/')) {
+        return 'block_comment'
+      }
+      i = end
+      continue
+    }
+    if (rules.oracleQQuote) {
+      const oq = scanOracleQuoteEnd(prefix, i, dialect)
+      if (oq) {
+        if (!oq.closed) return 'single'
+        i = oq.end
         continue
       }
-      if (ch === q) {
-        if (next === q) {
-          i += 1
-          continue
-        }
-        state = 'normal'
+    }
+    if (rules.dollarQuoting && ch === '$') {
+      const tag = matchDollarQuoteTag(prefix, i)
+      if (tag) {
+        const closeAt = prefix.indexOf(tag, i + tag.length)
+        if (closeAt === -1) return 'single'
+        i = closeAt + tag.length
+        continue
       }
+    }
+    if (
+      rules.postgresEscapeString &&
+      (ch === 'E' || ch === 'e') &&
+      next === "'" &&
+      isPostgresEscapeStringStart(prefix, i, dialect)
+    ) {
+      const seg = scanQuotedSegmentEnd(prefix, i + 1, "'", true)
+      if (!seg.closed) return 'single'
+      i = seg.end
       continue
     }
-    if (state === 'line_comment') {
-      if (ch === '\n') state = 'normal'
+    if (ch === "'") {
+      const seg = scanQuotedSegmentEnd(prefix, i, "'", rules.backslashEscapesSingleQuote)
+      if (!seg.closed) return 'single'
+      i = seg.end
       continue
     }
-    if (state === 'block_comment') {
-      if (ch === '*' && next === '/') {
-        state = 'normal'
-        i += 1
-      }
+    if (ch === '"' && rules.doubleQuoteIdentifiers) {
+      const seg = scanQuotedSegmentEnd(prefix, i, '"', rules.backslashEscapesDoubleQuote)
+      if (!seg.closed) return 'double'
+      i = seg.end
       continue
     }
-    if (state === 'bracket') {
-      if (ch === ']') {
-        if (next === ']') {
-          i += 1
-          continue
-        }
-        state = 'normal'
-      }
+    if (ch === '`' && rules.backtickIdentifiers) {
+      const seg = scanQuotedSegmentEnd(prefix, i, '`', false)
+      if (!seg.closed) return 'backtick'
+      i = seg.end
       continue
     }
-    if (allowDashDash && ch === '-' && next === '-') {
-      state = 'line_comment'
-      i += 1
-    } else if (allowSlashSlash && ch === '/' && next === '/') {
-      state = 'line_comment'
-      i += 1
-    } else if (allowHash && ch === '#') {
-      state = 'line_comment'
-    } else if (ch === '/' && next === '*') {
-      state = 'block_comment'
-      i += 1
-    } else if (ch === "'") {
-      state = 'single'
-    } else if (ch === '"') {
-      state = 'double'
-    } else if (ch === '`') {
-      state = 'backtick'
-    } else if (dialect === 'mssql' && ch === '[') {
-      state = 'bracket'
+    if (ch === '[' && rules.bracketIdentifiers !== 'none') {
+      const seg = scanBracketIdentEnd(prefix, i, rules.bracketIdentifiers === 'doubling')
+      if (!seg.closed) return 'bracket'
+      i = seg.end
+      continue
     }
+    i += 1
   }
-  return state
+  return 'normal'
 }
 
 export function shouldSkipInlineTrigger(prefix, suffix, dialect) {
@@ -205,6 +243,14 @@ export function shouldSkipInlineTrigger(prefix, suffix, dialect) {
   const isolated = isolateActiveSqlStatement(safePrefix, safeSuffix, dialect)
   const state = safePrefix ? scanQuoteCommentState(isolated.stmtPrefix, dialect) : 'normal'
   if (state === 'line_comment' || state === 'block_comment') {
+    return true
+  }
+  // Unclosed dollar-quote or Oracle q-quote string literal
+  if (
+    state === 'single' &&
+    ((getDialectLexerRules(dialect).dollarQuoting && /\$[A-Za-z_]?[A-Za-z0-9_]*\$[^$]*$/.test(isolated.stmtPrefix)) ||
+      (getDialectLexerRules(dialect).oracleQQuote && /\bn?q'[^\s]/i.test(isolated.stmtPrefix)))
+  ) {
     return true
   }
 
@@ -369,9 +415,12 @@ export function computePostApplyCursor(edits, originalOffset, newDocLength) {
   }
   let runningDelta = 0
   let deltaBefore = 0
+  let exactInsertPos = null
   let touchedCursorPos = null
   for (const e of edits) {
-    if (e.from <= originalOffset && originalOffset <= e.to) {
+    if (e.from === originalOffset && e.to === originalOffset) {
+      exactInsertPos = e.from + runningDelta + e.insert.length
+    } else if (e.from <= originalOffset && originalOffset <= e.to) {
       touchedCursorPos = e.from + runningDelta + e.insert.length
     }
     const hunkDelta = e.insert.length - (e.to - e.from)
@@ -380,8 +429,40 @@ export function computePostApplyCursor(edits, originalOffset, newDocLength) {
     }
     runningDelta += hunkDelta
   }
-  const target = touchedCursorPos !== null ? touchedCursorPos : originalOffset + deltaBefore
+  const target =
+    exactInsertPos !== null
+      ? exactInsertPos
+      : touchedCursorPos !== null
+        ? touchedCursorPos
+        : originalOffset + deltaBefore
   return clamp(0, newDocLength, target)
+}
+
+function sanitizeDirectEdits(rawEdits, docLength) {
+  if (!Array.isArray(rawEdits) || rawEdits.length === 0) return undefined
+  const valid = []
+  for (const e of rawEdits) {
+    if (
+      !e ||
+      typeof e.from !== 'number' ||
+      typeof e.to !== 'number' ||
+      typeof e.insert !== 'string' ||
+      !Number.isFinite(e.from) ||
+      !Number.isFinite(e.to)
+    ) {
+      return undefined
+    }
+    const from = Math.trunc(e.from)
+    const to = Math.trunc(e.to)
+    if (from < 0 || to < from || to > docLength) return undefined
+    if (from === to && e.insert.length === 0) return undefined
+    valid.push({ from, to, insert: e.insert })
+  }
+  valid.sort((a, b) => a.from - b.from || a.to - b.to)
+  for (let i = 1; i < valid.length; i += 1) {
+    if (valid[i].from < valid[i - 1].to) return undefined
+  }
+  return valid
 }
 
 export const ghostStateField = StateField.define({
@@ -397,19 +478,23 @@ export const ghostStateField = StateField.define({
         effectSet = true
       } else if (eff.is(setGhostEffect)) {
         if (hasActiveGhostPayload(eff.value)) {
-          const edits =
-            Array.isArray(eff.value.edits) && eff.value.edits.length > 0
-              ? eff.value.edits
-              : undefined
-          const mode =
-            eff.value.mode === 'edit' || eff.value.mode === 'complete' ? eff.value.mode : undefined
-          next = {
-            offset: eff.value.offset,
-            text: eff.value.text || '',
-            id: eff.value.id,
-            replaceChars: normalizeReplaceChars(eff.value.replaceChars, eff.value.offset),
-            ...(edits ? { edits } : {}),
-            ...(mode ? { mode } : {}),
+          const hasRawEdits = Array.isArray(eff.value.edits) && eff.value.edits.length > 0
+          const edits = hasRawEdits
+            ? sanitizeDirectEdits(eff.value.edits, tr.state.doc.length)
+            : undefined
+          if (hasRawEdits && !edits && !eff.value.text) {
+            next = null
+          } else {
+            const mode =
+              eff.value.mode === 'edit' || eff.value.mode === 'complete' ? eff.value.mode : undefined
+            next = {
+              offset: eff.value.offset,
+              text: typeof eff.value.text === 'string' ? eff.value.text : '',
+              id: eff.value.id,
+              replaceChars: normalizeReplaceChars(eff.value.replaceChars, eff.value.offset),
+              ...(edits ? { edits } : {}),
+              ...(mode ? { mode } : {}),
+            }
           }
         } else {
           next = null
@@ -505,9 +590,6 @@ function applyGhostChunk(view, chunk, kind) {
   const insertedText = chunk.replace(/\r\n?/g, '\n')
   const newOffset = replaceFrom + insertedText.length
   const effects = [
-    remaining
-      ? setGhostEffect.of({ offset: newOffset, text: remaining, id: ghost.id, replaceChars: 0 })
-      : clearGhostEffect.of(undefined),
     ghostAcceptedEffect.of({
       id: ghost.id,
       kind,
@@ -515,6 +597,9 @@ function applyGhostChunk(view, chunk, kind) {
       text: insertedText,
       partial: remaining.length > 0,
     }),
+    remaining
+      ? setGhostEffect.of({ offset: newOffset, text: remaining, id: ghost.id, replaceChars: 0 })
+      : clearGhostEffect.of(undefined),
   ]
   view.dispatch({
     changes: { from: replaceFrom, to: ghost.offset, insert: insertedText },
@@ -563,13 +648,13 @@ export function acceptGhostFull(view) {
       changes,
       selection: { anchor: targetCursor },
       effects: [
-        clearGhostEffect.of(undefined),
         ghostAcceptedEffect.of({
           id: ghost.id,
           kind: 'accepted',
           ranges,
           partial: false,
         }),
+        clearGhostEffect.of(undefined),
       ],
       userEvent: 'input.complete',
     })
@@ -589,8 +674,8 @@ export function acceptGhostWord(view) {
   if (!ghost || (Array.isArray(ghost.edits) && ghost.edits.length > 0)) {
     return false
   }
-  const match = /^(?:[ \t]*(?:\r?\n|[\w$]+|[^\s\w$\r\n]+)|[ \t]+)/.exec(ghost.text)
-  const chunk = match ? match[0] : ghost.text.slice(0, 1)
+  const match = /^(?:[ \t]*(?:\r?\n|[\p{L}\p{N}_$]+|[^\s\p{L}\p{N}_$\r\n]+)|[ \t]+)/u.exec(ghost.text)
+  const chunk = match ? match[0] : (Array.from(ghost.text)[0] ?? '')
   return applyGhostChunk(view, chunk, chunk.length === ghost.text.length ? 'accepted' : 'partial')
 }
 
@@ -727,13 +812,19 @@ export function createCmInlineAiExtension(options) {
       }
 
       handleTransactionEffects(vu) {
+        const allEffects = vu.transactions.flatMap((tr) => tr.effects)
         let handledAccept = false
-        for (const eff of vu.transactions.flatMap((tr) => tr.effects)) {
+        for (const eff of allEffects) {
           if (eff.is(ghostAcceptedEffect)) {
             handledAccept = true
             this.handleAcceptedEffect(vu, eff.value)
-          } else if (eff.is(clearGhostEffect) && this.lastOffered && !handledAccept) {
-            this.dropOffered('stale')
+          }
+        }
+        if (!handledAccept) {
+          for (const eff of allEffects) {
+            if (eff.is(clearGhostEffect) && this.lastOffered) {
+              this.dropOffered('stale')
+            }
           }
         }
         return handledAccept
@@ -747,6 +838,18 @@ export function createCmInlineAiExtension(options) {
           !(this.lastOffered.replaceChars > 0) &&
           !(Array.isArray(this.lastOffered.edits) && this.lastOffered.edits.length > 0)
         if (!isPureInsert) {
+          this.dropOffered('stale')
+          return false
+        }
+        // Verify the transaction was strictly a pure insertion at/after lastOffered.offset (no edits/deletions elsewhere)
+        let pureLocalInsert = true
+        const offeredOffset = this.lastOffered.offset
+        vu.changes.iterChanges((fromA, toA, fromB, toB) => {
+          if (fromA !== toA || fromA < offeredOffset || toB > sel.head || fromB < offeredOffset) {
+            pureLocalInsert = false
+          }
+        })
+        if (!pureLocalInsert) {
           this.dropOffered('stale')
           return false
         }
@@ -807,6 +910,9 @@ export function createCmInlineAiExtension(options) {
         const handledAccept = this.handleTransactionEffects(vu)
         if (!isEnabled() || vu.state.readOnly) {
           this.cancelPending()
+          if (this.lastOffered) {
+            this.dropOffered('stale')
+          }
           if (vu.state.field(ghostStateField, false)) {
             queueMicrotask(() => {
               if (!this.destroyed && this.view.state.field(ghostStateField, false)) {
@@ -942,7 +1048,16 @@ export function createCmInlineAiExtension(options) {
           this.cancelPending()
           return
         }
-        if (containsSensitiveSqlText(`${prefix}${suffix}`)) {
+        // Scan an expanded margin around the IPC slice (or entire doc up to 200 KiB) so boundary-straddling secrets cannot slip past
+        const docLen = state.doc.length
+        const sensitiveScanText =
+          docLen <= 200_000
+            ? state.doc.toString()
+            : state.doc.sliceString(
+                Math.max(0, offset - AI_MAX_IPC_PREFIX_CHARS - 512),
+                Math.min(docLen, offset + AI_MAX_IPC_SUFFIX_CHARS + 512)
+              )
+        if (containsSensitiveSqlText(sensitiveScanText)) {
           this.cancelPending()
           return
         }
@@ -961,7 +1076,15 @@ export function createCmInlineAiExtension(options) {
             ...(mode && mode !== 'auto' ? { mode } : {}),
           })
           if (this.inflight === flight) this.inflight = null
-          if (this.destroyed || ac.signal.aborted || !isEnabled()) return
+          if (
+            this.destroyed ||
+            ac.signal.aborted ||
+            !isEnabled() ||
+            this.view.state.readOnly ||
+            getDialect() !== dialect
+          ) {
+            return
+          }
           const elapsedMs = Math.max(0, Date.now() - startedAt)
           this.estimatedLatencyMs =
             this.estimatedLatencyMs > 0
@@ -975,12 +1098,14 @@ export function createCmInlineAiExtension(options) {
             resolvedEdits = resolveDocEdits(res.edits, offset, this.view.state.doc.length)
             if (!resolvedEdits) return
           }
-          if (!res.suggestion && !resolvedEdits) return
+          const normalizedSuggestion =
+            typeof res.suggestion === 'string' ? res.suggestion.replace(/\r\n?/g, '\n') : ''
+          if (!normalizedSuggestion && !resolvedEdits) return
 
           const replaceChars = normalizeReplaceChars(res.replaceChars, offset)
           const nextGhost = {
             offset,
-            text: res.suggestion || '',
+            text: normalizedSuggestion,
             id: res.id,
             replaceChars,
             ...(resolvedEdits ? { edits: resolvedEdits } : {}),
@@ -1009,6 +1134,28 @@ export function createCmInlineAiExtension(options) {
     }
   )
 
+  let escapeTabArmed = false
+
+  const resetEscapeTabListener = EditorView.updateListener.of((vu) => {
+    if (vu.docChanged || vu.selectionSet) {
+      escapeTabArmed = false
+    }
+  })
+
+  function handleEscapeKey(view) {
+    if (clearGhostCommand(view)) {
+      escapeTabArmed = false
+      return true
+    }
+    if (completionStatus(view.state) === 'active') {
+      escapeTabArmed = false
+      return false
+    }
+    // WCAG 2.1.2 keyboard focus escape: pressing Escape in idle editor lets next Tab leave the editor
+    escapeTabArmed = true
+    return false
+  }
+
   function insertTabSpaces(view, sel) {
     view.dispatch({
       changes: { from: sel.from, to: sel.to, insert: '  ' },
@@ -1019,6 +1166,10 @@ export function createCmInlineAiExtension(options) {
   }
 
   function handleTabKey(view) {
+    if (escapeTabArmed) {
+      escapeTabArmed = false
+      return false
+    }
     if (view.state.readOnly) {
       return false
     }
@@ -1044,12 +1195,13 @@ export function createCmInlineAiExtension(options) {
       !shouldSkipInlineTrigger(prefix, suffix, dialect)
 
     if (completionStatus(view.state) === 'active') {
+      // Allow CM6 completion acceptance BEFORE inline AI trigger so Tab never breaks autocomplete
+      if (acceptCompletion(view)) {
+        return true
+      }
       if (canTriggerAi) {
         closeCompletion(view)
         view.plugin(plugin)?.triggerImmediate()
-        return true
-      }
-      if (acceptCompletion(view)) {
         return true
       }
       return insertTabSpaces(view, sel)
@@ -1063,6 +1215,7 @@ export function createCmInlineAiExtension(options) {
   }
 
   function triggerManualEditCommand(view) {
+    escapeTabArmed = false
     if (view.state.readOnly || !isEnabled() || typeof requestCompletion !== 'function') {
       return false
     }
@@ -1081,13 +1234,14 @@ export function createCmInlineAiExtension(options) {
     ghostStateField,
     ghostDecorations,
     plugin,
+    resetEscapeTabListener,
     Prec.highest(
       keymap.of([
         { key: 'Tab', run: handleTabKey },
         { key: 'Alt-\\', run: triggerManualEditCommand },
         { key: 'Mod-ArrowRight', run: acceptGhostWord },
         { key: 'Mod-Alt-ArrowRight', run: acceptGhostLine },
-        { key: 'Escape', run: clearGhostCommand },
+        { key: 'Escape', run: handleEscapeKey },
       ])
     ),
   ]

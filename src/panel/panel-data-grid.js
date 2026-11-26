@@ -360,8 +360,37 @@ export function createPanelDataGridController(ctx) {
     return true
   }
 
+  function isPanelCellValueEqual(a, b) {
+    if (Object.is(a, b)) return true
+    if (a && b && typeof a === 'object' && typeof b === 'object') {
+      try {
+        return JSON.stringify(a) === JSON.stringify(b)
+      } catch {
+        return false
+      }
+    }
+    return false
+  }
+
+  function isBinaryPanelCellValue(value) {
+    if (value instanceof Uint8Array || value instanceof ArrayBuffer) return true
+    if (typeof value === 'string' && /^\[(?:BLOB|BINARY)\b[^\]]*\]$/i.test(value.trim())) {
+      return true
+    }
+    if (
+      value &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      value.type === 'Buffer' &&
+      Array.isArray(value.data)
+    ) {
+      return true
+    }
+    return false
+  }
+
   function stageCellValue(rowKey, rowObj, colName, nextVal, deferRender = false, patchTd = null) {
-    if (isSubmittingChanges()) return
+    if (isSubmittingChanges() || state.dataLoading || isActiveDataObjectView()) return
     const conn = getActiveConn()
     if (conn?.readOnly) {
       showBanner('Read-Only connection — cannot stage changes.', 'danger')
@@ -395,7 +424,7 @@ export function createPanelDataGridController(ctx) {
       entry = { primaryKeys, originalRow: { ...rowObj }, changes: {} }
       state.stagedUpdates.set(rowKey, entry)
     }
-    if (nextVal === origVal) {
+    if (isPanelCellValueEqual(nextVal, origVal)) {
       delete entry.changes[colName]
       if (Object.keys(entry.changes).length === 0) state.stagedUpdates.delete(rowKey)
     } else {
@@ -439,7 +468,9 @@ export function createPanelDataGridController(ctx) {
     if (coords.length === 0) return
     const rowObjs = allRows.map((entry) => {
       const out = {}
-      for (const col of visCols) {
+      // Include all table columns (including hidden PK columns) so sql-update WHERE clauses
+      // never lose non-null primary keys when PK columns are hidden or unselected.
+      for (const col of pd.columns) {
         out[col.name] = getEffectiveCellValue(entry.rowKey, entry.data, col.name)
       }
       return out
@@ -808,7 +839,7 @@ export function createPanelDataGridController(ctx) {
   }
 
   function bulkSetSelectedCellsValue(rawInput, options = {}) {
-    if (isSubmittingChanges() || getActiveConn()?.readOnly) return
+    if (isSubmittingChanges() || state.dataLoading || isActiveDataObjectView() || getActiveConn()?.readOnly) return
     const pd = state.pageData
     const dataGridSel = getDataGridSel()
     if (!pd || !dataGridSel) return
@@ -856,7 +887,7 @@ export function createPanelDataGridController(ctx) {
   }
 
   function cloneSelectedRows() {
-    if (isSubmittingChanges() || getActiveConn()?.readOnly) return
+    if (isSubmittingChanges() || state.dataLoading || isActiveDataObjectView() || getActiveConn()?.readOnly) return
     const pd = state.pageData
     if (!pd) return
     const rowKeys = getSelectedDataRowKeys()
@@ -897,7 +928,7 @@ export function createPanelDataGridController(ctx) {
   }
 
   function toggleDeleteSelectedRows() {
-    if (isSubmittingChanges() || getActiveConn()?.readOnly) return
+    if (isSubmittingChanges() || state.dataLoading || isActiveDataObjectView() || getActiveConn()?.readOnly) return
     const pd = state.pageData
     if (!pd) return
     const rowKeys = getSelectedDataRowKeys()
@@ -930,6 +961,9 @@ export function createPanelDataGridController(ctx) {
     }
     if (removedInsSet.size > 0) {
       state.stagedInserts = state.stagedInserts.filter((r) => !removedInsSet.has(r.tempId))
+      getDataGridSel()?.clear(true)
+      state.selectedRowKey = null
+      state.selectedCol = null
     }
     if (
       state.selectedRowKey &&
@@ -996,9 +1030,17 @@ export function createPanelDataGridController(ctx) {
     const pd = state.pageData
     if (!pd || !pd.columns?.length) return
     const visCols = getOrderedVisibleColumns()
-    const rows = getAllDisplayRows().map((entry) => {
+    const allDisplayRows = getAllDisplayRows()
+    const rows = allDisplayRows.map((entry) => {
       const out = {}
       for (const col of visCols) {
+        out[col.name] = getEffectiveCellValue(entry.rowKey, entry.data, col.name)
+      }
+      return out
+    })
+    const sourceRows = allDisplayRows.map((entry) => {
+      const out = {}
+      for (const col of pd.columns) {
         out[col.name] = getEffectiveCellValue(entry.rowKey, entry.data, col.name)
       }
       return out
@@ -1006,6 +1048,7 @@ export function createPanelDataGridController(ctx) {
     const text = formatExportData({
       columns: visCols,
       rows,
+      sourceRows,
       format,
       tableName: state.activeTable || 'table_name',
       schema: state.activeSchema,
@@ -1402,7 +1445,10 @@ export function createPanelDataGridController(ctx) {
       selectionController: getDataGridSel(),
       onBeforeDetachRow: (node) => {
         const activeInp = node.querySelector('input.cell-edit-input')
-        if (activeInp instanceof HTMLInputElement) activeInp.blur()
+        if (activeInp instanceof HTMLInputElement) {
+          activeInp.dataset.scrollDetached = '1'
+          activeInp.blur()
+        }
       },
       force,
     })
@@ -1836,7 +1882,7 @@ export function createPanelDataGridController(ctx) {
       1,
       Math.ceil(pd.totalRows / (pd.pageSize || state.pageSize || 100))
     )
-    $('dataPagerInfo').textContent = `${pd.totalRows} rows · Page ${pd.page} / ${totalPages}`
+    $('dataPagerInfo').textContent = `${pd.totalRows} rows${pd.truncated ? ' (truncated)' : ''} · Page ${pd.page} / ${totalPages}`
     $('prevPageBtn').disabled = pd.page <= 1
     $('nextPageBtn').disabled = pd.page >= totalPages
     if (state.transposed) {
@@ -1874,8 +1920,14 @@ export function createPanelDataGridController(ctx) {
         origin: null,
       }
     if (!isDataCellEditable(entry, col, pd, Boolean(getActiveConn()?.readOnly))) return
+    if (isBinaryPanelCellValue(currentVal)) {
+      showBanner(`Binary/BLOB cell "${col.name}" cannot be edited inline as text.`, 'warn')
+      return
+    }
     const column = col.name
     if (td.querySelector('input')) return
+    const originPageData = state.pageData
+    const originTableKey = getActiveTableKey()
     const initialEditText =
       currentVal === null || currentVal === undefined
         ? ''
@@ -1897,6 +1949,7 @@ export function createPanelDataGridController(ctx) {
     })
 
     const restoreCell = () => {
+      if (state.pageData !== originPageData || getActiveTableKey() !== originTableKey) return
       const fkInfo = (dataVirt.active ? dataVirt.fkMap : getActiveForeignKeyMap()).get(column) || null
       renderDataCellContent(td, entry, col, getEffectiveCellValue(rowKey, rowObj, column), fkInfo)
     }
@@ -1908,6 +1961,13 @@ export function createPanelDataGridController(ctx) {
     const commit = () => {
       if (done) return
       done = true
+      if (state.pageData !== originPageData || getActiveTableKey() !== originTableKey) {
+        return
+      }
+      if (!userTyped && input.value === initialEditText) {
+        restoreCell()
+        return
+      }
       const nextVal = coerceTypedCellInput(
         input.value,
         rowObj[column],
@@ -1921,12 +1981,7 @@ export function createPanelDataGridController(ctx) {
       if (e.key === 'Enter') {
         e.preventDefault()
         e.stopPropagation()
-        const isTextLike =
-          !isNumericSqlType(col.nativeType || col.type) &&
-          !isBooleanSqlType(col.nativeType || col.type)
-        if (currentVal === undefined && input.value === '' && !userTyped) {
-          cancel()
-        } else if (currentVal === null && input.value === '' && !isTextLike) {
+        if (!userTyped && input.value === initialEditText) {
           cancel()
         } else {
           commit()
@@ -1942,10 +1997,11 @@ export function createPanelDataGridController(ctx) {
         e.stopPropagation()
         if (done) return
         done = true
-        const isTextLike =
-          !isNumericSqlType(col.nativeType || col.type) &&
-          !isBooleanSqlType(col.nativeType || col.type)
-        if (input.value !== initialEditText || (userTyped && currentVal === null && isTextLike)) {
+        if (
+          state.pageData === originPageData &&
+          getActiveTableKey() === originTableKey &&
+          (input.value !== initialEditText || (userTyped && currentVal === null))
+        ) {
           const nextVal = coerceTypedCellInput(
             input.value,
             rowObj[column],
@@ -2043,10 +2099,16 @@ export function createPanelDataGridController(ctx) {
     })
     input.addEventListener('blur', () => {
       if (done) return
-      const isTextLike =
-        !isNumericSqlType(col.nativeType || col.type) &&
-        !isBooleanSqlType(col.nativeType || col.type)
-      if (input.value !== initialEditText || (userTyped && currentVal === null && isTextLike)) {
+      // Never auto-commit or stage stale edits when virtual scrolling or table switch detaches the row.
+      if (
+        input.dataset.scrollDetached === '1' ||
+        state.pageData !== originPageData ||
+        getActiveTableKey() !== originTableKey
+      ) {
+        cancel()
+        return
+      }
+      if (input.value !== initialEditText || (userTyped && currentVal === null)) {
         commit()
       } else {
         cancel()
@@ -2162,7 +2224,10 @@ export function createPanelDataGridController(ctx) {
     if (state.inspectorCollapsed) {
       drawer.style.height = ''
     } else {
-      const savedPx = Number(window.localStorage?.getItem('datanoa.panelValueInspectorPx'))
+      let savedPx = NaN
+      try {
+        savedPx = Number(window.localStorage?.getItem('datanoa.panelValueInspectorPx'))
+      } catch {}
       const targetPx = Number.isFinite(savedPx) && savedPx >= 148 ? Math.round(savedPx) : 220
       const boxH = drawer.parentElement?.getBoundingClientRect?.().height
       const maxAllowed = boxH && Number.isFinite(boxH) && boxH > 0 ? Math.max(148, Math.floor(boxH * 0.76)) : 560

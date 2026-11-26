@@ -1,5 +1,9 @@
+import * as https from 'node:https'
 import * as net from 'node:net'
+import type * as tls from 'node:tls'
 import { validateLibsqlEndpointUrl } from '../common/connection-uri'
+import type { DriverTlsOptions } from '../common/tls-and-tunnel'
+import { resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
 import { scrubDriverErrorText } from '../common/sql-credentials'
 import type {
   ApplyChangesParams,
@@ -364,18 +368,89 @@ interface ActiveLibsqlQuery {
   cancelled: boolean
 }
 
+function sendLibsqlHttpsPost(
+  url: URL,
+  headers: Record<string, string>,
+  body: string,
+  tlsOptions: tls.ConnectionOptions,
+  signal: AbortSignal,
+  maxBytes: number
+): Promise<{ text: string; ok: boolean; status: number }> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      url,
+      { method: 'POST', headers, ...tlsOptions, agent: false, signal },
+      (res) => {
+        const status = res.statusCode ?? 0
+        if (status >= 300 && status < 400) {
+          res.destroy()
+          reject(
+            new DatabaseDriverError(
+              `LibSQL HTTP redirect (HTTP ${status}) was blocked to protect credentials`,
+              'LIBSQL_ERROR',
+              'libsql'
+            )
+          )
+          return
+        }
+        const chunks: Buffer[] = []
+        let total = 0
+        let aborted = false
+        res.on('data', (chunk: Buffer | string) => {
+          if (aborted) return
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8')
+          total += buf.byteLength
+          if (total > maxBytes) {
+            aborted = true
+            res.destroy()
+            req.destroy()
+            reject(
+              new DatabaseDriverError(
+                `LibSQL HTTP response exceeded maximum size of ${maxBytes} bytes`,
+                'LIBSQL_RESPONSE_TOO_LARGE',
+                'libsql'
+              )
+            )
+            return
+          }
+          chunks.push(buf)
+        })
+        res.on('error', (err) => {
+          if (!aborted) reject(err)
+        })
+        res.on('end', () => {
+          if (aborted) return
+          resolve({
+            text: Buffer.concat(chunks, total).toString('utf8'),
+            ok: status >= 200 && status < 300,
+            status,
+          })
+        })
+      }
+    )
+    req.on('error', reject)
+    req.end(body)
+  })
+}
+
 export class LibsqlSession implements IDatabaseSession {
   readonly driverType = 'libsql' as const
   readonly profile: ConnectionProfile
   readonly pipelineUrl: string
   private readonly authToken?: string
+  private readonly tlsOptions?: tls.ConnectionOptions
   private readonly activeQueries = new Map<string, ActiveLibsqlQuery>()
   private readonly tableDetailsCache = new TableDetailsCache()
   private isClosed = false
 
-  constructor(profile: ConnectionProfile, authToken?: string) {
+  constructor(
+    profile: ConnectionProfile,
+    authToken?: string,
+    tlsOverride?: false | tls.ConnectionOptions
+  ) {
     this.profile = profile
     this.authToken = authToken
+    this.tlsOptions = tlsOverride === false ? undefined : tlsOverride
     this.pipelineUrl = resolveLibsqlPipelineUrl(profile, authToken)
   }
 
@@ -486,6 +561,7 @@ export class LibsqlSession implements IDatabaseSession {
       baton?: string | null
       baseUrl?: string | null
       signal?: AbortSignal
+      timeoutMs?: number
     }
   ): Promise<{
     baton: string | null
@@ -502,24 +578,52 @@ export class LibsqlSession implements IDatabaseSession {
       payload.baton = options.baton
     }
 
-    const combinedSignal = buildCombinedAbortSignal(LIBSQL_HTTP_TIMEOUT_MS, options?.signal)
-    let response: Response
+    const effectiveTimeoutMs =
+      typeof options?.timeoutMs === 'number' && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+        ? options.timeoutMs
+        : LIBSQL_HTTP_TIMEOUT_MS
+    const combinedSignal = buildCombinedAbortSignal(effectiveTimeoutMs, options?.signal)
+    const headers = this.buildHeaders()
+    const bodyText = JSON.stringify(payload)
+    let rawText: string
+    let responseOk: boolean
+    let responseStatus: number
+    let fetchedResponse: Response | null = null
     try {
-      response = await fetch(targetUrl, {
-        method: 'POST',
-        headers: this.buildHeaders(),
-        body: JSON.stringify(payload),
-        redirect: 'error',
-        signal: combinedSignal,
-      })
+      const parsedTarget = new URL(targetUrl)
+      if (this.tlsOptions !== undefined && parsedTarget.protocol === 'https:') {
+        const res = await sendLibsqlHttpsPost(
+          parsedTarget,
+          headers,
+          bodyText,
+          this.tlsOptions,
+          combinedSignal,
+          MAX_LIBSQL_RESPONSE_BYTES
+        )
+        rawText = res.text
+        responseOk = res.ok
+        responseStatus = res.status
+      } else {
+        fetchedResponse = await fetch(targetUrl, {
+          method: 'POST',
+          headers,
+          body: bodyText,
+          redirect: 'error',
+          signal: combinedSignal,
+        })
+        responseOk = fetchedResponse.ok
+        responseStatus = fetchedResponse.status
+        rawText = ''
+      }
     } catch (err: unknown) {
+      if (err instanceof DatabaseDriverError) throw err
       const errName = (err as { name?: string })?.name
       if (options?.signal?.aborted) {
         throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'libsql', err)
       }
       if (errName === 'TimeoutError' || errName === 'AbortError') {
         throw new DatabaseDriverError(
-          `LibSQL HTTP request timed out after ${LIBSQL_HTTP_TIMEOUT_MS}ms`,
+          `LibSQL HTTP request timed out after ${effectiveTimeoutMs}ms`,
           'TIMEOUT',
           'libsql',
           err
@@ -535,10 +639,26 @@ export class LibsqlSession implements IDatabaseSession {
       )
     }
 
-    const rawText = await readBoundedResponseText(response, MAX_LIBSQL_RESPONSE_BYTES)
-    if (!response.ok) {
+    if (fetchedResponse) {
+      try {
+        rawText = await readBoundedResponseText(fetchedResponse, MAX_LIBSQL_RESPONSE_BYTES)
+      } catch (err: unknown) {
+        if (err instanceof DatabaseDriverError) throw err
+        if (options?.signal?.aborted) {
+          throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'libsql', err)
+        }
+        throw new DatabaseDriverError(
+          `Invalid LibSQL Hrana response: ${scrubLibsqlErrorText(err instanceof Error ? err.message : String(err))}`,
+          'LIBSQL_PARSE_ERROR',
+          'libsql',
+          err
+        )
+      }
+    }
+
+    if (!responseOk) {
       throw new DatabaseDriverError(
-        scrubLibsqlErrorText(rawText.trim()) || `LibSQL HTTP error ${response.status}`,
+        scrubLibsqlErrorText(rawText.trim()) || `LibSQL HTTP error ${responseStatus}`,
         'LIBSQL_ERROR',
         'libsql'
       )
@@ -573,13 +693,14 @@ export class LibsqlSession implements IDatabaseSession {
 
   private async executePipeline(
     stmts: HranaExecuteStmt[],
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    timeoutMs?: number
   ): Promise<HranaExecuteResult[]> {
     const requests: HranaRequestItem[] = [
       ...stmts.map((stmt) => ({ type: 'execute' as const, stmt })),
       { type: 'close' as const },
     ]
-    const { results } = await this.sendHranaPipeline(requests, { signal })
+    const { results } = await this.sendHranaPipeline(requests, { signal, timeoutMs })
 
     const out: HranaExecuteResult[] = []
     for (let i = 0; i < stmts.length; i++) {
@@ -602,11 +723,13 @@ export class LibsqlSession implements IDatabaseSession {
   private async executeSingle(
     sql: string,
     params: unknown[] = [],
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    timeoutMs?: number
   ): Promise<HranaExecuteResult> {
     const [result] = await this.executePipeline(
       [{ sql, args: params.map(encodeHranaValue) }],
-      signal
+      signal,
+      timeoutMs
     )
     return result
   }
@@ -771,8 +894,6 @@ export class LibsqlSession implements IDatabaseSession {
       )
     }
 
-    this.tableDetailsCache.clear()
-
     const reloadQuery = buildSelectByPrimaryKeySql({
       driver: 'libsql',
       table: params.table,
@@ -899,15 +1020,17 @@ export class LibsqlSession implements IDatabaseSession {
       dmlResults.push(item.response?.result || {})
     }
 
-    // Verify optimistic concurrency lock (affected_row_count > 0 for every DELETE and UPDATE) BEFORE COMMIT!
+    // Verify optimistic concurrency lock (affected_row_count === 1 for every DELETE and UPDATE) BEFORE COMMIT!
     let offset = 0
     let deleted = 0
     for (let i = 0; i < batch.deletes.length; i++) {
       const count = Number(dmlResults[offset++]?.affected_row_count ?? 0)
-      if (count === 0) {
+      if (count !== 1) {
         await rollbackAndClose()
         throw new DatabaseDriverError(
-          'Record was modified or deleted by another session (optimistic lock conflict)',
+          count > 1
+            ? `Optimistic delete matched ${count} rows instead of 1`
+            : 'Record was modified or deleted by another session (optimistic lock conflict)',
           'conflict',
           'libsql'
         )
@@ -918,10 +1041,12 @@ export class LibsqlSession implements IDatabaseSession {
     let updated = 0
     for (let i = 0; i < batch.updates.length; i++) {
       const count = Number(dmlResults[offset++]?.affected_row_count ?? 0)
-      if (count === 0) {
+      if (count !== 1) {
         await rollbackAndClose()
         throw new DatabaseDriverError(
-          'Record was modified or deleted by another session (optimistic lock conflict)',
+          count > 1
+            ? `Optimistic update matched ${count} rows instead of 1`
+            : 'Record was modified or deleted by another session (optimistic lock conflict)',
           'conflict',
           'libsql'
         )
@@ -950,8 +1075,6 @@ export class LibsqlSession implements IDatabaseSession {
         'libsql'
       )
     }
-
-    this.tableDetailsCache.clear()
 
     return {
       ok: true,
@@ -1010,7 +1133,12 @@ export class LibsqlSession implements IDatabaseSession {
     return reconstructTableDdl(details, 'libsql')
   }
 
-  async runQuery(queryId: string, sql: string, maxRows = 1000): Promise<QueryResult> {
+  async runQuery(
+    queryId: string,
+    sql: string,
+    maxRows = 1000,
+    timeoutMs?: number
+  ): Promise<QueryResult> {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'libsql')
     }
@@ -1051,7 +1179,7 @@ export class LibsqlSession implements IDatabaseSession {
       if (stmts.length <= 1) {
         let res: HranaExecuteResult
         try {
-          res = await this.executeSingle(trimmed, [], controller.signal)
+          res = await this.executeSingle(trimmed, [], controller.signal, timeoutMs)
         } catch (singleErr: unknown) {
           if (
             !active.cancelled &&
@@ -1116,7 +1244,7 @@ export class LibsqlSession implements IDatabaseSession {
             { type: 'batch', batch: { steps } },
             { type: 'close' },
           ],
-          { signal: controller.signal }
+          { signal: controller.signal, timeoutMs }
         )
         const batchItem = results[0]
         if (!batchItem) {
@@ -1239,16 +1367,26 @@ export class LibsqlSession implements IDatabaseSession {
 export class LibsqlDriver implements IDatabaseDriver {
   readonly type = 'libsql' as const
 
-  async createSession(profile: ConnectionProfile, authToken?: string): Promise<IDatabaseSession> {
-    return new LibsqlSession(profile, authToken)
+  async createSession(
+    profile: ConnectionProfile,
+    authToken?: string,
+    extraSecrets?: DriverTlsOptions
+  ): Promise<IDatabaseSession> {
+    const tlsOverride = await resolveEffectiveTlsOptions(
+      profile,
+      extraSecrets,
+      extraSecrets?.tlsServername
+    )
+    return new LibsqlSession(profile, authToken, tlsOverride)
   }
 
   async testConnection(
     profile: ConnectionProfile,
-    authToken?: string
+    authToken?: string,
+    extraSecrets?: DriverTlsOptions
   ): Promise<{ ok: boolean; message?: string }> {
     return runDriverConnectionTest(
-      () => this.createSession(profile, authToken),
+      () => this.createSession(profile, authToken, extraSecrets),
       (err) => (err instanceof Error ? err.message : 'LibSQL connection failed')
     )
   }

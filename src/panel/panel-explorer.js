@@ -2,10 +2,12 @@
 // Side Panel Schema Explorer tree, SQL snippet generator, row counter, and unified context menu
 
 import {
+  ENGINE_BY_ID,
   quoteIdent,
   quoteTableRef,
   formatSqlLiteral,
   formatDdlForDisplay,
+  formatConnectionScopedMessage,
 } from './panel-core.js'
 import {
   $,
@@ -137,6 +139,7 @@ export function createPanelExplorerController(ctx) {
     loadSchema,
     selectTableAndOpen,
     showBanner,
+    showConnectionBanner,
     copyText,
     exportCurrentDataPage,
     exportCurrentSqlResult,
@@ -172,6 +175,16 @@ export function createPanelExplorerController(ctx) {
   } = ctx
 
   let countRowsSeq = 0
+  let sqlGenSeq = 0
+  const announcedSchemaErrors = new Map()
+
+  function reportConnectionError(connectionId, connObj, msg) {
+    if (typeof showConnectionBanner === 'function') {
+      showConnectionBanner(connectionId, msg, 'danger')
+    } else {
+      showBanner(formatConnectionScopedMessage(connObj, msg), 'danger')
+    }
+  }
 
   async function countRowsForTable(conn, obj) {
     if (!conn || !obj || conn.driver === 'redis') return
@@ -196,7 +209,8 @@ export function createPanelExplorerController(ctx) {
       showBanner(`${obj.name}: ${cnt ?? 0} ${isMongo ? 'document(s)' : 'row(s)'}`, 'success')
     } catch (err) {
       if (reqSeq !== countRowsSeq || !getConnById(targetConnId)) return
-      showBanner(`Count failed for ${obj.name}: ${err?.message || err}`, 'danger')
+      const msg = `Count failed for ${obj.name}: ${err?.message || err}`
+      reportConnectionError(targetConnId, conn, msg)
     }
   }
 
@@ -235,6 +249,67 @@ export function createPanelExplorerController(ctx) {
 
     const q = state.filter.trim().toLowerCase()
 
+    const createConnectionErrorBlock = (conn, schemaErr) => {
+      const errBox = document.createElement('div')
+      errBox.className = 'tree-conn-error'
+      const prevAnnounced = announcedSchemaErrors.get(conn.id)
+      if (!q && prevAnnounced !== schemaErr) {
+        errBox.setAttribute('role', 'alert')
+        announcedSchemaErrors.set(conn.id, schemaErr)
+      }
+
+      const errHead = document.createElement('div')
+      errHead.className = 'tree-conn-error-head'
+
+      const errIcon = document.createElement('span')
+      errIcon.className = 'tree-conn-error-icon'
+      errIcon.innerHTML =
+        '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>'
+
+      const errMsg = document.createElement('span')
+      errMsg.className = 'tree-conn-error-msg'
+      errMsg.textContent = schemaErr
+
+      errHead.append(errIcon, errMsg)
+      errBox.appendChild(errHead)
+
+      const errActions = document.createElement('div')
+      errActions.className = 'tree-conn-error-actions'
+
+      const isReloading = state.schemaLoading.has(conn.id)
+      const retryBtn = document.createElement('button')
+      retryBtn.type = 'button'
+      retryBtn.className = 'mini-btn'
+      retryBtn.dataset.action = 'retry-schema'
+      retryBtn.textContent = isReloading ? 'Retrying...' : 'Retry'
+      retryBtn.disabled = isReloading
+      if (isReloading) retryBtn.setAttribute('aria-busy', 'true')
+      retryBtn.addEventListener('click', (e) => {
+        e.stopPropagation()
+        if (state.schemaLoading.has(conn.id)) return
+        void loadSchema(conn.id)
+      })
+      errActions.appendChild(retryBtn)
+
+      const isEditable = !ENGINE_BY_ID[conn.driver]?.studioOnly
+      if (isEditable) {
+        const editBtn = document.createElement('button')
+        editBtn.type = 'button'
+        editBtn.className = 'mini-btn'
+        editBtn.dataset.action = 'edit-connection'
+        editBtn.textContent = 'Edit'
+        editBtn.addEventListener('click', (e) => {
+          e.stopPropagation()
+          const latest = getConnById(conn.id) || conn
+          populateFormFromProfile(latest, 'edit')
+        })
+        errActions.appendChild(editBtn)
+      }
+
+      errBox.appendChild(errActions)
+      return errBox
+    }
+
     const buildConnectionRow = (conn) => {
       const objects = state.schemaObjects[conn.id] || []
       const connSchemas = new Set(objects.map((o) => o.schema || '').filter(Boolean))
@@ -255,14 +330,17 @@ export function createPanelExplorerController(ctx) {
       if (q && !connMatches && matchingObjs.length === 0) return null
 
       const isConnOpen = state.expandedConns.has(conn.id) || (Boolean(q) && matchingObjs.length > 0)
+      const schemaErr =
+        typeof state.schemaErrors?.[conn.id] === 'string' ? state.schemaErrors[conn.id] : ''
       const connRow = document.createElement('div')
       connRow.className = 'tree-row'
+      connRow.dataset.connectionId = conn.id
 
       const connItem = document.createElement('div')
-      connItem.className = `tree-item tree-conn-item${state.activeConnectionId === conn.id ? ' active' : ''}`
+      connItem.className = `tree-item tree-conn-item${state.activeConnectionId === conn.id ? ' active' : ''}${schemaErr ? ' has-error' : ''}`
       connItem.setAttribute('role', 'button')
       connItem.tabIndex = 0
-      connItem.title = `${conn.name} (${conn.driver})${conn.folder ? ` — Folder: ${conn.folder}` : ''}`
+      connItem.title = `${conn.name} (${conn.driver})${conn.folder ? ` — Folder: ${conn.folder}` : ''}${schemaErr ? ` — Error: ${schemaErr}` : ''}`
 
       const chev = document.createElement('span')
       chev.className = `tree-chevron${isConnOpen ? ' open' : ''}`
@@ -277,6 +355,17 @@ export function createPanelExplorerController(ctx) {
       nameEl.textContent = conn.name
 
       connItem.append(chev, logo, nameEl)
+
+      if (schemaErr) {
+        const errDot = document.createElement('span')
+        errDot.className = 'conn-status-dot error'
+        errDot.setAttribute('role', 'img')
+        errDot.title = schemaErr
+        errDot.setAttribute('aria-label', `Connection error: ${schemaErr}`)
+        connItem.appendChild(errDot)
+      } else {
+        announcedSchemaErrors.delete(conn.id)
+      }
 
       if (state.schemaLoading.has(conn.id) && objects.length > 0) {
         const sp = document.createElement('span')
@@ -369,6 +458,10 @@ export function createPanelExplorerController(ctx) {
             childrenBox.appendChild(sk)
           }
         } else {
+          if (schemaErr) {
+            childrenBox.appendChild(createConnectionErrorBlock(conn, schemaErr))
+          }
+
           const listToShow = q && !connMatches ? matchingObjs : q ? matchingObjs : objects
           const tables = listToShow.filter((o) => o.kind === 'table')
           const views = listToShow.filter((o) => o.kind === 'view')
@@ -563,7 +656,7 @@ export function createPanelExplorerController(ctx) {
           renderObjGroup(getExplorerObjectGroupLabel(conn.driver), tables, false)
           renderObjGroup('Views', views, true)
 
-          if (tables.length === 0 && views.length === 0) {
+          if (tables.length === 0 && views.length === 0 && (!schemaErr || objects.length > 0)) {
             const none = document.createElement('div')
             none.className = 'col-leaf'
             none.textContent =
@@ -940,47 +1033,34 @@ export function createPanelExplorerController(ctx) {
         addItem(isMongo ? 'Count Docs' : 'Count Rows', () => countRowsForTable(conn, obj))
       }
       addSep()
-      addItem(isMongo ? 'Generate Find' : 'Generate SELECT', async () => {
-        await selectTableAndOpen(conn.id, obj.name, obj.schema, false)
-        let details = state.tableDetails[makeTableKey(conn.id, obj.name, obj.schema)]
+      const runSqlTemplateAction = async (kind) => {
+        const reqSeq = ++sqlGenSeq
+        const targetConnId = conn.id
+        await selectTableAndOpen(targetConnId, obj.name, obj.schema, false)
+        if (reqSeq !== sqlGenSeq) return
+        const connAfterSelect = state.activeConnectionId
+        let details = state.tableDetails[makeTableKey(targetConnId, obj.name, obj.schema)]
         if (!details) {
           details = await rpc('schema.tableDetails', {
-            connectionId: conn.id,
+            connectionId: targetConnId,
             table: obj.name,
             ...(obj.schema ? { schema: obj.schema } : {}),
           }).catch(() => null)
         }
-        setSqlText(generateSqlForTable('select', conn, obj, details))
+        if (reqSeq !== sqlGenSeq || state.activeConnectionId !== connAfterSelect) return
+        const latestConn = getConnById(targetConnId) || conn
+        setSqlText(generateSqlForTable(kind, latestConn, obj, details))
         switchTab('sql')
-      })
-      addItem(isMongo ? 'Generate Insert' : 'Generate INSERT', async () => {
-        await selectTableAndOpen(conn.id, obj.name, obj.schema, false)
-        let details = state.tableDetails[makeTableKey(conn.id, obj.name, obj.schema)]
-        if (!details) {
-          details = await rpc('schema.tableDetails', {
-            connectionId: conn.id,
-            table: obj.name,
-            ...(obj.schema ? { schema: obj.schema } : {}),
-          }).catch(() => null)
-        }
-        setSqlText(generateSqlForTable('insert', conn, obj, details))
-        switchTab('sql')
-      })
-      addItem(isMongo ? 'Generate Update' : 'Generate UPDATE', async () => {
-        await selectTableAndOpen(conn.id, obj.name, obj.schema, false)
-        let details = state.tableDetails[makeTableKey(conn.id, obj.name, obj.schema)]
-        if (!details) {
-          details = await rpc('schema.tableDetails', {
-            connectionId: conn.id,
-            table: obj.name,
-            ...(obj.schema ? { schema: obj.schema } : {}),
-          }).catch(() => null)
-        }
-        setSqlText(generateSqlForTable('update', conn, obj, details))
-        switchTab('sql')
-      })
+      }
+      addItem(isMongo ? 'Generate Find' : 'Generate SELECT', () => runSqlTemplateAction('select'))
+      addItem(isMongo ? 'Generate Insert' : 'Generate INSERT', () => runSqlTemplateAction('insert'))
+      addItem(isMongo ? 'Generate Update' : 'Generate UPDATE', () => runSqlTemplateAction('update'))
       addItem(isMongo ? 'Inspect Schema & Indexes' : 'Generate CREATE DDL', async () => {
-        await selectTableAndOpen(conn.id, obj.name, obj.schema, false)
+        const reqSeq = ++sqlGenSeq
+        const targetConnId = conn.id
+        await selectTableAndOpen(targetConnId, obj.name, obj.schema, false)
+        if (reqSeq !== sqlGenSeq) return
+        const connAfterSelect = state.activeConnectionId
         if (isMongo) {
           switchTab('structure')
           return
@@ -989,18 +1069,21 @@ export function createPanelExplorerController(ctx) {
           const ddlRes = await rpc(
             'schema.generateDdl',
             {
-              connectionId: conn.id,
+              connectionId: targetConnId,
               table: obj.name,
               ...(obj.schema ? { schema: obj.schema } : {}),
             },
             { timeoutMs: QUERY_TIMEOUT_MS }
           )
+          if (reqSeq !== sqlGenSeq || state.activeConnectionId !== connAfterSelect) return
           if (ddlRes?.ddl) {
             setSqlText(formatDdlForDisplay(ddlRes.ddl))
             switchTab('sql')
           }
         } catch (err) {
-          showBanner(err?.message || 'Failed to generate DDL', 'danger')
+          if (reqSeq !== sqlGenSeq || state.activeConnectionId !== connAfterSelect) return
+          const msg = err?.message || 'Failed to generate DDL'
+          reportConnectionError(targetConnId, conn, msg)
         }
       })
       if (!isRedis) {
@@ -1031,13 +1114,13 @@ export function createPanelExplorerController(ctx) {
         })
       }
       addItem('Jump to Console', () => {
-        resetSqlSafetyBannerDismissal?.()
         if (state.activeConnectionId !== conn.id) {
-          state.activeConnectionId = conn.id
-          void persistActiveConnectionId(conn.id)
+          activateConnection(conn.id)
+        } else {
+          resetSqlSafetyBannerDismissal?.()
+          renderConnectionsBar()
+          renderSqlSafetyBanner()
         }
-        renderConnectionsBar()
-        renderSqlSafetyBanner()
         switchTab('sql')
       })
       addSep()

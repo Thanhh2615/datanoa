@@ -120,8 +120,11 @@ export function resolveTlsSettings(
   if (sslMode === 'require' || sslMode === 'required') {
     return { ssl: true, sslMode: 'require', sslRejectUnauthorized: false }
   }
-  if (sslMode === 'prefer' || sslMode === 'allow') {
+  if (sslMode === 'prefer') {
     return { ssl: true }
+  }
+  if (sslMode === 'allow') {
+    return { ssl: defaultSsl }
   }
   if (sslMode.length > 0) {
     return {
@@ -440,7 +443,7 @@ function parseSqlNetworkUri(
     return { ok: false, error: `Invalid port in ${spec.driver} connection URI.` }
   }
 
-  const rawDb = decodeUriPart(url.pathname.replace(/^\/+/, ''))
+  const rawDb = decodeUriPart(url.pathname.replace(/^\/+/, '').replace(/\/+$/, ''))
   const hasOracleQueryTarget =
     spec.driver === 'oracle' &&
     ['sid', 'serviceName', 'service'].some((key) =>
@@ -591,7 +594,7 @@ function parseClickHouseUri(
   }
 
   const normalizedUrl = buildHttpOrigin(ssl ? 'https' : 'http', url.hostname, port)
-  const pathDb = decodeUriPart(url.pathname.replace(/^\/+/, ''))
+  const pathDb = decodeUriPart(url.pathname.replace(/^\/+/, '').replace(/\/+$/, ''))
   const database = pathDb || url.searchParams.get('database') || 'default'
   const user = url.username ? decodeUriPart(url.username) : (url.searchParams.get('user') || undefined)
   const rawPassword = url.password

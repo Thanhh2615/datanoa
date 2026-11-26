@@ -4,6 +4,16 @@ import {
   type SqlParserInstance,
 } from '../../vendor/sql-parser-pg-sqlite.js'
 import { MssqlParser, MysqlParser } from '../../vendor/sql-parser-mysql-mssql.js'
+import type { DatabaseDriverType } from '../protocol.js'
+import {
+  getDialectLexerRules,
+  isPostgresEscapeStringStart,
+  matchDollarQuoteTag,
+  scanBlockCommentEnd,
+  scanBracketIdentEnd,
+  scanLineCommentEnd,
+  scanQuotedSegmentEnd,
+} from '../shared-sql-core.js'
 
 const MAX_GRAMMAR_SQL_CHARS = 4000
 const MAX_GRAMMAR_CACHE_ENTRIES = 128
@@ -132,44 +142,70 @@ function getParserForDialect(key: GrammarDialectKey): SqlParserInstance {
   return instance
 }
 
-function hasNestedBlockComment(sql: string): boolean {
+function hasNestedBlockComment(sql: string, key: GrammarDialectKey): boolean {
+  const dialect: DatabaseDriverType = key
+  const rules = getDialectLexerRules(dialect)
+  const len = sql.length
   let depth = 0
-  let inQuote: string | null = null
-  for (let i = 0; i < sql.length; i += 1) {
+  let i = 0
+
+  while (i < len) {
     const ch = sql[i]
     const next = sql[i + 1]
-    if (inQuote) {
-      if (ch === '\\' && inQuote !== '`') {
-        i += 1
-      } else if (ch === inQuote) {
-        if (next === inQuote) i += 1
-        else inQuote = null
+
+    if (depth === 0) {
+      if (rules.lineCommentDash && ch === '-' && next === '-') {
+        i = scanLineCommentEnd(sql, i)
+        continue
       }
-      continue
+      if (rules.lineCommentHash && ch === '#') {
+        i = scanLineCommentEnd(sql, i - 1)
+        continue
+      }
+      if (isPostgresEscapeStringStart(sql, i, dialect)) {
+        i = scanQuotedSegmentEnd(sql, i + 1, "'", true).end
+        continue
+      }
+      if (rules.dollarQuoting && ch === '$') {
+        const tag = matchDollarQuoteTag(sql, i)
+        if (tag !== null) {
+          const closeIdx = sql.indexOf(tag, i + tag.length)
+          if (closeIdx < 0) return false
+          i = closeIdx + tag.length
+          continue
+        }
+      }
+      if (ch === "'" || ch === '"' || (ch === '`' && rules.backtickIdentifiers)) {
+        const allowBs =
+          (ch === "'" && rules.backslashEscapesSingleQuote) ||
+          (ch === '"' && rules.backslashEscapesDoubleQuote)
+        i = scanQuotedSegmentEnd(sql, i, ch, allowBs).end
+        continue
+      }
+      if (ch === '[' && rules.bracketIdentifiers !== 'none') {
+        i = scanBracketIdentEnd(sql, i, rules.bracketIdentifiers === 'doubling').end
+        continue
+      }
     }
-    if (depth === 0 && (ch === "'" || ch === '"' || ch === '`')) {
-      inQuote = ch
-      continue
-    }
-    if (depth === 0 && ch === '-' && next === '-') {
-      const nl = sql.indexOf('\n', i + 2)
-      if (nl === -1) return false
-      i = nl
-      continue
-    }
+
     if (ch === '/' && next === '*') {
       depth += 1
       if (depth > 1) return true
-      i += 1
-    } else if (depth > 0 && ch === '*' && next === '/') {
-      depth -= 1
-      i += 1
+      i += 2
+      continue
     }
+    if (depth > 0 && ch === '*' && next === '/') {
+      depth -= 1
+      i += 2
+      continue
+    }
+    i += 1
   }
   return false
 }
 
-function isCoreDmlStatement(sql: string): boolean {
+function isCoreDmlStatement(sql: string, key: GrammarDialectKey): boolean {
+  const rules = getDialectLexerRules(key)
   let i = 0
   while (i < sql.length) {
     const ch = sql[i]
@@ -178,16 +214,22 @@ function isCoreDmlStatement(sql: string): boolean {
       i += 1
       continue
     }
-    if ((ch === '-' && next === '-') || ch === '#') {
-      const nl = sql.indexOf('\n', i)
+    if (rules.lineCommentDash && ch === '-' && next === '-') {
+      const nl = sql.indexOf('\n', i + 2)
+      if (nl === -1) return false
+      i = nl + 1
+      continue
+    }
+    if (rules.lineCommentHash && ch === '#') {
+      const nl = sql.indexOf('\n', i + 1)
       if (nl === -1) return false
       i = nl + 1
       continue
     }
     if (ch === '/' && next === '*') {
-      const end = sql.indexOf('*/', i + 2)
-      if (end === -1) return false
-      i = end + 2
+      const end = scanBlockCommentEnd(sql, i, rules.nestedBlockComments)
+      if (end < i + 4 || sql[end - 2] !== '*' || sql[end - 1] !== '/') return false
+      i = end
       continue
     }
     break
@@ -210,109 +252,53 @@ function extractParserErrorOffset(err: unknown, maxLen: number): number | null {
   return Math.max(0, Math.min(maxLen, Math.trunc(rawOffset)))
 }
 
-function matchPgDollarTag(sql: string, index: number): string | null {
-  if (sql[index] !== '$') return null
-  if (sql[index + 1] === '$') return '$$'
-  const m = /^\$[A-Za-z_][A-Za-z0-9_]*\$/.exec(sql.slice(index, index + 64))
-  return m ? m[0] : null
-}
-
 function hasExcessiveParenNesting(sql: string, key: GrammarDialectKey): boolean {
+  const rules = getDialectLexerRules(key)
   const maxDepthLimit = key === 'postgres' ? MAX_PG_PAREN_DEPTH : MAX_OTHER_PAREN_DEPTH
   const maxUnclosedLimit = key === 'postgres' ? MAX_PG_UNCLOSED_PARENS : MAX_OTHER_PAREN_DEPTH
-  const allowHashComment = key === 'mysql'
-  const nestedBlockComments = key === 'postgres'
-  const allowBackslashInSingle = key === 'mysql'
 
   let depth = 0
-  let inQuote: string | null = null
-  let allowBackslash = false
+  const len = sql.length
+  let i = 0
 
-  for (let i = 0; i < sql.length; i += 1) {
+  while (i < len) {
     const ch = sql[i]
     const next = sql[i + 1]
 
-    if (inQuote !== null) {
-      if (allowBackslash && ch === '\\') {
-        i += 1
-        continue
-      }
-      if (ch === inQuote) {
-        if (next === inQuote) {
-          i += 1
-        } else {
-          inQuote = null
-          allowBackslash = false
-        }
-      }
+    if (rules.lineCommentDash && ch === '-' && next === '-') {
+      i = scanLineCommentEnd(sql, i)
       continue
     }
-
-    if (ch === '-' && next === '-') {
-      const nl = sql.indexOf('\n', i + 2)
-      if (nl === -1) break
-      i = nl
-      continue
-    }
-    if (allowHashComment && ch === '#') {
-      const nl = sql.indexOf('\n', i + 1)
-      if (nl === -1) break
-      i = nl
+    if (rules.lineCommentHash && ch === '#') {
+      i = scanLineCommentEnd(sql, i - 1)
       continue
     }
     if (ch === '/' && next === '*') {
-      let commentDepth = 1
-      let j = i + 2
-      while (j < sql.length && commentDepth > 0) {
-        if (nestedBlockComments && sql[j] === '/' && sql[j + 1] === '*') {
-          commentDepth += 1
-          j += 2
-        } else if (sql[j] === '*' && sql[j + 1] === '/') {
-          commentDepth -= 1
-          j += 2
-        } else {
-          j += 1
-        }
-      }
-      i = j - 1
+      i = scanBlockCommentEnd(sql, i, rules.nestedBlockComments)
       continue
     }
-    if (key === 'postgres' && (ch === 'E' || ch === 'e') && next === "'") {
-      const prev = i > 0 ? sql[i - 1] : ''
-      if (!/[A-Za-z0-9_$]/.test(prev)) {
-        inQuote = "'"
-        allowBackslash = true
-        i += 1
-        continue
-      }
+    if (isPostgresEscapeStringStart(sql, i, key)) {
+      i = scanQuotedSegmentEnd(sql, i + 1, "'", true).end
+      continue
     }
-    if (key === 'postgres' && ch === '$') {
-      const tag = matchPgDollarTag(sql, i)
+    if (rules.dollarQuoting && ch === '$') {
+      const tag = matchDollarQuoteTag(sql, i)
       if (tag !== null) {
         const closeIdx = sql.indexOf(tag, i + tag.length)
         if (closeIdx === -1) break
-        i = closeIdx + tag.length - 1
+        i = closeIdx + tag.length
         continue
       }
     }
-    if (key === 'mssql' && ch === '[') {
-      let j = i + 1
-      while (j < sql.length) {
-        if (sql[j] === ']') {
-          if (sql[j + 1] === ']') {
-            j += 2
-            continue
-          }
-          break
-        }
-        j += 1
-      }
-      i = j
+    if (ch === '[' && rules.bracketIdentifiers !== 'none') {
+      i = scanBracketIdentEnd(sql, i, rules.bracketIdentifiers === 'doubling').end
       continue
     }
-    if (ch === "'" || ch === '"' || ch === '`') {
-      inQuote = ch
-      allowBackslash = ch === "'" && allowBackslashInSingle
+    if (ch === "'" || ch === '"' || (ch === '`' && rules.backtickIdentifiers)) {
+      const allowBs =
+        (ch === "'" && rules.backslashEscapesSingleQuote) ||
+        (ch === '"' && rules.backslashEscapesDoubleQuote)
+      i = scanQuotedSegmentEnd(sql, i, ch, allowBs).end
       continue
     }
 
@@ -322,6 +308,7 @@ function hasExcessiveParenNesting(sql: string, key: GrammarDialectKey): boolean 
     } else if (ch === ')' && depth > 0) {
       depth -= 1
     }
+    i += 1
   }
 
   return depth > maxUnclosedLimit
@@ -428,7 +415,7 @@ export function checkSqlGrammar(sql: string, dialect?: string): SqlGrammarCheck 
     rememberGrammarCheck(cacheKey, cached)
     return cached
   }
-  if (!isCoreDmlStatement(sql) || hasNestedBlockComment(sql) || hasExcessiveParenNesting(sql, key)) {
+  if (!isCoreDmlStatement(sql, key) || hasNestedBlockComment(sql, key) || hasExcessiveParenNesting(sql, key)) {
     return UNSUPPORTED_CHECK
   }
   const result = parseWithInstance(getParserForDialect(key), sql)

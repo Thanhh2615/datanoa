@@ -1,3 +1,5 @@
+import { getDialectLexerRules, scanBlockCommentEnd, scanBracketIdentEnd, scanQuotedSegmentEnd } from './shared-sql-core.js'
+
 export const AI_EXPLAIN_LANGUAGE_OPTIONS = [
   { value: 'auto', label: 'Auto (IDE locale)' },
   { value: 'vi', label: 'Tiếng Việt' },
@@ -208,8 +210,9 @@ export function isLoopbackHostname(rawHost) {
     )
   }
 
-  if (LOCALHOST_HOSTNAME_RE.test(bare)) return true
-  const v4 = parseStrictIpv4Octets(bare)
+  const normalizedName = bare.endsWith('.') ? bare.slice(0, -1) : bare
+  if (LOCALHOST_HOSTNAME_RE.test(normalizedName)) return true
+  const v4 = parseStrictIpv4Octets(normalizedName)
   return v4 !== null && v4[0] === 127
 }
 
@@ -787,7 +790,12 @@ function renderHighlightedSqlCode(preEl, sqlText, dialect) {
     }
 
     // Comments
-    if (text.startsWith('--', i) || (isMongo && text.startsWith('//', i)) || ((isMysql || d === 'clickhouse') && ch === '#')) {
+    const rules = getDialectLexerRules(d)
+    if (
+      (rules.lineCommentDash && text.startsWith('--', i)) ||
+      (rules.lineCommentSlash && text.startsWith('//', i)) ||
+      (rules.lineCommentHash && ch === '#')
+    ) {
       const nl = text.indexOf('\n', i)
       const end = nl >= 0 ? nl : len
       emitToken('datanoa-sql-cmt', text.slice(i, end))
@@ -797,8 +805,7 @@ function renderHighlightedSqlCode(preEl, sqlText, dialect) {
     }
 
     if (text.startsWith('/*', i)) {
-      const close = text.indexOf('*/', i + 2)
-      const end = close >= 0 ? close + 2 : len
+      const end = scanBlockCommentEnd(text, i, rules.nestedBlockComments)
       emitToken('datanoa-sql-cmt', text.slice(i, end))
       i = end
       lineStart = false
@@ -806,7 +813,7 @@ function renderHighlightedSqlCode(preEl, sqlText, dialect) {
     }
 
     // Dollar-quoted strings (PostgreSQL, DuckDB, etc.)
-    if (!isMongo && !isRedis && ch === '$') {
+    if (rules.dollarQuoting && ch === '$') {
       const dqEnd = scanDollarQuotedEnd(text, i)
       if (dqEnd > i) {
         emitToken('datanoa-sql-str', text.slice(i, dqEnd))
@@ -817,7 +824,7 @@ function renderHighlightedSqlCode(preEl, sqlText, dialect) {
     }
 
     // Oracle alternate quote literals q'[...]' / q'(...)' / q'!...!'
-    if (d === 'oracle' && (ch === 'q' || ch === 'Q') && text[i + 1] === '\'') {
+    if (rules.oracleQQuote && (ch === 'q' || ch === 'Q') && text[i + 1] === '\'') {
       const qEnd = scanOracleQuoteLiteralEnd(text, i)
       if (qEnd > i) {
         emitToken('datanoa-sql-str', text.slice(i, qEnd))
@@ -835,9 +842,10 @@ function renderHighlightedSqlCode(preEl, sqlText, dialect) {
         text[i + 1] === '\'')
     ) {
       const quoteStart = ch === '\'' ? i : i + 1
+      const isPgEscape = rules.postgresEscapeString && (ch === 'e' || ch === 'E') && quoteStart > i
       const allowBackslashInSingleQuote =
-        isMysql || d === 'clickhouse' || d === 'bigquery' || quoteStart > i
-      const end = scanQuotedSegment(text, quoteStart, '\'', allowBackslashInSingleQuote)
+        rules.backslashEscapesSingleQuote || d === 'bigquery' || isPgEscape
+      const end = scanQuotedSegmentEnd(text, quoteStart, '\'', allowBackslashInSingleQuote).end
       emitToken('datanoa-sql-str', text.slice(i, end))
       i = end
       lineStart = false
@@ -846,7 +854,7 @@ function renderHighlightedSqlCode(preEl, sqlText, dialect) {
 
     // Double quotes: strings in MongoDB/Redis, identifiers in SQL
     if (ch === '"') {
-      const end = scanQuotedSegment(text, i, '"', isMongo || isRedis)
+      const end = scanQuotedSegmentEnd(text, i, '"', rules.backslashEscapesDoubleQuote || isMongo || isRedis).end
       emitToken(isMongo || isRedis ? 'datanoa-sql-str' : 'datanoa-sql-ident', text.slice(i, end))
       i = end
       lineStart = false
@@ -855,20 +863,19 @@ function renderHighlightedSqlCode(preEl, sqlText, dialect) {
 
     // Backtick identifiers
     if (!isMongo && ch === '`') {
-      const end = scanQuotedSegment(text, i, '`', false)
+      const end = scanQuotedSegmentEnd(text, i, '`', false).end
       emitToken('datanoa-sql-ident', text.slice(i, end))
       i = end
       lineStart = false
       continue
     }
 
-    // MSSQL [bracketed] identifiers
-    if (isMssql && ch === '[') {
-      const closeBracket = text.indexOf(']', i + 1)
-      const nl = text.indexOf('\n', i + 1)
-      if (closeBracket > i && (nl < 0 || closeBracket < nl)) {
-        emitToken('datanoa-sql-ident', text.slice(i, closeBracket + 1))
-        i = closeBracket + 1
+    // MSSQL / SQLite [bracketed] identifiers
+    if ((isMssql || rules.bracketIdentifiers !== 'none') && ch === '[') {
+      const br = scanBracketIdentEnd(text, i, isMssql || rules.bracketIdentifiers === 'doubling')
+      if (br.closed && !text.slice(i, br.end).includes('\n')) {
+        emitToken('datanoa-sql-ident', text.slice(i, br.end))
+        i = br.end
         lineStart = false
         continue
       }
@@ -1048,13 +1055,13 @@ function clearContainerHeightStyle(container) {
   }
 }
 
-function applyContainerUserHeight(container, px, edge) {
+function applyContainerUserHeight(container, px, edge, persistDataset = true) {
   const clamped = clampAiPanelHeight(px, container, edge)
   if (container.style) {
     container.style.height = `${clamped}px`
     container.style.maxHeight = 'none'
   }
-  if (container.dataset) {
+  if (persistDataset && container.dataset) {
     container.dataset.userHeight = String(clamped)
   }
   return clamped
@@ -1064,7 +1071,10 @@ function restoreSavedContainerHeight(container, edge) {
   const raw = container.dataset?.userHeight
   const parsed = raw !== undefined && raw !== '' ? Number(raw) : Number.NaN
   if (Number.isFinite(parsed) && parsed > 0) {
-    return applyContainerUserHeight(container, parsed, edge)
+    const selfRect =
+      typeof container.getBoundingClientRect === 'function' ? container.getBoundingClientRect() : null
+    const isMeasured = Boolean(selfRect && Number.isFinite(selfRect.height) && selfRect.height > 0)
+    return applyContainerUserHeight(container, parsed, edge, isMeasured)
   }
   clearContainerHeightStyle(container)
   return null
@@ -1129,6 +1139,10 @@ function createAiPanelResizer(container, edge, onResize) {
       document.body.style.userSelect = 'none'
     }
     const onMove = (moveEv) => {
+      if (!container.parentNode || container.isConnected === false) {
+        stopDrag()
+        return
+      }
       const curY = Number(moveEv.clientY) || 0
       const delta = normalizedEdge === 'top' ? startY - curY : curY - startY
       setHeight(startHeight + delta)
@@ -1180,8 +1194,35 @@ function createAiPanelResizer(container, edge, onResize) {
   return resizer
 }
 
+const explainPanelCallbacksMap = new WeakMap()
+const fixPanelCallbacksMap = new WeakMap()
+
+function appendPanelPrivacyPills(titleGroup, state) {
+  if (!state) return
+  if (state.destination === 'local' || state.destination === 'remote') {
+    const host = typeof state.host === 'string' ? state.host.trim() : ''
+    const prefix = state.destination === 'local' ? 'Local' : 'Remote'
+    const label = host ? `${prefix} · ${host}` : prefix
+    const destPill = el('span', 'datanoa-ai-pill datanoa-ai-dest-pill', label)
+    destPill.setAttribute('data-destination', state.destination)
+    destPill.title =
+      state.destination === 'local'
+        ? `AI requests stay on local host ${host || 'localhost'}`
+        : `AI requests are sent to external host ${host || 'remote endpoint'}`
+    titleGroup.appendChild(destPill)
+  }
+  const colorTag = typeof state.colorTag === 'string' ? state.colorTag.trim().toLowerCase() : ''
+  if (colorTag === 'prod' || colorTag === 'production') {
+    const prodPill = el('span', 'datanoa-ai-pill datanoa-ai-prod-pill', 'PROD')
+    prodPill.setAttribute('data-color-tag', 'prod')
+    prodPill.title = 'Production connection — review AI requests carefully'
+    titleGroup.appendChild(prodPill)
+  }
+}
+
 export function renderSharedExplainAiPanel(container, state, callbacks) {
   if (!container) return
+  explainPanelCallbacksMap.set(container, callbacks)
   if (
     state?.phase === 'loading' &&
     !container.hidden &&
@@ -1235,6 +1276,7 @@ export function renderSharedExplainAiPanel(container, state, callbacks) {
     )
     titleGroup.appendChild(metaPill)
   }
+  appendPanelPrivacyPills(titleGroup, state)
   header.appendChild(titleGroup)
 
   const controls = el('div', 'datanoa-ai-explain-controls')
@@ -1242,19 +1284,19 @@ export function renderSharedExplainAiPanel(container, state, callbacks) {
   if (state.phase === 'loading') {
     const cancelBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Cancel')
     cancelBtn.type = 'button'
-    cancelBtn.addEventListener('click', () => callbacks?.onCancel?.())
+    cancelBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onCancel?.())
     controls.appendChild(cancelBtn)
   } else if (!state.aiEnabled || !state.aiReady) {
     const setupBtn = el('button', 'btn btn-primary btn-sm datanoa-ai-btn', 'Configure Explain & Fix AI')
     setupBtn.type = 'button'
-    setupBtn.addEventListener('click', () => callbacks?.onConfigureAi?.())
+    setupBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onConfigureAi?.())
     controls.appendChild(setupBtn)
   } else {
     const label = state.phase === 'ready' || state.phase === 'error' ? 'Re-analyze' : 'Analyze with AI'
     const cls = state.phase === 'idle' ? 'btn btn-primary btn-sm datanoa-ai-btn' : 'btn btn-ghost btn-sm datanoa-ai-btn'
     const analyzeBtn = el('button', cls, label)
     analyzeBtn.type = 'button'
-    analyzeBtn.addEventListener('click', () => callbacks?.onAnalyze?.())
+    analyzeBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onAnalyze?.())
     controls.appendChild(analyzeBtn)
 
     if (state.phase === 'ready') {
@@ -1264,7 +1306,7 @@ export function renderSharedExplainAiPanel(container, state, callbacks) {
         state.collapsed ? 'Expand' : 'Collapse'
       )
       collapseBtn.type = 'button'
-      collapseBtn.addEventListener('click', () => callbacks?.onToggleCollapsed?.())
+      collapseBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onToggleCollapsed?.())
       controls.appendChild(collapseBtn)
     }
   }
@@ -1299,10 +1341,10 @@ export function renderSharedExplainAiPanel(container, state, callbacks) {
     const errActions = el('div', 'datanoa-ai-row-actions')
     const retryBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Retry')
     retryBtn.type = 'button'
-    retryBtn.addEventListener('click', () => callbacks?.onAnalyze?.())
+    retryBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onAnalyze?.())
     const cfgBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'AI Settings')
     cfgBtn.type = 'button'
-    cfgBtn.addEventListener('click', () => callbacks?.onConfigureAi?.())
+    cfgBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onConfigureAi?.())
     errActions.appendChild(retryBtn)
     errActions.appendChild(cfgBtn)
     errWrap.appendChild(errActions)
@@ -1347,47 +1389,57 @@ export function renderSharedExplainAiPanel(container, state, callbacks) {
   }
 
   if (Array.isArray(res.bottlenecks) && res.bottlenecks.length > 0) {
-    const sec = el('div', 'datanoa-ai-section')
-    sec.appendChild(el('div', 'datanoa-ai-section-label', 'Bottlenecks'))
-    const list = el('div', 'datanoa-ai-list')
-    for (const item of res.bottlenecks) {
-      const sevRaw = String(item.severity || 'medium').toLowerCase()
-      const sevLabel = sevRaw === 'high' ? 'High' : sevRaw === 'low' ? 'Low' : 'Medium'
-      const card = el('div', `datanoa-ai-item sev-${sevRaw}`)
-      const top = el('div', 'datanoa-ai-item-top')
-      top.appendChild(el('span', `datanoa-ai-sev sev-${sevRaw}`, sevLabel))
-      top.appendChild(el('strong', 'datanoa-ai-item-title', item.title || 'Bottleneck'))
-      card.appendChild(top)
-      if (item.detail) {
-        card.appendChild(el('p', 'datanoa-ai-item-detail', item.detail))
+    const validBottlenecks = res.bottlenecks.filter((item) => item && typeof item === 'object')
+    if (validBottlenecks.length > 0) {
+      const sec = el('div', 'datanoa-ai-section')
+      sec.appendChild(el('div', 'datanoa-ai-section-label', 'Bottlenecks'))
+      const list = el('div', 'datanoa-ai-list')
+      for (const item of validBottlenecks) {
+        const rawSev = String(item.severity || 'medium').toLowerCase()
+        const sevSafe = rawSev === 'high' || rawSev === 'low' ? rawSev : 'medium'
+        const sevLabel = sevSafe === 'high' ? 'High' : sevSafe === 'low' ? 'Low' : 'Medium'
+        const card = el('div', `datanoa-ai-item sev-${sevSafe}`)
+        const top = el('div', 'datanoa-ai-item-top')
+        top.appendChild(el('span', `datanoa-ai-sev sev-${sevSafe}`, sevLabel))
+        top.appendChild(el('strong', 'datanoa-ai-item-title', item.title || 'Bottleneck'))
+        card.appendChild(top)
+        if (item.detail) {
+          card.appendChild(el('p', 'datanoa-ai-item-detail', item.detail))
+        }
+        list.appendChild(card)
       }
-      list.appendChild(card)
+      sec.appendChild(list)
+      body.appendChild(sec)
     }
-    sec.appendChild(list)
-    body.appendChild(sec)
   }
 
   if (Array.isArray(res.indexSuggestions) && res.indexSuggestions.length > 0) {
-    const sec = el('div', 'datanoa-ai-section')
-    sec.appendChild(el('div', 'datanoa-ai-section-label', 'Suggested Indexes'))
-    const list = el('div', 'datanoa-ai-list')
-    for (const idx of res.indexSuggestions) {
-      const card = el('div', 'datanoa-ai-item')
-      const top = el('div', 'datanoa-ai-item-top')
-      top.appendChild(el('span', 'datanoa-ai-item-detail', idx.reason || 'Suggested index'))
-      const copyDdlBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Copy DDL')
-      copyDdlBtn.type = 'button'
-      copyDdlBtn.addEventListener('click', () => callbacks?.onCopyText?.(idx.ddl, 'DDL'))
-      top.appendChild(copyDdlBtn)
-      card.appendChild(top)
-      card.appendChild(createHighlightedSqlPre(idx.ddl, state.dialect))
-      list.appendChild(card)
+    const validIndexes = res.indexSuggestions.filter(
+      (idx) => idx && typeof idx === 'object' && typeof idx.ddl === 'string' && idx.ddl.trim().length > 0
+    )
+    if (validIndexes.length > 0) {
+      const sec = el('div', 'datanoa-ai-section')
+      sec.appendChild(el('div', 'datanoa-ai-section-label', 'Suggested Indexes'))
+      const list = el('div', 'datanoa-ai-list')
+      for (const idx of validIndexes) {
+        const card = el('div', 'datanoa-ai-item')
+        const top = el('div', 'datanoa-ai-item-top')
+        top.appendChild(el('span', 'datanoa-ai-item-detail', idx.reason || 'Suggested index'))
+        const copyDdlBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Copy DDL')
+        copyDdlBtn.type = 'button'
+        copyDdlBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onCopyText?.(idx.ddl, 'DDL'))
+        top.appendChild(copyDdlBtn)
+        card.appendChild(top)
+        card.appendChild(createHighlightedSqlPre(idx.ddl, state.dialect))
+        list.appendChild(card)
+      }
+      sec.appendChild(list)
+      body.appendChild(sec)
     }
-    sec.appendChild(list)
-    body.appendChild(sec)
   }
 
-  if (res.optimizedSql) {
+  const trimmedOptSql = typeof res.optimizedSql === 'string' ? res.optimizedSql.trim() : ''
+  if (trimmedOptSql) {
     const sec = el('div', 'datanoa-ai-section')
     const top = el('div', 'datanoa-ai-item-top')
     top.appendChild(
@@ -1397,17 +1449,17 @@ export function renderSharedExplainAiPanel(container, state, callbacks) {
 
     const replaceBtn = el('button', 'btn btn-primary btn-sm datanoa-ai-btn', 'Replace Query')
     replaceBtn.type = 'button'
-    replaceBtn.addEventListener('click', () => callbacks?.onApplySql?.(res.optimizedSql))
+    replaceBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onApplySql?.(res.optimizedSql))
 
     const copyBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Copy SQL')
     copyBtn.type = 'button'
     copyBtn.addEventListener('click', () =>
-      callbacks?.onCopyText?.(res.optimizedSql, 'Optimized SQL')
+      explainPanelCallbacksMap.get(container)?.onCopyText?.(res.optimizedSql, 'Optimized SQL')
     )
 
     const newTabBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'New Tab')
     newTabBtn.type = 'button'
-    newTabBtn.addEventListener('click', () => callbacks?.onOpenNewTab?.(res.optimizedSql))
+    newTabBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onOpenNewTab?.(res.optimizedSql))
 
     actions.appendChild(replaceBtn)
     actions.appendChild(copyBtn)
@@ -1441,6 +1493,7 @@ export function renderSharedExplainAiPanel(container, state, callbacks) {
 
 export function renderSharedAiFixPanel(container, state, callbacks) {
   if (!container) return
+  fixPanelCallbacksMap.set(container, callbacks)
   if (
     state?.phase === 'loading' &&
     !container.hidden &&
@@ -1498,20 +1551,23 @@ export function renderSharedAiFixPanel(container, state, callbacks) {
       titleGroup.appendChild(el('span', 'datanoa-ai-pill', pillParts.join(' · ')))
     }
   }
+  appendPanelPrivacyPills(titleGroup, state)
   header.appendChild(titleGroup)
 
   const controls = el('div', 'datanoa-ai-explain-controls')
   if (state.phase === 'loading') {
     const cancelBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Cancel')
     cancelBtn.type = 'button'
-    cancelBtn.addEventListener('click', () => callbacks?.onCancel?.())
+    cancelBtn.addEventListener('click', () => fixPanelCallbacksMap.get(container)?.onCancel?.())
     controls.appendChild(cancelBtn)
   }
 
-  const dismissBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Dismiss')
-  dismissBtn.type = 'button'
-  dismissBtn.addEventListener('click', () => callbacks?.onDismiss?.())
-  controls.appendChild(dismissBtn)
+  if (state.phase !== 'ready') {
+    const dismissBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Dismiss')
+    dismissBtn.type = 'button'
+    dismissBtn.addEventListener('click', () => fixPanelCallbacksMap.get(container)?.onDismiss?.())
+    controls.appendChild(dismissBtn)
+  }
 
   header.appendChild(controls)
   container.appendChild(header)
@@ -1536,13 +1592,13 @@ export function renderSharedAiFixPanel(container, state, callbacks) {
     if (state.aiEnabled && state.aiReady) {
       const retryBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Retry')
       retryBtn.type = 'button'
-      retryBtn.addEventListener('click', () => callbacks?.onRetry?.())
+      retryBtn.addEventListener('click', () => fixPanelCallbacksMap.get(container)?.onRetry?.())
       errActions.appendChild(retryBtn)
     }
     const cfgLabel = state.aiEnabled && state.aiReady ? 'AI Settings' : 'Configure Explain & Fix AI'
     const cfgBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', cfgLabel)
     cfgBtn.type = 'button'
-    cfgBtn.addEventListener('click', () => callbacks?.onConfigureAi?.())
+    cfgBtn.addEventListener('click', () => fixPanelCallbacksMap.get(container)?.onConfigureAi?.())
     errActions.appendChild(cfgBtn)
     errWrap.appendChild(errActions)
     scrollWrap.appendChild(errWrap)
@@ -1580,23 +1636,23 @@ export function renderSharedAiFixPanel(container, state, callbacks) {
   replaceBtn.type = 'button'
   replaceBtn.disabled = !hasFixedSql
   replaceBtn.addEventListener('click', () => {
-    if (hasFixedSql) callbacks?.onReplaceQuery?.(fixedSql)
+    if (hasFixedSql) fixPanelCallbacksMap.get(container)?.onReplaceQuery?.(fixedSql)
   })
 
   const copyBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Copy SQL')
   copyBtn.type = 'button'
   copyBtn.disabled = !hasFixedSql
   copyBtn.addEventListener('click', () => {
-    if (hasFixedSql) callbacks?.onCopySql?.(fixedSql)
+    if (hasFixedSql) fixPanelCallbacksMap.get(container)?.onCopySql?.(fixedSql)
   })
 
-  const bodyDismissBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Dismiss')
-  bodyDismissBtn.type = 'button'
-  bodyDismissBtn.addEventListener('click', () => callbacks?.onDismiss?.())
+  const footerDismissBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Dismiss')
+  footerDismissBtn.type = 'button'
+  footerDismissBtn.addEventListener('click', () => fixPanelCallbacksMap.get(container)?.onDismiss?.())
 
   actions.appendChild(replaceBtn)
   actions.appendChild(copyBtn)
-  actions.appendChild(bodyDismissBtn)
+  actions.appendChild(footerDismissBtn)
 
   scrollWrap.appendChild(body)
   container.appendChild(scrollWrap)
@@ -1719,11 +1775,43 @@ export async function openSharedAiConfigModal(options) {
   let standaloneBackdrop = null
   let disposed = false
   let saving = false
+  let mutating = false
+  let loadModelsSeq = 0
+  let actionSeq = 0
+  let savedSplitExplainDraft = null
+  const previousActiveElement =
+    typeof document !== 'undefined' && document.activeElement ? document.activeElement : null
+  let windowEscHandler = null
+
+  const clearDraftSecrets = () => {
+    drafts.autocomplete.keyDraft = ''
+    drafts.explain.keyDraft = ''
+    if (typeof keyInput !== 'undefined' && keyInput) {
+      keyInput.value = ''
+    }
+  }
 
   const dispose = () => {
     if (disposed) return
     disposed = true
     modalAbort.abort()
+    clearDraftSecrets()
+    if (typeof feedbackBox !== 'undefined' && feedbackBox) {
+      clearNode(feedbackBox)
+    }
+    if (windowEscHandler && typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('keydown', windowEscHandler)
+      windowEscHandler = null
+    }
+    if (previousActiveElement && typeof previousActiveElement.focus === 'function') {
+      try {
+        if (previousActiveElement.isConnected !== false) {
+          previousActiveElement.focus()
+        }
+      } catch {
+        // Ignore focus restoration errors in minimal/detached DOMs
+      }
+    }
   }
 
   const close = () => {
@@ -1932,7 +2020,8 @@ export async function openSharedAiConfigModal(options) {
 
   const keyInput = el('input', 'datanoa-ai-input')
   keyInput.type = 'password'
-  keyInput.autocomplete = 'off'
+  keyInput.autocomplete = 'new-password'
+  keyInput.spellcheck = false
   const keyField = createLabeledField('API Key (OS keyring)', 'api-key', keyInput, 'API Key (OS keyring)')
   const keyRow = el('div', 'datanoa-ai-inline-row')
   const clearKeyBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Clear')
@@ -2018,12 +2107,15 @@ export async function openSharedAiConfigModal(options) {
   body.appendChild(roleCard)
 
   const feedbackBox = el('div', 'datanoa-ai-feedback')
+  feedbackBox.setAttribute('role', 'status')
+  feedbackBox.setAttribute('aria-live', 'polite')
   feedbackBox.hidden = true
   body.appendChild(feedbackBox)
 
   const setFeedback = (text, tone) => {
     feedbackBox.hidden = !text
     feedbackBox.className = `datanoa-ai-feedback ${tone ? `tone-${tone}` : ''}`
+    feedbackBox.setAttribute('role', tone === 'error' ? 'alert' : 'status')
     clearNode(feedbackBox)
     if (!text) return
     if (tone === 'loading') {
@@ -2114,10 +2206,14 @@ export async function openSharedAiConfigModal(options) {
     }
 
     if (preset.keyKind === 'none') {
+      draft.keyDraft = ''
+      keyInput.value = ''
+      keyInput.disabled = true
       keyInput.placeholder = preset.keyPlaceholder
       clearKeyBtn.disabled = !draftHasPinnedOwnKey
       return
     }
+    keyInput.disabled = false
 
     if (isSplitExplain && draft.usingSharedKey && !draftHasPinnedOwnKey) {
       keyInput.placeholder = 'Reusing Autocomplete key on this host — paste to override'
@@ -2328,7 +2424,9 @@ export async function openSharedAiConfigModal(options) {
       if (!silent) setFeedback('Enter a valid http:// or https:// base URL', 'error')
       return
     }
+    const preset = AI_PRESET_OPTIONS.find((p) => p.id === targetDraft.presetId) || AI_PRESET_OPTIONS[0]
     const cacheSignature = `${targetDraft.format}|${normUrl(baseUrl)}`
+    const mySeq = ++loadModelsSeq
     fetchModelsBtn.disabled = true
     fetchModelsBtn.classList.add('is-loading')
     if (!silent) setFeedback('Loading models...', 'loading')
@@ -2338,12 +2436,14 @@ export async function openSharedAiConfigModal(options) {
         {
           format: targetDraft.format,
           baseUrl,
-          key: targetDraft.keyDraft.trim(),
+          key: preset.keyKind === 'none' ? '' : targetDraft.keyDraft.trim(),
           role: targetKey,
         },
         { signal: modalAbort.signal }
       )
-      if (disposed) return
+      if (disposed || mySeq !== loadModelsSeq) return
+      const curSig = `${drafts[targetKey].format}|${normUrl(drafts[targetKey].baseUrl)}`
+      if (curSig !== cacheSignature) return
       if (!res?.ok) {
         if (!silent) setFeedback(res?.message || 'Could not list models', 'error')
         return
@@ -2359,7 +2459,9 @@ export async function openSharedAiConfigModal(options) {
       } catch {
         // Best-effort latency hints
       }
-      if (disposed) return
+      if (disposed || mySeq !== loadModelsSeq) return
+      const curSigAfter = `${drafts[targetKey].format}|${normUrl(drafts[targetKey].baseUrl)}`
+      if (curSigAfter !== cacheSignature) return
       const rawModels = Array.isArray(res.models) ? res.models : []
       targetCache.showAll = false
       targetCache.pinned = targetDraft.model.trim()
@@ -2381,9 +2483,11 @@ export async function openSharedAiConfigModal(options) {
         )
       }
     } catch (err) {
-      if (!disposed && !silent) setFeedback(err instanceof Error ? err.message : String(err), 'error')
+      if (!disposed && mySeq === loadModelsSeq && !silent) {
+        setFeedback(err instanceof Error ? err.message : String(err), 'error')
+      }
     } finally {
-      if (!disposed) {
+      if (!disposed && mySeq === loadModelsSeq) {
         fetchModelsBtn.disabled = false
         fetchModelsBtn.classList.remove('is-loading')
       }
@@ -2433,6 +2537,16 @@ export async function openSharedAiConfigModal(options) {
     }
     captureFormIntoDrafts()
     if (nextSync) {
+      savedSplitExplainDraft = {
+        presetId: drafts.explain.presetId,
+        format: drafts.explain.format,
+        baseUrl: drafts.explain.baseUrl,
+        model: drafts.explain.model,
+        hasKey: drafts.explain.hasKey,
+        hasOwnKey: drafts.explain.hasOwnKey,
+        usingSharedKey: drafts.explain.usingSharedKey,
+        pinnedBaseUrl: drafts.explain.pinnedBaseUrl,
+      }
       const src = drafts[activeRole]
       const srcNormUrl = normUrl(src.baseUrl)
       drafts.autocomplete.presetId = src.presetId
@@ -2469,15 +2583,28 @@ export async function openSharedAiConfigModal(options) {
       }
       syncMode = true
     } else {
-      drafts.explain.presetId = drafts.autocomplete.presetId
-      drafts.explain.format = drafts.autocomplete.format
-      drafts.explain.baseUrl = drafts.autocomplete.baseUrl
-      drafts.explain.model = drafts.autocomplete.model
-      drafts.explain.keyDraft = drafts.autocomplete.keyDraft
-      if (!drafts.explain.hasOwnKey && drafts.autocomplete.hasKey) {
-        drafts.explain.hasKey = true
-        drafts.explain.usingSharedKey = true
+      if (savedSplitExplainDraft) {
+        drafts.explain.presetId = savedSplitExplainDraft.presetId
+        drafts.explain.format = savedSplitExplainDraft.format
+        drafts.explain.baseUrl = savedSplitExplainDraft.baseUrl
+        drafts.explain.model = savedSplitExplainDraft.model
+        drafts.explain.hasKey = savedSplitExplainDraft.hasKey
+        drafts.explain.hasOwnKey = savedSplitExplainDraft.hasOwnKey
+        drafts.explain.usingSharedKey = savedSplitExplainDraft.usingSharedKey
+        drafts.explain.pinnedBaseUrl = savedSplitExplainDraft.pinnedBaseUrl
+        savedSplitExplainDraft = null
+      } else {
+        drafts.explain.presetId = drafts.autocomplete.presetId
+        drafts.explain.format = drafts.autocomplete.format
+        drafts.explain.baseUrl = drafts.autocomplete.baseUrl
+        drafts.explain.model = drafts.autocomplete.model
+        if (!drafts.explain.hasOwnKey && drafts.autocomplete.hasKey) {
+          drafts.explain.hasKey = true
+          drafts.explain.usingSharedKey = true
+        }
       }
+      // Never copy typed unsaved API key across roles when splitting Sync mode
+      drafts.explain.keyDraft = ''
       if (modelCaches.explain.items.length === 0 && modelCaches.autocomplete.items.length > 0) {
         modelCaches.explain.items = modelCaches.autocomplete.items.map((item) => ({ ...item }))
         modelCaches.explain.pinned = drafts.explain.model.trim()
@@ -2527,11 +2654,40 @@ export async function openSharedAiConfigModal(options) {
     syncFimWarning()
   })
 
+  const originOfUrl = (raw) => {
+    try {
+      const parsed = new URL(String(raw || '').trim())
+      return parsed.origin.toLowerCase()
+    } catch {
+      return ''
+    }
+  }
+
+  roleTabs.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'Home' || e.key === 'End') {
+      e.preventDefault()
+      const nextRole =
+        e.key === 'Home'
+          ? 'autocomplete'
+          : e.key === 'End'
+            ? 'explain'
+            : activeRole === 'autocomplete'
+              ? 'explain'
+              : 'autocomplete'
+      selectRoleTab(nextRole)
+      const targetTab = nextRole === 'explain' ? explainTabParts.tab : autoTabParts.tab
+      targetTab.focus?.()
+    }
+  })
+
   presetSelect.addEventListener('change', () => {
     const draft = getActiveDraft()
     const preset = AI_PRESET_OPTIONS.find((p) => p.id === presetSelect.value) || AI_PRESET_OPTIONS[0]
     draft.presetId = preset.id
     draft.format = preset.format
+    // Always clear any unsaved typed API key when switching providers to prevent cross-host exfiltration
+    draft.keyDraft = ''
+    keyInput.value = ''
     urlInput.readOnly = !preset.editableUrl
     if (preset.baseUrl !== null && preset.baseUrl !== '') {
       draft.baseUrl = preset.baseUrl
@@ -2560,7 +2716,15 @@ export async function openSharedAiConfigModal(options) {
   })
 
   urlInput.addEventListener('input', () => {
-    getActiveDraft().baseUrl = urlInput.value
+    const draft = getActiveDraft()
+    const prevOrigin = originOfUrl(draft.baseUrl)
+    const nextOrigin = originOfUrl(urlInput.value)
+    if (prevOrigin && nextOrigin && prevOrigin !== nextOrigin && draft.keyDraft) {
+      // Clear unsaved typed API key when host/origin changes so a key is never sent to a different host
+      draft.keyDraft = ''
+      keyInput.value = ''
+    }
+    draft.baseUrl = urlInput.value
     syncDestinationIndicator(false)
     syncKeyPlaceholderAndClearBtn()
     syncFimWarning()
@@ -2665,7 +2829,8 @@ export async function openSharedAiConfigModal(options) {
     if (disposed) return null
 
     if (syncMode) {
-      const draftKey = auto.keyDraft.trim()
+      const autoPreset = AI_PRESET_OPTIONS.find((p) => p.id === auto.presetId) || AI_PRESET_OPTIONS[0]
+      const draftKey = autoPreset.keyKind === 'none' ? '' : auto.keyDraft.trim()
       if (draftKey) {
         const keyRes = await rpc(
           'ai.key.set',
@@ -2680,7 +2845,8 @@ export async function openSharedAiConfigModal(options) {
         auto.pinnedBaseUrl = auto.hasKey ? autoUrl : ''
       }
     } else {
-      const autoDraftKey = auto.keyDraft.trim()
+      const autoPreset = AI_PRESET_OPTIONS.find((p) => p.id === auto.presetId) || AI_PRESET_OPTIONS[0]
+      const autoDraftKey = autoPreset.keyKind === 'none' ? '' : auto.keyDraft.trim()
       if (autoDraftKey) {
         const keyRes = await rpc(
           'ai.key.set',
@@ -2693,7 +2859,8 @@ export async function openSharedAiConfigModal(options) {
         auto.hasOwnKey = auto.hasKey
         auto.pinnedBaseUrl = auto.hasKey ? autoUrl : ''
       }
-      const expDraftKey = drafts.explain.keyDraft.trim()
+      const expPreset = AI_PRESET_OPTIONS.find((p) => p.id === drafts.explain.presetId) || AI_PRESET_OPTIONS[0]
+      const expDraftKey = expPreset.keyKind === 'none' ? '' : drafts.explain.keyDraft.trim()
       if (expDraftKey) {
         const keyRes = await rpc(
           'ai.key.set',
@@ -2722,23 +2889,31 @@ export async function openSharedAiConfigModal(options) {
   }
 
   clearKeyBtn.addEventListener('click', async () => {
+    if (mutating || saving || disposed) return
+    mutating = true
+    const mySeq = ++actionSeq
     const role = activeDraftKey()
+    const clearSynced = syncMode
     clearKeyBtn.disabled = true
     try {
       await rpc(
         'ai.key.set',
-        { key: '', baseUrl: drafts[role].baseUrl.trim(), role },
+        { key: '', baseUrl: drafts[role].baseUrl.trim(), role, clearSynced },
         { signal: modalAbort.signal }
       )
-      if (disposed) return
+      if (disposed || mySeq !== actionSeq) return
       drafts[role].keyDraft = ''
+      if (clearSynced) {
+        drafts.autocomplete.keyDraft = ''
+        drafts.explain.keyDraft = ''
+      }
       keyInput.value = ''
       const fresh = await rpc('ai.status.get', undefined, { signal: modalAbort.signal })
-      if (disposed) return
+      if (disposed || mySeq !== actionSeq) return
       snapshot = fresh
       syncKeyFlagsFromSnapshot(fresh)
       syncRoleTabDots(fresh)
-      syncDestinationIndicator(true)
+      syncDestinationIndicator(false)
       syncKeyPlaceholderAndClearBtn()
       onStatusUpdated?.(fresh)
       const roleSnap = fresh?.roles?.[role]
@@ -2754,10 +2929,12 @@ export async function openSharedAiConfigModal(options) {
         setFeedback('Saved API key is still present in OS keyring for this endpoint', 'error')
       }
     } catch (err) {
-      if (!disposed) {
+      if (!disposed && mySeq === actionSeq) {
         setFeedback(err instanceof Error ? err.message : String(err), 'error')
         clearKeyBtn.disabled = false
       }
+    } finally {
+      mutating = false
     }
   })
 
@@ -2776,9 +2953,14 @@ export async function openSharedAiConfigModal(options) {
   })
 
   benchBtn.addEventListener('click', async () => {
+    if (mutating || saving || disposed) return
     captureFormIntoDrafts()
     const autoDraft = drafts.autocomplete
     const autoCache = modelCaches.autocomplete
+    const autoPreset = AI_PRESET_OPTIONS.find((p) => p.id === autoDraft.presetId) || AI_PRESET_OPTIONS[0]
+    const startSig = `${autoDraft.format}|${normUrl(autoDraft.baseUrl)}`
+    const mySeq = ++actionSeq
+    mutating = true
     benchBtn.disabled = true
     benchBtn.classList.add('is-loading')
     setFeedback('Benchmarking SQL completion speed...', 'loading')
@@ -2798,13 +2980,14 @@ export async function openSharedAiConfigModal(options) {
         {
           format: autoDraft.format,
           baseUrl: autoDraft.baseUrl.trim(),
-          key: autoDraft.keyDraft.trim(),
+          key: autoPreset.keyKind === 'none' ? '' : autoDraft.keyDraft.trim(),
           models: candidates,
           role: 'autocomplete',
         },
         { signal: modalAbort.signal }
       )
-      if (disposed) return
+      if (disposed || mySeq !== actionSeq) return
+      if (`${drafts.autocomplete.format}|${normUrl(drafts.autocomplete.baseUrl)}` !== startSig) return
       const rows = (res?.results || [])
         .filter((r) => r.ok)
         .sort((a, b) => (a.ms ?? 99999) - (b.ms ?? 99999))
@@ -2829,14 +3012,32 @@ export async function openSharedAiConfigModal(options) {
         setFeedback(res?.message || 'No candidate model passed SQL benchmark', 'error')
       }
     } catch (err) {
-      if (!disposed) setFeedback(err instanceof Error ? err.message : String(err), 'error')
+      if (!disposed && mySeq === actionSeq) {
+        setFeedback(err instanceof Error ? err.message : String(err), 'error')
+      }
     } finally {
-      if (!disposed) {
+      mutating = false
+      if (!disposed && mySeq === actionSeq) {
         benchBtn.disabled = false
         benchBtn.classList.remove('is-loading')
       }
     }
   })
+
+  const buildDraftTestInput = (role, draft) => {
+    const preset = AI_PRESET_OPTIONS.find((p) => p.id === draft.presetId) || AI_PRESET_OPTIONS[0]
+    const payload = {
+      role,
+      format: draft.format,
+      baseUrl: draft.baseUrl.trim(),
+      model: draft.model.trim(),
+    }
+    const trimmedKey = preset.keyKind === 'none' ? '' : draft.keyDraft.trim()
+    if (trimmedKey) {
+      payload.key = trimmedKey
+    }
+    return payload
+  }
 
   const formatSyncTestFeedback = (autoRes, expRes) => {
     if (autoRes?.ok && expRes?.ok) {
@@ -2870,18 +3071,26 @@ export async function openSharedAiConfigModal(options) {
   }
 
   testBtn.addEventListener('click', async () => {
+    if (mutating || saving || disposed) return
+    captureFormIntoDrafts()
+    const mySeq = ++actionSeq
+    mutating = true
     testBtn.disabled = true
     testBtn.classList.add('is-loading')
     setFeedback('Testing provider...', 'loading')
     try {
-      await persistCurrentDraft()
-      if (disposed) return
+      // Test the unsaved draft directly WITHOUT persisting broken settings/keys to config or keyring
       if (syncMode) {
+        const autoDraft = drafts.autocomplete
         const autoOn = drafts.autocomplete.enabled
         const expOn = drafts.explain.enabled
         if (!autoOn && expOn) {
-          const expRes = await rpc('ai.provider.test', { role: 'explain' }, { signal: modalAbort.signal })
-          if (disposed) return
+          const expRes = await rpc(
+            'ai.provider.test',
+            buildDraftTestInput('explain', autoDraft),
+            { signal: modalAbort.signal }
+          )
+          if (disposed || mySeq !== actionSeq) return
           setFeedback(
             expRes?.ok
               ? `Explain & Fix connected in ${expRes.ms ?? 0}ms`
@@ -2889,15 +3098,27 @@ export async function openSharedAiConfigModal(options) {
             expRes?.ok ? 'ok' : 'error'
           )
         } else if (autoOn && expOn) {
-          const autoRes = await rpc('ai.provider.test', { role: 'autocomplete' }, { signal: modalAbort.signal })
-          if (disposed) return
-          const expRes = await rpc('ai.provider.test', { role: 'explain' }, { signal: modalAbort.signal })
-          if (disposed) return
+          const autoRes = await rpc(
+            'ai.provider.test',
+            buildDraftTestInput('autocomplete', autoDraft),
+            { signal: modalAbort.signal }
+          )
+          if (disposed || mySeq !== actionSeq) return
+          const expRes = await rpc(
+            'ai.provider.test',
+            buildDraftTestInput('explain', autoDraft),
+            { signal: modalAbort.signal }
+          )
+          if (disposed || mySeq !== actionSeq) return
           const summary = formatSyncTestFeedback(autoRes, expRes)
           setFeedback(summary.text, summary.tone)
         } else {
-          const autoRes = await rpc('ai.provider.test', { role: 'autocomplete' }, { signal: modalAbort.signal })
-          if (disposed) return
+          const autoRes = await rpc(
+            'ai.provider.test',
+            buildDraftTestInput('autocomplete', autoDraft),
+            { signal: modalAbort.signal }
+          )
+          if (disposed || mySeq !== actionSeq) return
           setFeedback(
             autoRes?.ok
               ? `Connected in ${autoRes.ms ?? 0}ms`
@@ -2908,8 +3129,12 @@ export async function openSharedAiConfigModal(options) {
       } else {
         const role = activeRole
         const roleLabel = role === 'explain' ? 'Explain & Fix' : 'Autocomplete'
-        const res = await rpc('ai.provider.test', { role }, { signal: modalAbort.signal })
-        if (disposed) return
+        const res = await rpc(
+          'ai.provider.test',
+          buildDraftTestInput(role, drafts[role]),
+          { signal: modalAbort.signal }
+        )
+        if (disposed || mySeq !== actionSeq) return
         setFeedback(
           res?.ok
             ? `${roleLabel} connected in ${res.ms ?? 0}ms`
@@ -2918,17 +3143,20 @@ export async function openSharedAiConfigModal(options) {
         )
       }
       const fresh = await rpc('ai.status.get', undefined, { signal: modalAbort.signal })
-      if (disposed) return
+      if (disposed || mySeq !== actionSeq) return
       snapshot = fresh
       syncKeyFlagsFromSnapshot(fresh)
       syncRoleTabDots(fresh)
-      syncDestinationIndicator(true)
+      syncDestinationIndicator(false)
       syncKeyPlaceholderAndClearBtn()
       onStatusUpdated?.(fresh)
     } catch (err) {
-      if (!disposed) setFeedback(err instanceof Error ? err.message : String(err), 'error')
+      if (!disposed && mySeq === actionSeq) {
+        setFeedback(err instanceof Error ? err.message : String(err), 'error')
+      }
     } finally {
-      if (!disposed) {
+      mutating = false
+      if (!disposed && mySeq === actionSeq) {
         testBtn.disabled = false
         testBtn.classList.remove('is-loading')
       }
@@ -2936,7 +3164,7 @@ export async function openSharedAiConfigModal(options) {
   })
 
   const triggerSave = async () => {
-    if (saving || disposed) return
+    if (saving || mutating || disposed) return
     saving = true
     saveBtn.disabled = true
     saveBtn.classList.add('is-loading')
@@ -2958,14 +3186,50 @@ export async function openSharedAiConfigModal(options) {
     void triggerSave()
   })
 
+  const getModalFocusableElements = () => {
+    if (typeof card.querySelectorAll !== 'function') return []
+    const raw = Array.from(
+      card.querySelectorAll('button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])')
+    )
+    return raw.filter((node) => {
+      if (!node || node.disabled || node.hidden) return false
+      let cur = node
+      while (cur && cur !== card) {
+        if (cur.hidden) return false
+        cur = cur.parentElement
+      }
+      return true
+    })
+  }
+
   card.addEventListener('keydown', (e) => {
     if (e.isComposing) return
+    if (e.key === 'Tab') {
+      const focusables = getModalFocusableElements()
+      if (focusables.length > 0) {
+        const first = focusables[0]
+        const last = focusables[focusables.length - 1]
+        const active = typeof document !== 'undefined' ? document.activeElement : null
+        if (e.shiftKey) {
+          if (active === first || active === card || !focusables.includes(active)) {
+            e.preventDefault()
+            last.focus?.()
+          }
+        } else if (active === last || !focusables.includes(active)) {
+          e.preventDefault()
+          first.focus?.()
+        }
+      }
+      return
+    }
     if (e.key === 'Escape') {
       e.stopPropagation()
       close()
       return
     }
-    if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+    const targetTag = String(e.target?.tagName || '').toUpperCase()
+    const inFormControl = targetTag === 'INPUT' || targetTag === 'TEXTAREA' || targetTag === 'SELECT'
+    if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && !inFormControl) {
       const lowerKey = typeof e.key === 'string' ? e.key.toLowerCase() : ''
       if (e.key === '1' || e.code === 'Digit1') {
         e.preventDefault()
@@ -2993,6 +3257,16 @@ export async function openSharedAiConfigModal(options) {
     }
   })
 
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    windowEscHandler = (ev) => {
+      if (ev.isComposing) return
+      if (ev.key === 'Escape' && !disposed) {
+        close()
+      }
+    }
+    window.addEventListener('keydown', windowEscHandler)
+  }
+
   syncRoleTabDots(snapshot)
   syncViewFromDrafts(true)
   void refreshStats()
@@ -3000,7 +3274,18 @@ export async function openSharedAiConfigModal(options) {
 
   if (mountModal) {
     mountModal(card, undefined, dispose)
+    card.focus?.()
   } else {
+    // Prevent duplicate stacked standalone AI config modals
+    if (typeof document.querySelectorAll === 'function') {
+      for (const stale of Array.from(document.querySelectorAll('.datanoa-ai-backdrop'))) {
+        if (typeof stale._closeAiModal === 'function') {
+          stale._closeAiModal()
+        } else if (stale.parentNode) {
+          stale.parentNode.removeChild(stale)
+        }
+      }
+    }
     standaloneBackdrop = el('div', 'modal-backdrop datanoa-ai-backdrop')
     standaloneBackdrop._closeAiModal = close
     standaloneBackdrop.addEventListener('click', (e) => {
@@ -3008,7 +3293,7 @@ export async function openSharedAiConfigModal(options) {
     })
     standaloneBackdrop.appendChild(card)
     document.body.appendChild(standaloneBackdrop)
-    card.focus()
+    card.focus?.()
   }
 }
 

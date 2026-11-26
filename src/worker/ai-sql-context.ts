@@ -9,8 +9,41 @@ import type {
   TableDetails,
 } from '../protocol'
 import { hasExplainAnalyzeOption } from '../drivers/common/sql-tools'
-import { isolateActiveSqlStatement, splitSqlStatements } from '../shared-sql-core.js'
+import {
+  getDialectLexerRules,
+  isPostgresEscapeStringStart,
+  isolateActiveSqlStatement,
+  matchDollarQuoteTag,
+  scanBlockCommentEnd,
+  scanBracketIdentEnd,
+  scanLineCommentEnd,
+  scanOracleQuoteEnd,
+  scanQuotedSegmentEnd,
+  splitSqlStatements,
+} from '../shared-sql-core.js'
+import { scrubSensitiveText } from '../shared-sql-safety.js'
 import { AI_PREFIX_CHARS, hasSensitiveContent, looksInjected, type AiDialect } from './ai-client'
+
+/**
+ * Wraps arbitrary untrusted text (SQL, plans, errors) in a backtick fence strictly longer
+ * than any backtick sequence present inside `content`, preventing markdown fence breakout.
+ */
+export function fencePromptBlock(content: string, lang = ''): string {
+  const safeContent = typeof content === 'string' ? content : ''
+  const runs = safeContent.match(/`+/g)
+  const maxRun = runs ? Math.max(...runs.map((r) => r.length)) : 0
+  const fence = '`'.repeat(Math.max(3, maxRun + 1))
+  return `${fence}${lang}\n${safeContent}\n${fence}`
+}
+
+/**
+ * Sanitizes database catalog identifiers (schema, table, column, index names) before prompt interpolation,
+ * removing newlines, tabs, backticks, and C0/DEL control characters that could inject prompt instructions.
+ */
+export function sanitizeCatalogName(name: string): string {
+  if (typeof name !== 'string') return ''
+  return name.replace(/[\r\n\t\x00-\x1f\x7f`]+/g, ' ').replace(/ {2,}/g, ' ').trim()
+}
 
 const CURSOR = '<CURSOR>'
 const MAX_SCHEMA_CHARS = 6000
@@ -226,68 +259,101 @@ function scanDollarQuote(text: string, dollarIndex: number): { end: number; clos
 
 /** Strips SQL comments and string literals while keeping quoted/bracketed identifiers intact. */
 function maskSqlCommentsAndStringsForTableScan(sqlText: string, dialect?: AiDialect): string {
+  const rules = getDialectLexerRules(dialect)
   const parts: string[] = []
   let i = 0
   while (i < sqlText.length) {
     const ch = sqlText[i]
     const next = sqlText[i + 1]
-    if (ch === '-' && next === '-') {
-      const nl = sqlText.indexOf('\n', i + 2)
+    if (rules.lineCommentDash && ch === '-' && next === '-') {
+      const end = scanLineCommentEnd(sqlText, i)
       parts.push(' ')
-      if (nl === -1) break
-      parts.push('\n')
-      i = nl + 1
+      if (end > i && (sqlText[end - 1] === '\n' || sqlText[end - 1] === '\r')) {
+        parts.push('\n')
+      }
+      i = end
       continue
     }
-    if (ch === '#' && dialect !== 'mssql' && dialect !== 'oracle') {
-      const nl = sqlText.indexOf('\n', i + 1)
+    if (
+      ch === '#' &&
+      (rules.lineCommentHash || (dialect === undefined && (!next || !/[A-Za-z0-9_#>]/.test(next))))
+    ) {
+      const end = scanLineCommentEnd(sqlText, i - 1)
       parts.push(' ')
-      if (nl === -1) break
-      parts.push('\n')
-      i = nl + 1
+      if (end > i && (sqlText[end - 1] === '\n' || sqlText[end - 1] === '\r')) {
+        parts.push('\n')
+      }
+      i = end
+      continue
+    }
+    if (rules.lineCommentSlash && ch === '/' && next === '/') {
+      const end = scanLineCommentEnd(sqlText, i)
+      parts.push(' ')
+      if (end > i && (sqlText[end - 1] === '\n' || sqlText[end - 1] === '\r')) {
+        parts.push('\n')
+      }
+      i = end
       continue
     }
     if (ch === '/' && next === '*') {
-      const close = sqlText.indexOf('*/', i + 2)
+      const end = scanBlockCommentEnd(sqlText, i, rules.nestedBlockComments)
       parts.push(' ')
-      if (close === -1) break
-      i = close + 2
+      i = end
       continue
     }
-    if (dialect === 'oracle' || dialect === undefined) {
-      const qMatch = scanOracleQQuote(sqlText, i)
+    if (rules.oracleQQuote || dialect === undefined) {
+      const qMatch = dialect === undefined ? scanOracleQQuote(sqlText, i) : scanOracleQuoteEnd(sqlText, i, dialect)
       if (qMatch) {
         parts.push(' ')
         i = qMatch.end
         continue
       }
     }
-    if ((dialect === 'postgres' || dialect === undefined) && ch === '$') {
-      const dq = scanDollarQuote(sqlText, i)
-      if (dq) {
+    if ((rules.dollarQuoting || dialect === undefined) && ch === '$') {
+      const tag = matchDollarQuoteTag(sqlText, i)
+      if (tag) {
+        const closeAt = sqlText.indexOf(tag, i + tag.length)
         parts.push(' ')
-        i = dq.end
+        i = closeAt === -1 ? sqlText.length : closeAt + tag.length
         continue
       }
     }
-    if (ch === "'") {
-      const allowBackslash = dialect !== 'mssql' && dialect !== 'oracle'
-      const str = scanQuotedString(sqlText, i, "'", {
-        backslashEscape: allowBackslash,
-        doubledEscape: true,
-      })
+    if (
+      rules.postgresEscapeString &&
+      (ch === 'E' || ch === 'e') &&
+      next === "'" &&
+      isPostgresEscapeStringStart(sqlText, i, dialect)
+    ) {
+      const str = scanQuotedSegmentEnd(sqlText, i + 1, "'", true)
       parts.push(' ')
       i = str.end
       continue
     }
-    if (ch === '[' && (dialect === 'mssql' || dialect === undefined)) {
-      const br = scanBracketIdent(sqlText, i)
+    if (ch === "'") {
+      const str = scanQuotedSegmentEnd(
+        sqlText,
+        i,
+        "'",
+        dialect === undefined ? true : rules.backslashEscapesSingleQuote
+      )
+      parts.push(' ')
+      i = str.end
+      continue
+    }
+    if (ch === '[' && (rules.bracketIdentifiers !== 'none' || dialect === undefined)) {
+      const br = scanBracketIdentEnd(sqlText, i, rules.bracketIdentifiers !== 'no-doubling')
       parts.push(sqlText.slice(i, br.end))
       i = br.end
       continue
     }
-    if (ch === '"' || ch === '`') {
-      const q = scanQuotedString(sqlText, i, ch, { backslashEscape: false, doubledEscape: true })
+    if (ch === '"' && rules.doubleQuoteIdentifiers) {
+      const q = scanQuotedSegmentEnd(sqlText, i, '"', rules.backslashEscapesDoubleQuote)
+      parts.push(sqlText.slice(i, q.end))
+      i = q.end
+      continue
+    }
+    if (ch === '`' && rules.backtickIdentifiers) {
+      const q = scanQuotedSegmentEnd(sqlText, i, '`', false)
       parts.push(sqlText.slice(i, q.end))
       i = q.end
       continue
@@ -315,9 +381,9 @@ function unquoteIdent(raw: string): string {
 const SQL_IDENT_ATOM =
   '(?:\\[(?:[^\\]\\r\\n]|\\]\\])+\\]|"(?:[^"\\r\\n]|"")+"|`(?:[^`\\r\\n]|``)+`|[A-Za-z0-9_$]+)'
 const SQL_REFERENCED_TABLE_PATTERN =
-  `\\b(?:FROM|JOIN|UPDATE|INTO|TABLE|DESCRIBE)\\s+(?:(${SQL_IDENT_ATOM})\\s*\\.\\s*)?(${SQL_IDENT_ATOM})`
+  `\\b(?:FROM(?:\\s+ONLY)?|JOIN|UPDATE(?:\\s+ONLY)?|INTO|TABLE(?:\\s+IF\\s+NOT\\s+EXISTS)?|DESCRIBE)\\s+(?:(${SQL_IDENT_ATOM})\\s*\\.\\s*)?(?:(${SQL_IDENT_ATOM})\\s*\\.\\s*)?(${SQL_IDENT_ATOM})`
 const SQL_TRAILING_PARTIAL_TABLE_RE = new RegExp(
-  `(?:^|[\\s(,;])(?:FROM|JOIN|UPDATE|INTO|TABLE|DESCRIBE)\\s+(?:(${SQL_IDENT_ATOM})\\s*\\.\\s*)?(["\`[]?)([A-Za-z0-9_$]{1,64})$`,
+  `(?:^|[\\s(,;])(?:FROM(?:\\s+ONLY)?|JOIN|UPDATE(?:\\s+ONLY)?|INTO|TABLE(?:\\s+IF\\s+NOT\\s+EXISTS)?|DESCRIBE)\\s+(?:(${SQL_IDENT_ATOM})\\s*\\.\\s*)?(?:(${SQL_IDENT_ATOM})\\s*\\.\\s*)?(["\`[]?)([A-Za-z0-9_$]{1,64})$`,
   'i'
 )
 
@@ -335,8 +401,8 @@ export function extractTrailingPartialTableName(
   const masked = maskSqlCommentsAndStringsForTableScan(prefix.slice(-INLINE_PREFIX_CHARS), dialect)
   const match = SQL_TRAILING_PARTIAL_TABLE_RE.exec(masked)
   if (!match) return null
-  const schema = match[1] ? unquoteIdent(match[1]) : undefined
-  const partial = match[3]
+  const schema = match[2] ? unquoteIdent(match[2]) : match[1] ? unquoteIdent(match[1]) : undefined
+  const partial = match[4]
   if (!partial) return null
   return schema ? { schema, partial } : { partial }
 }
@@ -348,8 +414,11 @@ export function extractReferencedTables(sqlText: string, dialect?: AiDialect): s
   const re = new RegExp(SQL_REFERENCED_TABLE_PATTERN, 'gi')
   let match: RegExpExecArray | null
   while ((match = re.exec(masked)) !== null) {
-    const schemaPart = match[1] ? unquoteIdent(match[1]) : ''
-    const tablePart = match[2] ? unquoteIdent(match[2]) : ''
+    const p1 = match[1] ? unquoteIdent(match[1]) : ''
+    const p2 = match[2] ? unquoteIdent(match[2]) : ''
+    const p3 = match[3] ? unquoteIdent(match[3]) : ''
+    const schemaPart = p2 ? p2 : p1
+    const tablePart = p3
     if (!tablePart) continue
     const qualified = schemaPart ? `${schemaPart}.${tablePart}` : tablePart
     const key = qualified.toLowerCase()
@@ -368,17 +437,14 @@ function lookupDetails(
 ): TableDetails | undefined {
   if (!snapshot) return undefined
   const lower = rawName.toLowerCase()
-  const direct = snapshot.details.get(lower)
-  if (direct) return direct
   if (lower.includes('.')) {
-    const bare = lower.split('.').pop() || ''
-    return snapshot.details.get(bare)
+    return snapshot.details.get(lower)
   }
   if (activeSchema) {
     const qualified = snapshot.details.get(`${activeSchema.toLowerCase()}.${lower}`)
     if (qualified) return qualified
   }
-  return undefined
+  return snapshot.details.get(lower)
 }
 
 function extractReferencedColumnTokens(sqlText: string, dialect?: AiDialect): Set<string> {
@@ -418,7 +484,9 @@ function buildCompactTableParts(
 } {
   const fkByCol = new Map<string, string>()
   for (const fk of details.foreignKeys || []) {
-    fkByCol.set(fk.column.toLowerCase(), `${fk.referencedTable}.${fk.referencedColumn}`)
+    const refTable = sanitizeCatalogName(fk.referencedTable)
+    const refCol = sanitizeCatalogName(fk.referencedColumn)
+    fkByCol.set(fk.column.toLowerCase(), `${refTable}.${refCol}`)
   }
   const selectedColumns = prioritizeColumns(
     details.columns || [],
@@ -434,14 +502,21 @@ function buildCompactTableParts(
     const fk = fkByCol.get(c.name.toLowerCase())
     if (fk) tags.push(`FK->${fk}`)
     const suffix = tags.length > 0 ? ` ${tags.join(' ')}` : ''
-    return `${c.name} ${c.type || 'any'}${suffix}`
+    const colName = sanitizeCatalogName(c.name)
+    const colType = sanitizeCatalogName(c.type || 'any') || 'any'
+    return `${colName} ${colType}${suffix}`
   })
   const idxList = (details.indexes || [])
-    .filter((i) => !i.isPrimary && i.columns.length > 0)
+    .filter((i) => !i.isPrimary && Array.isArray(i.columns) && i.columns.length > 0)
     .slice(0, 6)
-    .map((i) => `${i.isUnique ? 'uniq:' : ''}${i.name}(${i.columns.join(', ')})`)
+    .map(
+      (i) =>
+        `${i.isUnique ? 'uniq:' : ''}${sanitizeCatalogName(i.name)}(${i.columns.map(sanitizeCatalogName).join(', ')})`
+    )
   const idxNote = idxList.length > 0 ? ` [idx: ${idxList.join('; ')}]` : ''
-  const title = details.schema ? `${details.schema}.${details.name}` : details.name
+  const cleanSchema = sanitizeCatalogName(details.schema || '')
+  const cleanName = sanitizeCatalogName(details.name)
+  const title = cleanSchema ? `${cleanSchema}.${cleanName}` : cleanName
   return { title, cols, idxNote }
 }
 
@@ -456,6 +531,7 @@ function fitColumnListToBudget(
   idxNote: string,
   budget: number
 ): string {
+  if (budget <= 0) return ''
   const full = `${title} (${cols.join(', ')})${idxNote}`
   if (full.length <= budget) return full
   const withoutIdx = `${title} (${cols.join(', ')})`
@@ -471,12 +547,14 @@ function fitColumnListToBudget(
     len += add
   }
   if (kept.length > 0) {
-    return `${prefix}${kept.join(', ')}${ellipsisSuffix}`
+    const out = `${prefix}${kept.join(', ')}${ellipsisSuffix}`
+    if (out.length <= budget) return out
   }
-  if (cols.length > 0 && budget >= prefix.length + 9) {
-    const maxCol = budget - prefix.length - 6
+  if (cols.length > 0) {
+    const maxCol = budget - prefix.length - 3 - ellipsisSuffix.length
     if (maxCol >= 4) {
-      return `${prefix}${cols[0].slice(0, maxCol)}...${ellipsisSuffix}`
+      const out = `${prefix}${cols[0].slice(0, maxCol)}...${ellipsisSuffix}`
+      if (out.length <= budget) return out
     }
   }
   return budget >= `${title} (...)`.length ? `${title} (...)` : ''
@@ -611,12 +689,20 @@ export function buildPrunedSchemaBlock(
 ): string {
   const lines: string[] = []
   const usedKeys = new Set<string>()
+  const usedBareKeys = new Set<string>()
   let chars = 0
 
+  const markUsed = (k: string, bareLower: string) => {
+    usedKeys.add(k)
+    usedBareKeys.add(bareLower)
+  }
+
   const pushLine = (line: string): boolean => {
-    if (!line || chars + line.length + 1 > maxChars) return false
+    if (!line) return false
+    const sep = lines.length > 0 ? 1 : 0
+    if (chars + sep + line.length > maxChars) return false
     lines.push(line)
-    chars += line.length + 1
+    chars += sep + line.length
     return true
   }
 
@@ -650,26 +736,32 @@ export function buildPrunedSchemaBlock(
     if (det) {
       const k = `${(det.schema || '').toLowerCase()}.${det.name.toLowerCase()}`
       if (!usedKeys.has(k)) {
-        usedKeys.add(k)
+        markUsed(k, det.name.toLowerCase())
         tier1Details.push(det)
         tier1Items.push({ kind: 'details', details: det })
       }
     } else if (schemaMap) {
       const bare = name.includes('.') ? name.split('.').pop() || name : name
-      const cols = lookupSchemaMapCols(schemaMap, name, bare)
+      const cols = name.includes('.')
+        ? lookupSchemaMapCols(schemaMap, name)
+        : lookupSchemaMapCols(schemaMap, activeSchema ? `${activeSchema}.${bare}` : undefined, name, bare)
       if (cols) {
         const bareKey = `.${bare.toLowerCase()}`
         if (!usedKeys.has(bareKey)) {
-          usedKeys.add(bareKey)
+          markUsed(bareKey, bare.toLowerCase())
           const selected = prioritizeColumns(cols, 24, (c) => Boolean(referencedCols?.has(c.toLowerCase())))
-          tier1Items.push({ kind: 'map', title: bare, cols: [...selected] })
+          tier1Items.push({
+            kind: 'map',
+            title: sanitizeCatalogName(bare),
+            cols: selected.map(sanitizeCatalogName),
+          })
         }
       }
     }
   }
 
   for (let i = 0; i < tier1Items.length; i++) {
-    const remainingBudget = maxChars - chars - 1
+    const remainingBudget = maxChars - chars - (lines.length > 0 ? 1 : 0)
     if (remainingBudget <= 0) break
     const remainingCount = tier1Items.length - 1 - i
     const reservedForRest =
@@ -703,13 +795,14 @@ export function buildPrunedSchemaBlock(
       if (!det) continue
       const k = `${(det.schema || '').toLowerCase()}.${det.name.toLowerCase()}`
       if (usedKeys.has(k)) continue
-      usedKeys.add(k)
+      markUsed(k, det.name.toLowerCase())
       if (!pushLine(formatCompactTableDdl(det))) break
     }
   }
 
   // Tier 3: Remaining objects summary (gracefully degrades full -> key cols -> compact names to keep columns for 20-50+ tables)
   const remaining = new Map<string, { full: string; medium: string; compact: string }>()
+  const remainingBareKeys = new Set<string>()
   if (snapshot) {
     for (const obj of snapshot.objects) {
       if (obj.kind && obj.kind !== 'table' && obj.kind !== 'view' && obj.kind !== 'materialized_view') {
@@ -724,12 +817,15 @@ export function buildPrunedSchemaBlock(
         const fkCols = new Set((det.foreignKeys || []).map((fk) => fk.column.toLowerCase()))
         cols = prioritizeColumns(det.columns || [], 8, (c) =>
           Boolean(c.isPrimaryKey || fkCols.has(c.name.toLowerCase()))
-        ).map((c) => c.name)
+        ).map((c) => sanitizeCatalogName(c.name))
       } else {
-        cols = lookupSchemaMapCols(schemaMap, obj.name)?.slice(0, 8) ?? []
+        cols = (lookupSchemaMapCols(schemaMap, obj.name)?.slice(0, 8) ?? []).map(sanitizeCatalogName)
       }
-      const label = obj.schema ? `${obj.schema}.${obj.name}` : obj.name
+      const cleanSchema = sanitizeCatalogName(obj.schema || '')
+      const cleanName = sanitizeCatalogName(obj.name)
+      const label = cleanSchema ? `${cleanSchema}.${cleanName}` : cleanName
       const keyCols = cols.slice(0, 4)
+      remainingBareKeys.add(obj.name.toLowerCase())
       remaining.set(k, {
         full: cols.length > 0 ? `${label}(${cols.join(', ')})` : label,
         medium: keyCols.length > 0 ? `${label}(${keyCols.join(', ')})` : label,
@@ -738,21 +834,22 @@ export function buildPrunedSchemaBlock(
     }
   }
   if (schemaMap) {
-    for (const [tbl, cols] of Object.entries(schemaMap)) {
+    for (const [tbl, rawCols] of Object.entries(schemaMap)) {
+      if (!Array.isArray(rawCols)) continue
       const bare = tbl.includes('.') ? tbl.split('.').pop() || tbl : tbl
       const bareLower = bare.toLowerCase()
-      if (
-        Array.from(usedKeys).some((k) => k === bareLower || k.endsWith(`.${bareLower}`)) ||
-        Array.from(remaining.keys()).some((k) => k.endsWith(`.${bareLower}`))
-      ) {
+      if (usedBareKeys.has(bareLower) || remainingBareKeys.has(bareLower)) {
         continue
       }
+      const cols = rawCols.map(sanitizeCatalogName)
+      const cleanTbl = sanitizeCatalogName(tbl)
       const top8 = cols.slice(0, 8)
       const top4 = cols.slice(0, 4)
+      remainingBareKeys.add(bareLower)
       remaining.set(`.${bareLower}`, {
-        full: top8.length > 0 ? `${tbl}(${top8.join(', ')})` : tbl,
-        medium: top4.length > 0 ? `${tbl}(${top4.join(', ')})` : tbl,
-        compact: tbl,
+        full: top8.length > 0 ? `${cleanTbl}(${top8.join(', ')})` : cleanTbl,
+        medium: top4.length > 0 ? `${cleanTbl}(${top4.join(', ')})` : cleanTbl,
+        compact: cleanTbl,
       })
     }
   }
@@ -787,23 +884,28 @@ function buildDdlColumnDefs(
 ): { title: string; cols: string[] } {
   const fkByCol = new Map<string, string>()
   for (const fk of details.foreignKeys || []) {
-    fkByCol.set(fk.column.toLowerCase(), `${fk.referencedTable}(${fk.referencedColumn})`)
+    fkByCol.set(
+      fk.column.toLowerCase(),
+      `${sanitizeCatalogName(fk.referencedTable)}(${sanitizeCatalogName(fk.referencedColumn)})`
+    )
   }
   const selectedColumns = prioritizeColumns(details.columns || [], limit, (c) => {
     const lower = c.name.toLowerCase()
     return Boolean(c.isPrimaryKey || fkByCol.has(lower) || referencedCols?.has(lower))
   })
   const cols = selectedColumns.map((c) => {
-    const parts: string[] = [c.name]
+    const parts: string[] = [sanitizeCatalogName(c.name)]
     if (includeTypes) {
-      parts.push(c.type || 'TEXT')
+      parts.push(sanitizeCatalogName(c.type || 'TEXT') || 'TEXT')
     }
     if (c.isPrimaryKey) parts.push('PRIMARY KEY')
     const fk = fkByCol.get(c.name.toLowerCase())
     if (fk) parts.push(`REFERENCES ${fk}`)
     return parts.join(' ')
   })
-  const title = details.schema ? `${details.schema}.${details.name}` : details.name
+  const cleanSchema = sanitizeCatalogName(details.schema || '')
+  const cleanName = sanitizeCatalogName(details.name)
+  const title = cleanSchema ? `${cleanSchema}.${cleanName}` : cleanName
   return { title, cols }
 }
 
@@ -847,12 +949,20 @@ export function buildCompactSqlDdlSchemaBlock(
 ): string {
   const lines: string[] = []
   const usedKeys = new Set<string>()
+  const usedBareKeys = new Set<string>()
   let chars = 0
 
+  const markUsed = (k: string, bareLower: string) => {
+    usedKeys.add(k)
+    usedBareKeys.add(bareLower)
+  }
+
   const pushLine = (line: string): boolean => {
-    if (!line || chars + line.length + 1 > maxChars) return false
+    if (!line) return false
+    const sep = lines.length > 0 ? 1 : 0
+    if (chars + sep + line.length > maxChars) return false
     lines.push(line)
-    chars += line.length + 1
+    chars += sep + line.length
     return true
   }
 
@@ -898,7 +1008,11 @@ export function buildCompactSqlDdlSchemaBlock(
         if (!usedKeys.has(bareKey)) {
           usedKeys.add(bareKey)
           const selected = prioritizeColumns(cols, 24, (c) => Boolean(referencedCols?.has(c.toLowerCase())))
-          tier1Items.push({ kind: 'map', title: bare, cols: [...selected] })
+          tier1Items.push({
+            kind: 'map',
+            title: sanitizeCatalogName(bare),
+            cols: selected.map(sanitizeCatalogName),
+          })
         }
       }
     }
@@ -957,7 +1071,9 @@ export function buildCompactSqlDdlSchemaBlock(
       const k = `${(obj.schema || '').toLowerCase()}.${obj.name.toLowerCase()}`
       const bareKey = `.${obj.name.toLowerCase()}`
       if (usedKeys.has(k) || usedKeys.has(bareKey)) continue
-      const label = obj.schema ? `${obj.schema}.${obj.name}` : obj.name
+      const cleanSchema = sanitizeCatalogName(obj.schema || '')
+      const cleanName = sanitizeCatalogName(obj.name)
+      const label = cleanSchema ? `${cleanSchema}.${cleanName}` : cleanName
       const det = lookupDetails(snapshot, obj.name, obj.schema)
       if (det && det.columns.length > 0) {
         const fullDefs = buildDdlColumnDefs(det, 8, true).cols
@@ -968,7 +1084,7 @@ export function buildCompactSqlDdlSchemaBlock(
           compact: `-- table ${label}`,
         })
       } else {
-        const cols = lookupSchemaMapCols(schemaMap, obj.name) ?? []
+        const cols = (lookupSchemaMapCols(schemaMap, obj.name) ?? []).map(sanitizeCatalogName)
         const top8 = cols.slice(0, 8)
         const top4 = cols.slice(0, 4)
         remaining.set(k, {
@@ -980,21 +1096,28 @@ export function buildCompactSqlDdlSchemaBlock(
     }
   }
   if (schemaMap) {
-    for (const [tbl, cols] of Object.entries(schemaMap)) {
+    const usedBareDdl = new Set<string>(
+      Array.from(usedKeys).map((k) => (k.includes('.') ? k.split('.').pop() || k : k))
+    )
+    const remainingBareDdl = new Set<string>(
+      Array.from(remaining.keys()).map((k) => (k.includes('.') ? k.split('.').pop() || k : k))
+    )
+    for (const [tbl, rawCols] of Object.entries(schemaMap)) {
+      if (!Array.isArray(rawCols)) continue
       const bare = tbl.includes('.') ? tbl.split('.').pop() || tbl : tbl
       const bareLower = bare.toLowerCase()
-      if (
-        Array.from(usedKeys).some((k) => k === bareLower || k.endsWith(`.${bareLower}`)) ||
-        Array.from(remaining.keys()).some((k) => k.endsWith(`.${bareLower}`))
-      ) {
+      if (usedBareDdl.has(bareLower) || remainingBareDdl.has(bareLower)) {
         continue
       }
+      const cols = rawCols.map(sanitizeCatalogName)
+      const cleanTbl = sanitizeCatalogName(tbl)
       const top8 = cols.slice(0, 8)
       const top4 = cols.slice(0, 4)
+      remainingBareDdl.add(bareLower)
       remaining.set(`.${bareLower}`, {
-        full: top8.length > 0 ? `CREATE TABLE ${tbl} (${top8.join(', ')});` : `-- table ${tbl}`,
-        medium: top4.length > 0 ? `CREATE TABLE ${tbl} (${top4.join(', ')});` : `-- table ${tbl}`,
-        compact: `-- table ${tbl}`,
+        full: top8.length > 0 ? `CREATE TABLE ${cleanTbl} (${top8.join(', ')});` : `-- table ${cleanTbl}`,
+        medium: top4.length > 0 ? `CREATE TABLE ${cleanTbl} (${top4.join(', ')});` : `-- table ${cleanTbl}`,
+        compact: `-- table ${cleanTbl}`,
       })
     }
   }
@@ -1021,35 +1144,34 @@ export function buildCompactSqlDdlSchemaBlock(
   return lines.join('\n')
 }
 
-export function maskLongStringLiterals(sql: string): string {
+export function maskLongStringLiterals(sql: string, dialect?: AiDialect): string {
+  const rules = getDialectLexerRules(dialect)
   let out = ''
   let i = 0
   while (i < sql.length) {
-    if (sql[i] === "'") {
-      let end = i + 1
-      while (end < sql.length) {
-        if (sql[end] === '\\' && end + 1 < sql.length) {
-          end += 2
-          continue
-        }
-        if (sql[end] === "'") {
-          if (sql[end + 1] === "'") {
-            end += 2
-            continue
-          }
-          break
-        }
-        end++
-      }
-      if (end < sql.length && sql[end] === "'") {
-        const innerLen = end - i - 1
-        out += innerLen >= LONG_LITERAL_MIN ? "'...'" : sql.slice(i, end + 1)
-        i = end + 1
+    const ch = sql[i]
+    const isPgEscape =
+      rules.postgresEscapeString &&
+      (ch === 'E' || ch === 'e') &&
+      sql[i + 1] === "'" &&
+      isPostgresEscapeStringStart(sql, i, dialect)
+    if (ch === "'" || isPgEscape) {
+      const quoteStart = isPgEscape ? i + 1 : i
+      const seg = scanQuotedSegmentEnd(
+        sql,
+        quoteStart,
+        "'",
+        (dialect === undefined ? true : rules.backslashEscapesSingleQuote) || isPgEscape
+      )
+      if (seg.closed) {
+        const innerLen = seg.end - quoteStart - 2
+        out += innerLen >= LONG_LITERAL_MIN ? (isPgEscape ? "E'...'" : "'...'") : sql.slice(i, seg.end)
+        i = seg.end
         continue
       }
     }
-    out += sql[i]
-    i++
+    out += ch
+    i += 1
   }
   return out
 }
@@ -1468,52 +1590,75 @@ export function isPrefixInComment(prefix: string, dialect?: AiDialect): boolean 
   if (dialect === 'mongodb') {
     return scanMongoScript(prefix).unclosedComment
   }
+  const rules = getDialectLexerRules(dialect)
   let i = 0
-  while (i < prefix.length) {
+  const len = prefix.length
+  while (i < len) {
     const ch = prefix[i]
     const next = prefix[i + 1]
-    if (ch === '-' && next === '-') {
-      const nl = prefix.indexOf('\n', i + 2)
-      if (nl === -1) return true
-      i = nl + 1
+    if (rules.lineCommentDash && ch === '-' && next === '-') {
+      const end = scanLineCommentEnd(prefix, i)
+      if (end >= len && prefix[len - 1] !== '\n' && prefix[len - 1] !== '\r') return true
+      i = end
       continue
     }
-    if (ch === '#' && dialect !== 'mssql' && dialect !== 'oracle') {
-      const nl = prefix.indexOf('\n', i + 1)
-      if (nl === -1) return true
-      i = nl + 1
+    if (rules.lineCommentHash && ch === '#') {
+      const end = scanLineCommentEnd(prefix, i - 1)
+      if (end >= len && prefix[len - 1] !== '\n' && prefix[len - 1] !== '\r') return true
+      i = end
+      continue
+    }
+    if (rules.lineCommentSlash && ch === '/' && next === '/') {
+      const end = scanLineCommentEnd(prefix, i)
+      if (end >= len && prefix[len - 1] !== '\n' && prefix[len - 1] !== '\r') return true
+      i = end
       continue
     }
     if (ch === '/' && next === '*') {
-      const close = prefix.indexOf('*/', i + 2)
-      if (close === -1) return true
-      i = close + 2
+      const end = scanBlockCommentEnd(prefix, i, rules.nestedBlockComments)
+      if (end >= len && !prefix.slice(i + 2).endsWith('*/')) return true
+      i = end
       continue
     }
-    if (dialect === 'mssql' && ch === '[') {
-      i = scanBracketIdent(prefix, i).end
+    if (rules.bracketIdentifiers !== 'none' && ch === '[') {
+      i = scanBracketIdentEnd(prefix, i, rules.bracketIdentifiers === 'doubling').end
       continue
     }
-    if (dialect === 'oracle') {
-      const qMatch = scanOracleQQuote(prefix, i)
+    if (rules.oracleQQuote) {
+      const qMatch = scanOracleQuoteEnd(prefix, i, dialect)
       if (qMatch) {
         i = qMatch.end
         continue
       }
     }
-    if ((dialect === 'postgres' || dialect === undefined) && ch === '$') {
-      const dq = scanDollarQuote(prefix, i)
-      if (dq) {
-        i = dq.end
+    if ((rules.dollarQuoting || dialect === undefined) && ch === '$') {
+      const tag = matchDollarQuoteTag(prefix, i)
+      if (tag) {
+        const closeAt = prefix.indexOf(tag, i + tag.length)
+        if (closeAt === -1) return false
+        i = closeAt + tag.length
         continue
       }
     }
-    if (ch === "'" || ch === '"' || ch === '`') {
-      const allowBackslash = ch !== '`' && dialect !== 'mssql' && dialect !== 'oracle'
-      i = scanQuotedString(prefix, i, ch, {
-        backslashEscape: allowBackslash,
-        doubledEscape: true,
-      }).end
+    if (
+      rules.postgresEscapeString &&
+      (ch === 'E' || ch === 'e') &&
+      next === "'" &&
+      isPostgresEscapeStringStart(prefix, i, dialect)
+    ) {
+      i = scanQuotedSegmentEnd(prefix, i + 1, "'", true).end
+      continue
+    }
+    if (ch === "'") {
+      i = scanQuotedSegmentEnd(prefix, i, "'", rules.backslashEscapesSingleQuote).end
+      continue
+    }
+    if (ch === '"' && rules.doubleQuoteIdentifiers) {
+      i = scanQuotedSegmentEnd(prefix, i, '"', rules.backslashEscapesDoubleQuote).end
+      continue
+    }
+    if (ch === '`' && rules.backtickIdentifiers) {
+      i = scanQuotedSegmentEnd(prefix, i, '`', false).end
       continue
     }
     i += 1
@@ -1737,7 +1882,7 @@ function extractSafePriorTabSql(
     const joined = safeLines.join('\n')
     return joined && !hasSensitiveContent(joined, '', '', dialect) ? joined : ''
   }
-  const stmts = splitSqlStatements(precedingRaw, dialect === 'mongodb' ? 'sqlite' : dialect)
+  const stmts = splitSqlStatements(precedingRaw, dialect)
   const candidates: string[] =
     stmts.length > 0 ? stmts.map((slice) => slice.text) : [precedingRaw]
   const kept: string[] = []
@@ -1745,7 +1890,7 @@ function extractSafePriorTabSql(
   for (let i = candidates.length - 1; i >= 0; i--) {
     const rawStmt = candidates[i]?.trim() ?? ''
     if (!rawStmt || hasSensitiveContent(rawStmt, '', '', dialect)) continue
-    const masked = maskLongStringLiterals(rawStmt.replace(/\s+/g, ' ').trim())
+    const masked = maskLongStringLiterals(rawStmt.replace(/\s+/g, ' ').trim(), dialect)
     if (!masked || hasSensitiveContent(masked, '', '', dialect)) continue
     const formatted = masked.endsWith(';') ? masked : `${masked};`
     if (chars + formatted.length + 1 > MAX_PRIOR_TAB_SQL_CHARS) {
@@ -1805,15 +1950,16 @@ export function buildSqlCompletionContext(
         ? `You are a ${engineName} HOLE FILLER. Fill the ${CURSOR} hole inside <COMPLETION>...</COMPLETION> with ONLY the exact raw MongoDB Shell / MQL to insert at ${CURSOR}, grounded strictly in the provided Schema collections and fields. Never invent collections or fields absent from Schema, never invent arbitrary literal filter values absent from the current query, Recent history, or Prior SQL, never wrap in backticks or markdown, never repeat text before or after ${CURSOR}, no prose.`
         : `You are a ${engineName} SQL HOLE FILLER. Fill the ${CURSOR} hole inside <COMPLETION>...</COMPLETION> with ONLY the exact raw SQL characters to insert at ${CURSOR}, grounded strictly in the provided Schema tables, columns, and foreign keys. Never invent tables or columns absent from Schema, never wrap in backticks or markdown fences, never repeat text already before or after ${CURSOR}, no prose.\nRules:\n1) Complete partial identifiers from Schema without repeating already-typed characters (e.g. <QUERY>SELECT * FROM <tbl_pre><CURSOR></QUERY> -> <COMPLETION><tbl_rest></COMPLETION>).\n2) Keep existing quoting style when inside quotes (e.g. <QUERY>SELECT * FROM "<tbl_pre><CURSOR></QUERY> -> <COMPLETION><tbl_rest>"</COMPLETION>).\n3) Prefer JOIN/ON/ORDER BY/GROUP BY clauses and structural predicates (e.g. IS NULL / IS NOT NULL) using real columns and foreign keys from Schema; stop cleanly at the end of the current clause or statement.\n4) NEVER fabricate or guess arbitrary literal filter values (such as dummy IDs like '1234567890', fake dates, emails, or speculative WHERE filters). Only reuse concrete literal values that already appear in the current query, Recent query history, or Prior SQL in tab; otherwise stop before inventing unrequested WHERE conditions.`
 
+  const sqlLang = input.dialect === 'mongodb' ? 'javascript' : input.dialect === 'redis' ? 'text' : 'sql'
   const parts: string[] = [`Dialect: ${engineName}`]
   if (schemaBlock) {
-    parts.push(`Schema:\n${schemaBlock}`)
+    parts.push(`Schema:\n${fencePromptBlock(schemaBlock, 'text')}`)
   }
   if (recent.length > 0) {
-    parts.push(`Recent:\n${recent.map((q) => `- ${q}`).join('\n')}`)
+    parts.push(`Recent:\n${fencePromptBlock(recent.map((q) => `- ${q}`).join('\n'), 'text')}`)
   }
   if (priorSql) {
-    parts.push(`Prior SQL in tab:\n${priorSql}`)
+    parts.push(`Prior SQL in tab:\n${fencePromptBlock(priorSql, sqlLang)}`)
   }
   parts.push(
     `<QUERY>\n${prefixWin}${CURSOR}${suffixWin}\n</QUERY>\nTASK: Fill the ${CURSOR} hole using Schema and Recent history. Never invent dummy literal values; reply ONLY with <COMPLETION>...</COMPLETION>.`
@@ -1904,8 +2050,10 @@ export function buildSqlStatementEditContext(
 
   const user = [
     `Dialect: ${engineName}`,
-    ...(schemaBlock ? [`Schema:\n${schemaBlock}`] : []),
-    ...(recent.length > 0 ? [`Recent:\n${recent.map((q) => `- ${q}`).join('\n')}`] : []),
+    ...(schemaBlock ? [`Schema:\n${fencePromptBlock(schemaBlock, 'text')}`] : []),
+    ...(recent.length > 0
+      ? [`Recent:\n${fencePromptBlock(recent.map((q) => `- ${q}`).join('\n'), 'text')}`]
+      : []),
     `<STATEMENT>\n${input.statementBeforeCursor}${CURSOR}${input.statementAfterCursor}\n</STATEMENT>\n${taskLine}`,
   ].join('\n\n')
 
@@ -1951,21 +2099,49 @@ export function resolveExplainLanguage(
   return { code: 'en', label: LANGUAGE_LABELS.en }
 }
 
+const PLAN_SECRET_ASSIGN_RE =
+  /((?:pass(?:word|wd)?|(?<![a-zA-Z])pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token|private[_-]?key|token)["']?\s*[:=]\s*["'])([^"'\r\n]+)(["'])/gi
+
+function redactSecretLiteralsForPrompt(text: string): string {
+  const scrubbed = scrubSensitiveText(text)
+  return scrubbed.replace(PLAN_SECRET_ASSIGN_RE, '$1[REDACTED]$3')
+}
+
+function safeSerializePlanCell(cell: unknown): string {
+  if (cell === null || cell === undefined) return 'NULL'
+  if (typeof cell === 'bigint') return cell.toString()
+  let txt: string
+  if (typeof cell === 'object') {
+    try {
+      txt = JSON.stringify(cell, (_k, v: unknown) => (typeof v === 'bigint' ? v.toString() : v)) ?? ''
+    } catch {
+      txt = String(cell)
+    }
+  } else {
+    txt = String(cell)
+  }
+  return redactSecretLiteralsForPrompt(txt.replace(/\r?\n/g, ' '))
+}
+
 function serializePlanTable(columns: { name: string; type: string }[], rows: unknown[][]): string {
   if (!columns.length && !rows.length) return '(no plan rows returned)'
-  const header = columns.map((c) => c.name || 'col').join(' | ')
+  const header = columns.map((c) => sanitizeCatalogName(c?.name || 'col') || 'col').join(' | ')
+  const truncationNote = '... (plan output truncated)'
   const lines: string[] = [header]
   let chars = header.length + 1
   for (const row of rows) {
     if (!Array.isArray(row)) continue
-    const cells = row.map((cell) => {
-      if (cell === null || cell === undefined) return 'NULL'
-      const txt = typeof cell === 'object' ? JSON.stringify(cell) : String(cell)
-      return txt.replace(/\r?\n/g, ' ')
-    })
+    const cells = row.map((cell) => safeSerializePlanCell(cell))
     const line = cells.join(' | ')
     if (chars + line.length + 1 > MAX_PLAN_CHARS) {
-      lines.push('... (plan output truncated)')
+      // Preserve as much of row 0 as fits (critical for single-row Postgres EXPLAIN FORMAT JSON)
+      if (lines.length === 1) {
+        const room = MAX_PLAN_CHARS - chars - truncationNote.length - 2
+        if (room > 32) {
+          lines.push(line.slice(0, room))
+        }
+      }
+      lines.push(truncationNote)
       break
     }
     lines.push(line)
@@ -1980,6 +2156,7 @@ export interface BuildExplainAnalysisPromptInput {
   planColumns: { name: string; type: string }[]
   planRows: unknown[][]
   snapshot: WorkerSchemaSnapshot | null
+  activeSchema?: string
   language?: AiExplainLanguage
   uiLocale?: string
 }
@@ -2013,7 +2190,7 @@ export function buildExplainAnalysisPrompt(input: BuildExplainAnalysisPromptInpu
           input.snapshot,
           undefined,
           referencedTables,
-          undefined,
+          input.activeSchema,
           undefined,
           MAX_EXPLAIN_SCHEMA_CHARS
         )
@@ -2037,13 +2214,17 @@ export function buildExplainAnalysisPrompt(input: BuildExplainAnalysisPromptInpu
     `Respond with ONLY one valid JSON object matching:\n` +
     `{"summary":"string","bottlenecks":[{"title":"string","detail":"string","severity":"high|medium|low"}],"optimizedSql":"string or null","indexSuggestions":[{"ddl":"string","reason":"string"}],"caveats":["string"]}`
 
+  const sqlLang =
+    input.dialect === 'mongodb' ? 'javascript' : input.dialect === 'redis' ? 'text' : 'sql'
   const userParts: string[] = [
     `Engine: ${engineName}`,
-    `Original query:\n${input.sql.trim().slice(0, 4000)}`,
-    `Execution plan:\n${planText}`,
+    `Original query:\n${fencePromptBlock(input.sql.trim().slice(0, 4000), sqlLang)}`,
+    `Execution plan:\n${fencePromptBlock(planText, 'text')}`,
   ]
   if (schemaBlock) {
-    userParts.push(`Relevant tables, columns, FKs & existing indexes:\n${schemaBlock}`)
+    userParts.push(
+      `Relevant tables, columns, FKs & existing indexes:\n${fencePromptBlock(schemaBlock, 'text')}`
+    )
   }
 
   return {
@@ -2200,18 +2381,114 @@ function repairTruncatedJson(fragment: string): unknown | null {
   return null
 }
 
-function extractJsonObject(raw: string): { value: unknown; truncated: boolean } | null {
-  const start = raw.indexOf('{')
-  if (start === -1) return null
-  const end = raw.lastIndexOf('}')
-  if (end > start) {
-    const parsed = parseJsonWithLooseFallback(raw.slice(start, end + 1))
-    if (parsed !== null) {
-      return { value: parsed, truncated: false }
+function findBalancedJsonObjectEnd(raw: string, start: number): number {
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = start; i < raw.length; i += 1) {
+    const ch = raw[i]
+    if (inString) {
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === '"') {
+        inString = false
+      }
+      continue
+    }
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+    if (ch === '{') {
+      depth += 1
+    } else if (ch === '}') {
+      depth -= 1
+      if (depth === 0) return i
     }
   }
-  const repaired = repairTruncatedJson(raw.slice(start))
-  return repaired !== null ? { value: repaired, truncated: true } : null
+  return -1
+}
+
+function hasAnyPreferredKey(
+  value: Record<string, unknown>,
+  preferredKeys?: readonly string[]
+): boolean {
+  if (!preferredKeys || preferredKeys.length === 0) return true
+  for (const key of preferredKeys) {
+    if (Object.hasOwn(value, key)) return true
+  }
+  return false
+}
+
+function extractJsonObject(
+  raw: string,
+  preferredKeys?: readonly string[]
+): { value: unknown; truncated: boolean } | null {
+  let searchFrom = 0
+  let attempts = 0
+  let fallbackComplete: { value: unknown; truncated: boolean } | null = null
+  let fallbackTruncated: { value: unknown; truncated: boolean } | null = null
+
+  while (searchFrom < raw.length && attempts < 32) {
+    const start = raw.indexOf('{', searchFrom)
+    if (start === -1) break
+    attempts += 1
+    const closeIdx = findBalancedJsonObjectEnd(raw, start)
+    if (closeIdx !== -1) {
+      const slice = raw.slice(start, closeIdx + 1)
+      const parsed = parseJsonWithLooseFallback(slice)
+      if (isPlainRecord(parsed)) {
+        const candidate = { value: parsed, truncated: false }
+        if (hasAnyPreferredKey(parsed, preferredKeys)) {
+          return candidate
+        }
+        if (fallbackComplete === null) fallbackComplete = candidate
+        searchFrom = closeIdx + 1
+        continue
+      }
+      const repairedSlice = repairTruncatedJson(slice)
+      if (isPlainRecord(repairedSlice)) {
+        const candidate = { value: repairedSlice, truncated: true }
+        if (hasAnyPreferredKey(repairedSlice, preferredKeys)) {
+          return candidate
+        }
+        if (fallbackTruncated === null) fallbackTruncated = candidate
+      }
+      searchFrom = start + 1
+      continue
+    }
+    const repaired = repairTruncatedJson(raw.slice(start))
+    if (isPlainRecord(repaired)) {
+      const candidate = { value: repaired, truncated: true }
+      if (hasAnyPreferredKey(repaired, preferredKeys)) {
+        return candidate
+      }
+      if (fallbackTruncated === null) fallbackTruncated = candidate
+    }
+    searchFrom = start + 1
+  }
+
+  return fallbackComplete ?? fallbackTruncated
+}
+
+const SAFE_INDEX_DDL_RE =
+  /^(?:CREATE\s+(?:UNIQUE\s+|FULLTEXT\s+|SPATIAL\s+|BITMAP\s+|CLUSTERED\s+|NONCLUSTERED\s+)?INDEX\b|ALTER\s+TABLE\s+[\s\S]+?\bADD\s+(?:UNIQUE\s+)?(?:INDEX|KEY)\b|db\.(?:[A-Za-z0-9_$.]+|getCollection\([^)]+\))\.createIndex\s*\()/i
+
+function sanitizeSuggestedIndexDdl(rawDdl: string): string {
+  const cleaned = stripSqlCodeFence(rawDdl).trim()
+  if (!cleaned || looksInjected(cleaned)) return ''
+  // Keep ONLY the first statement if model appended extra statements after `;`
+  const stmts = splitSqlStatements(cleaned, 'postgres')
+  const firstStmt = (stmts[0]?.text ?? cleaned).trim()
+  if (!firstStmt || !SAFE_INDEX_DDL_RE.test(firstStmt)) return ''
+  if (/\b(?:DROP|DELETE|TRUNCATE|GRANT|REVOKE|EXEC|EXECUTE)\b/i.test(firstStmt)) return ''
+  return firstStmt.slice(0, 500)
 }
 
 function clampStr(v: unknown, max: number): string {
@@ -2224,7 +2501,13 @@ export function parseExplainAnalysis(
   durationMs: number
 ): AiExplainAnalysisResult {
   const withoutThink = stripThinkBlocks(raw)
-  const extracted = extractJsonObject(withoutThink)
+  const extracted = extractJsonObject(withoutThink, [
+    'summary',
+    'bottlenecks',
+    'optimizedSql',
+    'indexSuggestions',
+    'caveats',
+  ])
   const parsed = extracted?.value ?? null
   if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
     const obj = parsed as Record<string, unknown>
@@ -2253,7 +2536,7 @@ export function parseExplainAnalysis(
       .map((item) => {
         if (typeof item !== 'object' || item === null) return null
         const rec = item as Record<string, unknown>
-        const ddl = clampStr(rec.ddl, 500)
+        const ddl = sanitizeSuggestedIndexDdl(clampStr(rec.ddl, 500))
         const reason = clampStr(rec.reason, 400)
         return ddl ? { ddl, reason } : null
       })
@@ -2321,18 +2604,24 @@ export function countFixQueryStatements(sql: string, dialect: AiDialect): number
 export function buildFixQueryPrompt(input: BuildFixQueryPromptInput): BuiltFixQueryPrompt {
   const resolvedLanguage = resolveExplainLanguage(input.language, input.uiLocale)
   const engineName = dialectLabel(input.dialect)
-  const cappedSql = input.sql.trim().slice(0, MAX_FIX_QUERY_SQL_CHARS)
-  const cappedError = input.errorMessage.trim().slice(0, MAX_FIX_QUERY_ERROR_CHARS)
+  const trimmedSql = input.sql.trim()
+  const cappedSql = trimmedSql.slice(0, MAX_FIX_QUERY_SQL_CHARS)
+  const cappedError = redactSecretLiteralsForPrompt(input.errorMessage.trim()).slice(
+    0,
+    MAX_FIX_QUERY_ERROR_CHARS
+  )
   const cappedSchema =
     typeof input.schemaBlock === 'string'
       ? input.schemaBlock.trim().slice(0, MAX_FIX_QUERY_SCHEMA_CHARS)
       : ''
+  const sqlWasTruncated = cappedSql.length < trimmedSql.length
   const statementCount =
+    !sqlWasTruncated &&
     typeof input.statementCount === 'number' &&
     Number.isInteger(input.statementCount) &&
     input.statementCount >= 1
       ? input.statementCount
-      : countFixQueryStatements(input.sql, input.dialect)
+      : countFixQueryStatements(cappedSql, input.dialect)
   const isMultiStatement = statementCount > 1
 
   const introLine = isMultiStatement
@@ -2359,13 +2648,17 @@ export function buildFixQueryPrompt(input: BuildFixQueryPromptInput): BuiltFixQu
     ? `Broken script (${statementCount} statements):`
     : 'Broken query:'
 
+  const sqlLang =
+    input.dialect === 'mongodb' ? 'javascript' : input.dialect === 'redis' ? 'text' : 'sql'
   const userParts: string[] = [
     `Engine: ${engineName}`,
-    `${sqlHeader}\n${cappedSql}`,
-    `Database error:\n${cappedError}`,
+    `${sqlHeader}\n${fencePromptBlock(cappedSql, sqlLang)}`,
+    `Database error:\n${fencePromptBlock(cappedError, 'text')}`,
   ]
   if (cappedSchema) {
-    userParts.push(`Relevant schema (tables, columns, FKs & indexes):\n${cappedSchema}`)
+    userParts.push(
+      `Relevant schema (tables, columns, FKs & indexes):\n${fencePromptBlock(cappedSchema, 'text')}`
+    )
   }
 
   return {
@@ -2659,7 +2952,7 @@ export function parseFixQueryResult(raw: string, meta: ParseFixQueryMeta): AiFix
   }
   const withoutThink = stripThinkBlocks(raw)
   const unfenced = stripOuterJsonFence(withoutThink)
-  const extracted = extractJsonObject(unfenced)
+  const extracted = extractJsonObject(unfenced, ['fixedSql', 'explanation', 'changesSummary'])
   let obj: Record<string, unknown> | null = isPlainRecord(extracted?.value) ? extracted.value : null
 
   const needsRecovery =

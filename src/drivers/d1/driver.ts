@@ -2,6 +2,8 @@
 // Cloudflare D1 pure-TS HTTP driver (native fetch, zero vendor bytes).
 // Reuses the SQLite schema/SQL helpers because D1 is SQLite-compatible.
 
+import * as https from 'node:https'
+import type * as tls from 'node:tls'
 import type {
   ApplyChangesParams,
   ApplyChangesResult,
@@ -29,6 +31,8 @@ import {
   runDriverConnectionTest,
 } from '../common/driver'
 import { validateD1EndpointUrl } from '../common/connection-uri'
+import type { DriverTlsOptions } from '../common/tls-and-tunnel'
+import { resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
 import { scrubDriverErrorText } from '../common/sql-credentials'
 import { parseJsonPreservingBigInts } from '../../shared-grid-paste.js'
 import {
@@ -56,6 +60,110 @@ import {
 } from '../common/sql-tools'
 
 const D1_HTTP_TIMEOUT_MS = 30_000
+const MAX_D1_RESPONSE_BYTES = 32 * 1024 * 1024
+
+async function readBoundedD1ResponseText(response: Response, maxBytes: number): Promise<string> {
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    const text = await response.text()
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+      throw new DatabaseDriverError(
+        `Cloudflare D1 response exceeded maximum size of ${maxBytes} bytes`,
+        'D1_RESPONSE_TOO_LARGE',
+        'd1'
+      )
+    }
+    return text
+  }
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value) {
+        total += value.byteLength
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {})
+          throw new DatabaseDriverError(
+            `Cloudflare D1 response exceeded maximum size of ${maxBytes} bytes`,
+            'D1_RESPONSE_TOO_LARGE',
+            'd1'
+          )
+        }
+        chunks.push(value)
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  return Buffer.concat(chunks, total).toString('utf8')
+}
+
+function sendD1HttpsPost(
+  url: URL,
+  headers: Record<string, string>,
+  body: string,
+  tlsOptions: tls.ConnectionOptions,
+  signal: AbortSignal,
+  maxBytes: number
+): Promise<{ text: string; ok: boolean; status: number }> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      url,
+      { method: 'POST', headers, ...tlsOptions, agent: false, signal },
+      (res) => {
+        const status = res.statusCode ?? 0
+        if (status >= 300 && status < 400) {
+          res.destroy()
+          reject(
+            new DatabaseDriverError(
+              `Cloudflare D1 HTTP redirect (HTTP ${status}) was blocked to protect credentials`,
+              'D1_ERROR',
+              'd1'
+            )
+          )
+          return
+        }
+        const chunks: Buffer[] = []
+        let total = 0
+        let aborted = false
+        res.on('data', (chunk: Buffer | string) => {
+          if (aborted) return
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8')
+          total += buf.byteLength
+          if (total > maxBytes) {
+            aborted = true
+            res.destroy()
+            req.destroy()
+            reject(
+              new DatabaseDriverError(
+                `Cloudflare D1 response exceeded maximum size of ${maxBytes} bytes`,
+                'D1_RESPONSE_TOO_LARGE',
+                'd1'
+              )
+            )
+            return
+          }
+          chunks.push(buf)
+        })
+        res.on('error', (err) => {
+          if (!aborted) reject(err)
+        })
+        res.on('end', () => {
+          if (aborted) return
+          resolve({
+            text: Buffer.concat(chunks, total).toString('utf8'),
+            ok: status >= 200 && status < 300,
+            status,
+          })
+        })
+      }
+    )
+    req.on('error', reject)
+    req.end(body)
+  })
+}
 const D1_UNSUPPORTED_TX_REASON =
   'Cloudflare D1 HTTP API executes stateless requests without interactive multi-statement transactions'
 const D1_DEFAULT_API_ORIGIN = 'https://api.cloudflare.com/client/v4'
@@ -234,13 +342,19 @@ export class D1Session implements IDatabaseSession {
   readonly profile: ConnectionProfile
   readonly endpoint: string
   private readonly authToken?: string
+  private readonly tlsOptions?: tls.ConnectionOptions
   private readonly activeQueries = new Map<string, ActiveD1Query>()
   private readonly tableDetailsCache = new TableDetailsCache()
   private isClosed = false
 
-  constructor(profile: ConnectionProfile, authToken?: string) {
+  constructor(
+    profile: ConnectionProfile,
+    authToken?: string,
+    tlsOverride?: false | tls.ConnectionOptions
+  ) {
     this.profile = profile
     this.authToken = authToken
+    this.tlsOptions = tlsOverride === false ? undefined : tlsOverride
     this.endpoint = resolveD1Endpoint(profile, authToken)
   }
 
@@ -256,30 +370,39 @@ export class D1Session implements IDatabaseSession {
     return headers
   }
 
-  private async execute(
-    sql: string,
-    params: unknown[] = [],
+  private async postD1Json(
+    bodyText: string,
     signal?: AbortSignal,
-    options?: { mutation?: boolean }
-  ): Promise<D1QueryResultPayload> {
-    if (this.isClosed) {
-      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'd1')
-    }
-
-    let rawText: string
-    let responseOk: boolean
-    let responseStatus: number
+    timeoutMs?: number
+  ): Promise<{ rawText: string; responseOk: boolean; responseStatus: number }> {
+    const effectiveTimeoutMs =
+      typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
+        ? timeoutMs
+        : D1_HTTP_TIMEOUT_MS
+    const combinedSignal = buildCombinedAbortSignal(effectiveTimeoutMs, signal)
+    const headers = this.buildHeaders()
     try {
+      const parsedEndpoint = new URL(this.endpoint)
+      if (this.tlsOptions !== undefined && parsedEndpoint.protocol === 'https:') {
+        const res = await sendD1HttpsPost(
+          parsedEndpoint,
+          headers,
+          bodyText,
+          this.tlsOptions,
+          combinedSignal,
+          MAX_D1_RESPONSE_BYTES
+        )
+        return { rawText: res.text, responseOk: res.ok, responseStatus: res.status }
+      }
       const response = await fetch(this.endpoint, {
         method: 'POST',
-        headers: this.buildHeaders(),
-        body: JSON.stringify({ sql, params: params.map(normalizeD1Param) }),
-        signal: buildCombinedAbortSignal(D1_HTTP_TIMEOUT_MS, signal),
+        headers,
+        body: bodyText,
+        signal: combinedSignal,
         redirect: 'error',
       })
-      responseOk = response.ok
-      responseStatus = response.status
-      rawText = await response.text()
+      const rawText = await readBoundedD1ResponseText(response, MAX_D1_RESPONSE_BYTES)
+      return { rawText, responseOk: response.ok, responseStatus: response.status }
     } catch (err: unknown) {
       if (err instanceof DatabaseDriverError) throw err
       const errName = (err as { name?: string })?.name
@@ -288,7 +411,7 @@ export class D1Session implements IDatabaseSession {
       }
       if (errName === 'TimeoutError' || errName === 'AbortError') {
         throw new DatabaseDriverError(
-          `Cloudflare D1 HTTP request timed out after ${D1_HTTP_TIMEOUT_MS}ms`,
+          `Cloudflare D1 HTTP request timed out after ${effectiveTimeoutMs}ms`,
           'TIMEOUT',
           'd1',
           err
@@ -302,6 +425,23 @@ export class D1Session implements IDatabaseSession {
         err
       )
     }
+  }
+
+  private async execute(
+    sql: string,
+    params: unknown[] = [],
+    signal?: AbortSignal,
+    options?: { mutation?: boolean; timeoutMs?: number }
+  ): Promise<D1QueryResultPayload> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'd1')
+    }
+
+    const { rawText, responseOk, responseStatus } = await this.postD1Json(
+      JSON.stringify({ sql, params: params.map(normalizeD1Param) }),
+      signal,
+      options?.timeoutMs
+    )
 
     const envelope = parseD1Envelope(rawText)
     const detail = scrubDriverErrorText(envelope.errors.join('; '))
@@ -458,8 +598,6 @@ export class D1Session implements IDatabaseSession {
         'd1'
       )
     }
-    this.tableDetailsCache.clear()
-
     const reloadQuery = buildSelectByPrimaryKeySql({
       driver: 'd1',
       table: params.table,
@@ -497,7 +635,7 @@ export class D1Session implements IDatabaseSession {
   private async executeBatch(
     queries: Array<{ sql: string; params: unknown[] }>,
     signal?: AbortSignal,
-    options?: { conflictSentinel?: string }
+    options?: { conflictSentinel?: string; timeoutMs?: number }
   ): Promise<D1QueryResultPayload[]> {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'd1')
@@ -520,47 +658,21 @@ export class D1Session implements IDatabaseSession {
       }
     }
     if (queries.length === 1) {
-      return [await this.execute(queries[0].sql, queries[0].params, signal, { mutation: true })]
+      return [
+        await this.execute(queries[0].sql, queries[0].params, signal, {
+          mutation: true,
+          timeoutMs: options?.timeoutMs,
+        }),
+      ]
     }
 
-    let rawText: string
-    let responseOk: boolean
-    let responseStatus: number
-    try {
-      const response = await fetch(this.endpoint, {
-        method: 'POST',
-        headers: this.buildHeaders(),
-        body: JSON.stringify({
-          batch: queries.map((q) => ({ sql: q.sql, params: q.params.map(normalizeD1Param) })),
-        }),
-        signal: buildCombinedAbortSignal(D1_HTTP_TIMEOUT_MS, signal),
-        redirect: 'error',
-      })
-      responseOk = response.ok
-      responseStatus = response.status
-      rawText = await response.text()
-    } catch (err: unknown) {
-      if (err instanceof DatabaseDriverError) throw err
-      const errName = (err as { name?: string })?.name
-      if (signal?.aborted) {
-        throw new DatabaseDriverError('Query execution was cancelled', 'cancelled', 'd1', err)
-      }
-      if (errName === 'TimeoutError' || errName === 'AbortError') {
-        throw new DatabaseDriverError(
-          `Cloudflare D1 HTTP request timed out after ${D1_HTTP_TIMEOUT_MS}ms`,
-          'TIMEOUT',
-          'd1',
-          err
-        )
-      }
-      throw new DatabaseDriverError(
-        scrubDriverErrorText(err instanceof Error ? err.message : '') ||
-          'Cloudflare D1 HTTP request failed',
-        'CONNECTION_FAILED',
-        'd1',
-        err
-      )
-    }
+    const { rawText, responseOk, responseStatus } = await this.postD1Json(
+      JSON.stringify({
+        batch: queries.map((q) => ({ sql: q.sql, params: q.params.map(normalizeD1Param) })),
+      }),
+      signal,
+      options?.timeoutMs
+    )
 
     const envelope = parseD1Envelope(rawText)
     const detail = scrubDriverErrorText(envelope.errors.join('; '))
@@ -725,7 +837,6 @@ export class D1Session implements IDatabaseSession {
       undefined,
       guarded ? { conflictSentinel: D1_GUARD_SENTINEL } : undefined
     )
-    this.tableDetailsCache.clear()
 
     if (payloads.length !== queries.length) {
       throw new DatabaseDriverError(
@@ -812,7 +923,15 @@ export class D1Session implements IDatabaseSession {
     return reconstructTableDdl(details, 'd1')
   }
 
-  async runQuery(queryId: string, sql: string, maxRows = 1000): Promise<QueryResult> {
+  async runQuery(
+    queryId: string,
+    sql: string,
+    maxRows = 1000,
+    timeoutMs?: number
+  ): Promise<QueryResult> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'd1')
+    }
     const trimmed = sql.trim()
     if (!trimmed) {
       throw new DatabaseDriverError('SQL statement cannot be empty', 'invalid_params', 'd1')
@@ -837,11 +956,12 @@ export class D1Session implements IDatabaseSession {
       if (statements.length > 1) {
         payloads = await this.executeBatch(
           statements.map((stmtSql) => ({ sql: stmtSql, params: [] })),
-          controller.signal
+          controller.signal,
+          { timeoutMs }
         )
       } else if (statements.length === 1) {
         try {
-          payloads = [await this.execute(statements[0], [], controller.signal)]
+          payloads = [await this.execute(statements[0], [], controller.signal, { timeoutMs })]
         } catch (singleErr: unknown) {
           if (
             !active.cancelled &&
@@ -870,7 +990,7 @@ export class D1Session implements IDatabaseSession {
         const rows = res.results || []
         const columns = columnsFromRows(rows)
         const affected = Number(res.meta?.changes ?? 0)
-        const stripped = statement.replace(/^(?:\s|--[^\n]*\n|\/\*[\s\S]*?\*\/)+/, '').trim()
+        const stripped = statement.replace(/^(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)+/, '').trim()
         if (
           statements.length > 1 &&
           rows.length > 0 &&
@@ -884,9 +1004,11 @@ export class D1Session implements IDatabaseSession {
             statements.length
           )
         }
+        const isPragmaWrite =
+          /^PRAGMA\s+(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?[A-Za-z_][A-Za-z0-9_]*\s*=/i.test(stripped)
         const isSelect =
           columns.length > 0 ||
-          (/^PRAGMA\b/i.test(stripped) && !stripped.includes('=') && !isMutatingStatement(statement, 'd1')) ||
+          (/^PRAGMA\b/i.test(stripped) && !isPragmaWrite && !isMutatingStatement(statement, 'd1')) ||
           ((/^WITH\b/i.test(stripped) || /^(?:SELECT|EXPLAIN)\b/i.test(stripped)) &&
             !isMutatingStatement(statement, 'd1'))
 
@@ -987,16 +1109,26 @@ export class D1Session implements IDatabaseSession {
 export class D1Driver implements IDatabaseDriver {
   readonly type = 'd1' as const
 
-  async createSession(profile: ConnectionProfile, authToken?: string): Promise<IDatabaseSession> {
-    return new D1Session(profile, authToken)
+  async createSession(
+    profile: ConnectionProfile,
+    authToken?: string,
+    extraSecrets?: DriverTlsOptions
+  ): Promise<IDatabaseSession> {
+    const tlsOverride = await resolveEffectiveTlsOptions(
+      profile,
+      extraSecrets,
+      extraSecrets?.tlsServername
+    )
+    return new D1Session(profile, authToken, tlsOverride)
   }
 
   async testConnection(
     profile: ConnectionProfile,
-    authToken?: string
+    authToken?: string,
+    extraSecrets?: DriverTlsOptions
   ): Promise<{ ok: boolean; message?: string }> {
     return runDriverConnectionTest(
-      () => this.createSession(profile, authToken),
+      () => this.createSession(profile, authToken, extraSecrets),
       (err) =>
         scrubDriverErrorText(err instanceof Error ? err.message : '') ||
         'Cloudflare D1 connection failed'

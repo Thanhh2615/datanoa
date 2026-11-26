@@ -11,6 +11,7 @@ import {
   countPanelStructChanges,
   buildPanelMigrationSql as coreBuildPanelMigrationSql,
   validatePanelStructDraft as coreValidatePanelStructDraft,
+  formatConnectionScopedMessage,
 } from './panel-core.js'
 import {
   $,
@@ -63,6 +64,7 @@ export function canEditDriverStructure(details, conn) {
   return (
     Boolean(details) &&
     details.kind !== 'view' &&
+    details.kind !== 'materialized_view' &&
     conn?.driver !== 'redis' &&
     conn?.driver !== 'mongodb' &&
     !conn?.readOnly
@@ -82,6 +84,7 @@ export function createPanelStructureController(ctx) {
     getActiveConn,
     getConnById,
     showBanner,
+    showConnectionBanner,
     savePanelViewState,
     loadSchema,
     loadTableDetails,
@@ -301,6 +304,33 @@ export function createPanelStructureController(ctx) {
     }
   }
 
+  function reportStructureConnectionError(connId, msg) {
+    if (typeof showConnectionBanner === 'function') {
+      showConnectionBanner(connId, msg, 'danger')
+    } else {
+      showBanner(formatConnectionScopedMessage(getConnById(connId), msg), 'danger')
+    }
+  }
+
+  function pruneDeletedColumnRefs(draft, removedColId) {
+    if (!draft || !removedColId) return
+    const activeCols = draft.columns.filter((c) => c.status !== 'deleted')
+    const activeIds = new Set(activeCols.map((c) => c.id))
+    for (const idx of draft.indexes) {
+      if (idx.status !== 'new' || !Array.isArray(idx.columnRefs)) continue
+      idx.columnRefs = idx.columnRefs.filter((r) => !r.colId || (r.colId !== removedColId && activeIds.has(r.colId)))
+      idx.columns = getIndexColNames(draft, idx)
+    }
+    const fallbackCol = activeCols[0] || null
+    for (const fk of draft.foreignKeys) {
+      if (fk.status !== 'new') continue
+      if (fk.columnId === removedColId || (fk.columnId && !activeIds.has(fk.columnId))) {
+        fk.columnId = fallbackCol?.id || null
+        fk.column = fallbackCol?.name || ''
+      }
+    }
+  }
+
   function closeMigrationConfirmModal(force = false) {
     if (state.isMigrating && !force) return
     $('confirmMigrationModal').hidden = true
@@ -311,35 +341,43 @@ export function createPanelStructureController(ctx) {
     if (state.isMigrating || !state.activeConnectionId || !state.structDraft) return
     const conn = getActiveConn()
     if (conn?.readOnly) {
-      showBanner('Read-Only connection — cannot alter table structure.', 'danger')
+      reportStructureConnectionError(state.activeConnectionId, 'Read-Only connection — cannot alter table structure.')
       return
     }
     const driver = conn?.driver || 'sqlite'
     const count = countPanelStructChanges(state.structDraft)
     if (count === 0) return
     const plan = validatePanelStructDraft(state.structDraft, driver)
-    pendingMigrationPlan = plan
-    $('confirmMigrationTitle').textContent = plan.valid
+    const pinnedPlan = {
+      ...plan,
+      targetConnId: state.activeConnectionId,
+      targetDriver: driver,
+      targetSchema: state.activeSchema || '',
+      targetTable: state.activeTable || state.structDraft.originalTableName,
+      targetNextTable: state.structDraft.tableName.trim(),
+    }
+    pendingMigrationPlan = pinnedPlan
+    $('confirmMigrationTitle').textContent = pinnedPlan.valid
       ? `Confirm Migration — ${state.structDraft.originalTableName}`
       : 'Fix Invalid Schema Changes'
     $('confirmMigrationBadge').textContent = `${driver.toUpperCase()} · ${count} change(s)`
 
     const errEl = $('confirmMigrationErrors')
-    errEl.hidden = plan.errors.length === 0
-    errEl.textContent = plan.errors.length ? `Blocking Errors:\n• ${plan.errors.join('\n• ')}` : ''
+    errEl.hidden = pinnedPlan.errors.length === 0
+    errEl.textContent = pinnedPlan.errors.length ? `Blocking Errors:\n• ${pinnedPlan.errors.join('\n• ')}` : ''
 
     const warnEl = $('confirmMigrationWarnings')
-    warnEl.hidden = plan.warnings.length === 0
-    warnEl.textContent = plan.warnings.length
-      ? `Safety Warnings:\n• ${plan.warnings.join('\n• ')}`
+    warnEl.hidden = pinnedPlan.warnings.length === 0
+    warnEl.textContent = pinnedPlan.warnings.length
+      ? `Safety Warnings:\n• ${pinnedPlan.warnings.join('\n• ')}`
       : ''
 
     const diffEl = $('confirmMigrationDiffs')
-    diffEl.textContent = plan.diffs.join('\n')
+    diffEl.textContent = pinnedPlan.diffs.join('\n')
     diffEl.style.whiteSpace = 'pre-wrap'
 
-    $('confirmMigrationSql').textContent = plan.statements.length
-      ? plan.statements.join('\n\n')
+    $('confirmMigrationSql').textContent = pinnedPlan.statements.length
+      ? pinnedPlan.statements.join('\n\n')
       : '-- Resolve errors above to generate valid migration SQL.'
 
     const execBtn = $('confirmMigrationExecuteBtn')
@@ -347,8 +385,8 @@ export function createPanelStructureController(ctx) {
       state.structDraft.columns.some((c) => c.status === 'deleted') ||
       state.structDraft.foreignKeys.some((f) => f.status === 'deleted')
     setButtonLoading(execBtn, false)
-    execBtn.disabled = !plan.valid || plan.statements.length === 0
-    execBtn.textContent = plan.valid ? 'Confirm & Execute' : 'Fix Errors to Apply'
+    execBtn.disabled = !pinnedPlan.valid || pinnedPlan.statements.length === 0
+    execBtn.textContent = pinnedPlan.valid ? 'Confirm & Execute' : 'Fix Errors to Apply'
     execBtn.className = `btn btn-sm ${hasDestructive ? 'btn-danger-solid' : 'btn-primary'}`
     if ($('cancelMigrationBtn')) $('cancelMigrationBtn').disabled = false
     if ($('copyMigrationSqlModalBtn')) $('copyMigrationSqlModalBtn').disabled = false
@@ -356,15 +394,15 @@ export function createPanelStructureController(ctx) {
 
     const isSqliteRebuild =
       (driver === 'sqlite' || driver === 'libsql') &&
-      (Boolean(plan.isRebuild) ||
-        plan.statements.some((s) => /PRAGMA\s+(?:foreign_keys\s*=\s*OFF|defer_foreign_keys)/i.test(s)))
+      (Boolean(pinnedPlan.isRebuild) ||
+        pinnedPlan.statements.some((s) => /PRAGMA\s+(?:foreign_keys\s*=\s*OFF|defer_foreign_keys)/i.test(s)))
     if (isSqliteRebuild && state.activeConnectionId) {
       const checkConnId = state.activeConnectionId
       void rpc('tx.status', { connectionId: checkConnId })
         .then((txStatus) => {
           if (
             $('confirmMigrationModal').hidden ||
-            pendingMigrationPlan !== plan ||
+            pendingMigrationPlan !== pinnedPlan ||
             state.activeConnectionId !== checkConnId
           ) {
             return
@@ -372,12 +410,12 @@ export function createPanelStructureController(ctx) {
           if (txStatus && (txStatus.active || (txStatus.supported && !txStatus.autoCommit))) {
             const txErr =
               'Cannot rebuild SQLite/LibSQL table while a manual transaction is active (SQLite ignores PRAGMA foreign_keys = OFF inside a transaction). Commit or rollback the transaction first.'
-            if (!plan.errors.includes(txErr)) {
-              plan.errors.push(txErr)
+            if (!pinnedPlan.errors.includes(txErr)) {
+              pinnedPlan.errors.push(txErr)
             }
-            plan.valid = false
+            pinnedPlan.valid = false
             errEl.hidden = false
-            errEl.textContent = `Blocking Errors:\n• ${plan.errors.join('\n• ')}`
+            errEl.textContent = `Blocking Errors:\n• ${pinnedPlan.errors.join('\n• ')}`
             execBtn.disabled = true
             execBtn.textContent = 'Fix Errors to Apply'
           }
@@ -398,11 +436,33 @@ export function createPanelStructureController(ctx) {
     ) {
       return
     }
-    const targetConnId = state.activeConnectionId
-    const targetTable = state.activeTable
-    const targetSchema = state.activeSchema
-    const nextTable = state.structDraft.tableName.trim()
-    const driver = getActiveConn()?.driver || 'sqlite'
+    const activeConn = getActiveConn()
+    if (
+      state.activeConnectionId !== plan.targetConnId ||
+      (state.activeTable || '') !== plan.targetTable ||
+      (state.activeSchema || '') !== plan.targetSchema ||
+      (activeConn?.driver || 'sqlite') !== plan.targetDriver
+    ) {
+      closeMigrationConfirmModal(true)
+      reportStructureConnectionError(
+        state.activeConnectionId,
+        'Migration aborted: active connection or table changed after preview.'
+      )
+      return
+    }
+    if (activeConn?.readOnly) {
+      closeMigrationConfirmModal(true)
+      reportStructureConnectionError(
+        plan.targetConnId,
+        'Read-Only connection — cannot alter table structure.'
+      )
+      return
+    }
+    const targetConnId = plan.targetConnId
+    const targetTable = plan.targetTable
+    const targetSchema = plan.targetSchema || undefined
+    const nextTable = plan.targetNextTable || state.structDraft.tableName.trim()
+    const driver = plan.targetDriver
     const isSqliteRebuild =
       (driver === 'sqlite' || driver === 'libsql') &&
       (Boolean(plan.isRebuild) ||
@@ -461,6 +521,7 @@ export function createPanelStructureController(ctx) {
         state.activeTable === targetTable &&
         (state.activeSchema || '') === (targetSchema || '')
       if (stillSameContext) {
+        const expectedTableAfter = nextTable || targetTable
         if (nextTable && nextTable !== state.activeTable) {
           state.activeTable = nextTable
         }
@@ -470,16 +531,28 @@ export function createPanelStructureController(ctx) {
         showBanner(`Applied ${plan.statements.length} schema change(s)`, 'success')
         savePanelViewState()
         await loadSchema(targetConnId)
-        if (state.activeConnectionId === targetConnId && state.activeTable) {
+        if (
+          state.activeConnectionId === targetConnId &&
+          state.activeTable === expectedTableAfter &&
+          (state.activeSchema || '') === (targetSchema || '')
+        ) {
           await loadTableDetails(targetConnId, state.activeTable, state.activeSchema)
           await loadTablePage(targetConnId, state.activeTable, 1, state.activeSchema)
         }
       } else if (getConnById(targetConnId)) {
-        showBanner(`Applied ${plan.statements.length} schema change(s)`, 'success')
+        const successMsg = `Applied ${plan.statements.length} schema change(s)`
+        if (state.activeConnectionId === targetConnId) {
+          showBanner(successMsg, 'success')
+        } else if (typeof showConnectionBanner === 'function') {
+          showConnectionBanner(targetConnId, successMsg, 'success')
+        } else {
+          showBanner(formatConnectionScopedMessage(getConnById(targetConnId), successMsg), 'success')
+        }
         void loadSchema(targetConnId)
       }
     } catch (err) {
       stopTimer()
+      delete state.tableDetails[makeTableKey(targetConnId, targetTable, targetSchema)]
       state.isMigrating = false
       setButtonLoading(execBtn, false)
       if (cancelBtn) cancelBtn.disabled = false
@@ -490,7 +563,7 @@ export function createPanelStructureController(ctx) {
         errEl.hidden = false
         errEl.textContent = `Migration Failed:\n${msg}`
       }
-      showBanner(`Schema migration failed: ${msg}`, 'danger')
+      reportStructureConnectionError(targetConnId, `Schema migration failed: ${msg}`)
     }
   }
 
@@ -736,6 +809,8 @@ export function createPanelStructureController(ctx) {
         if (col.status === 'new') tr.classList.add('row-inserted')
         if (col.status === 'deleted') tr.classList.add('row-deleted')
         const isDel = col.status === 'deleted'
+        const isGeneratedLocked = Boolean(col.isGenerated)
+        const isFieldDisabled = isDel || isGeneratedLocked
 
         const nameTd = document.createElement('td')
         nameTd.className = 'struct-td-input'
@@ -743,7 +818,7 @@ export function createPanelStructureController(ctx) {
         nameInp.type = 'text'
         nameInp.className = 'struct-cell-input'
         nameInp.value = col.name
-        nameInp.disabled = isDel
+        nameInp.disabled = isFieldDisabled
         nameInp.addEventListener('input', () => {
           col.name = nameInp.value
           syncPanelColRename(col.id, col.name.trim())
@@ -764,7 +839,7 @@ export function createPanelStructureController(ctx) {
         const { wrap: typeComboWrap } = createPanelComboInput(
           col.dataType,
           getPanelDriverColumnTypes(getActiveConn()?.driver || 'sqlite'),
-          isDel,
+          isFieldDisabled,
           (nextVal) => {
             col.dataType = nextVal
             typeTd.classList.toggle(
@@ -792,7 +867,7 @@ export function createPanelStructureController(ctx) {
         pkCb.type = 'checkbox'
         pkCb.className = 'struct-checkbox'
         pkCb.checked = col.isPrimaryKey
-        pkCb.disabled = isDel
+        pkCb.disabled = isFieldDisabled
         pkTd.appendChild(pkCb)
         tr.appendChild(pkTd)
 
@@ -802,7 +877,7 @@ export function createPanelStructureController(ctx) {
         nullCb.type = 'checkbox'
         nullCb.className = 'struct-checkbox'
         nullCb.checked = col.nullable
-        nullCb.disabled = isDel || col.isPrimaryKey
+        nullCb.disabled = isFieldDisabled || col.isPrimaryKey
         nullTd.appendChild(nullCb)
         tr.appendChild(nullTd)
 
@@ -840,14 +915,14 @@ export function createPanelStructureController(ctx) {
         defInp.type = 'text'
         defInp.className = 'struct-cell-input'
         defInp.value = col.defaultValue
-        defInp.disabled = isDel
-        defInp.placeholder = col.nullable ? 'NULL' : 'None'
+        defInp.disabled = isFieldDisabled
+        defInp.placeholder = isGeneratedLocked ? 'GENERATED' : col.nullable ? 'NULL' : 'None'
         const clrBtn = document.createElement('button')
         clrBtn.type = 'button'
         clrBtn.className = 'struct-clear-btn'
         clrBtn.textContent = '×'
         clrBtn.title = 'Clear Default'
-        clrBtn.hidden = !col.defaultValue || isDel
+        clrBtn.hidden = !col.defaultValue || isFieldDisabled
 
         const syncDef = () => {
           clrBtn.hidden = !col.defaultValue || isDel
@@ -887,6 +962,7 @@ export function createPanelStructureController(ctx) {
           actBtn.addEventListener('click', () => {
             const p = draft.columns.indexOf(col)
             if (p !== -1) draft.columns.splice(p, 1)
+            pruneDeletedColumnRefs(draft, col.id)
             renderStructure()
           })
         } else if (col.status === 'deleted') {
@@ -900,6 +976,7 @@ export function createPanelStructureController(ctx) {
           actBtn.classList.add('btn-danger')
           actBtn.addEventListener('click', () => {
             col.status = 'deleted'
+            pruneDeletedColumnRefs(draft, col.id)
             renderStructure()
           })
         }
@@ -1084,11 +1161,21 @@ export function createPanelStructureController(ctx) {
           row1.style.gap = '6px'
           const colSel = document.createElement('select')
           colSel.className = 'struct-cell-select struct-fk-col-select'
+          let matchedFkCol = false
           for (const c of activeCols) {
             const isMatch = fk.columnId ? c.id === fk.columnId : c.name === fk.column
+            if (isMatch) matchedFkCol = true
             const opt = new Option(c.name.trim() || '(unnamed)', c.name, isMatch, isMatch)
             opt.dataset.colId = c.id
             colSel.appendChild(opt)
+          }
+          if (!matchedFkCol && activeCols.length > 0) {
+            fk.columnId = activeCols[0].id
+            fk.column = activeCols[0].name
+            colSel.value = activeCols[0].name
+          } else if (activeCols.length === 0) {
+            fk.columnId = null
+            fk.column = ''
           }
           syncSelectTooltip(colSel)
           colSel.addEventListener('change', () => {

@@ -7,6 +7,8 @@ import {
   type AiInlineEdit,
   type AiRole,
   type AiStatusSnapshot,
+  type ConnectionAiPolicy,
+  type ConnectionProfile,
   type DatabaseDriverType,
   type QueryHistoryEntry,
 } from '../protocol'
@@ -102,6 +104,96 @@ function isLoopbackBaseUrl(baseUrl: string): boolean {
   return isLoopbackHost(hostOf(baseUrl))
 }
 
+export type ConnectionAiPolicyRpcKind = 'complete' | 'edit' | 'explain' | 'fix'
+
+export interface ConnectionAiPolicyDecision {
+  allowed: boolean
+  effectivePolicy: ConnectionAiPolicy
+  code?: 'ai.blocked'
+  reason?: string
+}
+
+/**
+ * Resolves the effective per-connection AI egress policy.
+ * Explicit `aiPolicy` always wins; when omitted, `prod`/`production` connections fail closed to `'ask'`
+ * while non-production profiles remain `'allow'` for backwards compatibility.
+ */
+export function resolveEffectiveConnectionAiPolicy(
+  profile: { colorTag?: string; aiPolicy?: ConnectionAiPolicy } | null | undefined,
+  _isLocalProvider: boolean
+): ConnectionAiPolicy {
+  if (profile?.aiPolicy === 'never' || profile?.aiPolicy === 'ask' || profile?.aiPolicy === 'allow') {
+    return profile.aiPolicy
+  }
+  const normalizedTag =
+    typeof profile?.colorTag === 'string' ? profile.colorTag.trim().toLowerCase() : ''
+  if (normalizedTag === 'prod' || normalizedTag === 'production') {
+    return 'ask'
+  }
+  return 'allow'
+}
+
+/**
+ * Evaluates whether a given AI RPC request may proceed for a connection profile.
+ * Enforces fail-closed blocking (`ai.blocked`) for `'never'`, auto-inline on `'ask'`/`prod`,
+ * and unconfirmed manual requests on `'ask'`/`prod`.
+ */
+export function evaluateConnectionAiPolicy(input: {
+  colorTag?: string
+  aiPolicy?: ConnectionAiPolicy
+  isLocalProvider: boolean
+  manual?: boolean
+  confirmed?: boolean
+  rpcKind: ConnectionAiPolicyRpcKind
+}): ConnectionAiPolicyDecision {
+  const effectivePolicy = resolveEffectiveConnectionAiPolicy(
+    { colorTag: input.colorTag, aiPolicy: input.aiPolicy },
+    input.isLocalProvider
+  )
+  if (effectivePolicy === 'never') {
+    return {
+      allowed: false,
+      effectivePolicy,
+      code: 'ai.blocked',
+      reason: 'ai.blocked: AI assistance is disabled for this connection (policy: never).',
+    }
+  }
+  if (effectivePolicy === 'ask') {
+    const isExplicitUserAction =
+      input.rpcKind === 'explain' || input.rpcKind === 'fix' ? true : input.manual === true
+    if (!isExplicitUserAction) {
+      return {
+        allowed: false,
+        effectivePolicy,
+        code: 'ai.blocked',
+        reason:
+          'ai.blocked: Automatic inline AI requests are blocked on this connection (policy: ask).',
+      }
+    }
+    if (input.confirmed !== true) {
+      return {
+        allowed: false,
+        effectivePolicy,
+        code: 'ai.blocked',
+        reason:
+          'ai.blocked: Explicit confirmation is required before sending SQL from this connection to AI (policy: ask).',
+      }
+    }
+  }
+  return { allowed: true, effectivePolicy }
+}
+
+function readOptionalBoolean(value: unknown, key: string): boolean {
+  if (!value || typeof value !== 'object') return false
+  return (value as Record<string, unknown>)[key] === true
+}
+
+function readOptionalString(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const raw = (value as Record<string, unknown>)[key]
+  return typeof raw === 'string' ? raw : undefined
+}
+
 function isMidLineBeforeExistingExpression(suffix: string): boolean {
   const nl = suffix.indexOf('\n')
   const sameLine = nl === -1 ? suffix : suffix.slice(0, nl)
@@ -137,7 +229,11 @@ function isUsageMap(value: unknown): value is UsageMap {
   return (
     typeof value === 'object' &&
     value !== null &&
-    Object.values(value).every((v) => Array.isArray(v) && v.every((n) => typeof n === 'number'))
+    !Array.isArray(value) &&
+    Object.values(value).every(
+      (v) =>
+        Array.isArray(v) && v.every((n) => typeof n === 'number' && Number.isFinite(n) && n >= 0)
+    )
   )
 }
 
@@ -375,11 +471,12 @@ export function registerAiHandlers({
       if (entry.replaceChars > 0 || (entry.edits && entry.edits.length > 0)) continue
       if (entry.scopeKey !== scopeKey || entry.rawSuffix !== rawSuffix) continue
       if (!rawPrefix.startsWith(entry.rawPrefix)) continue
+      const delta = rawPrefix.slice(entry.rawPrefix.length)
+      if (delta.length >= entry.suggestion.length || !entry.suggestion.startsWith(delta)) continue
       if (!best || entry.rawPrefix.length > best.rawPrefix.length) best = entry
     }
     if (best) {
       const delta = rawPrefix.slice(best.rawPrefix.length)
-      if (delta.length > best.suggestion.length || !best.suggestion.startsWith(delta)) return null
       rememberCompletion(best)
       return { suggestion: best.suggestion.slice(delta.length), replaceChars: 0 }
     }
@@ -413,7 +510,12 @@ export function registerAiHandlers({
     flight: CompletionFlight,
     signal?: AbortSignal
   ): Promise<CompletionResultPayload> {
-    if (signal?.aborted) return Promise.resolve({ suggestion: '', id: 0 })
+    if (signal?.aborted) {
+      if (flight.waiters <= 0 && !flight.controller.signal.aborted) {
+        flight.controller.abort()
+      }
+      return Promise.resolve({ suggestion: '', id: 0 })
+    }
     flight.waiters += 1
     let released = false
     const leave = (abortUpstream: boolean) => {
@@ -451,6 +553,7 @@ export function registerAiHandlers({
   const pendingRoleHealthSeq: Record<AiRole, number> = { autocomplete: 0, explain: 0 }
   const reconciledRoleSeq: Record<AiRole, number> = { autocomplete: 0, explain: 0 }
   const lastRoleHealthSig: Record<AiRole, string | null> = { autocomplete: null, explain: null }
+  const roleLastTestedDraft: Record<AiRole, boolean> = { autocomplete: false, explain: false }
   let lastExplainUsingSharedKey = false
 
   function roleHealthSignature(roleCfg: ResolvedAiRoleConfig): string {
@@ -483,6 +586,44 @@ export function registerAiHandlers({
   let lastLog = { message: '', at: 0 }
   let historyCache: QueryHistoryEntry[] | null = null
   let statsQueue: Promise<void> = Promise.resolve()
+  let usageQueue: Promise<void> = Promise.resolve()
+  let disposed = false
+
+  async function checkConnectionAiPolicy(
+    connId: string,
+    isLocalProvider: boolean,
+    rpcKind: ConnectionAiPolicyRpcKind,
+    manual: boolean,
+    confirmed: boolean
+  ): Promise<ConnectionAiPolicyDecision> {
+    if (!connId) {
+      return { allowed: true, effectivePolicy: 'allow' }
+    }
+    const finder = (
+      sessionManager as { findProfile?: (id: string) => Promise<ConnectionProfile | null> }
+    ).findProfile
+    if (typeof finder !== 'function') {
+      return { allowed: true, effectivePolicy: 'allow' }
+    }
+    try {
+      const profile = await finder.call(sessionManager, connId)
+      return evaluateConnectionAiPolicy({
+        colorTag: profile?.colorTag,
+        aiPolicy: profile?.aiPolicy,
+        isLocalProvider,
+        manual,
+        confirmed,
+        rpcKind,
+      })
+    } catch {
+      return {
+        allowed: false,
+        effectivePolicy: 'never',
+        code: 'ai.blocked',
+        reason: 'ai.blocked: Unable to verify connection AI policy; blocking request fail-closed.',
+      }
+    }
+  }
 
   function resetCompleteErrorCooldown(): void {
     consecutiveCompleteErrors = 0
@@ -539,6 +680,7 @@ export function registerAiHandlers({
     )
     if (snapChangeSeq === settingsChangeSeq) {
       const changedRoles: Record<AiRole, boolean> = { autocomplete: false, explain: false }
+      const syncedDraftReconciled: Record<AiRole, boolean> = { autocomplete: false, explain: false }
       for (const role of ['autocomplete', 'explain'] as const) {
         const sig = roleHealthSignature(cfg[role])
         if (seqBeforeRead[role] > reconciledRoleSeq[role]) {
@@ -547,6 +689,9 @@ export function registerAiHandlers({
             changedRoles[role] = true
             roleRuntime[role].lastError = null
             roleRuntime[role].lastSlow = false
+          } else if (roleLastTestedDraft[role]) {
+            syncedDraftReconciled[role] = true
+            roleLastTestedDraft[role] = false
           }
         }
         lastRoleHealthSig[role] = sig
@@ -557,10 +702,18 @@ export function registerAiHandlers({
         cfg.explain.enabled &&
         roleProviderSignature(cfg.autocomplete) === roleProviderSignature(cfg.explain)
       ) {
-        if (changedRoles.explain && !changedRoles.autocomplete && roleRuntime.autocomplete.lastError) {
+        if (
+          (changedRoles.explain || syncedDraftReconciled.explain) &&
+          !changedRoles.autocomplete &&
+          roleRuntime.autocomplete.lastError
+        ) {
           roleRuntime.explain.lastError = roleRuntime.autocomplete.lastError
           roleRuntime.explain.lastSlow = roleRuntime.autocomplete.lastSlow
-        } else if (changedRoles.autocomplete && !changedRoles.explain && roleRuntime.explain.lastError) {
+        } else if (
+          (changedRoles.autocomplete || syncedDraftReconciled.autocomplete) &&
+          !changedRoles.explain &&
+          roleRuntime.explain.lastError
+        ) {
           roleRuntime.autocomplete.lastError = roleRuntime.explain.lastError
           roleRuntime.autocomplete.lastSlow = roleRuntime.explain.lastSlow
         }
@@ -580,7 +733,9 @@ export function registerAiHandlers({
   }
 
   async function refreshStatus(): Promise<void> {
+    if (disposed) return
     const snap = await buildStatusSnapshot()
+    if (disposed) return
     orca.panels.post('ai.status.changed', snap)
   }
 
@@ -589,21 +744,30 @@ export function registerAiHandlers({
     return isUsageMap(stored) ? stored : {}
   }
 
-  async function recordUsage(baseUrl: string, model: string, ms: number): Promise<void> {
+  function recordUsage(baseUrl: string, model: string, ms: number): Promise<void> {
+    if (disposed || !Number.isFinite(ms) || ms < 0) return Promise.resolve()
     const key = modelKey(baseUrl, model)
-    const usage = await readUsage()
-    const { [key]: prev = [], ...rest } = usage
-    const next: UsageMap = { ...rest, [key]: [...prev, ms].slice(-USAGE_SAMPLES) }
-    const keys = Object.keys(next)
-    for (const old of keys.slice(0, Math.max(0, keys.length - USAGE_MODELS))) {
-      delete next[old]
-    }
-    await orca.storage.set(AI_USAGE_KEY, next)
+    usageQueue = usageQueue
+      .then(async () => {
+        if (disposed) return
+        const usage = await readUsage()
+        const { [key]: prev = [], ...rest } = usage
+        const next: UsageMap = { ...rest, [key]: [...prev, ms].slice(-USAGE_SAMPLES) }
+        const keys = Object.keys(next)
+        for (const old of keys.slice(0, Math.max(0, keys.length - USAGE_MODELS))) {
+          delete next[old]
+        }
+        await orca.storage.set(AI_USAGE_KEY, next)
+      })
+      .catch(() => undefined)
+    return usageQueue
   }
 
   function updateStats(change: (store: AiStatsStore) => AiStatsStore): void {
+    if (disposed) return
     statsQueue = statsQueue
       .then(async () => {
+        if (disposed) return
         const stored = await orca.storage.get(AI_STATS_KEY)
         const base = isStatsStore(stored) ? stored : emptyStats(Date.now())
         await orca.storage.set(AI_STATS_KEY, sanitizeJsonPayload(change(base)))
@@ -626,10 +790,10 @@ export function registerAiHandlers({
     try {
       const raw = await orca.storage.get(QUERY_HISTORY_STORAGE_KEY)
       historyCache = Array.isArray(raw) ? (raw as unknown as QueryHistoryEntry[]) : []
+      return historyCache
     } catch {
-      historyCache = []
+      return []
     }
-    return historyCache
   }
 
   function buildTestCompletionRequest(dialect: DatabaseDriverType = 'sqlite') {
@@ -681,8 +845,56 @@ export function registerAiHandlers({
   registerHandler('ai.provider.test', async (input) => {
     const role = parseAiRole(input?.role)
     const cfg = await readConfig()
-    const roleCfg = role === 'explain' ? cfg.explain : cfg.autocomplete
+    const savedRoleCfg = role === 'explain' ? cfg.explain : cfg.autocomplete
     const runtime = roleRuntime[role]
+
+    const rawDraftFormat = readOptionalString(input, 'format')
+    const rawDraftBaseUrl = readOptionalString(input, 'baseUrl')
+    const rawDraftModel = readOptionalString(input, 'model')
+    const rawDraftKey = readOptionalString(input, 'key')
+    const isDraftTest =
+      rawDraftFormat !== undefined ||
+      rawDraftBaseUrl !== undefined ||
+      rawDraftModel !== undefined ||
+      rawDraftKey !== undefined
+
+    let roleCfg: ResolvedAiRoleConfig = savedRoleCfg
+    if (isDraftTest) {
+      const draftFormat = rawDraftFormat !== undefined ? parseFormat(rawDraftFormat) : savedRoleCfg.provider.format
+      const draftBaseUrlRaw = (rawDraftBaseUrl ?? savedRoleCfg.provider.baseUrl).trim()
+      const draftModel = (rawDraftModel ?? savedRoleCfg.provider.model).trim()
+      const urlCheck = validateAiBaseUrl(draftBaseUrlRaw)
+      if (!urlCheck.ok) {
+        return { ok: false, message: urlCheck.error, ms: null, role }
+      }
+      const draftKey = await configStore.keyForListing(
+        draftFormat,
+        urlCheck.url,
+        (rawDraftKey ?? '').trim(),
+        role
+      )
+      if (draftKey) {
+        const keyCheck = validateAiBaseUrl(urlCheck.url, { hasApiKey: true })
+        if (!keyCheck.ok) {
+          return { ok: false, message: keyCheck.error, ms: null, role }
+        }
+      }
+      roleCfg = {
+        role,
+        enabled: true,
+        validProvider: urlCheck.ok && draftModel.length > 0,
+        hasKey: Boolean(draftKey),
+        usingSharedKey: false,
+        provider: {
+          format: draftFormat,
+          baseUrl: urlCheck.url,
+          model: draftModel,
+          apiKey: draftKey,
+          maxTokens: savedRoleCfg.provider.maxTokens,
+        },
+      }
+    }
+
     if (!roleCfg.validProvider) {
       return { ok: false, message: 'Set a valid http(s) Base URL and model name.', ms: null, role }
     }
@@ -723,6 +935,8 @@ export function registerAiHandlers({
       const ms = Date.now() - started
       runtime.lastError = null
       runtime.lastSlow = false
+      roleLastTestedDraft[role] =
+        isDraftTest && roleProviderSignature(roleCfg) !== roleProviderSignature(savedRoleCfg)
       void refreshStatus()
       return { ok: true, message: '', ms, role }
     } catch (err) {
@@ -775,7 +989,8 @@ export function registerAiHandlers({
     }
   })
 
-  registerHandler('ai.models.bench', async (input) => {
+  registerHandler('ai.models.bench', async (input, ctx) => {
+    const role = parseAiRole(input?.role)
     const rawUrl = typeof input?.baseUrl === 'string' ? input.baseUrl.trim() : ''
     const baseCheck = validateAiBaseUrl(rawUrl)
     if (!baseCheck.ok) {
@@ -787,7 +1002,7 @@ export function registerAiHandlers({
       format,
       url,
       typeof input?.key === 'string' ? input.key.trim() : '',
-      input?.role
+      role
     )
     if (apiKey) {
       const keyCheck = validateAiBaseUrl(url, { hasApiKey: true })
@@ -795,12 +1010,21 @@ export function registerAiHandlers({
         return { results: [], message: keyCheck.error }
       }
     }
-    const ids = (Array.isArray(input?.models) ? input.models : [])
-      .filter((id): id is string => typeof id === 'string' && id.trim() !== '')
-      .slice(0, AI_BENCH_BATCH_SIZE)
+    const rawModels = Array.isArray(input?.models) ? input.models : []
+    const ids = Array.from(
+      new Set(
+        rawModels
+          .filter((id): id is string => typeof id === 'string' && id.trim() !== '')
+          .map((id) => id.trim())
+      )
+    ).slice(0, AI_BENCH_BATCH_SIZE)
     const req = buildTestCompletionRequest()
+    const chatReq = buildTestExplainChatRequest()
     const results = await Promise.all(
       ids.map(async (model) => {
+        if (role === 'explain' && (format === 'mistral-fim' || isChatIncompatibleBaseModel(model))) {
+          return { model, ok: false, ms: null }
+        }
         const provider: AiProviderConfig = {
           format,
           baseUrl: url,
@@ -808,12 +1032,26 @@ export function registerAiHandlers({
           apiKey,
           maxTokens: AI_BENCH_MAX_TOKENS,
         }
+        const signals = [AbortSignal.timeout(AI_BENCH_TIMEOUT_MS)]
+        if (ctx?.signal) signals.push(ctx.signal)
         const started = Date.now()
         try {
+          if (role === 'explain') {
+            const reply = await completeChat(
+              provider,
+              chatReq.system,
+              chatReq.user,
+              AI_BENCH_MAX_TOKENS,
+              AbortSignal.any(signals),
+              fetchPost,
+              'sqlite'
+            )
+            return { model, ok: reply.trim().length > 0, ms: Date.now() - started }
+          }
           const suggestion = await completeSql(
             provider,
             req,
-            AbortSignal.timeout(AI_BENCH_TIMEOUT_MS),
+            AbortSignal.any(signals),
             fetchPost
           )
           return { model, ok: isExpectedSqlBenchAnswer(suggestion), ms: Date.now() - started }
@@ -883,6 +1121,35 @@ export function registerAiHandlers({
     const requestedMode: 'auto' | 'complete' | 'edit' =
       input.mode === 'edit' ? 'edit' : input.mode === 'complete' ? 'complete' : 'auto'
     const isManual = input.manual === true
+    const isConfirmed = readOptionalBoolean(input, 'confirmed')
+
+    const autoFimOnly = isFimOnlyModel(auto.provider.format, auto.provider.model)
+    const crossesLocalToRemote =
+      isLoopbackBaseUrl(auto.provider.baseUrl) && !isLoopbackBaseUrl(cfg.explain.provider.baseUrl)
+    const canRouteEditToExplain =
+      !cfg.sync &&
+      autoFimOnly &&
+      isRoleReady(cfg.explain) &&
+      !isFimOnlyModel(cfg.explain.provider.format, cfg.explain.provider.model) &&
+      (!crossesLocalToRemote || isManual)
+
+    const policyCheck = await checkConnectionAiPolicy(
+      connId,
+      isLoopbackBaseUrl(auto.provider.baseUrl) &&
+        (!canRouteEditToExplain || isLoopbackBaseUrl(cfg.explain.provider.baseUrl)),
+      requestedMode === 'edit' ? 'edit' : 'complete',
+      isManual,
+      isConfirmed
+    )
+    if (!policyCheck.allowed) {
+      if (isManual) {
+        throw createHostError(
+          'not_permitted',
+          policyCheck.reason ?? 'ai.blocked: AI assistance is blocked for this connection.'
+        )
+      }
+      return empty
+    }
 
     const isolated = isolateActiveSqlStatement(boundedPrefix, boundedSuffix, dialect)
     if (hasSensitiveContent(isolated.stmtPrefix, isolated.stmtSuffix, '', dialect)) {
@@ -904,15 +1171,6 @@ export function registerAiHandlers({
         : isolated.stmtPrefix
     const cacheSuffixKey = targetingPrecedingErrored ? '' : isolated.stmtSuffix
 
-    const autoFimOnly = isFimOnlyModel(auto.provider.format, auto.provider.model)
-    const crossesLocalToRemote =
-      isLoopbackBaseUrl(auto.provider.baseUrl) && !isLoopbackBaseUrl(cfg.explain.provider.baseUrl)
-    const canRouteEditToExplain =
-      !cfg.sync &&
-      autoFimOnly &&
-      isRoleReady(cfg.explain) &&
-      !isFimOnlyModel(cfg.explain.provider.format, cfg.explain.provider.model) &&
-      (!crossesLocalToRemote || isManual)
     const editScopeTag = canRouteEditToExplain
       ? `|edit:${cfg.explain.provider.baseUrl}|${cfg.explain.provider.model}`
       : autoFimOnly
@@ -920,7 +1178,8 @@ export function registerAiHandlers({
         : ''
 
     const mKey = modelKey(auto.provider.baseUrl, auto.provider.model)
-    const scopeKey = `${auto.provider.baseUrl}|${auto.provider.model}${editScopeTag}|${connId}|${dialect}|${activeSchema}|${activeTable}|${requestedMode}`
+    const schemaRev = connId ? schemaCache.getConnectionRevision(connId) : 0
+    const scopeKey = `${auto.provider.baseUrl}|${auto.provider.model}${editScopeTag}|${connId}|r${schemaRev}|${dialect}|${activeSchema}|${activeTable}|${requestedMode}`
     const exactCacheKey = buildExactCacheKey(scopeKey, cachePrefixKey, cacheSuffixKey)
     const cached = lookupCompletion(scopeKey, cachePrefixKey, cacheSuffixKey, exactCacheKey)
     if (cached !== null) {
@@ -1022,7 +1281,12 @@ export function registerAiHandlers({
           (!partial && delta.length <= 3 && !delta.includes('\n')))
       if (canReuse) {
         const reused = await joinFlight(activeFlight, ctx?.signal)
-        if (ctx?.signal?.aborted) {
+        const currentPanelFlight = activeFlightByPanel.get(panelId)
+        if (
+          ctx?.signal?.aborted ||
+          activeFlight.controller.signal.aborted ||
+          (currentPanelFlight !== undefined && currentPanelFlight !== activeFlight)
+        ) {
           return empty
         }
         if (
@@ -1198,15 +1462,12 @@ export function registerAiHandlers({
         }
 
         const elapsed = Date.now() - started
-        resetCompleteErrorCooldown()
+        if (activeHealthRole === 'autocomplete') {
+          resetCompleteErrorCooldown()
+        }
         roleRuntime[activeHealthRole].lastMs = elapsed
         roleRuntime[activeHealthRole].lastError = null
         roleRuntime[activeHealthRole].lastSlow = false
-        if (activeHealthRole === 'explain') {
-          roleRuntime.autocomplete.lastMs = elapsed
-          roleRuntime.autocomplete.lastError = null
-          roleRuntime.autocomplete.lastSlow = false
-        }
         latestLastMs = elapsed
         void recordUsage(activeProvider.baseUrl, activeProvider.model, elapsed).catch(() => undefined)
         if (!suggestion && (!edits || edits.length === 0)) {
@@ -1215,7 +1476,7 @@ export function registerAiHandlers({
         }
 
         suggestedCount += 1
-        updateStats((store) => recordMetricLatency(store, mKey, elapsed))
+        updateStats((store) => recordMetricLatency(store, activeModelKey, elapsed))
         void refreshStatus()
 
         rememberCompletion({
@@ -1230,24 +1491,28 @@ export function registerAiHandlers({
         })
         return {
           suggestion,
-          id: rememberSuggestion(mKey),
+          id: rememberSuggestion(activeModelKey),
           ...(replaceChars > 0 ? { replaceChars } : {}),
           ...(edits ? { edits } : {}),
           ...(outMode ? { mode: outMode } : {}),
         }
       } catch (err) {
         if (err instanceof Error && err.name === 'TimeoutError') {
-          noteCompleteError(mKey)
+          if (activeHealthRole === 'autocomplete') {
+            noteCompleteError(activeModelKey)
+          }
           roleRuntime[activeHealthRole].lastSlow = true
           void recordUsage(activeProvider.baseUrl, activeProvider.model, AI_COMPLETE_TIMEOUT_MS).catch(
             () => undefined
           )
-          updateStats((store) => recordMetricLatency(store, mKey, AI_COMPLETE_TIMEOUT_MS))
+          updateStats((store) => recordMetricLatency(store, activeModelKey, AI_COMPLETE_TIMEOUT_MS))
           void refreshStatus()
         } else if (controller.signal.aborted) {
-          updateStats((store) => bumpMetric(store, mKey, 'stale'))
+          updateStats((store) => bumpMetric(store, activeModelKey, 'stale'))
         } else {
-          noteCompleteError(mKey)
+          if (activeHealthRole === 'autocomplete') {
+            noteCompleteError(activeModelKey)
+          }
           const msg = explainFailure(
             err,
             hostOf(activeProvider.baseUrl),
@@ -1343,17 +1608,19 @@ export function registerAiHandlers({
       const lower = rawName.toLowerCase()
       if (seen.has(lower)) continue
       seen.add(lower)
-      const bare =
-        dialect !== 'mongodb' && lower.includes('.') ? lower.split('.').pop() || lower : lower
+      const hasDot = dialect !== 'mongodb' && lower.includes('.')
+      const bare = hasDot ? lower.split('.').pop() || lower : lower
       const qualified =
-        dialect !== 'mongodb' && activeSchema && !lower.includes('.')
+        dialect !== 'mongodb' && activeSchema && !hasDot
           ? `${activeSchema.toLowerCase()}.${lower}`
           : ''
-      if (
-        snapshot?.details.has(lower) ||
-        snapshot?.details.has(bare) ||
-        (qualified && snapshot?.details.has(qualified))
-      ) {
+      const alreadyDetailed = hasDot
+        ? Boolean(snapshot?.details.has(lower))
+        : Boolean(
+            (qualified && snapshot?.details.has(qualified)) ||
+              (!qualified && snapshot?.details.has(lower))
+          )
+      if (alreadyDetailed) {
         continue
       }
       if (isFreshEnrichMiss(buildEnrichMissKey(connId, dialect, rawName, activeSchema), connRevision, now)) {
@@ -1406,17 +1673,18 @@ export function registerAiHandlers({
     const existingSnap = schemaCache.getSnapshot(connId)
     const missing = refs.slice(0, 8).filter((name) => {
       const lower = name.toLowerCase()
-      const bare =
-        dialect !== 'mongodb' && lower.includes('.') ? lower.split('.').pop() || lower : lower
+      const hasDot = dialect !== 'mongodb' && lower.includes('.')
       const qualified =
-        dialect !== 'mongodb' && activeSchema && !lower.includes('.')
+        dialect !== 'mongodb' && activeSchema && !hasDot
           ? `${activeSchema.toLowerCase()}.${lower}`
           : ''
-      return (
-        !existingSnap?.details.has(lower) &&
-        !existingSnap?.details.has(bare) &&
-        (!qualified || !existingSnap?.details.has(qualified))
-      )
+      if (hasDot) {
+        return !existingSnap?.details.has(lower)
+      }
+      if (qualified) {
+        return !existingSnap?.details.has(qualified)
+      }
+      return !existingSnap?.details.has(lower)
     })
     if (missing.length === 0) return
     try {
@@ -1486,12 +1754,27 @@ export function registerAiHandlers({
       )
     }
 
+    const connId = typeof input.connectionId === 'string' ? input.connectionId : ''
+    const explainPolicy = await checkConnectionAiPolicy(
+      connId,
+      isLoopbackBaseUrl(explainCfg.provider.baseUrl),
+      'explain',
+      true,
+      readOptionalBoolean(input, 'confirmed')
+    )
+    if (!explainPolicy.allowed) {
+      throw createHostError(
+        'not_permitted',
+        explainPolicy.reason ?? 'ai.blocked: AI EXPLAIN analysis is blocked for this connection.'
+      )
+    }
+
     const panelId = ctx?.panel?.id || 'default'
     inflightExplainByPanel.get(panelId)?.abort()
     const controller = new AbortController()
     inflightExplainByPanel.set(panelId, controller)
 
-    const connId = typeof input.connectionId === 'string' ? input.connectionId : ''
+    const activeSchema = (readOptionalString(input, 'activeSchema') ?? '').trim()
 
     try {
       const refs =
@@ -1500,7 +1783,7 @@ export function registerAiHandlers({
           : dialect === 'mongodb'
             ? extractReferencedMongoCollections(input.sql)
             : extractReferencedTables(input.sql, dialect)
-      await enrichTableDetailsForRefs(connId, dialect, refs)
+      await enrichTableDetailsForRefs(connId, dialect, refs, activeSchema || undefined)
 
       const { system, user, resolvedLanguage } = buildExplainAnalysisPrompt({
         dialect,
@@ -1508,6 +1791,7 @@ export function registerAiHandlers({
         planColumns: Array.isArray(input.planColumns) ? input.planColumns : [],
         planRows: Array.isArray(input.planRows) ? input.planRows : [],
         snapshot: connId ? schemaCache.getSnapshot(connId) : null,
+        activeSchema: activeSchema || undefined,
         language: input.language ?? cfg.explainLanguage,
         uiLocale: input.uiLocale,
       })
@@ -1598,12 +1882,26 @@ export function registerAiHandlers({
       )
     }
 
+    const connId = typeof input.connectionId === 'string' ? input.connectionId : ''
+    const fixPolicy = await checkConnectionAiPolicy(
+      connId,
+      isLoopbackBaseUrl(explainCfg.provider.baseUrl),
+      'fix',
+      true,
+      readOptionalBoolean(input, 'confirmed')
+    )
+    if (!fixPolicy.allowed) {
+      throw createHostError(
+        'not_permitted',
+        fixPolicy.reason ?? 'ai.blocked: AI query fix is blocked for this connection.'
+      )
+    }
+
     const panelId = ctx?.panel?.id || 'default'
     inflightFixByPanel.get(panelId)?.abort()
     const controller = new AbortController()
     inflightFixByPanel.set(panelId, controller)
 
-    const connId = typeof input.connectionId === 'string' ? input.connectionId : ''
     const activeSchema = typeof input.activeSchema === 'string' ? input.activeSchema.trim() : ''
     const activeTable = typeof input.activeTable === 'string' ? input.activeTable.trim() : ''
 
@@ -1738,6 +2036,7 @@ export function registerAiHandlers({
       historyCache = null
     },
     dispose: () => {
+      disposed = true
       settingsSub.dispose()
       for (const ctrl of inflightByPanel.values()) ctrl.abort()
       for (const ctrl of inflightExplainByPanel.values()) ctrl.abort()

@@ -1,4 +1,4 @@
-import type { Extension, StateEffect, StateField } from '../vendor/codemirror.js'
+import type { EditorState, Extension, StateEffect, StateField } from '../vendor/codemirror.js'
 import type { SqlDiagnostic, SqlDiagnosticRange } from './shared-sql-diagnostics.js'
 
 export interface DbSqlErrorPayload {
@@ -34,5 +34,7 @@ export const triggerSqlLintEffect: {
 }
 
 export const sqlDiagnosticsField: StateField<SqlDiagnosticsState>
+
+export function collectActiveDiagnostics(state: EditorState): SqlDiagnostic[]
 
 export function createCmSqlLintExtension(options?: CmSqlLintOptions): Extension

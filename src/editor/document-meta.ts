@@ -138,11 +138,14 @@ export function upsertDatanoaMetadataHeader(
   key: 'connectionId' | 'table' | 'schema',
   value: string
 ): void {
+  const safeValue = String(value ?? '')
+    .replace(/[\r\n\0]+/g, ' ')
+    .trim()
   const prefix = `-- datanoa: ${key}=`
   const idx = metadataLines.findIndex((line) =>
     line.toLowerCase().startsWith(prefix.toLowerCase())
   )
-  const nextLine = `${prefix}${value}`
+  const nextLine = `${prefix}${safeValue}`
   if (idx >= 0) {
     metadataLines[idx] = nextLine
   } else {
@@ -192,6 +195,9 @@ function sanitizeStudioSnapshotForLocalStorage(
   const safe: StudioPersistedViewState = { ...snapshot }
   if (typeof safe.activeWhereClause === 'string' && containsSensitiveSqlLiteral(safe.activeWhereClause)) {
     safe.activeWhereClause = ''
+  }
+  if (typeof safe.clientFilter === 'string' && containsSensitiveSqlLiteral(safe.clientFilter)) {
+    safe.clientFilter = ''
   }
   if (typeof safe.sqlDraft === 'string' && containsSensitiveSqlLiteral(safe.sqlDraft)) {
     delete safe.sqlDraft
@@ -264,21 +270,47 @@ export function readLocalStudioWarmCache(): StudioWarmCacheSnapshot | null {
   }
 }
 
+/**
+ * Strips all live database rows from a Studio warm cache snapshot so plaintext
+ * query/table data is never persisted into `localStorage`.
+ */
+export function stripLiveRowsForWarmCache(
+  snapshot: StudioWarmCacheSnapshot
+): StudioWarmCacheSnapshot {
+  const sanitizedSqlResult = snapshot.lastSqlResult
+    ? sanitizeSqlResultForStorage(snapshot.lastSqlResult)
+    : snapshot.lastSqlResult
+  const rowlessSqlResult: QueryResult | null | undefined = sanitizedSqlResult
+    ? {
+        ...sanitizedSqlResult,
+        rows: [],
+        ...(Array.isArray(sanitizedSqlResult.resultSets)
+          ? {
+              resultSets: sanitizedSqlResult.resultSets.map((rs) => ({
+                ...rs,
+                rows: [],
+              })),
+            }
+          : {}),
+      }
+    : sanitizedSqlResult
+  return {
+    ...snapshot,
+    updatedAt: Number.isFinite(snapshot.updatedAt) ? snapshot.updatedAt : Date.now(),
+    connections: sanitizeWarmConnections(snapshot.connections),
+    whereClause:
+      typeof snapshot.whereClause === 'string' && containsSensitiveSqlLiteral(snapshot.whereClause)
+        ? ''
+        : snapshot.whereClause,
+    pageData: null,
+    lastSqlResult: rowlessSqlResult,
+  }
+}
+
 export function writeLocalStudioWarmCache(snapshot: StudioWarmCacheSnapshot): void {
   if (typeof window === 'undefined') return
   try {
-    const candidate: StudioWarmCacheSnapshot = {
-      ...snapshot,
-      updatedAt: Number.isFinite(snapshot.updatedAt) ? snapshot.updatedAt : Date.now(),
-      connections: sanitizeWarmConnections(snapshot.connections),
-      whereClause:
-        typeof snapshot.whereClause === 'string' && containsSensitiveSqlLiteral(snapshot.whereClause)
-          ? ''
-          : snapshot.whereClause,
-      lastSqlResult: snapshot.lastSqlResult
-        ? sanitizeSqlResultForStorage(snapshot.lastSqlResult)
-        : snapshot.lastSqlResult,
-    }
+    const candidate = stripLiveRowsForWarmCache(snapshot)
     const clean = sanitizeJsonPayload(candidate) as StudioWarmCacheSnapshot
     let serialized = JSON.stringify(clean)
     if (measureWarmCacheBytes(serialized) > MAX_STUDIO_WARM_CACHE_BYTES) {
@@ -318,10 +350,11 @@ export function syncInitialThemeFromHost(options?: { forceTokenProbe?: boolean }
     document.body.appendChild(probe)
     const bg = getComputedStyle(probe).backgroundColor
     probe.remove()
+    const isColorFunc = /^color\(\s*[a-z0-9-]+\s+/i.test(bg.trim())
     const parts = bg.match(/[\d.]+/g)
-    if (!parts || (parts.length > 3 && Number(parts[3]) === 0)) return null
+    if (!parts || parts.length < 3 || (parts.length > 3 && Number(parts[3]) === 0)) return null
     const toLin = (c: number) => {
-      const s = c / 255
+      const s = isColorFunc ? Math.max(0, Math.min(1, c)) : Math.max(0, Math.min(1, c / 255))
       return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4
     }
     const lum =

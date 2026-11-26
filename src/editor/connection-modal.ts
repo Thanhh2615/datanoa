@@ -2,6 +2,7 @@
 // Fullscreen Studio 9-Engine Connection Manager Modal (URI parser, .env & .db workspace scanner, test/save/delete)
 
 import type {
+  ConnectionAiPolicy,
   ConnectionColorTag,
   ConnectionProfile,
   DatabaseDriverType,
@@ -257,9 +258,14 @@ export interface StudioConnectionModalContext {
   currentWorkspaceScope?: string
 }
 
+export interface OpenConnectionModalOptions {
+  focusSection?: 'tls' | 'ai'
+}
+
 export function openStudioConnectionModal(
   ctx: StudioConnectionModalContext,
-  editProfile?: ConnectionProfile
+  editProfile?: ConnectionProfile,
+  options?: OpenConnectionModalOptions
 ): void {
   if (typeof document === 'undefined') return
   const isEdit = editProfile !== undefined
@@ -267,9 +273,18 @@ export function openStudioConnectionModal(
 
   let driver: DatabaseDriverType = editProfile ? editProfile.driver : 'sqlite'
   if (!isKnownConnectionDriver(driver)) driver = 'sqlite'
-  let colorTag: ConnectionColorTag = editProfile?.colorTag ?? 'none'
+  const rawTag = String(editProfile?.colorTag ?? 'none').trim().toLowerCase()
+  let colorTag: ConnectionColorTag =
+    rawTag === 'production'
+      ? 'prod'
+      : rawTag === 'dev' || rawTag === 'staging' || rawTag === 'prod'
+        ? rawTag
+        : 'none'
   let hadPassword = Boolean(editProfile?.hasPassword)
   let hadAuthToken = Boolean(editProfile?.hasAuthToken)
+  let hadSslKeyPassphrase = Boolean(editProfile?.hasSslKeyPassphrase)
+  let hadSshPassphrase = Boolean(editProfile?.hasSshPassphrase)
+  let hadSshPassword = Boolean(editProfile?.hasSshPassword)
   let lastParsedUri = ''
   let lastParsedDisplayUri = ''
   let lastParsedCandidateId = ''
@@ -998,11 +1013,54 @@ export function openStudioConnectionModal(
   const roCheck = createCheck('Read-Only Mode')
   roCheck.input.checked = Boolean(editProfile?.readOnly)
 
+  const aiPolicySel = createSelect([
+    { value: '', label: 'Default (Auto)' },
+    { value: 'allow', label: 'Allow' },
+    { value: 'ask', label: 'Ask before sending' },
+    { value: 'never', label: 'Never' },
+  ])
+  aiPolicySel.setAttribute('aria-label', 'AI Access Policy')
+  if (
+    editProfile?.aiPolicy === 'allow' ||
+    editProfile?.aiPolicy === 'ask' ||
+    editProfile?.aiPolicy === 'never'
+  ) {
+    aiPolicySel.value = editProfile.aiPolicy
+  }
+  const aiPolicyHint = document.createElement('div')
+  aiPolicyHint.className = 'datanoa-conn-hint'
+  aiPolicyHint.style.marginTop = '4px'
+  const isProdColorTag = (tag: string): boolean => {
+    const norm = String(tag || '').trim().toLowerCase()
+    return norm === 'prod' || norm === 'production'
+  }
+  const syncAiPolicyHint = (): void => {
+    const isProd = isProdColorTag(colorTag)
+    showEl(aiPolicyHint, isProd)
+    if (isProd) {
+      aiPolicyHint.textContent =
+        aiPolicySel.value === 'allow'
+          ? 'Production tag active — AI access is explicitly allowed for this connection.'
+          : aiPolicySel.value === 'never'
+            ? 'Production tag active — AI access is blocked for this connection.'
+            : 'Production connections default to ask/fail-closed protection for remote AI unless explicitly overridden.'
+    }
+  }
+  aiPolicySel.addEventListener('change', () => {
+    syncStudioSelectTooltip(aiPolicySel, 'AI Access Policy')
+    syncAiPolicyHint()
+  })
+  const aiPolicyWrap = document.createElement('div')
+  aiPolicyWrap.appendChild(aiPolicySel)
+  aiPolicyWrap.appendChild(aiPolicyHint)
+  const rowAiPolicy = createField('AI Access Policy', aiPolicyWrap, true, aiPolicySel)
+
   const envPills = document.createElement('div')
   envPills.className = 'datanoa-conn-env-pills'
   const envPillBtns = new Map<ConnectionColorTag, HTMLButtonElement>()
   const syncEnvPills = (): void => {
     envPillBtns.forEach((btn, id) => btn.classList.toggle('active', id === colorTag))
+    syncAiPolicyHint()
   }
   for (const tag of CONNECTION_ENV_TAGS) {
     const btn = document.createElement('button')
@@ -1307,6 +1365,7 @@ export function openStudioConnectionModal(
   for (const row of [
     rowName,
     rowEnv,
+    rowAiPolicy,
     rowFolderGroup,
     rowWorkspacePin,
     rowFilePath,
@@ -1363,7 +1422,7 @@ export function openStudioConnectionModal(
 
   // ---- SSH Tunnel (Bastion) ----
   const sshSection = createCollapsible('SSH Tunnel (Bastion)')
-  const sshCheck = createCheck('Enable SSH Tunnel (uses OS ssh -N -L)')
+  const sshCheck = createCheck('Enable SSH Tunnel')
   const sshHostInp = createInput('bastion.example.com', true)
   const sshPortInp = createInput('22', true)
   sshPortInp.inputMode = 'numeric'
@@ -1417,8 +1476,7 @@ export function openStudioConnectionModal(
     const hasCert = Boolean(
       sslCaPathInp.value.trim() || sslCertPathInp.value.trim() || sslKeyPathInp.value.trim()
     )
-    const hasPassphrase =
-      Boolean(sslKeyPassphraseInp.value) || Boolean(editProfile?.hasSslKeyPassphrase)
+    const hasPassphrase = Boolean(sslKeyPassphraseInp.value) || hadSslKeyPassphrase
     const rejectDisabled = sslRejectCheck.input.checked === false
     tlsSection.sync(customMode || hasCert || hasPassphrase || rejectDisabled ? 'mTLS' : null)
   }
@@ -1460,6 +1518,7 @@ export function openStudioConnectionModal(
       sslCheck.input.checked = true
       if (
         sslModeSel.value === 'auto' ||
+        sslModeSel.value === 'disable' ||
         sslModeSel.value === 'verify-ca' ||
         sslModeSel.value === 'verify-full'
       ) {
@@ -1475,11 +1534,70 @@ export function openStudioConnectionModal(
   redisDbSel.addEventListener('change', () => {
     syncStudioSelectTooltip(redisDbSel, 'Redis DB Index')
   })
-  for (const inp of [sslCaPathInp, sslCertPathInp, sslKeyPathInp]) {
+  for (const inp of [sslCaPathInp, sslCertPathInp, sslKeyPathInp, sslKeyPassphraseInp]) {
     inp.addEventListener('input', syncTlsUi)
+  }
+  const invalidateDbStoredSecrets = (): void => {
+    hadPassword = false
+    hadAuthToken = false
+    if (!passwordInp.value && !placeholderPending) {
+      passwordInp.placeholder = 'Optional'
+    }
+    if (!authTokenInp.value) {
+      authTokenInp.placeholder =
+        driver === 'd1' ? 'Bearer API token with D1 access' : 'Optional Bearer token'
+    }
+  }
+  const invalidateSslStoredSecret = (): void => {
+    hadSslKeyPassphrase = false
+    if (!sslKeyPassphraseInp.value) {
+      sslKeyPassphraseInp.placeholder = 'Optional private key passphrase'
+    }
+  }
+  const invalidateSshStoredSecrets = (): void => {
+    hadSshPassphrase = false
+    hadSshPassword = false
+    if (!sshPassphraseInp.value) {
+      sshPassphraseInp.placeholder = 'Optional SSH key passphrase'
+    }
+    if (!sshPasswordInp.value) {
+      sshPasswordInp.placeholder = 'Optional SSH password'
+    }
+  }
+  const markAutoUriConsumedOnManualEdit = (): void => {
+    if (activeAutoDisplayUri && uriInp.value.trim() === activeAutoDisplayUri) {
+      if (activeAutoCandidateId) {
+        lastParsedCandidateId = activeAutoCandidateId
+      } else if (activeAutoRawUri) {
+        lastParsedUri = activeAutoRawUri
+      }
+      lastParsedDisplayUri = activeAutoDisplayUri
+    }
+  }
+  for (const inp of [
+    hostInp,
+    portInp,
+    userInp,
+    chUrlInp,
+    libsqlUrlInp,
+    d1AccountInp,
+    d1DatabaseInp,
+    d1EndpointInp,
+  ]) {
+    inp.addEventListener('input', () => {
+      invalidateDbStoredSecrets()
+      markAutoUriConsumedOnManualEdit()
+    })
+  }
+  databaseInp.addEventListener('input', markAutoUriConsumedOnManualEdit)
+  passwordInp.addEventListener('input', markAutoUriConsumedOnManualEdit)
+  sslKeyPathInp.addEventListener('input', invalidateSslStoredSecret)
+  for (const inp of [sshHostInp, sshPortInp, sshUserInp, sshKeyPathInp]) {
+    inp.addEventListener('input', invalidateSshStoredSecrets)
   }
   sshCheck.input.addEventListener('change', syncSshUi)
   sshAuthSel.addEventListener('change', () => {
+    invalidateSshStoredSecrets()
     syncStudioSelectTooltip(sshAuthSel, 'SSH Auth Method')
     syncSshUi()
   })
@@ -1530,6 +1648,7 @@ export function openStudioConnectionModal(
     optionsInp,
     sslCheck.input,
     roCheck.input,
+    aiPolicySel,
     folderGroupInp,
     workspaceScopeSel,
     sslModeSel,
@@ -1581,12 +1700,16 @@ export function openStudioConnectionModal(
   const resetFormAuthAndTunnels = (): void => {
     hadPassword = false
     hadAuthToken = false
+    hadSslKeyPassphrase = false
+    hadSshPassphrase = false
+    hadSshPassword = false
     lastParsedUri = ''
     lastOracleParsedUrl = ''
     lastParsedPlaceholder = false
     placeholderPending = false
     uriInp.value = ''
     authTokenInp.value = ''
+    authTokenInp.placeholder = 'Optional Bearer token'
     passwordInp.value = ''
     passwordInp.placeholder = 'Optional'
     sslModeSel.value = 'auto'
@@ -1594,6 +1717,7 @@ export function openStudioConnectionModal(
     sslCertPathInp.value = ''
     sslKeyPathInp.value = ''
     sslKeyPassphraseInp.value = ''
+    sslKeyPassphraseInp.placeholder = 'Optional private key passphrase'
     sslRejectCheck.input.checked = true
     sshCheck.input.checked = false
     sshHostInp.value = ''
@@ -1602,7 +1726,9 @@ export function openStudioConnectionModal(
     sshAuthSel.value = 'agent'
     sshKeyPathInp.value = ''
     sshPassphraseInp.value = ''
+    sshPassphraseInp.placeholder = 'Optional SSH key passphrase'
     sshPasswordInp.value = ''
+    sshPasswordInp.placeholder = 'Optional SSH password'
     tlsSection.setExpanded(false)
     sshSection.setExpanded(false)
     syncStudioSelectTooltip(sslModeSel, 'SSL Mode')
@@ -1624,6 +1750,17 @@ export function openStudioConnectionModal(
       activeAutoCandidateId = item.candidateId || null
       activeAutoRawUri = item.candidateId ? null : item.url
       activeAutoDisplayUri = maskedUrl
+      const hasUnparsedSecret =
+        Boolean(item.candidateId) || (item.password === undefined && maskedUrl !== item.url)
+      if (hasUnparsedSecret) {
+        lastParsedUri = ''
+        lastParsedCandidateId = ''
+        lastParsedDisplayUri = ''
+      } else {
+        lastParsedUri = item.url
+        lastParsedCandidateId = ''
+        lastParsedDisplayUri = maskedUrl
+      }
     } else {
       uriInp.value = ''
     }
@@ -2062,7 +2199,13 @@ export function openStudioConnectionModal(
       driver === 'd1' ? 'Bearer API token with D1 access' : 'Optional Bearer token'
   }
   const applyDriver = (next: DatabaseDriverType, applyDefaults: boolean): void => {
+    const prevDriver = driver
     const prevMeta = getStudioEngineMeta(driver)
+    if (applyDefaults && prevDriver !== next) {
+      invalidateDbStoredSecrets()
+      invalidateSslStoredSecret()
+      invalidateSshStoredSecrets()
+    }
     driver = next
     const meta = getStudioEngineMeta(next)
     engineTiles.forEach((tile, id) => {
@@ -2155,6 +2298,8 @@ export function openStudioConnectionModal(
     workspaceScopeSel.value = ''
     syncStudioSelectTooltip(workspaceScopeSel, 'Workspace Scope (Pin Connection)')
     colorTag = 'none'
+    aiPolicySel.value = ''
+    syncStudioSelectTooltip(aiPolicySel, 'AI Access Policy')
     syncEnvPills()
     roCheck.input.checked = false
     filePathInp.value = ''
@@ -2185,9 +2330,19 @@ export function openStudioConnectionModal(
     const sameDriverAsStored = isEdit && editProfile?.driver === driver
     const folderValue = folderGroupInp.value.trim().slice(0, 64)
     const scopeValue = (workspaceScopeSel.value || '').trim().slice(0, 260)
+    const rawAiPolicy = aiPolicySel.value
+    const aiPolicy: ConnectionAiPolicy | undefined =
+      rawAiPolicy === 'allow' || rawAiPolicy === 'ask' || rawAiPolicy === 'never'
+        ? rawAiPolicy
+        : undefined
     const attachFolderScope = <T extends ConnectionProfile>(profile: T): T => {
       profile.folder = folderValue
       profile.workspaceScope = scopeValue
+      if (aiPolicy) {
+        profile.aiPolicy = aiPolicy
+      } else {
+        delete profile.aiPolicy
+      }
       return profile
     }
 
@@ -2290,6 +2445,7 @@ export function openStudioConnectionModal(
       const pgOptions = optionsInp.value.trim()
       if (pgOptions) profile.options = pgOptions
     }
+    let urlForcedSsl: boolean | null = null
     if (driver === 'mongodb') {
       const mongoUrl = scrubStudioNetworkFormUrl(chUrlInp.value)
       if (mongoUrl) {
@@ -2304,8 +2460,13 @@ export function openStudioConnectionModal(
             }
           }
           const mongoTls = parsedMongo.searchParams.get('tls') || parsedMongo.searchParams.get('ssl')
-          if (mongoTls === 'true') profile.ssl = true
-          else if (mongoTls === 'false') profile.ssl = false
+          if (mongoTls === 'true') {
+            profile.ssl = true
+            urlForcedSsl = true
+          } else if (mongoTls === 'false') {
+            profile.ssl = false
+            urlForcedSsl = false
+          }
         } catch {
           // Keep the scrubbed URL string as entered when URL parser fails
         }
@@ -2329,8 +2490,13 @@ export function openStudioConnectionModal(
           } else if (parsedCh.protocol === 'http:') {
             profile.port = 8123
           }
-          if (parsedCh.protocol === 'https:') profile.ssl = true
-          else if (parsedCh.protocol === 'http:') profile.ssl = false
+          if (parsedCh.protocol === 'https:') {
+            profile.ssl = true
+            urlForcedSsl = true
+          } else if (parsedCh.protocol === 'http:') {
+            profile.ssl = false
+            urlForcedSsl = false
+          }
         } catch {
           // Keep the typed URL verbatim when it is not a valid absolute URL
         }
@@ -2338,11 +2504,16 @@ export function openStudioConnectionModal(
         profile.url = `${ssl ? 'https' : 'http'}://${host}:${port}`
       }
     }
-    const keepStoredSslPassphrase = sameDriverAsStored && Boolean(editProfile?.hasSslKeyPassphrase)
+    const keepStoredSslPassphrase = sameDriverAsStored && hadSslKeyPassphrase
     const sslKeyPassphrase = sslKeyPassphraseInp.value
     const sslMode = sslModeSel.value
     if (sslMode === 'auto' || sslMode === 'disable' || sslMode === 'require' || sslMode === 'verify-ca' || sslMode === 'verify-full') {
       profile.sslMode = sslMode
+    }
+    if (urlForcedSsl === false) {
+      profile.sslMode = 'disable'
+    } else if (urlForcedSsl === true && profile.sslMode === 'disable') {
+      profile.sslMode = 'auto'
     }
     const sslCaPath = sslCaPathInp.value.trim()
     const sslCertPath = sslCertPathInp.value.trim()
@@ -2380,9 +2551,9 @@ export function openStudioConnectionModal(
       }
       if (sshAuthMethod === 'password') sshPassword = sshPasswordInp.value
       profile.hasSshPassphrase =
-        Boolean(sshPassphrase) || (sshAuthMethod === 'key' && sameDriverAsStored && Boolean(editProfile?.hasSshPassphrase))
+        Boolean(sshPassphrase) || (sshAuthMethod === 'key' && sameDriverAsStored && hadSshPassphrase)
       profile.hasSshPassword =
-        Boolean(sshPassword) || (sshAuthMethod === 'password' && sameDriverAsStored && Boolean(editProfile?.hasSshPassword))
+        Boolean(sshPassword) || (sshAuthMethod === 'password' && sameDriverAsStored && hadSshPassword)
     }
 
     const submission: ConnectionSubmission = { profile: attachFolderScope(profile) }
@@ -2452,6 +2623,10 @@ export function openStudioConnectionModal(
       const dropStored = clearMissingSecret || (isEdit && targetChanged)
       if (dropStored || res.password !== undefined || res.placeholderPassword) hadPassword = false
       if (dropStored || res.authToken !== undefined) hadAuthToken = false
+      if (dropStored) {
+        invalidateSslStoredSecret()
+        invalidateSshStoredSecrets()
+      }
       const nextPassword =
         res.password !== undefined ? res.password : dropStored ? '' : passwordInp.value
       const nextAuthToken =
@@ -2466,6 +2641,7 @@ export function openStudioConnectionModal(
       d1EndpointInp.value = ''
       hostInp.value = 'localhost'
       portInp.value = ''
+      userInp.value = ''
       databaseInp.value = ''
       chUrlInp.value = ''
       optionsInp.value = ''
@@ -2812,7 +2988,7 @@ export function openStudioConnectionModal(
       setButtonLoading(testBtn, true, `Testing... ${elapsed}`)
     })
     try {
-      if (!(await ensureUriParsed())) return
+      if (!(await ensureUriParsed()) || !isModalOpen()) return
       if (!validateRequiredFields() || !ensurePasswordBeforeSubmit()) return
       showNotice('neutral', 'Testing connection...')
       const sub = buildSubmission(editId || `conn_test_${Date.now()}`)
@@ -2821,17 +2997,21 @@ export function openStudioConnectionModal(
         sub,
         { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
       )
+      if (!isModalOpen()) return
       showNotice(
         res.ok ? 'success' : 'error',
         res.message ||
           (res.ok ? 'Connection verified' : 'Connection test failed.')
       )
     } catch (err: unknown) {
+      if (!isModalOpen()) return
       showNotice('error', `Error: ${err instanceof Error ? err.message : String(err)}`)
     } finally {
       stopTimer()
-      setButtonLoading(testBtn, false)
-      setBusy(false)
+      if (isModalOpen()) {
+        setButtonLoading(testBtn, false)
+        setBusy(false)
+      }
     }
   }
 
@@ -2845,7 +3025,7 @@ export function openStudioConnectionModal(
     })
     let savedId = ''
     try {
-      if (!(await ensureUriParsed())) return
+      if (!(await ensureUriParsed()) || !isModalOpen()) return
       if (!validateRequiredFields()) return
       const targetId = editId || `conn_${driver}_${Date.now()}`
       if (!ensurePasswordBeforeSubmit()) return
@@ -2857,11 +3037,13 @@ export function openStudioConnectionModal(
           sub,
           { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
         )
+        if (!isModalOpen()) return
         if (!testRes.ok) {
           showNotice('error', testRes.message || 'Connection test failed.')
           return
         }
       } catch (testErr: unknown) {
+        if (!isModalOpen()) return
         showNotice(
           'error',
           `Connection failed: ${testErr instanceof Error ? testErr.message : String(testErr)}`
@@ -2874,17 +3056,21 @@ export function openStudioConnectionModal(
         sub,
         { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
       )
+      if (!isModalOpen()) return
       if (!res.ok) {
         showNotice('error', 'Failed to save connection.')
         return
       }
       savedId = res.id || targetId
     } catch (err: unknown) {
+      if (!isModalOpen()) return
       showNotice('error', `Error: ${err instanceof Error ? err.message : String(err)}`)
     } finally {
       stopTimer()
-      setButtonLoading(saveBtn, false)
-      setBusy(false)
+      if (isModalOpen()) {
+        setButtonLoading(saveBtn, false)
+        setBusy(false)
+      }
     }
     if (!savedId) return
     if (isModalOpen()) closeModalClean()
@@ -3095,7 +3281,7 @@ export function openStudioConnectionModal(
     hostInp.value = 'localhost'
     applyDriver(driver, true)
   }
-  tlsSection.setExpanded(hasCustomTls)
+  tlsSection.setExpanded(hasCustomTls || options?.focusSection === 'tls')
   sshSection.setExpanded(sshEnabledInitially)
   syncTlsUi()
   syncSshUi()
@@ -3103,6 +3289,7 @@ export function openStudioConnectionModal(
   syncStudioSelectTooltip(redisDbSel, 'Redis DB Index')
   syncStudioSelectTooltip(sslModeSel, 'SSL Mode')
   syncStudioSelectTooltip(sshAuthSel, 'SSH Auth Method')
+  syncStudioSelectTooltip(aiPolicySel, 'AI Access Policy')
 
   modal.appendChild(head)
   modal.appendChild(noticeBox)
@@ -3114,7 +3301,13 @@ export function openStudioConnectionModal(
     return true
   })
   if (!backdropRef) return
-  if (isEdit) {
+  if (options?.focusSection === 'tls') {
+    tlsSection.root.scrollIntoView?.({ block: 'center' })
+    sslModeSel.focus?.()
+  } else if (options?.focusSection === 'ai') {
+    rowAiPolicy.scrollIntoView?.({ block: 'center' })
+    aiPolicySel.focus?.()
+  } else if (isEdit) {
     nameInp.focus?.()
     nameInp.select?.()
   } else {

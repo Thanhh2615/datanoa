@@ -9,17 +9,17 @@ import type {
   TableDetails,
 } from '../protocol.js'
 import {
+  getDialectLexerRules,
   isIdentContChar,
   isIdentStartChar,
   isPostgresEscapeStringStart,
   matchDollarQuoteTag,
   scanBlockCommentEnd,
+  scanBracketIdentEnd,
   scanLineCommentEnd,
+  scanOracleQuoteEnd,
   scanQuotedSegmentEnd,
   splitSqlStatements,
-  supportsDollarQuoting,
-  supportsNestedBlockComments,
-  usesBackslashAndHash,
 } from '../drivers/common/sql-lexer.js'
 
 export interface EditableSelectAnalysis {
@@ -43,13 +43,13 @@ export interface AnalyzeEditableSelectParams {
 
 interface SqlToken {
   text: string
-  type: 'word' | 'ident' | 'punct'
+  type: 'word' | 'ident' | 'punct' | 'literal'
   depth: number
 }
 
 /**
- * Tokenizes SQL statement into words, quoted identifiers, and punctuation,
- * tracking parenthesis nesting depth while strictly skipping string literals and comments.
+ * Tokenizes SQL statement into words, quoted identifiers, literals, and punctuation,
+ * tracking parenthesis nesting depth while strictly skipping comments.
  */
 function tokenizeSqlStatement(
   sql: string,
@@ -57,11 +57,7 @@ function tokenizeSqlStatement(
 ): SqlToken[] {
   const tokens: SqlToken[] = []
   const len = sql.length
-  const backslashAndHash = usesBackslashAndHash(dialect)
-  const nestedComments = supportsNestedBlockComments(dialect)
-  const dollarQuotes = supportsDollarQuoting(dialect)
-  const bracketIdents =
-    dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1' || dialect === 'mssql'
+  const rules = getDialectLexerRules(dialect)
   let depth = 0
   let i = 0
 
@@ -69,41 +65,59 @@ function tokenizeSqlStatement(
     const ch = sql[i]
 
     // 1. Line comments: -- ...
-    if (ch === '-' && i + 1 < len && sql[i + 1] === '-') {
+    if (rules.lineCommentDash && ch === '-' && i + 1 < len && sql[i + 1] === '-') {
+      i = scanLineCommentEnd(sql, i)
+      continue
+    }
+
+    // 1b. ClickHouse line comments: // ...
+    if (rules.lineCommentSlash && ch === '/' && i + 1 < len && sql[i + 1] === '/') {
       i = scanLineCommentEnd(sql, i)
       continue
     }
 
     // 2. MySQL / MariaDB / ClickHouse line comments: # ...
-    if (ch === '#' && backslashAndHash) {
+    if (rules.lineCommentHash && ch === '#') {
       i = scanLineCommentEnd(sql, i - 1)
       continue
     }
 
     // 3. Block comments: /* ... */
     if (ch === '/' && i + 1 < len && sql[i + 1] === '*') {
-      i = scanBlockCommentEnd(sql, i, nestedComments)
+      i = scanBlockCommentEnd(sql, i, rules.nestedBlockComments)
       continue
     }
 
     // 4. PostgreSQL escape string: E'...'
     if (isPostgresEscapeStringStart(sql, i, dialect)) {
-      i = scanQuotedSegmentEnd(sql, i + 1, "'", true).end
+      const end = scanQuotedSegmentEnd(sql, i + 1, "'", true).end
+      tokens.push({ text: "''", type: 'literal', depth })
+      i = end
+      continue
+    }
+
+    // 4b. Oracle q'...' / nq'...' alternative quote literal
+    const oracleQuote = scanOracleQuoteEnd(sql, i, dialect)
+    if (oracleQuote) {
+      tokens.push({ text: "''", type: 'literal', depth })
+      i = oracleQuote.end
       continue
     }
 
     // 5. String literal: '...'
     if (ch === "'") {
-      const allowBackslash = backslashAndHash
-      i = scanQuotedSegmentEnd(sql, i, "'", allowBackslash).end
+      const end = scanQuotedSegmentEnd(sql, i, "'", rules.backslashEscapesSingleQuote).end
+      tokens.push({ text: "''", type: 'literal', depth })
+      i = end
       continue
     }
 
     // 6. Dollar-quoted blocks: $$...$$ or $tag$...$tag$ (PG/CRDB only)
-    if (dollarQuotes && ch === '$') {
+    if (rules.dollarQuoting && ch === '$') {
       const tag = matchDollarQuoteTag(sql, i)
       if (tag !== null) {
         const closeIdx = sql.indexOf(tag, i + tag.length)
+        tokens.push({ text: "''", type: 'literal', depth })
         i = closeIdx >= 0 ? closeIdx + tag.length : len
         continue
       }
@@ -111,7 +125,7 @@ function tokenizeSqlStatement(
 
     // 7. Double-quoted identifier: "..."
     if (ch === '"') {
-      const seg = scanQuotedSegmentEnd(sql, i, '"', false)
+      const seg = scanQuotedSegmentEnd(sql, i, '"', rules.backslashEscapesDoubleQuote)
       const raw = sql.slice(i + 1, seg.closed ? seg.end - 1 : seg.end)
       const unescaped = raw.replace(/""/g, '"')
       tokens.push({ text: unescaped, type: 'ident', depth })
@@ -120,7 +134,7 @@ function tokenizeSqlStatement(
     }
 
     // 8. Backtick identifier: `...`
-    if (ch === '`') {
+    if (ch === '`' && rules.backtickIdentifiers) {
       const seg = scanQuotedSegmentEnd(sql, i, '`', false)
       const raw = sql.slice(i + 1, seg.closed ? seg.end - 1 : seg.end)
       const unescaped = raw.replace(/``/g, '`')
@@ -129,23 +143,48 @@ function tokenizeSqlStatement(
       continue
     }
 
-    // 9. Bracket identifier: [...] (SQLite family only)
-    if (bracketIdents && ch === '[') {
-      let j = i + 1
-      while (j < len) {
-        if (sql[j] === ']') {
-          if (j + 1 < len && sql[j + 1] === ']') {
-            j += 2
-            continue
-          }
-          break
-        }
-        j++
-      }
-      const raw = sql.slice(i + 1, j)
-      const unescaped = raw.replace(/]]/g, ']')
+    // 9. Bracket identifier: [...] (SQLite family & MSSQL)
+    if (rules.bracketIdentifiers !== 'none' && ch === '[') {
+      const allowDoubling = rules.bracketIdentifiers === 'doubling'
+      const seg = scanBracketIdentEnd(sql, i, allowDoubling)
+      const raw = sql.slice(i + 1, seg.closed ? seg.end - 1 : seg.end)
+      const unescaped = allowDoubling ? raw.replace(/]]/g, ']') : raw
       tokens.push({ text: unescaped, type: 'ident', depth })
-      i = j < len ? j + 1 : len
+      i = seg.end
+      continue
+    }
+
+    // 9b. Numeric literals (prevent `SELECT 999 id` from collapsing to bare `id`)
+    if (
+      (ch >= '0' && ch <= '9') ||
+      (ch === '.' && i + 1 < len && sql[i + 1] >= '0' && sql[i + 1] <= '9')
+    ) {
+      let j = i
+      if (ch === '0' && j + 1 < len && (sql[j + 1] === 'x' || sql[j + 1] === 'X')) {
+        j += 2
+        while (j < len && /[0-9A-Fa-f]/.test(sql[j])) j++
+      } else {
+        if (ch === '.') {
+          j++
+          while (j < len && sql[j] >= '0' && sql[j] <= '9') j++
+        } else {
+          while (j < len && sql[j] >= '0' && sql[j] <= '9') j++
+          if (j < len && sql[j] === '.') {
+            j++
+            while (j < len && sql[j] >= '0' && sql[j] <= '9') j++
+          }
+        }
+        if (j < len && (sql[j] === 'e' || sql[j] === 'E')) {
+          let exp = j + 1
+          if (exp < len && (sql[exp] === '+' || sql[exp] === '-')) exp++
+          if (exp < len && sql[exp] >= '0' && sql[exp] <= '9') {
+            while (exp < len && sql[exp] >= '0' && sql[exp] <= '9') exp++
+            j = exp
+          }
+        }
+      }
+      tokens.push({ text: sql.slice(i, j), type: 'literal', depth })
+      i = j
       continue
     }
 
@@ -207,6 +246,7 @@ function tokenizeSqlStatement(
 
 const SQL_AGGREGATE_FUNCTIONS: ReadonlySet<string> = new Set([
   'COUNT',
+  'COUNT_BIG',
   'SUM',
   'AVG',
   'MIN',
@@ -214,8 +254,13 @@ const SQL_AGGREGATE_FUNCTIONS: ReadonlySet<string> = new Set([
   'GROUP_CONCAT',
   'STRING_AGG',
   'ARRAY_AGG',
+  'ARRAY_CONCAT_AGG',
   'JSON_AGG',
   'JSONB_AGG',
+  'JSON_ARRAYAGG',
+  'JSON_OBJECTAGG',
+  'LISTAGG',
+  'XMLAGG',
   'BOOL_AND',
   'BOOL_OR',
   'STDDEV',
@@ -228,8 +273,43 @@ const SQL_AGGREGATE_FUNCTIONS: ReadonlySet<string> = new Set([
   'BIT_OR',
   'BIT_XOR',
   'UNIQ',
+  'UNIQEXACT',
+  'UNIQCOMBINED',
+  'UNIQHLL12',
+  'GROUPARRAY',
+  'GROUPUNIQARRAY',
+  'SUMIF',
+  'COUNTIF',
+  'AVGIF',
+  'MINIF',
+  'MAXIF',
   'ARGMIN',
   'ARGMAX',
+  'COLLECT_LIST',
+  'COLLECT_SET',
+])
+
+const SQL_SET_RETURNING_FUNCTIONS: ReadonlySet<string> = new Set([
+  'UNNEST',
+  'GENERATE_SERIES',
+  'GENERATE_SUBSCRIPTS',
+  'JSON_EACH',
+  'JSONB_EACH',
+  'JSON_EACH_TEXT',
+  'JSONB_EACH_TEXT',
+  'JSON_ARRAY_ELEMENTS',
+  'JSONB_ARRAY_ELEMENTS',
+  'JSON_ARRAY_ELEMENTS_TEXT',
+  'JSONB_ARRAY_ELEMENTS_TEXT',
+  'JSON_OBJECT_KEYS',
+  'JSONB_OBJECT_KEYS',
+  'JSON_TABLE',
+  'OPENJSON',
+  'STRING_SPLIT',
+  'ARRAYJOIN',
+  'EXPLODE',
+  'POSEXPLODE',
+  'REGEXP_SPLIT_TO_TABLE',
 ])
 
 interface ProjectionItem {
@@ -289,6 +369,14 @@ function classifyProjectionItem(tokens: SqlToken[]): ProjectionItem {
   ) {
     alias = tokens[3].text
     base = tokens.slice(0, 3)
+  } else if (
+    tokens.length >= 2 &&
+    tokens[tokens.length - 1].depth === 0 &&
+    isIdentifierToken(tokens[tokens.length - 1]) &&
+    tokens[tokens.length - 2].text !== '.'
+  ) {
+    alias = tokens[tokens.length - 1].text
+    base = tokens.slice(0, -1)
   }
 
   let directColumn: string | undefined
@@ -339,6 +427,8 @@ function skipSelectProjectionModifiers(
       while (cursor < endIdx && !(tokens[cursor].depth === targetDepth && tokens[cursor].text === ')')) {
         cursor++
       }
+      cursor++
+    } else if (cursor < endIdx) {
       cursor++
     }
     if (
@@ -392,6 +482,12 @@ const FORBIDDEN_TOP_LEVEL_KEYWORDS: ReadonlySet<string> = new Set([
   'UNION',
   'INTERSECT',
   'EXCEPT',
+  'MINUS',
+  'APPLY',
+  'PIVOT',
+  'UNPIVOT',
+  'TABLESAMPLE',
+  'LATERAL',
   'HAVING',
   'WINDOW',
 ])
@@ -517,17 +613,19 @@ export function analyzeEditableSelectQuery(
     return { editable: false, reason: 'Query has no FROM clause' }
   }
 
-  // 3b. Reject aggregate calls anywhere in the SELECT projection
+  // 3b. Reject aggregate and set-returning function calls anywhere in the SELECT projection
   const projStartIdx = skipSelectProjectionModifiers(tokens, 1, fromIdx, dialect)
   const projectionTokens = tokens.slice(projStartIdx, fromIdx)
   for (let idx = 0; idx < projectionTokens.length; idx++) {
     const t = projectionTokens[idx]
-    if (
-      t.type === 'word' &&
-      SQL_AGGREGATE_FUNCTIONS.has(t.text.toUpperCase()) &&
-      projectionTokens[idx + 1]?.text === '('
-    ) {
-      return { editable: false, reason: 'aggregate_query' }
+    if (t.type === 'word' && projectionTokens[idx + 1]?.text === '(') {
+      const upper = t.text.toUpperCase()
+      if (SQL_AGGREGATE_FUNCTIONS.has(upper)) {
+        return { editable: false, reason: 'aggregate_query' }
+      }
+      if (SQL_SET_RETURNING_FUNCTIONS.has(upper)) {
+        return { editable: false, reason: 'set_returning_function' }
+      }
     }
   }
   const projectionItems = parseProjectionItems(tokens, projStartIdx, fromIdx)
@@ -537,15 +635,28 @@ export function analyzeEditableSelectQuery(
     return { editable: false, reason: 'Incomplete FROM clause' }
   }
 
-  // Reject subqueries in FROM clause: FROM (...)
+  // Reject FROM ONLY <table> (table inheritance) or subqueries / SRFs in FROM clause
+  if (tokens[cursor].type === 'word' && tokens[cursor].text.toUpperCase() === 'ONLY') {
+    return {
+      editable: false,
+      reason: 'FROM ONLY queries cannot be edited inline',
+    }
+  }
   if (tokens[cursor].text === '(') {
     return {
       editable: false,
       reason: 'Subqueries in FROM clause cannot be edited inline',
     }
   }
+  if (
+    tokens[cursor].type === 'word' &&
+    SQL_SET_RETURNING_FUNCTIONS.has(tokens[cursor].text.toUpperCase()) &&
+    tokens[cursor + 1]?.text === '('
+  ) {
+    return { editable: false, reason: 'set_returning_function' }
+  }
 
-  // 4. Parse table reference: [schema .] table
+  // 4. Parse table reference: [schema .] table (reject 3-part catalog.schema.table)
   const firstPart = tokens[cursor].text
   cursor++
 
@@ -560,9 +671,23 @@ export function analyzeEditableSelectQuery(
     schema = firstPart
     table = tokens[cursor].text
     cursor++
+    if (cursor < tokens.length && tokens[cursor].text === '.') {
+      return {
+        editable: false,
+        reason: 'Cross-database 3-part table references cannot be edited inline',
+      }
+    }
   }
 
-  // 5. Handle optional table alias: [AS] alias
+  // Reject table-valued function calls in FROM (e.g., FROM fn(...))
+  if (cursor < tokens.length && tokens[cursor].depth === 0 && tokens[cursor].text === '(') {
+    return {
+      editable: false,
+      reason: 'Table-valued functions cannot be edited inline',
+    }
+  }
+
+  // 5. Handle optional table alias: [AS] alias (reject column alias lists `u(a, b)`)
   if (cursor < tokens.length && tokens[cursor].depth === 0) {
     const nextUpper = tokens[cursor].text.toUpperCase()
     if (nextUpper === 'AS') {
@@ -576,6 +701,12 @@ export function analyzeEditableSelectQuery(
       tokens[cursor].text !== ';'
     ) {
       cursor++ // consume bare alias (e.g. 'users u')
+    }
+  }
+  if (cursor < tokens.length && tokens[cursor].depth === 0 && tokens[cursor].text === '(') {
+    return {
+      editable: false,
+      reason: 'Table column alias lists cannot be edited inline',
     }
   }
 
@@ -634,7 +765,7 @@ export function analyzeEditableSelectQuery(
     const matchedObj = schemaObjects.find((obj) => {
       const nameMatch = obj.name.toLowerCase() === table.toLowerCase()
       if (schema) {
-        return nameMatch && obj.schema.toLowerCase() === schema.toLowerCase()
+        return nameMatch && Boolean(obj.schema) && obj.schema.toLowerCase() === schema.toLowerCase()
       }
       return nameMatch
     })
@@ -711,11 +842,14 @@ export function analyzeEditableSelectQuery(
 
   for (const pkCol of tableDetails.primaryKey) {
     const lower = pkCol.toLowerCase()
-    if (computedNames.has(lower)) {
+    if (computedNames.has(lower) || aliasedSourceColumns.has(lower)) {
       return { editable: false, reason: 'aliased_or_computed_pk' }
     }
-    if (aliasedSourceColumns.has(lower)) {
-      return { editable: false, reason: 'aliased_or_computed_pk' }
+    if (!seenColNames.has(lower)) {
+      return {
+        editable: false,
+        reason: `Primary key column "${pkCol}" is missing from SELECT projection`,
+      }
     }
     if (directByName.has(lower)) continue
     if (
@@ -723,12 +857,6 @@ export function analyzeEditableSelectQuery(
       tableDetails.columns.some((c) => c.name.toLowerCase() === lower)
     ) {
       continue
-    }
-    if (!seenColNames.has(lower)) {
-      return {
-        editable: false,
-        reason: `Primary key column "${pkCol}" is missing from SELECT projection`,
-      }
     }
     return { editable: false, reason: 'aliased_or_computed_pk' }
   }

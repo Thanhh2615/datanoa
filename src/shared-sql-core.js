@@ -10,20 +10,207 @@ const MYSQL_FAMILY_DIALECTS = new Set(['mysql', 'mariadb'])
 
 const POSTGRES_FAMILY_DIALECTS = new Set(['postgres', 'cockroachdb'])
 
+const SQLITE_FAMILY_LEXER_RULE = Object.freeze({
+  lineCommentDash: true,
+  lineCommentHash: false,
+  lineCommentSlash: false,
+  nestedBlockComments: false,
+  backslashEscapesSingleQuote: false,
+  backslashEscapesDoubleQuote: false,
+  dollarQuoting: false,
+  postgresEscapeString: false,
+  oracleQQuote: false,
+  mysqlExecComments: false,
+  mysqlDelimiter: false,
+  bracketIdentifiers: 'no-doubling',
+  backtickIdentifiers: true,
+  doubleQuoteIdentifiers: true,
+  compoundRoutineBegin: true,
+})
+
+const POSTGRES_FAMILY_LEXER_RULE = Object.freeze({
+  lineCommentDash: true,
+  lineCommentHash: false,
+  lineCommentSlash: false,
+  nestedBlockComments: true,
+  backslashEscapesSingleQuote: false,
+  backslashEscapesDoubleQuote: false,
+  dollarQuoting: true,
+  postgresEscapeString: true,
+  oracleQQuote: false,
+  mysqlExecComments: false,
+  mysqlDelimiter: false,
+  bracketIdentifiers: 'none',
+  backtickIdentifiers: false,
+  doubleQuoteIdentifiers: true,
+  compoundRoutineBegin: false,
+})
+
+const MYSQL_FAMILY_LEXER_RULE = Object.freeze({
+  lineCommentDash: true,
+  lineCommentHash: true,
+  lineCommentSlash: false,
+  nestedBlockComments: false,
+  backslashEscapesSingleQuote: true,
+  backslashEscapesDoubleQuote: true,
+  dollarQuoting: false,
+  postgresEscapeString: false,
+  oracleQQuote: false,
+  mysqlExecComments: true,
+  mysqlDelimiter: true,
+  bracketIdentifiers: 'none',
+  backtickIdentifiers: true,
+  doubleQuoteIdentifiers: true,
+  compoundRoutineBegin: true,
+})
+
+const DEFAULT_DIALECT_LEXER_RULES = Object.freeze({
+  lineCommentDash: true,
+  lineCommentHash: false,
+  lineCommentSlash: false,
+  nestedBlockComments: false,
+  backslashEscapesSingleQuote: false,
+  backslashEscapesDoubleQuote: false,
+  dollarQuoting: false,
+  postgresEscapeString: false,
+  oracleQQuote: false,
+  mysqlExecComments: false,
+  mysqlDelimiter: false,
+  bracketIdentifiers: 'none',
+  backtickIdentifiers: true,
+  doubleQuoteIdentifiers: true,
+  compoundRoutineBegin: false,
+})
+
+/**
+ * Single source of truth for lexical rules across all 12 supported Datanoa dialects.
+ * Reused by splitters, RO/danger guards, diagnostics, grammar checks, params, editability, and AI context.
+ */
+export const DIALECT_LEXER_RULES = Object.freeze({
+  sqlite: SQLITE_FAMILY_LEXER_RULE,
+  libsql: SQLITE_FAMILY_LEXER_RULE,
+  d1: SQLITE_FAMILY_LEXER_RULE,
+  postgres: POSTGRES_FAMILY_LEXER_RULE,
+  cockroachdb: POSTGRES_FAMILY_LEXER_RULE,
+  mysql: MYSQL_FAMILY_LEXER_RULE,
+  mariadb: MYSQL_FAMILY_LEXER_RULE,
+  clickhouse: Object.freeze({
+    lineCommentDash: true,
+    lineCommentHash: true,
+    lineCommentSlash: true,
+    nestedBlockComments: true,
+    backslashEscapesSingleQuote: true,
+    backslashEscapesDoubleQuote: true,
+    dollarQuoting: false,
+    postgresEscapeString: false,
+    oracleQQuote: false,
+    mysqlExecComments: false,
+    mysqlDelimiter: false,
+    bracketIdentifiers: 'none',
+    backtickIdentifiers: true,
+    doubleQuoteIdentifiers: true,
+    compoundRoutineBegin: false,
+  }),
+  mssql: Object.freeze({
+    lineCommentDash: true,
+    lineCommentHash: false,
+    lineCommentSlash: false,
+    nestedBlockComments: true,
+    backslashEscapesSingleQuote: false,
+    backslashEscapesDoubleQuote: false,
+    dollarQuoting: false,
+    postgresEscapeString: false,
+    oracleQQuote: false,
+    mysqlExecComments: false,
+    mysqlDelimiter: false,
+    bracketIdentifiers: 'doubling',
+    backtickIdentifiers: false,
+    doubleQuoteIdentifiers: true,
+    compoundRoutineBegin: true,
+  }),
+  oracle: Object.freeze({
+    lineCommentDash: true,
+    lineCommentHash: false,
+    lineCommentSlash: false,
+    nestedBlockComments: false,
+    backslashEscapesSingleQuote: false,
+    backslashEscapesDoubleQuote: false,
+    dollarQuoting: false,
+    postgresEscapeString: false,
+    oracleQQuote: true,
+    mysqlExecComments: false,
+    mysqlDelimiter: false,
+    bracketIdentifiers: 'none',
+    backtickIdentifiers: false,
+    doubleQuoteIdentifiers: true,
+    compoundRoutineBegin: true,
+  }),
+  mongodb: Object.freeze({
+    lineCommentDash: false,
+    lineCommentHash: false,
+    lineCommentSlash: true,
+    nestedBlockComments: false,
+    backslashEscapesSingleQuote: true,
+    backslashEscapesDoubleQuote: true,
+    dollarQuoting: false,
+    postgresEscapeString: false,
+    oracleQQuote: false,
+    mysqlExecComments: false,
+    mysqlDelimiter: false,
+    bracketIdentifiers: 'none',
+    backtickIdentifiers: false,
+    doubleQuoteIdentifiers: true,
+    compoundRoutineBegin: false,
+  }),
+  redis: Object.freeze({
+    lineCommentDash: false,
+    lineCommentHash: true,
+    lineCommentSlash: false,
+    nestedBlockComments: false,
+    backslashEscapesSingleQuote: true,
+    backslashEscapesDoubleQuote: true,
+    dollarQuoting: false,
+    postgresEscapeString: false,
+    oracleQQuote: false,
+    mysqlExecComments: false,
+    mysqlDelimiter: false,
+    bracketIdentifiers: 'none',
+    backtickIdentifiers: false,
+    doubleQuoteIdentifiers: true,
+    compoundRoutineBegin: false,
+  }),
+})
+
+export function getDialectLexerRules(dialect) {
+  if (typeof dialect === 'string' && Object.prototype.hasOwnProperty.call(DIALECT_LEXER_RULES, dialect)) {
+    return DIALECT_LEXER_RULES[dialect]
+  }
+  return DEFAULT_DIALECT_LEXER_RULES
+}
+
 export function usesBackslashAndHash(dialect) {
-  return dialect !== undefined && BACKTICK_DIALECTS.has(dialect)
+  const rules = getDialectLexerRules(dialect)
+  return rules.lineCommentHash && rules.backslashEscapesSingleQuote && dialect !== 'redis'
 }
 
 function usesMysqlExecutableComments(dialect) {
-  return dialect !== undefined && MYSQL_FAMILY_DIALECTS.has(dialect)
+  return getDialectLexerRules(dialect).mysqlExecComments
 }
 
 export function supportsNestedBlockComments(dialect) {
-  return dialect === 'postgres' || dialect === 'cockroachdb'
+  return getDialectLexerRules(dialect).nestedBlockComments
 }
 
 export function supportsDollarQuoting(dialect) {
-  return dialect === 'postgres' || dialect === 'cockroachdb'
+  return getDialectLexerRules(dialect).dollarQuoting
+}
+
+export function supportsBracketIdentifiers(dialect) {
+  return getDialectLexerRules(dialect).bracketIdentifiers !== 'none'
+}
+
+export function supportsSlashLineComments(dialect) {
+  return getDialectLexerRules(dialect).lineCommentSlash
 }
 
 export function matchMysqlExecCommentPrefix(sql, index, dialect) {
@@ -48,7 +235,7 @@ export function matchMysqlExecCommentPrefix(sql, index, dialect) {
 }
 
 export function isPostgresEscapeStringStart(sql, index, dialect) {
-  if (dialect === undefined || !POSTGRES_FAMILY_DIALECTS.has(dialect)) return false
+  if (!getDialectLexerRules(dialect).postgresEscapeString) return false
   const ch = sql[index]
   if (ch !== 'E' && ch !== 'e') return false
   if (index + 1 >= sql.length || sql[index + 1] !== "'") return false
@@ -70,12 +257,12 @@ export function quoteIdentForDialect(ident, dialect) {
   return `"${raw.replace(/"/g, '""')}"`
 }
 
-function scanBracketIdentEnd(sql, start) {
+export function scanBracketIdentEnd(sql, start, allowDoubling = true) {
   let i = start + 1
   const len = sql.length
   while (i < len) {
     if (sql[i] === ']') {
-      if (i + 1 < len && sql[i + 1] === ']') {
+      if (allowDoubling && i + 1 < len && sql[i + 1] === ']') {
         i += 2
         continue
       }
@@ -86,43 +273,43 @@ function scanBracketIdentEnd(sql, start) {
   return { end: len, closed: false }
 }
 
-function tryParseQuotedTableParts(trimmed) {
-  const quoteChar = trimmed[0]
-  if (quoteChar === '[') {
-    const parts = []
-    let pos = 0
-    const len = trimmed.length
-    while (pos < len) {
-      if (trimmed[pos] !== '[') return null
-      const seg = scanBracketIdentEnd(trimmed, pos)
-      if (!seg.closed) return null
-      const unescaped = trimmed.slice(pos + 1, seg.end - 1).replace(/\]\]/g, ']')
-      if (!unescaped) return null
-      parts.push(unescaped)
-      pos = seg.end
-      if (pos < len) {
-        if (trimmed[pos] !== '.') return null
-        pos++
-        if (pos >= len) return null
-      }
-    }
-    return parts
-  }
-  if (quoteChar !== '"' && quoteChar !== '`') return null
+function tryParseTableReferenceParts(trimmed) {
   const parts = []
   let pos = 0
   const len = trimmed.length
 
   while (pos < len) {
-    if (trimmed[pos] !== quoteChar) return null
-    const seg = scanQuotedSegmentEnd(trimmed, pos, quoteChar, false)
-    if (!seg.closed) return null
-    const rawInner = trimmed.slice(pos + 1, seg.end - 1)
-    const unescaped =
-      quoteChar === '`' ? rawInner.replace(/``/g, '`') : rawInner.replace(/""/g, '"')
-    if (!unescaped) return null
-    parts.push(unescaped)
-    pos = seg.end
+    const ch = trimmed[pos]
+    if (ch === '[') {
+      const seg = scanBracketIdentEnd(trimmed, pos, true)
+      if (!seg.closed) return null
+      const unescaped = trimmed.slice(pos + 1, seg.end - 1).replace(/\]\]/g, ']')
+      if (!unescaped) return null
+      parts.push(unescaped)
+      pos = seg.end
+    } else if (ch === '"' || ch === '`') {
+      const seg = scanQuotedSegmentEnd(trimmed, pos, ch, false)
+      if (!seg.closed) return null
+      const rawInner = trimmed.slice(pos + 1, seg.end - 1)
+      const unescaped =
+        ch === '`' ? rawInner.replace(/``/g, '`') : rawInner.replace(/""/g, '"')
+      if (!unescaped) return null
+      parts.push(unescaped)
+      pos = seg.end
+    } else {
+      let end = pos
+      while (end < len && trimmed[end] !== '.') {
+        const c = trimmed[end]
+        if (c === '"' || c === '`' || c === '[' || c === ']' || /\s/.test(c)) {
+          return null
+        }
+        end++
+      }
+      if (end === pos) return null
+      parts.push(trimmed.slice(pos, end))
+      pos = end
+    }
+
     if (pos < len) {
       if (trimmed[pos] !== '.') return null
       pos++
@@ -130,7 +317,7 @@ function tryParseQuotedTableParts(trimmed) {
     }
   }
 
-  return parts
+  return parts.length > 0 ? parts : null
 }
 
 export function quoteTableReference(tableName, dialect) {
@@ -138,26 +325,16 @@ export function quoteTableReference(tableName, dialect) {
   if (!trimmed) {
     return quoteIdentForDialect('table_name', dialect)
   }
-  const parsedQuotedParts = tryParseQuotedTableParts(trimmed)
-  if (parsedQuotedParts) {
-    return parsedQuotedParts.map((part) => quoteIdentForDialect(part, dialect)).join('.')
-  }
-  if (
-    !trimmed.includes('"') &&
-    !trimmed.includes('`') &&
-    !trimmed.includes('[') &&
-    trimmed.includes('.')
-  ) {
-    return trimmed
-      .split('.')
-      .filter((part) => part.length > 0)
-      .map((part) => quoteIdentForDialect(part, dialect))
-      .join('.')
+  const parsedParts = tryParseTableReferenceParts(trimmed)
+  if (parsedParts) {
+    return parsedParts.map((part) => quoteIdentForDialect(part, dialect)).join('.')
   }
   return quoteIdentForDialect(trimmed, dialect)
 }
 
-export function normalizeJsonValue(value) {
+const MAX_NORMALIZE_JSON_DEPTH = 64
+
+function normalizeJsonValueInternal(value, depth, ancestors) {
   if (value === undefined) return null
   if (value === null || typeof value === 'boolean' || typeof value === 'string') return value
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
@@ -175,29 +352,44 @@ export function normalizeJsonValue(value) {
     const view = new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
     return Array.from(view, (b) => b.toString(16).padStart(2, '0')).join('')
   }
-  if (Array.isArray(value)) {
-    return value.map((item) => normalizeJsonValue(item))
-  }
   if (typeof value === 'object') {
-    const out = {}
-    for (const [k, v] of Object.entries(value)) {
-      if (v !== undefined && typeof v !== 'function' && typeof v !== 'symbol') {
-        const normalized = normalizeJsonValue(v)
-        if (k === '__proto__') {
-          Object.defineProperty(out, k, {
-            value: normalized,
-            enumerable: true,
-            writable: true,
-            configurable: true,
-          })
-        } else {
-          out[k] = normalized
+    if (ancestors.has(value)) {
+      return '[Circular]'
+    }
+    if (depth >= MAX_NORMALIZE_JSON_DEPTH) {
+      return '[MaxDepth]'
+    }
+    ancestors.add(value)
+    try {
+      if (Array.isArray(value)) {
+        return value.map((item) => normalizeJsonValueInternal(item, depth + 1, ancestors))
+      }
+      const out = {}
+      for (const [k, v] of Object.entries(value)) {
+        if (v !== undefined && typeof v !== 'function' && typeof v !== 'symbol') {
+          const normalized = normalizeJsonValueInternal(v, depth + 1, ancestors)
+          if (k === '__proto__') {
+            Object.defineProperty(out, k, {
+              value: normalized,
+              enumerable: true,
+              writable: true,
+              configurable: true,
+            })
+          } else {
+            out[k] = normalized
+          }
         }
       }
+      return out
+    } finally {
+      ancestors.delete(value)
     }
-    return out
   }
   return null
+}
+
+export function normalizeJsonValue(value) {
+  return normalizeJsonValueInternal(value, 0, new WeakSet())
 }
 
 function formatSqlStringLiteral(raw, dialect) {
@@ -490,7 +682,7 @@ function scanJsRegexLiteralEnd(text, start) {
   return -1
 }
 
-function advanceMongoJsToken(text, i, prevKind) {
+export function advanceMongoJsToken(text, i, prevKind) {
   const len = text.length
   const ch = text[i]
   if (/\s/.test(ch)) {
@@ -598,6 +790,35 @@ function splitMongoStatements(script) {
   return results
 }
 
+const MYSQL_DELIMITER_LINE_RE =
+  /^DELIMITER[ \t]+([^\s\r\n]+)(?:[ \t]+(?:--|#)[^\r\n]*)?[ \t]*(?:\r?\n|$)/i
+
+function matchesCustomDelimiterAt(script, i, delimiter) {
+  if (!delimiter || !script.startsWith(delimiter, i)) return false
+  if (delimiter === ';') return true
+  const firstIsWord = isIdentContChar(delimiter.charCodeAt(0))
+  const lastIsWord = isIdentContChar(delimiter.charCodeAt(delimiter.length - 1))
+  if (firstIsWord && i > 0 && isIdentContChar(script.charCodeAt(i - 1))) return false
+  if (
+    lastIsWord &&
+    i + delimiter.length < script.length &&
+    isIdentContChar(script.charCodeAt(i + delimiter.length))
+  ) {
+    return false
+  }
+  return true
+}
+
+function popLastBlockEntry(blockStack, targetKind) {
+  for (let idx = blockStack.length - 1; idx >= 0; idx--) {
+    if (blockStack[idx] === targetKind) {
+      blockStack.splice(idx, 1)
+      return true
+    }
+  }
+  return false
+}
+
 /**
  * Splits a SQL script into executable statements, preserving source offsets and ignoring
  * semicolons inside quotes, compound trigger/routine BEGIN..END blocks, MySQL DELIMITER blocks,
@@ -609,18 +830,9 @@ export function splitSqlStatements(script, dialect) {
   }
   const results = []
   const len = script.length
-  const backslashAndHash = usesBackslashAndHash(dialect)
-  const nestedComments = supportsNestedBlockComments(dialect)
-  const dollarQuotes = supportsDollarQuoting(dialect)
-  const allowMysqlDelimiter = dialect !== undefined && MYSQL_FAMILY_DIALECTS.has(dialect)
-  const supportsCompoundRoutineBegin =
-    dialect === 'sqlite' ||
-    dialect === 'libsql' ||
-    dialect === 'd1' ||
-    dialect === 'mysql' ||
-    dialect === 'mariadb' ||
-    dialect === 'mssql' ||
-    dialect === 'oracle'
+  const rules = getDialectLexerRules(dialect)
+  const allowMysqlDelimiter = rules.mysqlDelimiter
+  const supportsCompoundRoutineBegin = rules.compoundRoutineBegin
 
   let segStart = 0
   let hasExecutableToken = false
@@ -630,15 +842,15 @@ export function splitSqlStatements(script, dialect) {
 
   let stmtHeaderWords = []
   let isCompoundHeader = false
-  let compoundDepth = 0
-  let caseDepth = 0
+  let blockStack = []
   let prevWordUpper = ''
+
+  const hasOpenBegin = () => blockStack.includes('BEGIN')
 
   const resetStatementState = () => {
     stmtHeaderWords = []
     isCompoundHeader = false
-    compoundDepth = 0
-    caseDepth = 0
+    blockStack = []
     prevWordUpper = ''
   }
 
@@ -671,7 +883,7 @@ export function splitSqlStatements(script, dialect) {
       if (atLineStart) {
         let wsEnd = i
         while (wsEnd < len && (script[wsEnd] === ' ' || script[wsEnd] === '\t')) wsEnd++
-        const delimMatch = /^DELIMITER\s+([^\s\r\n]+)[ \t]*(?:\r?\n|$)/i.exec(script.slice(wsEnd))
+        const delimMatch = MYSQL_DELIMITER_LINE_RE.exec(script.slice(wsEnd))
         if (delimMatch && delimMatch[1]) {
           delimiter = delimMatch[1]
           i = wsEnd + delimMatch[0].length
@@ -682,22 +894,24 @@ export function splitSqlStatements(script, dialect) {
       }
     }
 
-    if (delimiter.length > 0 && compoundDepth === 0 && execCommentDepth === 0) {
-      if (script.startsWith(delimiter, i)) {
-        if (delimiter === ';' || !isIdentContChar(script.charCodeAt(i))) {
-          flushSegment(i, delimiter.length)
-          i += delimiter.length
-          continue
-        }
+    if (delimiter.length > 0 && !hasOpenBegin() && execCommentDepth === 0) {
+      if (matchesCustomDelimiterAt(script, i, delimiter)) {
+        flushSegment(i, delimiter.length)
+        i += delimiter.length
+        continue
       }
     }
 
     const ch = script[i]
-    if (ch === '-' && i + 1 < len && script[i + 1] === '-') {
+    if (rules.lineCommentDash && ch === '-' && i + 1 < len && script[i + 1] === '-') {
       i = scanLineCommentEnd(script, i)
       continue
     }
-    if (ch === '#' && backslashAndHash) {
+    if (rules.lineCommentSlash && ch === '/' && i + 1 < len && script[i + 1] === '/') {
+      i = scanLineCommentEnd(script, i)
+      continue
+    }
+    if (rules.lineCommentHash && ch === '#') {
       i = scanLineCommentEnd(script, i - 1)
       continue
     }
@@ -714,7 +928,7 @@ export function splitSqlStatements(script, dialect) {
         i += execLen
         continue
       }
-      i = scanBlockCommentEnd(script, i, nestedComments)
+      i = scanBlockCommentEnd(script, i, rules.nestedBlockComments)
       continue
     }
     if (isPostgresEscapeStringStart(script, i, dialect)) {
@@ -730,20 +944,22 @@ export function splitSqlStatements(script, dialect) {
       prevWordUpper = ''
       continue
     }
-    if (ch === "'" || ch === '"' || ch === '`') {
+    if (ch === "'" || ch === '"' || (ch === '`' && rules.backtickIdentifiers)) {
       hasExecutableToken = true
-      const allowBackslash = ch === "'" && backslashAndHash
+      const allowBackslash =
+        (ch === "'" && rules.backslashEscapesSingleQuote) ||
+        (ch === '"' && rules.backslashEscapesDoubleQuote)
       i = scanQuotedSegmentEnd(script, i, ch, allowBackslash).end
       prevWordUpper = ''
       continue
     }
-    if (ch === '[' && dialect === 'mssql') {
+    if (ch === '[' && rules.bracketIdentifiers !== 'none') {
       hasExecutableToken = true
-      i = scanBracketIdentEnd(script, i).end
+      i = scanBracketIdentEnd(script, i, rules.bracketIdentifiers === 'doubling').end
       prevWordUpper = ''
       continue
     }
-    if (dollarQuotes && ch === '$') {
+    if (rules.dollarQuoting && ch === '$') {
       const tag = matchDollarQuoteTag(script, i)
       if (tag !== null) {
         hasExecutableToken = true
@@ -776,22 +992,18 @@ export function splitSqlStatements(script, dialect) {
         if (wordUpper === 'BEGIN') {
           const nextWord = peekNextUpperWord(end)
           if (!NON_TRANSACTION_BEGIN_FOLLOWERS.has(nextWord)) {
-            compoundDepth++
+            blockStack.push('BEGIN')
           }
         } else if (wordUpper === 'CASE' && prevWordUpper !== 'END') {
-          caseDepth++
+          blockStack.push('CASE')
         } else if (wordUpper === 'END') {
           const nextWord = peekNextUpperWord(end)
           if (COMPOUND_END_SUFFIX_WORDS.has(nextWord)) {
-            if (nextWord === 'CASE' && caseDepth > 0) {
-              caseDepth--
+            if (nextWord === 'CASE') {
+              popLastBlockEntry(blockStack, 'CASE')
             }
-          } else if (caseDepth > 0 && compoundDepth === 0) {
-            caseDepth--
-          } else if (caseDepth > 0 && nextWord !== ';') {
-            caseDepth--
-          } else if (compoundDepth > 0) {
-            compoundDepth--
+          } else if (blockStack.length > 0) {
+            blockStack.pop()
           }
         }
       }
@@ -1016,17 +1228,8 @@ function splitUnterminatedSqlStatements(script, dialect) {
   }
 
   const len = script.length
-  const backslashAndHash = usesBackslashAndHash(dialect)
-  const nestedComments = supportsNestedBlockComments(dialect)
-  const dollarQuotes = supportsDollarQuoting(dialect)
-  const supportsCompoundRoutineBegin =
-    dialect === 'sqlite' ||
-    dialect === 'libsql' ||
-    dialect === 'd1' ||
-    dialect === 'mysql' ||
-    dialect === 'mariadb' ||
-    dialect === 'mssql' ||
-    dialect === 'oracle'
+  const rules = getDialectLexerRules(dialect)
+  const supportsCompoundRoutineBegin = rules.compoundRoutineBegin
   const results = []
 
   let i = 0
@@ -1036,8 +1239,7 @@ function splitUnterminatedSqlStatements(script, dialect) {
   let parenDepth = 0
   let stmtHeaderWords = []
   let isCompoundHeader = false
-  let compoundDepth = 0
-  let caseDepth = 0
+  let blockStack = []
   let execCommentDepth = 0
   let stmtVerb = ''
   let awaitingWithMainVerb = false
@@ -1046,6 +1248,8 @@ function splitUnterminatedSqlStatements(script, dialect) {
   let prevWordUpper = ''
   let prevNonWsKind = 'start'
   let sawNewline = false
+
+  const hasOpenBegin = () => blockStack.includes('BEGIN')
 
   const peekNextUpperWord = (fromIdx) => {
     let k = fromIdx
@@ -1068,8 +1272,7 @@ function splitUnterminatedSqlStatements(script, dialect) {
     hasToken = false
     stmtHeaderWords = []
     isCompoundHeader = false
-    compoundDepth = 0
-    caseDepth = 0
+    blockStack = []
     execCommentDepth = 0
     stmtVerb = ''
     awaitingWithMainVerb = false
@@ -1086,13 +1289,19 @@ function splitUnterminatedSqlStatements(script, dialect) {
       i++
       continue
     }
-    if (ch === '-' && i + 1 < len && script[i + 1] === '-') {
+    if (rules.lineCommentDash && ch === '-' && i + 1 < len && script[i + 1] === '-') {
       const end = scanLineCommentEnd(script, i)
       if (script.slice(i, end).includes('\n')) sawNewline = true
       i = end
       continue
     }
-    if (ch === '#' && backslashAndHash) {
+    if (rules.lineCommentSlash && ch === '/' && i + 1 < len && script[i + 1] === '/') {
+      const end = scanLineCommentEnd(script, i)
+      if (script.slice(i, end).includes('\n')) sawNewline = true
+      i = end
+      continue
+    }
+    if (rules.lineCommentHash && ch === '#') {
       const end = scanLineCommentEnd(script, i - 1)
       if (script.slice(i, end).includes('\n')) sawNewline = true
       i = end
@@ -1116,7 +1325,7 @@ function splitUnterminatedSqlStatements(script, dialect) {
         i += execLen
         continue
       }
-      const end = scanBlockCommentEnd(script, i, nestedComments)
+      const end = scanBlockCommentEnd(script, i, rules.nestedBlockComments)
       if (script.slice(i, end).includes('\n')) sawNewline = true
       i = end
       continue
@@ -1144,10 +1353,12 @@ function splitUnterminatedSqlStatements(script, dialect) {
       i = oracleQ.end
       continue
     }
-    if (ch === "'" || ch === '"' || ch === '`') {
+    if (ch === "'" || ch === '"' || (ch === '`' && rules.backtickIdentifiers)) {
       if (!hasToken) segStart = i
       hasToken = true
-      const allowBs = ch === "'" && backslashAndHash
+      const allowBs =
+        (ch === "'" && rules.backslashEscapesSingleQuote) ||
+        (ch === '"' && rules.backslashEscapesDoubleQuote)
       const end = scanQuotedSegmentEnd(script, i, ch, allowBs).end
       lastTokenEnd = end
       prevWordUpper = ''
@@ -1156,10 +1367,10 @@ function splitUnterminatedSqlStatements(script, dialect) {
       i = end
       continue
     }
-    if (ch === '[' && dialect === 'mssql') {
+    if (ch === '[' && rules.bracketIdentifiers !== 'none') {
       if (!hasToken) segStart = i
       hasToken = true
-      const end = scanBracketIdentEnd(script, i).end
+      const end = scanBracketIdentEnd(script, i, rules.bracketIdentifiers === 'doubling').end
       lastTokenEnd = end
       prevWordUpper = ''
       prevNonWsKind = 'ident'
@@ -1167,7 +1378,7 @@ function splitUnterminatedSqlStatements(script, dialect) {
       i = end
       continue
     }
-    if (dollarQuotes && ch === '$') {
+    if (rules.dollarQuoting && ch === '$') {
       const tag = matchDollarQuoteTag(script, i)
       if (tag !== null) {
         if (!hasToken) segStart = i
@@ -1206,7 +1417,7 @@ function splitUnterminatedSqlStatements(script, dialect) {
       continue
     }
     if (ch === ';') {
-      if (parenDepth === 0 && compoundDepth === 0 && execCommentDepth === 0) {
+      if (parenDepth === 0 && !hasOpenBegin() && execCommentDepth === 0) {
         flushSeg(i)
         segStart = i + 1
       }
@@ -1224,7 +1435,7 @@ function splitUnterminatedSqlStatements(script, dialect) {
         hasToken &&
         sawNewline &&
         parenDepth === 0 &&
-        compoundDepth === 0 &&
+        !hasOpenBegin() &&
         execCommentDepth === 0 &&
         UNTERM_STMT_STARTERS.has(wordUpper)
       ) {
@@ -1301,20 +1512,18 @@ function splitUnterminatedSqlStatements(script, dialect) {
         if (wordUpper === 'BEGIN') {
           const nextWord = peekNextUpperWord(end)
           if (!NON_TRANSACTION_BEGIN_FOLLOWERS.has(nextWord)) {
-            compoundDepth++
+            blockStack.push('BEGIN')
           }
         } else if (wordUpper === 'CASE' && prevWordUpper !== 'END') {
-          caseDepth++
+          blockStack.push('CASE')
         } else if (wordUpper === 'END') {
           const nextWord = peekNextUpperWord(end)
           if (COMPOUND_END_SUFFIX_WORDS.has(nextWord)) {
-            if (nextWord === 'CASE' && caseDepth > 0) {
-              caseDepth--
+            if (nextWord === 'CASE') {
+              popLastBlockEntry(blockStack, 'CASE')
             }
-          } else if (caseDepth > 0) {
-            caseDepth--
-          } else if (compoundDepth > 0) {
-            compoundDepth--
+          } else if (blockStack.length > 0) {
+            blockStack.pop()
           }
         }
       }
@@ -1345,9 +1554,7 @@ function splitUnterminatedSqlStatements(script, dialect) {
 function extractSqlStatementSignature(stmtSql, dialect) {
   const sql = String(stmtSql || '')
   const len = sql.length
-  const backslashAndHash = usesBackslashAndHash(dialect)
-  const nestedComments = supportsNestedBlockComments(dialect)
-  const dollarQuotes = supportsDollarQuoting(dialect)
+  const rules = getDialectLexerRules(dialect)
   const tokens = []
 
   let i = 0
@@ -1357,16 +1564,20 @@ function extractSqlStatementSignature(stmtSql, dialect) {
       i++
       continue
     }
-    if (ch === '-' && i + 1 < len && sql[i + 1] === '-') {
+    if (rules.lineCommentDash && ch === '-' && i + 1 < len && sql[i + 1] === '-') {
       i = scanLineCommentEnd(sql, i)
       continue
     }
-    if (ch === '#' && backslashAndHash) {
+    if (rules.lineCommentSlash && ch === '/' && i + 1 < len && sql[i + 1] === '/') {
+      i = scanLineCommentEnd(sql, i)
+      continue
+    }
+    if (rules.lineCommentHash && ch === '#') {
       i = scanLineCommentEnd(sql, i - 1)
       continue
     }
     if (ch === '/' && i + 1 < len && sql[i + 1] === '*') {
-      i = scanBlockCommentEnd(sql, i, nestedComments)
+      i = scanBlockCommentEnd(sql, i, rules.nestedBlockComments)
       continue
     }
     if (isPostgresEscapeStringStart(sql, i, dialect)) {
@@ -1379,10 +1590,10 @@ function extractSqlStatementSignature(stmtSql, dialect) {
       continue
     }
     if (ch === "'") {
-      i = scanQuotedSegmentEnd(sql, i, "'", backslashAndHash).end
+      i = scanQuotedSegmentEnd(sql, i, "'", rules.backslashEscapesSingleQuote).end
       continue
     }
-    if (dollarQuotes && ch === '$') {
+    if (rules.dollarQuoting && ch === '$') {
       const tag = matchDollarQuoteTag(sql, i)
       if (tag !== null) {
         const closeIdx = sql.indexOf(tag, i + tag.length)
@@ -1390,15 +1601,16 @@ function extractSqlStatementSignature(stmtSql, dialect) {
         continue
       }
     }
-    if (ch === '"' || ch === '`') {
-      const end = scanQuotedSegmentEnd(sql, i, ch, false).end
+    if (ch === '"' || (ch === '`' && rules.backtickIdentifiers)) {
+      const allowBs = ch === '"' && rules.backslashEscapesDoubleQuote
+      const end = scanQuotedSegmentEnd(sql, i, ch, allowBs).end
       const bare = unquoteSqlIdent(sql.slice(i, end)).trim().toLowerCase()
       if (bare) tokens.push({ kind: 'ident', isQuoted: true, upper: bare.toUpperCase(), bare })
       i = end
       continue
     }
-    if (ch === '[' && dialect === 'mssql') {
-      const end = scanBracketIdentEnd(sql, i).end
+    if (ch === '[' && rules.bracketIdentifiers !== 'none') {
+      const end = scanBracketIdentEnd(sql, i, rules.bracketIdentifiers === 'doubling').end
       const bare = unquoteSqlIdent(sql.slice(i, end)).trim().toLowerCase()
       if (bare) tokens.push({ kind: 'ident', isQuoted: true, upper: bare.toUpperCase(), bare })
       i = end
@@ -1821,18 +2033,21 @@ export function remapSqlTargetRange(target, editFrom, editTo, insertLen) {
  * Strips leading SQL comments while stopping before MySQL executable comments (`/*!50001 ...`).
  */
 export function stripLeadingSqlComments(sql, dialect) {
-  const allowHash = usesBackslashAndHash(dialect)
-  const nestedComments = supportsNestedBlockComments(dialect)
+  const rules = getDialectLexerRules(dialect)
   const len = sql.length
   let i = 0
   while (i < len) {
     while (i < len && /\s/.test(sql[i])) i++
     if (i >= len) break
-    if (sql[i] === '-' && i + 1 < len && sql[i + 1] === '-') {
+    if (rules.lineCommentDash && sql[i] === '-' && i + 1 < len && sql[i + 1] === '-') {
       i = scanLineCommentEnd(sql, i)
       continue
     }
-    if (allowHash && sql[i] === '#') {
+    if (rules.lineCommentSlash && sql[i] === '/' && i + 1 < len && sql[i + 1] === '/') {
+      i = scanLineCommentEnd(sql, i)
+      continue
+    }
+    if (rules.lineCommentHash && sql[i] === '#') {
       i = scanLineCommentEnd(sql, i - 1)
       continue
     }
@@ -1840,7 +2055,7 @@ export function stripLeadingSqlComments(sql, dialect) {
       if (matchMysqlExecCommentPrefix(sql, i, dialect) > 0) {
         break
       }
-      i = scanBlockCommentEnd(sql, i, nestedComments)
+      i = scanBlockCommentEnd(sql, i, rules.nestedBlockComments)
       continue
     }
     break
@@ -1848,23 +2063,40 @@ export function stripLeadingSqlComments(sql, dialect) {
   return sql.slice(i)
 }
 
-export function stripCommentsAndLiterals(sql, dialect, preserveMysqlExecComments = true) {
-  const backslashAndHash = usesBackslashAndHash(dialect)
-  const nestedComments = supportsNestedBlockComments(dialect)
-  const dollarQuotes = supportsDollarQuoting(dialect)
+export function stripCommentsAndLiteralsDetailed(sql, dialect, options = {}) {
+  const rules = getDialectLexerRules(dialect)
+  const preserveMysqlExecComments = options.preserveMysqlExecComments ?? true
+  const literalPlaceholder = options.literalPlaceholder ?? ' '
+  const identPlaceholder = options.identPlaceholder ?? literalPlaceholder
+  const allowBsSingle =
+    typeof options.backslashOverride === 'boolean'
+      ? options.backslashOverride
+      : rules.backslashEscapesSingleQuote
+  const allowBsDouble =
+    typeof options.backslashOverride === 'boolean'
+      ? options.backslashOverride && rules.backslashEscapesDoubleQuote
+      : rules.backslashEscapesDoubleQuote
+
   let out = ''
   let i = 0
   let execCommentDepth = 0
+  let hasUnclosedQuote = false
+  let hasUnclosedComment = false
   const len = sql.length
 
   while (i < len) {
     const ch = sql[i]
-    if (ch === '-' && i + 1 < len && sql[i + 1] === '-') {
+    if (rules.lineCommentDash && ch === '-' && i + 1 < len && sql[i + 1] === '-') {
       out += ' '
       i = scanLineCommentEnd(sql, i)
       continue
     }
-    if (ch === '#' && backslashAndHash) {
+    if (rules.lineCommentSlash && ch === '/' && i + 1 < len && sql[i + 1] === '/') {
+      out += ' '
+      i = scanLineCommentEnd(sql, i)
+      continue
+    }
+    if (rules.lineCommentHash && ch === '#') {
       out += ' '
       i = scanLineCommentEnd(sql, i - 1)
       continue
@@ -1886,36 +2118,46 @@ export function stripCommentsAndLiterals(sql, dialect, preserveMysqlExecComments
         continue
       }
       out += ' '
-      i = scanBlockCommentEnd(sql, i, nestedComments)
+      const block = scanBlockCommentWithState(sql, i, rules.nestedBlockComments)
+      if (!block.closed) hasUnclosedComment = true
+      i = block.end
       continue
     }
     if (isPostgresEscapeStringStart(sql, i, dialect)) {
-      out += ' '
-      i = scanQuotedSegmentEnd(sql, i + 1, "'", true).end
+      out += literalPlaceholder
+      const seg = scanQuotedSegmentEnd(sql, i + 1, "'", true)
+      if (!seg.closed) hasUnclosedQuote = true
+      i = seg.end
       continue
     }
     const oracleQuote = scanOracleQuoteEnd(sql, i, dialect)
     if (oracleQuote) {
-      out += ' '
+      out += literalPlaceholder
+      if (!oracleQuote.closed) hasUnclosedQuote = true
       i = oracleQuote.end
       continue
     }
-    if (ch === "'" || ch === '"' || ch === '`') {
-      out += ' '
-      const allowBackslash = ch === "'" && backslashAndHash
-      i = scanQuotedSegmentEnd(sql, i, ch, allowBackslash).end
+    if (ch === "'" || ch === '"' || (ch === '`' && rules.backtickIdentifiers)) {
+      out += ch === "'" ? literalPlaceholder : identPlaceholder
+      const allowBackslash = ch === "'" ? allowBsSingle : ch === '"' ? allowBsDouble : false
+      const seg = scanQuotedSegmentEnd(sql, i, ch, allowBackslash)
+      if (!seg.closed) hasUnclosedQuote = true
+      i = seg.end
       continue
     }
-    if (ch === '[' && dialect === 'mssql') {
-      out += ' '
-      i = scanBracketIdentEnd(sql, i).end
+    if (ch === '[' && rules.bracketIdentifiers !== 'none') {
+      out += identPlaceholder
+      const seg = scanBracketIdentEnd(sql, i, rules.bracketIdentifiers === 'doubling')
+      if (!seg.closed) hasUnclosedQuote = true
+      i = seg.end
       continue
     }
-    if (dollarQuotes && ch === '$') {
+    if (rules.dollarQuoting && ch === '$') {
       const tag = matchDollarQuoteTag(sql, i)
       if (tag !== null) {
-        out += ' '
+        out += literalPlaceholder
         const closeIdx = sql.indexOf(tag, i + tag.length)
+        if (closeIdx < 0) hasUnclosedQuote = true
         i = closeIdx >= 0 ? closeIdx + tag.length : len
         continue
       }
@@ -1924,7 +2166,15 @@ export function stripCommentsAndLiterals(sql, dialect, preserveMysqlExecComments
     i++
   }
 
-  return out
+  if (execCommentDepth > 0) {
+    hasUnclosedComment = true
+  }
+
+  return { text: out, hasUnclosedQuote, hasUnclosedComment }
+}
+
+export function stripCommentsAndLiterals(sql, dialect, preserveMysqlExecComments = true) {
+  return stripCommentsAndLiteralsDetailed(sql, dialect, { preserveMysqlExecComments }).text
 }
 
 const SQL_DDL_VERBS = new Set([
@@ -2064,7 +2314,99 @@ export const KNOWN_SQL_DEFAULT_KEYWORDS =
 
 export const FORBIDDEN_DEFAULT_TOKENS = /[;\r\n\0]|--|\/\*|\*\//
 export const FORBIDDEN_SUBQUERY_VERBS =
-  /\b(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|ATTACH|DETACH|PRAGMA|UNION|EXEC)\b/i
+  /\b(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|ATTACH|DETACH|PRAGMA|UNION|EXEC|EXECUTE|TRUNCATE|REPLACE|MERGE|GRANT|REVOKE|CALL|DO|COPY|LOAD|SET|VACUUM)\b/i
+
+function isSafeSingleQuotedLiteralBothModes(val) {
+  if (!val || val.length < 2 || val[0] !== "'") return false
+  const noBs = scanQuotedSegmentEnd(val, 0, "'", false)
+  if (!noBs.closed || noBs.end !== val.length) return false
+  const withBs = scanQuotedSegmentEnd(val, 0, "'", true)
+  return withBs.closed && withBs.end === val.length
+}
+
+function hasUnquotedForbiddenDefaultToken(val) {
+  for (const allowBs of [false, true]) {
+    let i = 0
+    const len = val.length
+    while (i < len) {
+      const ch = val[i]
+      if (ch === "'") {
+        const seg = scanQuotedSegmentEnd(val, i, "'", allowBs)
+        if (!seg.closed) return true
+        i = seg.end
+        continue
+      }
+      if (ch === ';' || ch === '\r' || ch === '\n' || ch === '\0' || ch === '#') {
+        return true
+      }
+      if (ch === '-' && i + 1 < len && val[i + 1] === '-') return true
+      if (ch === '/' && i + 1 < len && (val[i + 1] === '*' || val[i + 1] === '/')) return true
+      if (ch === '*' && i + 1 < len && val[i + 1] === '/') return true
+      i++
+    }
+  }
+  return false
+}
+
+function hasBalancedParensBothModes(input, singleOuterGroupOnly = false) {
+  for (const allowBs of [false, true]) {
+    let depth = 0
+    let i = 0
+    const len = input.length
+    while (i < len) {
+      const ch = input[i]
+      if (ch === "'") {
+        const seg = scanQuotedSegmentEnd(input, i, "'", allowBs)
+        if (!seg.closed) return false
+        i = seg.end
+        continue
+      }
+      if (ch === '(') {
+        depth++
+      } else if (ch === ')') {
+        depth--
+        if (depth < 0) return false
+        if (singleOuterGroupOnly && depth === 0 && i < len - 1) return false
+      }
+      i++
+    }
+    if (depth !== 0) return false
+  }
+  return true
+}
+
+function isSafeMysqlEnumOrSetBothModes(cleaned) {
+  const header = /^(?:ENUM|SET)\s*\(/i.exec(cleaned)
+  if (!header || !cleaned.endsWith(')')) return false
+  const inner = cleaned.slice(header[0].length, -1).trim()
+  if (!inner) return false
+  for (const allowBs of [false, true]) {
+    let i = 0
+    const len = inner.length
+    let count = 0
+    while (i < len) {
+      while (i < len && /\s/.test(inner[i])) i++
+      if (i >= len || inner[i] !== "'") return false
+      const seg = scanQuotedSegmentEnd(inner, i, "'", allowBs)
+      if (!seg.closed) return false
+      const lit = inner.slice(i, seg.end)
+      if (FORBIDDEN_DEFAULT_TOKENS.test(lit) || !isSafeSingleQuotedLiteralBothModes(lit)) {
+        return false
+      }
+      count++
+      i = seg.end
+      while (i < len && /\s/.test(inner[i])) i++
+      if (i < len) {
+        if (inner[i] !== ',') return false
+        i++
+        while (i < len && /\s/.test(inner[i])) i++
+        if (i >= len) return false
+      }
+    }
+    if (count === 0) return false
+  }
+  return true
+}
 
 export function findTopLevelPostgresCastIndex(input) {
   let depth = 0
@@ -2128,7 +2470,7 @@ export function hasBalancedParens(input, singleOuterGroupOnly = false) {
 }
 
 function isPureSqlStringLiteral(val) {
-  return /^'(?:[^']|'')*'$/.test(val)
+  return isSafeSingleQuotedLiteralBothModes(val)
 }
 
 export function isNumericOrBooleanTypeName(dataType) {
@@ -2159,7 +2501,7 @@ export function normalizeSqlDefaultExpression(rawDefault, dataType = 'TEXT') {
   }
 
   if (trimmed.startsWith('(') && trimmed.endsWith(')')) {
-    if (!hasBalancedParens(trimmed, true)) {
+    if (!hasBalancedParensBothModes(trimmed, true) || hasUnquotedForbiddenDefaultToken(trimmed)) {
       throw new Error(`Invalid parenthesized default expression: ${trimmed}`)
     }
     if (FORBIDDEN_SUBQUERY_VERBS.test(trimmed)) {
@@ -2190,7 +2532,11 @@ export function normalizeSqlDefaultExpression(rawDefault, dataType = 'TEXT') {
   }
 
   if (KNOWN_SQL_DEFAULT_KEYWORDS.test(trimmed)) {
-    if (!hasBalancedParens(trimmed) || FORBIDDEN_SUBQUERY_VERBS.test(trimmed)) {
+    if (
+      !hasBalancedParensBothModes(trimmed) ||
+      hasUnquotedForbiddenDefaultToken(trimmed) ||
+      FORBIDDEN_SUBQUERY_VERBS.test(trimmed)
+    ) {
       throw new Error(`Invalid SQL default function expression: ${trimmed}`)
     }
     return trimmed
@@ -2201,17 +2547,22 @@ export function normalizeSqlDefaultExpression(rawDefault, dataType = 'TEXT') {
       throw new Error(`Numeric/boolean column cannot use string default ${trimmed}.`)
     }
     const inner = trimmed.slice(1, -1).replace(/'/g, "''")
-    return `'${inner}'`
+    const quoted = `'${inner}'`
+    if (!isSafeSingleQuotedLiteralBothModes(quoted)) {
+      throw new Error(`Invalid SQL default expression: ${trimmed}`)
+    }
+    return quoted
   }
 
-  if (trimmed.includes('#') || trimmed.includes("'")) {
+  if (trimmed.includes('#') || trimmed.includes("'") || trimmed.includes('\\')) {
+    const quoted = `'${trimmed.replace(/'/g, "''")}'`
     if (
-      /^'(?:[^']|'')*'$/.test(`'${trimmed.replace(/'/g, "''")}'`) &&
+      isSafeSingleQuotedLiteralBothModes(quoted) &&
       !trimmed.startsWith("'") &&
       !isNumericOrBooleanTypeName(dataType) &&
       !/\b(?:OR|AND|SELECT|UNION)\b/i.test(trimmed)
     ) {
-      return `'${trimmed.replace(/'/g, "''")}'`
+      return quoted
     }
     throw new Error(`Invalid SQL default expression: ${trimmed}`)
   }
@@ -2224,7 +2575,11 @@ export function normalizeSqlDefaultExpression(rawDefault, dataType = 'TEXT') {
     throw new Error(`Invalid SQL keyword in default expression: ${trimmed}`)
   }
 
-  return `'${trimmed.replace(/'/g, "''")}'`
+  const wrapped = `'${trimmed.replace(/'/g, "''")}'`
+  if (!isSafeSingleQuotedLiteralBothModes(wrapped)) {
+    throw new Error(`Invalid SQL default expression: ${trimmed}`)
+  }
+  return wrapped
 }
 
 export function validateColumnTypeSpec(rawType) {
@@ -2232,15 +2587,24 @@ export function validateColumnTypeSpec(rawType) {
   if (!cleaned) {
     throw new Error('Column data type is required.')
   }
-  const isMysqlEnumOrSet =
-    /^(?:ENUM|SET)\s*\(\s*'(?:[^']|'')*'(?:\s*,\s*'(?:[^']|'')*')*\s*\)$/i.test(cleaned)
-  if (isMysqlEnumOrSet) {
-    if (FORBIDDEN_DEFAULT_TOKENS.test(cleaned)) {
+  if (/^(?:ENUM|SET)\s*\(/i.test(cleaned)) {
+    if (
+      FORBIDDEN_DEFAULT_TOKENS.test(cleaned) ||
+      hasUnquotedForbiddenDefaultToken(cleaned) ||
+      !isSafeMysqlEnumOrSetBothModes(cleaned)
+    ) {
       throw new Error(`Invalid SQL column type: ${rawType}`)
     }
     return cleaned
   }
-  if (!/^[A-Za-z][A-Za-z0-9_(),\s[\]]*$/.test(cleaned) || !hasBalancedParens(cleaned)) {
+  if (FORBIDDEN_DEFAULT_TOKENS.test(cleaned) || cleaned.includes('#')) {
+    throw new Error(`Invalid SQL column type: ${rawType}`)
+  }
+  const isSchemaQualifiedOrPlainType =
+    /^(?:(?:"(?:[^"]|"")+"|[A-Za-z_][A-Za-z0-9_$]*)\.)?(?:"(?:[^"]|"")+"(?:\s*\[\])*|[A-Za-z][A-Za-z0-9_(),\s[\]]*)$/.test(
+      cleaned
+    )
+  if (!isSchemaQualifiedOrPlainType || !hasBalancedParens(cleaned)) {
     throw new Error(`Invalid SQL column type: ${rawType}`)
   }
   if (FORBIDDEN_SUBQUERY_VERBS.test(cleaned)) {
@@ -2536,156 +2900,368 @@ function isUnarySignContext(tokens) {
   return false
 }
 
-function tokenizeSqlForFormat(sql, dialect) {
+const FORMAT_THREE_CHAR_OPS = new Set(['->>', '#>>', '<=>', '!~*', '<->'])
+const FORMAT_TWO_CHAR_OPS = new Set([
+  ':=',
+  '=>',
+  '->',
+  '#>',
+  '@>',
+  '<@',
+  '~*',
+  '!~',
+  '<=',
+  '>=',
+  '<>',
+  '!=',
+  '||',
+  '&&',
+  '<<',
+  '>>',
+  '^@',
+  '?|',
+  '?&',
+  '+=',
+  '-=',
+  '*=',
+  '/=',
+  '%=',
+])
+
+const FORMAT_STRING_PREFIX_CHARS = new Set(['N', 'n', 'X', 'x', 'B', 'b'])
+
+function isUnicodeFormatIdentStart(sql, idx) {
+  const code = sql.charCodeAt(idx)
+  return isIdentStartChar(code) || (code >= 0x80 && !/\s/.test(sql[idx]))
+}
+
+function isUnicodeFormatIdentCont(sql, idx) {
+  const code = sql.charCodeAt(idx)
+  return isIdentContChar(code) || code === 36 || (code >= 0x80 && !/\s/.test(sql[idx]))
+}
+
+function scanNumericTokenEnd(sql, start) {
+  const len = sql.length
+  let end = start
+  if (sql[end] === '0' && end + 1 < len && (sql[end + 1] === 'x' || sql[end + 1] === 'X')) {
+    let hexEnd = end + 2
+    while (hexEnd < len && /[0-9A-Fa-f_]/.test(sql[hexEnd])) hexEnd++
+    if (hexEnd > end + 2) return hexEnd
+  }
+  if (sql[end] === '0' && end + 1 < len && (sql[end + 1] === 'b' || sql[end + 1] === 'B')) {
+    let binEnd = end + 2
+    while (binEnd < len && /[01_]/.test(sql[binEnd])) binEnd++
+    if (binEnd > end + 2) return binEnd
+  }
+  if (sql[end] === '.') {
+    end++
+    while (end < len && /[0-9_]/.test(sql[end])) end++
+  } else {
+    while (end < len && /[0-9_]/.test(sql[end])) end++
+    if (end < len && sql[end] === '.' && end + 1 < len && /[0-9]/.test(sql[end + 1])) {
+      end++
+      while (end < len && /[0-9_]/.test(sql[end])) end++
+    }
+  }
+  if (end < len && (sql[end] === 'e' || sql[end] === 'E')) {
+    let exp = end + 1
+    if (exp < len && (sql[exp] === '+' || sql[exp] === '-')) exp++
+    if (exp < len && /[0-9]/.test(sql[exp])) {
+      while (exp < len && /[0-9_]/.test(sql[exp])) exp++
+      end = exp
+    }
+  }
+  return end
+}
+
+function tokenizeSqlForFormat(sql, dialect, options = {}) {
   const tokens = []
   const len = sql.length
+  const rules = getDialectLexerRules(dialect)
+  const allowBsSingle =
+    typeof options.backslashOverride === 'boolean'
+      ? options.backslashOverride
+      : rules.backslashEscapesSingleQuote
+  const allowBsDouble =
+    typeof options.backslashOverride === 'boolean'
+      ? options.backslashOverride && rules.backslashEscapesDoubleQuote
+      : rules.backslashEscapesDoubleQuote
+  const mergeUnarySign = options.mergeUnarySign ?? true
   let i = 0
+  let sawNewlineBefore = false
+
+  const pushTok = (tok) => {
+    tok.hadNewlineBefore = sawNewlineBefore
+    tokens.push(tok)
+    sawNewlineBefore = false
+  }
 
   while (i < len) {
     const ch = sql[i]
     if (/\s/.test(ch)) {
+      if (ch === '\n' || ch === '\r') sawNewlineBefore = true
       i++
       continue
     }
-    if (ch === '-' && i + 1 < len && sql[i + 1] === '-') {
+    if (rules.lineCommentDash && ch === '-' && i + 1 < len && sql[i + 1] === '-') {
       const end = scanLineCommentEnd(sql, i)
       const text = sql.slice(i, end).replace(/[\r\n]+$/, '')
-      tokens.push({ kind: 'line_comment', text, upper: '' })
+      pushTok({ kind: 'line_comment', text, upper: '' })
+      if (end < len || sql.slice(i, end).includes('\n')) sawNewlineBefore = true
       i = end
       continue
     }
-    if (ch === '#' && usesBackslashAndHash(dialect)) {
+    if (rules.lineCommentSlash && ch === '/' && i + 1 < len && sql[i + 1] === '/') {
+      const end = scanLineCommentEnd(sql, i)
+      const text = sql.slice(i, end).replace(/[\r\n]+$/, '')
+      pushTok({ kind: 'line_comment', text, upper: '' })
+      if (end < len || sql.slice(i, end).includes('\n')) sawNewlineBefore = true
+      i = end
+      continue
+    }
+    if (rules.lineCommentHash && ch === '#') {
       const end = scanLineCommentEnd(sql, i - 1)
       const text = sql.slice(i, end).replace(/[\r\n]+$/, '')
-      tokens.push({ kind: 'line_comment', text, upper: '' })
+      pushTok({ kind: 'line_comment', text, upper: '' })
+      if (end < len || sql.slice(i, end).includes('\n')) sawNewlineBefore = true
       i = end
       continue
     }
     if (ch === '/' && i + 1 < len && sql[i + 1] === '*') {
-      const end = scanBlockCommentEnd(sql, i, supportsNestedBlockComments(dialect))
-      tokens.push({ kind: 'block_comment', text: sql.slice(i, end), upper: '' })
+      const end = scanBlockCommentEnd(sql, i, rules.nestedBlockComments)
+      pushTok({ kind: 'block_comment', text: sql.slice(i, end), upper: '' })
       i = end
       continue
     }
     if (isPostgresEscapeStringStart(sql, i, dialect)) {
       const end = scanQuotedSegmentEnd(sql, i + 1, "'", true).end
-      tokens.push({ kind: 'quoted', text: sql.slice(i, end), upper: '' })
+      pushTok({ kind: 'quoted', text: sql.slice(i, end), upper: '' })
+      i = end
+      continue
+    }
+    if (
+      (ch === 'U' || ch === 'u') &&
+      i + 2 < len &&
+      sql[i + 1] === '&' &&
+      sql[i + 2] === "'" &&
+      (i === 0 || !isIdentContChar(sql.charCodeAt(i - 1)))
+    ) {
+      const end = scanQuotedSegmentEnd(sql, i + 2, "'", allowBsSingle).end
+      pushTok({ kind: 'quoted', text: sql.slice(i, end), upper: '' })
+      i = end
+      continue
+    }
+    if (
+      FORMAT_STRING_PREFIX_CHARS.has(ch) &&
+      i + 1 < len &&
+      sql[i + 1] === "'" &&
+      (i === 0 || !isIdentContChar(sql.charCodeAt(i - 1)))
+    ) {
+      const end = scanQuotedSegmentEnd(sql, i + 1, "'", allowBsSingle).end
+      pushTok({ kind: 'quoted', text: sql.slice(i, end), upper: '' })
       i = end
       continue
     }
     const oracleQuote = scanOracleQuoteEnd(sql, i, dialect)
     if (oracleQuote) {
-      tokens.push({ kind: 'quoted', text: sql.slice(i, oracleQuote.end), upper: '' })
+      pushTok({ kind: 'quoted', text: sql.slice(i, oracleQuote.end), upper: '' })
       i = oracleQuote.end
       continue
     }
-    if (ch === "'" || ch === '"' || ch === '`') {
-      const allowBackslash = ch === "'" && usesBackslashAndHash(dialect)
+    if (ch === "'" || ch === '"' || (ch === '`' && rules.backtickIdentifiers)) {
+      const allowBackslash = ch === "'" ? allowBsSingle : ch === '"' ? allowBsDouble : false
       const end = scanQuotedSegmentEnd(sql, i, ch, allowBackslash).end
-      tokens.push({ kind: 'quoted', text: sql.slice(i, end), upper: '' })
+      pushTok({ kind: 'quoted', text: sql.slice(i, end), upper: '' })
       i = end
       continue
     }
-    if (ch === '[' && dialect === 'mssql') {
-      const end = scanBracketIdentEnd(sql, i).end
-      tokens.push({ kind: 'quoted', text: sql.slice(i, end), upper: '' })
+    if (ch === '[' && rules.bracketIdentifiers !== 'none') {
+      const end = scanBracketIdentEnd(sql, i, rules.bracketIdentifiers === 'doubling').end
+      pushTok({ kind: 'quoted', text: sql.slice(i, end), upper: '' })
       i = end
       continue
     }
     if (ch === '$') {
-      const tag = matchDollarQuoteTag(sql, i)
-      if (tag !== null) {
-        const closeIdx = sql.indexOf(tag, i + tag.length)
-        const end = closeIdx >= 0 ? closeIdx + tag.length : len
-        tokens.push({ kind: 'quoted', text: sql.slice(i, end), upper: '' })
+      if (rules.dollarQuoting) {
+        const tag = matchDollarQuoteTag(sql, i)
+        if (tag !== null) {
+          const closeIdx = sql.indexOf(tag, i + tag.length)
+          const end = closeIdx >= 0 ? closeIdx + tag.length : len
+          pushTok({ kind: 'quoted', text: sql.slice(i, end), upper: '' })
+          i = end
+          continue
+        }
+      }
+      if (i + 1 < len && /[0-9]/.test(sql[i + 1])) {
+        let end = i + 2
+        while (end < len && /[0-9]/.test(sql[end])) end++
+        const text = sql.slice(i, end)
+        pushTok({ kind: 'param', text, upper: text })
+        i = end
+        continue
+      }
+    }
+    if (ch === '@' && i + 1 < len) {
+      let varStart = i + 1
+      if (sql[varStart] === '@') varStart++
+      if (varStart < len && isIdentStartChar(sql.charCodeAt(varStart))) {
+        let end = varStart + 1
+        while (end < len && (isIdentContChar(sql.charCodeAt(end)) || sql[end] === '$' || sql[end] === '#')) {
+          end++
+        }
+        const text = sql.slice(i, end)
+        pushTok({ kind: 'param', text, upper: text })
+        i = end
+        continue
+      }
+    }
+    if (!rules.lineCommentHash && ch === '#' && i + 1 < len) {
+      let tempStart = i + 1
+      if (sql[tempStart] === '#') tempStart++
+      if (tempStart < len && isIdentStartChar(sql.charCodeAt(tempStart))) {
+        let end = tempStart + 1
+        while (end < len && (isIdentContChar(sql.charCodeAt(end)) || sql[end] === '$' || sql[end] === '#')) {
+          end++
+        }
+        const text = sql.slice(i, end)
+        pushTok({ kind: 'quoted', text, upper: text.toUpperCase() })
         i = end
         continue
       }
     }
     if (ch === ':' && i + 1 < len && sql[i + 1] === ':') {
-      tokens.push({ kind: 'cast', text: '::', upper: '::' })
+      pushTok({ kind: 'cast', text: '::', upper: '::' })
       i += 2
       continue
     }
+    if (ch === ':' && i + 1 < len && sql[i + 1] === '=') {
+      pushTok({ kind: 'other', text: ':=', upper: ':=' })
+      i += 2
+      continue
+    }
+    if (ch === ':' && i + 1 < len && isIdentStartChar(sql.charCodeAt(i + 1))) {
+      let end = i + 2
+      while (end < len && isIdentContChar(sql.charCodeAt(end))) end++
+      const text = sql.slice(i, end)
+      pushTok({ kind: 'param', text, upper: text })
+      i = end
+      continue
+    }
     if (ch === '(') {
-      tokens.push({ kind: 'paren_open', text: '(', upper: '(' })
+      pushTok({ kind: 'paren_open', text: '(', upper: '(' })
       i++
       continue
     }
     if (ch === ')') {
-      tokens.push({ kind: 'paren_close', text: ')', upper: ')' })
+      pushTok({ kind: 'paren_close', text: ')', upper: ')' })
       i++
       continue
     }
     if (ch === ',') {
-      tokens.push({ kind: 'comma', text: ',', upper: ',' })
+      pushTok({ kind: 'comma', text: ',', upper: ',' })
       i++
       continue
     }
     if (ch === ';') {
-      tokens.push({ kind: 'semicolon', text: ';', upper: ';' })
+      pushTok({ kind: 'semicolon', text: ';', upper: ';' })
       i++
       continue
     }
     if (ch === '.') {
-      tokens.push({ kind: 'dot', text: '.', upper: '.' })
+      const prevIdx = findPrevNonCommentIndex(tokens, tokens.length)
+      const prev = prevIdx >= 0 ? tokens[prevIdx] : null
+      const canStartDecimal =
+        i + 1 < len &&
+        /[0-9]/.test(sql[i + 1]) &&
+        (!prev ||
+          (prev.kind !== 'word' &&
+            prev.kind !== 'quoted' &&
+            prev.kind !== 'number' &&
+            prev.kind !== 'param' &&
+            prev.kind !== 'paren_close'))
+      if (canStartDecimal) {
+        const end = scanNumericTokenEnd(sql, i)
+        const text = sql.slice(i, end)
+        pushTok({ kind: 'number', text, upper: text })
+        i = end
+        continue
+      }
+      pushTok({ kind: 'dot', text: '.', upper: '.' })
       i++
       continue
     }
-    if (isIdentStartChar(sql.charCodeAt(i))) {
+    if (isUnicodeFormatIdentStart(sql, i)) {
       let end = i + 1
-      while (end < len && (isIdentContChar(sql.charCodeAt(end)) || sql.charCodeAt(end) === 36)) {
+      while (end < len && isUnicodeFormatIdentCont(sql, end)) {
         end++
       }
       const text = sql.slice(i, end)
-      tokens.push({ kind: 'word', text, upper: text.toUpperCase() })
+      pushTok({ kind: 'word', text, upper: text.toUpperCase() })
       i = end
       continue
     }
     if (/[0-9]/.test(ch)) {
-      let end = i + 1
-      while (end < len && /[0-9._eE+-]/.test(sql[end])) {
-        if ((sql[end] === '+' || sql[end] === '-') && !/[eE]/.test(sql[end - 1])) break
-        end++
-      }
+      const end = scanNumericTokenEnd(sql, i)
       const text = sql.slice(i, end)
-      tokens.push({ kind: 'other', text, upper: text })
+      pushTok({ kind: 'number', text, upper: text })
       i = end
       continue
     }
+    const three = i + 2 < len ? sql.slice(i, i + 3) : ''
+    if (three && FORMAT_THREE_CHAR_OPS.has(three)) {
+      pushTok({ kind: 'other', text: three, upper: three })
+      i += 3
+      continue
+    }
     const two = i + 1 < len ? sql.slice(i, i + 2) : ''
-    if (two === '<=' || two === '>=' || two === '<>' || two === '!=' || two === '||' || two === '->') {
-      if (two === '->' && i + 2 < len && sql[i + 2] === '>') {
-        tokens.push({ kind: 'other', text: '->>', upper: '->>' })
-        i += 3
-        continue
-      }
-      tokens.push({ kind: 'other', text: two, upper: two })
+    if (two && FORMAT_TWO_CHAR_OPS.has(two)) {
+      pushTok({ kind: 'other', text: two, upper: two })
       i += 2
       continue
     }
     if (
+      mergeUnarySign &&
       (ch === '-' || ch === '+') &&
       i + 1 < len &&
       (/[0-9]/.test(sql[i + 1]) || (sql[i + 1] === '.' && i + 2 < len && /[0-9]/.test(sql[i + 2]))) &&
       isUnarySignContext(tokens)
     ) {
-      let end = i + 1
-      if (sql[end] === '.') end++
-      while (end < len && /[0-9._eE+-]/.test(sql[end])) {
-        if ((sql[end] === '+' || sql[end] === '-') && !/[eE]/.test(sql[end - 1])) break
-        end++
-      }
+      const end = scanNumericTokenEnd(sql, i + 1)
       const text = sql.slice(i, end)
-      tokens.push({ kind: 'other', text, upper: text })
+      pushTok({ kind: 'number', text, upper: text })
       i = end
       continue
     }
-    tokens.push({ kind: 'other', text: ch, upper: ch })
+    pushTok({ kind: 'other', text: ch, upper: ch })
     i++
   }
 
   return tokens
+}
+
+function readsTheSameForFormat(originalSql, formattedSql, dialect) {
+  for (const backslashOverride of [false, true]) {
+    const a = tokenizeSqlForFormat(originalSql, dialect, {
+      backslashOverride,
+      mergeUnarySign: false,
+    })
+    const b = tokenizeSqlForFormat(formattedSql, dialect, {
+      backslashOverride,
+      mergeUnarySign: false,
+    })
+    if (a.length !== b.length) return false
+    for (let idx = 0; idx < a.length; idx++) {
+      const ta = a[idx]
+      const tb = b[idx]
+      if (ta.kind !== tb.kind) return false
+      if (ta.kind === 'word') {
+        if (ta.text.toLowerCase() !== tb.text.toLowerCase()) return false
+      } else if (ta.text !== tb.text) {
+        return false
+      }
+    }
+  }
+  return true
 }
 
 function matchCompoundClauseLength(tokens, index) {
@@ -2890,11 +3466,17 @@ function createFormatFrame(kind, baseIndent, indent, isCteBody = false) {
  */
 export function formatSql(sql, dialect = 'postgres') {
   if (!sql || !sql.trim()) return ''
+  const trimmedSql = sql.trim()
   if (dialect === 'redis' || dialect === 'mongodb') {
-    return sql.trim()
+    return trimmedSql
+  }
+  const inputScan = stripCommentsAndLiteralsDetailed(trimmedSql, dialect)
+  if (inputScan.hasUnclosedQuote || inputScan.hasUnclosedComment) {
+    return trimmedSql
   }
 
-  const tokens = tokenizeSqlForFormat(sql, dialect)
+  const rules = getDialectLexerRules(dialect)
+  const tokens = tokenizeSqlForFormat(trimmedSql, dialect)
   const makeIndent = (level) => '  '.repeat(Math.max(0, level))
   const parenStack = [createFormatFrame('query', 0, 0, false)]
   const getCurrentFrame = () => parenStack[parenStack.length - 1]
@@ -2903,6 +3485,19 @@ export function formatSql(sql, dialect = 'postgres') {
   let forceNewlineIndent = null
   let afterSemicolon = false
   let prevToken = null
+  let stmtHeaderWords = []
+  let isCompoundHeader = false
+  let compoundBlockStack = []
+  let prevWordUpperForBlock = ''
+
+  const hasOpenCompoundBegin = () => compoundBlockStack.includes('BEGIN')
+
+  const resetCompoundState = () => {
+    stmtHeaderWords = []
+    isCompoundHeader = false
+    compoundBlockStack = []
+    prevWordUpperForBlock = ''
+  }
 
   const appendBreak = (newlinePrefix) => {
     out = out.replace(/[ \t]+$/, '')
@@ -2923,17 +3518,23 @@ export function formatSql(sql, dialect = 'postgres') {
     if (out.length === 0) return false
     const lastChar = out[out.length - 1]
     if (lastChar === '\n' || lastChar === ' ' || lastChar === '\t') return false
+    if (tok.kind === 'dot') {
+      if (prevToken && prevToken.kind === 'number') return true
+      return false
+    }
     if (
       tok.kind === 'comma' ||
       tok.kind === 'semicolon' ||
       tok.kind === 'paren_close' ||
-      tok.kind === 'dot' ||
       tok.kind === 'cast'
     ) {
       return false
     }
     if (prevToken) {
-      if (prevToken.kind === 'paren_open' || prevToken.kind === 'dot' || prevToken.kind === 'cast') {
+      if (prevToken.kind === 'dot') {
+        return out.length >= 2 && out[out.length - 2] === ' '
+      }
+      if (prevToken.kind === 'paren_open' || prevToken.kind === 'cast') {
         return false
       }
       if (tok.kind === 'paren_open' && prevToken.kind === 'word') {
@@ -2951,6 +3552,13 @@ export function formatSql(sql, dialect = 'postgres') {
   while (i < tokens.length) {
     const tok = tokens[i]
     const frame = getCurrentFrame()
+
+    if (afterSemicolon && tok.kind === 'line_comment' && !tok.hadNewlineBefore) {
+      out += ` ${tok.text}`
+      prevToken = tok
+      i++
+      continue
+    }
 
     if (afterSemicolon) {
       appendBreak('\n\n')
@@ -2982,12 +3590,52 @@ export function formatSql(sql, dialect = 'postgres') {
 
     if (tok.kind === 'semicolon') {
       out = out.replace(/[ \t]+$/, '') + ';'
-      parenStack.length = 0
-      parenStack.push(createFormatFrame('query', 0, 0, false))
-      afterSemicolon = true
+      if (hasOpenCompoundBegin()) {
+        forceNewlineIndent = frame.indent
+      } else {
+        parenStack.length = 0
+        parenStack.push(createFormatFrame('query', 0, 0, false))
+        afterSemicolon = true
+        resetCompoundState()
+      }
       prevToken = tok
       i++
       continue
+    }
+
+    if (tok.kind === 'word' && parenStack.length === 1) {
+      if (stmtHeaderWords.length < 10) {
+        stmtHeaderWords.push(tok.upper)
+        if (
+          rules.compoundRoutineBegin &&
+          !isCompoundHeader &&
+          stmtHeaderWords[0] === 'CREATE' &&
+          COMPOUND_CREATE_TARGETS.has(tok.upper)
+        ) {
+          isCompoundHeader = true
+        }
+      }
+      if (isCompoundHeader) {
+        const nextIdx = findNextNonCommentIndex(tokens, i)
+        const nextTok = nextIdx < tokens.length ? tokens[nextIdx] : null
+        const nextWord = nextTok ? (nextTok.kind === 'semicolon' ? ';' : nextTok.upper) : ''
+        if (tok.upper === 'BEGIN') {
+          if (!NON_TRANSACTION_BEGIN_FOLLOWERS.has(nextWord)) {
+            compoundBlockStack.push('BEGIN')
+          }
+        } else if (tok.upper === 'CASE' && prevWordUpperForBlock !== 'END') {
+          compoundBlockStack.push('CASE')
+        } else if (tok.upper === 'END') {
+          if (COMPOUND_END_SUFFIX_WORDS.has(nextWord)) {
+            if (nextWord === 'CASE') popLastBlockEntry(compoundBlockStack, 'CASE')
+          } else if (compoundBlockStack.length > 0) {
+            compoundBlockStack.pop()
+          }
+        }
+      }
+      prevWordUpperForBlock = tok.upper
+    } else if (tok.kind !== 'line_comment' && tok.kind !== 'block_comment') {
+      prevWordUpperForBlock = ''
     }
 
     if (tok.kind === 'paren_open') {
@@ -3212,11 +3860,18 @@ export function formatSql(sql, dialect = 'postgres') {
     i++
   }
 
-  return out
+  const formatted = out
     .split('\n')
     .map((line) => line.replace(/[ \t]+$/, ''))
     .join('\n')
     .trim()
+
+  // Token-preservation guard: fall back verbatim if ANY token
+  // drifted under either backslash-escape mode (e.g. operator splitting, comment pasting).
+  if (!readsTheSameForFormat(trimmedSql, formatted, dialect)) {
+    return trimmedSql
+  }
+  return formatted
 }
 
 function isSqliteTriggerIdentStart(code) {
@@ -3572,9 +4227,29 @@ export function splitOracleSlashChunks(script) {
     if (atLineStart && atTopLevel) {
       let k = i
       while (k < len && (raw[k] === ' ' || raw[k] === '\t')) k++
-      if (k < len && raw[k] === '/') {
+      if (
+        k < len &&
+        raw[k] === '/' &&
+        (k + 1 >= len || (raw[k + 1] !== '/' && raw[k + 1] !== '*'))
+      ) {
         let after = k + 1
         while (after < len && (raw[after] === ' ' || raw[after] === '\t')) after++
+        if (after < len && raw[after] === '-' && after + 1 < len && raw[after + 1] === '-') {
+          const nl = raw.indexOf('\n', after + 2)
+          after = nl < 0 ? len : nl
+        } else if (
+          after > k + 1 &&
+          after + 1 < len &&
+          raw[after] === '/' &&
+          raw[after + 1] === '*'
+        ) {
+          const closeIdx = raw.indexOf('*/', after + 2)
+          const nlIdx = raw.indexOf('\n', after + 2)
+          if (closeIdx >= 0 && (nlIdx < 0 || closeIdx < nlIdx)) {
+            after = closeIdx + 2
+            while (after < len && (raw[after] === ' ' || raw[after] === '\t')) after++
+          }
+        }
         if (after === len || raw[after] === '\n') {
           const piece = raw.slice(chunkStart, i).trim()
           if (piece.length > 0) {
@@ -3722,8 +4397,7 @@ const AI_CONTINUATION_TAIL_WORDS = new Set([
 
 function skipWsAndSqlComments(text, start, dialect) {
   const len = text.length
-  const allowHash = usesBackslashAndHash(dialect)
-  const nested = supportsNestedBlockComments(dialect)
+  const rules = getDialectLexerRules(dialect)
   let i = start
   while (i < len) {
     const ch = text[i]
@@ -3731,18 +4405,22 @@ function skipWsAndSqlComments(text, start, dialect) {
       i++
       continue
     }
-    if (ch === '-' && i + 1 < len && text[i + 1] === '-') {
+    if (rules.lineCommentDash && ch === '-' && i + 1 < len && text[i + 1] === '-') {
       i = scanLineCommentEnd(text, i)
       continue
     }
-    if (ch === '#' && allowHash) {
+    if (rules.lineCommentSlash && ch === '/' && i + 1 < len && text[i + 1] === '/') {
+      i = scanLineCommentEnd(text, i)
+      continue
+    }
+    if (rules.lineCommentHash && ch === '#') {
       i = scanLineCommentEnd(text, i - 1)
       continue
     }
     if (ch === '/' && i + 1 < len && text[i + 1] === '*') {
       const execLen = matchMysqlExecCommentPrefix(text, i, dialect)
       if (execLen > 0) break
-      i = scanBlockCommentEnd(text, i, nested)
+      i = scanBlockCommentEnd(text, i, rules.nestedBlockComments)
       continue
     }
     break
@@ -3885,9 +4563,7 @@ function findRecoveryBreakInSpan(text, spanStart, spanEnd, kind, dialect) {
 function findAbandonedSqlRecoveryStart(prefix, suffix, dialect) {
   const len = prefix.length
   if (len === 0) return 0
-  const backslashAndHash = usesBackslashAndHash(dialect)
-  const nestedComments = supportsNestedBlockComments(dialect)
-  const dollarQuotes = supportsDollarQuoting(dialect)
+  const rules = getDialectLexerRules(dialect)
   let i = 0
   let parenDepth = 0
   let openKind = null
@@ -3898,11 +4574,15 @@ function findAbandonedSqlRecoveryStart(prefix, suffix, dialect) {
 
   while (i < len) {
     const ch = prefix[i]
-    if (ch === '-' && i + 1 < len && prefix[i + 1] === '-') {
+    if (rules.lineCommentDash && ch === '-' && i + 1 < len && prefix[i + 1] === '-') {
       i = scanLineCommentEnd(prefix, i)
       continue
     }
-    if (ch === '#' && backslashAndHash) {
+    if (rules.lineCommentSlash && ch === '/' && i + 1 < len && prefix[i + 1] === '/') {
+      i = scanLineCommentEnd(prefix, i)
+      continue
+    }
+    if (rules.lineCommentHash && ch === '#') {
       i = scanLineCommentEnd(prefix, i - 1)
       continue
     }
@@ -3912,7 +4592,7 @@ function findAbandonedSqlRecoveryStart(prefix, suffix, dialect) {
         i += execLen
         continue
       }
-      const block = scanBlockCommentWithState(prefix, i, nestedComments)
+      const block = scanBlockCommentWithState(prefix, i, rules.nestedBlockComments)
       if (!block.closed) {
         const brk = findRecoveryBreakInSpan(prefix, i, len, 'block_comment', dialect)
         if (brk >= 0) firstCandidateBreak = brk
@@ -3950,7 +4630,7 @@ function findAbandonedSqlRecoveryStart(prefix, suffix, dialect) {
       i = oracleQuote.end
       continue
     }
-    if (dollarQuotes && ch === '$') {
+    if (rules.dollarQuoting && ch === '$') {
       const tag = matchDollarQuoteTag(prefix, i)
       if (tag !== null) {
         const closeIdx = prefix.indexOf(tag, i + tag.length)
@@ -3958,8 +4638,10 @@ function findAbandonedSqlRecoveryStart(prefix, suffix, dialect) {
         continue
       }
     }
-    if (ch === "'" || ch === '"' || ch === '`') {
-      const allowBackslash = ch === "'" && backslashAndHash
+    if (ch === "'" || ch === '"' || (ch === '`' && rules.backtickIdentifiers)) {
+      const allowBackslash =
+        (ch === "'" && rules.backslashEscapesSingleQuote) ||
+        (ch === '"' && rules.backslashEscapesDoubleQuote)
       const seg = scanQuotedSegmentEnd(prefix, i, ch, allowBackslash)
       const brk = findRecoveryBreakInSpan(prefix, i, seg.end, ch, dialect)
       if (!seg.closed) {
@@ -3975,8 +4657,8 @@ function findAbandonedSqlRecoveryStart(prefix, suffix, dialect) {
       i = seg.end
       continue
     }
-    if (ch === '[' && dialect === 'mssql') {
-      i = scanBracketIdentEnd(prefix, i).end
+    if (ch === '[' && rules.bracketIdentifiers !== 'none') {
+      i = scanBracketIdentEnd(prefix, i, rules.bracketIdentifiers === 'doubling').end
       continue
     }
     if (ch === '(') parenDepth++
@@ -4007,18 +4689,9 @@ function findAbandonedSqlRecoveryStart(prefix, suffix, dialect) {
 function splitAiSqlSegments(script, dialect, baseStart = 0) {
   const results = []
   const len = script.length
-  const backslashAndHash = usesBackslashAndHash(dialect)
-  const nestedComments = supportsNestedBlockComments(dialect)
-  const dollarQuotes = supportsDollarQuoting(dialect)
-  const allowMysqlDelimiter = dialect !== undefined && MYSQL_FAMILY_DIALECTS.has(dialect)
-  const supportsCompoundRoutineBegin =
-    dialect === 'sqlite' ||
-    dialect === 'libsql' ||
-    dialect === 'd1' ||
-    dialect === 'mysql' ||
-    dialect === 'mariadb' ||
-    dialect === 'mssql' ||
-    dialect === 'oracle'
+  const rules = getDialectLexerRules(dialect)
+  const allowMysqlDelimiter = rules.mysqlDelimiter
+  const supportsCompoundRoutineBegin = rules.compoundRoutineBegin
 
   let segStart = baseStart
   let hasExecutableToken = false
@@ -4029,8 +4702,7 @@ function splitAiSqlSegments(script, dialect, baseStart = 0) {
 
   let stmtHeaderWords = []
   let isCompoundHeader = false
-  let compoundDepth = 0
-  let caseDepth = 0
+  let blockStack = []
   let prevWordUpper = ''
   let firstTopWord = ''
   let withAwaitingMainDml = false
@@ -4039,11 +4711,12 @@ function splitAiSqlSegments(script, dialect, baseStart = 0) {
   let lastSignificantUpperWord = ''
   let lastSignificantPunct = ''
 
+  const hasOpenBegin = () => blockStack.includes('BEGIN')
+
   const resetStatementState = () => {
     stmtHeaderWords = []
     isCompoundHeader = false
-    compoundDepth = 0
-    caseDepth = 0
+    blockStack = []
     prevWordUpper = ''
     firstTopWord = ''
     withAwaitingMainDml = false
@@ -4089,7 +4762,7 @@ function splitAiSqlSegments(script, dialect, baseStart = 0) {
       if (atLineStart) {
         let wsEnd = i
         while (wsEnd < len && (script[wsEnd] === ' ' || script[wsEnd] === '\t')) wsEnd++
-        const delimMatch = /^DELIMITER\s+([^\s\r\n]+)[ \t]*(?:\r?\n|$)/i.exec(script.slice(wsEnd))
+        const delimMatch = MYSQL_DELIMITER_LINE_RE.exec(script.slice(wsEnd))
         if (delimMatch && delimMatch[1]) {
           delimiter = delimMatch[1]
           i = wsEnd + delimMatch[0].length
@@ -4100,13 +4773,11 @@ function splitAiSqlSegments(script, dialect, baseStart = 0) {
       }
     }
 
-    if (delimiter.length > 0 && parenDepth === 0 && compoundDepth === 0 && execCommentDepth === 0) {
-      if (script.startsWith(delimiter, i)) {
-        if (delimiter === ';' || !isIdentContChar(script.charCodeAt(i))) {
-          flushSegment(i, delimiter.length, i)
-          i += delimiter.length
-          continue
-        }
+    if (delimiter.length > 0 && parenDepth === 0 && !hasOpenBegin() && execCommentDepth === 0) {
+      if (matchesCustomDelimiterAt(script, i, delimiter)) {
+        flushSegment(i, delimiter.length, i)
+        i += delimiter.length
+        continue
       }
     }
 
@@ -4117,7 +4788,7 @@ function splitAiSqlSegments(script, dialect, baseStart = 0) {
       if (
         hasExecutableToken &&
         parenDepth === 0 &&
-        compoundDepth === 0 &&
+        !hasOpenBegin() &&
         execCommentDepth === 0 &&
         !isCompoundHeader
       ) {
@@ -4157,11 +4828,15 @@ function splitAiSqlSegments(script, dialect, baseStart = 0) {
       }
     }
 
-    if (ch === '-' && i + 1 < len && script[i + 1] === '-') {
+    if (rules.lineCommentDash && ch === '-' && i + 1 < len && script[i + 1] === '-') {
       i = scanLineCommentEnd(script, i)
       continue
     }
-    if (ch === '#' && backslashAndHash) {
+    if (rules.lineCommentSlash && ch === '/' && i + 1 < len && script[i + 1] === '/') {
+      i = scanLineCommentEnd(script, i)
+      continue
+    }
+    if (rules.lineCommentHash && ch === '#') {
       i = scanLineCommentEnd(script, i - 1)
       continue
     }
@@ -4178,7 +4853,7 @@ function splitAiSqlSegments(script, dialect, baseStart = 0) {
         i += execLen
         continue
       }
-      i = scanBlockCommentEnd(script, i, nestedComments)
+      i = scanBlockCommentEnd(script, i, rules.nestedBlockComments)
       continue
     }
     if (isPostgresEscapeStringStart(script, i, dialect)) {
@@ -4198,24 +4873,26 @@ function splitAiSqlSegments(script, dialect, baseStart = 0) {
       lastSignificantPunct = "'"
       continue
     }
-    if (ch === "'" || ch === '"' || ch === '`') {
+    if (ch === "'" || ch === '"' || (ch === '`' && rules.backtickIdentifiers)) {
       hasExecutableToken = true
-      const allowBackslash = ch === "'" && backslashAndHash
+      const allowBackslash =
+        (ch === "'" && rules.backslashEscapesSingleQuote) ||
+        (ch === '"' && rules.backslashEscapesDoubleQuote)
       i = scanQuotedSegmentEnd(script, i, ch, allowBackslash).end
       prevWordUpper = ''
       lastSignificantUpperWord = ''
       lastSignificantPunct = ch
       continue
     }
-    if (ch === '[' && dialect === 'mssql') {
+    if (ch === '[' && rules.bracketIdentifiers !== 'none') {
       hasExecutableToken = true
-      i = scanBracketIdentEnd(script, i).end
+      i = scanBracketIdentEnd(script, i, rules.bracketIdentifiers === 'doubling').end
       prevWordUpper = ''
       lastSignificantUpperWord = ''
       lastSignificantPunct = ']'
       continue
     }
-    if (dollarQuotes && ch === '$') {
+    if (rules.dollarQuoting && ch === '$') {
       const tag = matchDollarQuoteTag(script, i)
       if (tag !== null) {
         hasExecutableToken = true
@@ -4293,22 +4970,18 @@ function splitAiSqlSegments(script, dialect, baseStart = 0) {
         if (wordUpper === 'BEGIN') {
           const nextWord = peekNextUpperWord(end)
           if (!NON_TRANSACTION_BEGIN_FOLLOWERS.has(nextWord)) {
-            compoundDepth++
+            blockStack.push('BEGIN')
           }
         } else if (wordUpper === 'CASE' && prevWordUpper !== 'END') {
-          caseDepth++
+          blockStack.push('CASE')
         } else if (wordUpper === 'END') {
           const nextWord = peekNextUpperWord(end)
           if (COMPOUND_END_SUFFIX_WORDS.has(nextWord)) {
-            if (nextWord === 'CASE' && caseDepth > 0) {
-              caseDepth--
+            if (nextWord === 'CASE') {
+              popLastBlockEntry(blockStack, 'CASE')
             }
-          } else if (caseDepth > 0 && compoundDepth === 0) {
-            caseDepth--
-          } else if (caseDepth > 0 && nextWord !== ';') {
-            caseDepth--
-          } else if (compoundDepth > 0) {
-            compoundDepth--
+          } else if (blockStack.length > 0) {
+            blockStack.pop()
           }
         }
       }

@@ -164,6 +164,7 @@ export function openSharedFilePickerModal(config) {
 
     let closed = false
     let loadSeq = 0
+    let isLoadingDir = false
     let currentDir = ''
     let parentDir = null
     let allEntries = []
@@ -181,6 +182,7 @@ export function openSharedFilePickerModal(config) {
     }
 
     const resolveChoice = () => {
+      if (isLoadingDir) return ''
       if (mode === 'folder') {
         return selectedEntry?.kind === 'dir' ? selectedEntry.path : currentDir
       }
@@ -189,9 +191,10 @@ export function openSharedFilePickerModal(config) {
 
     const syncConfirm = () => {
       const chosen = resolveChoice()
-      dom.previewEl.textContent = chosen || (mode === 'file' ? 'Select a file to continue' : '')
+      dom.previewEl.textContent =
+        chosen || (isLoadingDir ? 'Loading...' : mode === 'file' ? 'Select a file to continue' : '')
       dom.previewEl.title = chosen || ''
-      dom.confirmBtn.disabled = !chosen
+      dom.confirmBtn.disabled = isLoadingDir || !chosen
     }
 
     // Update selection classes in place so double-click targets stay attached and focus is preserved
@@ -282,6 +285,7 @@ export function openSharedFilePickerModal(config) {
 
     const loadDir = async (dir, strictDir = false) => {
       const seq = ++loadSeq
+      isLoadingDir = true
       dom.statusEl.textContent = 'Loading...'
       dom.statusEl.className = cls.status
       selectedEntry = null
@@ -289,6 +293,7 @@ export function openSharedFilePickerModal(config) {
       try {
         const res = await config.listDir({ dir, mode, extensions, strictDir })
         if (closed || seq !== loadSeq) return
+        isLoadingDir = false
         if (!res?.ok) {
           if (res?.currentDir && !currentDir) {
             currentDir = res.currentDir
@@ -301,6 +306,7 @@ export function openSharedFilePickerModal(config) {
           }
           dom.statusEl.textContent = res?.error || 'Cannot open directory'
           dom.statusEl.className = `${cls.status} is-error`
+          syncConfirm()
           return
         }
         currentDir = res.currentDir || ''
@@ -317,9 +323,27 @@ export function openSharedFilePickerModal(config) {
         dom.statusEl.textContent = countLabel
       } catch (err) {
         if (closed || seq !== loadSeq) return
+        isLoadingDir = false
         dom.statusEl.textContent = err instanceof Error ? err.message : String(err)
         dom.statusEl.className = `${cls.status} is-error`
+        syncConfirm()
       }
+    }
+
+    const isElementVisible = (el) => {
+      if (!(el instanceof HTMLElement) || el.hidden) return false
+      let node = el
+      while (node && node !== dom.overlay) {
+        if (node.hidden) return false
+        if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
+          const style = window.getComputedStyle(node)
+          if (style.display === 'none' || style.visibility === 'hidden') return false
+        } else if (node.style?.display === 'none' || node.style?.visibility === 'hidden') {
+          return false
+        }
+        node = node.parentElement
+      }
+      return true
     }
 
     const moveSelection = (delta) => {
@@ -341,7 +365,7 @@ export function openSharedFilePickerModal(config) {
 
     const trapTabFocus = (e) => {
       const focusables = Array.from(dom.modal.querySelectorAll(FOCUSABLE_SELECTOR)).filter(
-        (el) => el instanceof HTMLElement && el.offsetParent !== null
+        (el) => isElementVisible(el)
       )
       if (focusables.length === 0) return
       const first = focusables[0]
