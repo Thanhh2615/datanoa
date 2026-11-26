@@ -43,7 +43,7 @@ cd datanoa
 # 2. Install dependencies
 npm install
 
-# 3. Bundle vendor drivers & parsers (iconv-lite, pg, mysql2, mongodb, mssql, oracledb, CodeMirror 6, node-sql-parser) into vendor/ (< 1 MiB & CSP audit)
+# 3. Bundle vendor drivers & parsers (iconv-lite, pg, mysql2, mongodb, mssql, oracledb, ssh2, CodeMirror 6, node-sql-parser) into vendor/ (< 1 MiB & CSP audit)
 npm run build
 
 # 4. Run the full verification pipeline (build + size + typecheck + validate + check)
@@ -57,7 +57,7 @@ orca plugin dev load .
 ```
 
 > **Note on "Install plugin -> Local folder" in Orca Desktop:**
-> All runtime dependencies (`vendor/iconv-lite.js`, `vendor/pg.js`, `vendor/mysql2.js`, `vendor/mongodb.js`, `vendor/mssql.js`, `vendor/oracledb.js`, `vendor/codemirror.js`, `vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js`) are pre-bundled into `vendor/` (`~3.76 MB` total; total packaged workspace payload `<= 25,000,000` bytes). However, Orca Desktop's **Local folder** installer scans the entire folder on disk (including untracked directories) against a 50 MiB / file-count limit. Before installing from a local checkout via **Install plugin -> Local folder** (or inspecting with `orca plugin inspect .`), remove dev-only directories (`rm -rf node_modules .serena .orca .datanoa .vite`) or use `orca plugin dev load .`.
+> All runtime dependencies (`vendor/iconv-lite.js`, `vendor/pg.js`, `vendor/mysql2.js`, `vendor/mongodb.js`, `vendor/mssql.js`, `vendor/oracledb.js`, `vendor/ssh2.js`, `vendor/codemirror.js`, `vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js`) are pre-bundled into `vendor/` (`~3.88 MB` total; total packaged workspace payload `<= 25,000,000` bytes). However, Orca Desktop's **Local folder** installer scans the entire folder on disk (including untracked directories) against a 50 MiB / file-count limit. Before installing from a local checkout via **Install plugin -> Local folder** (or inspecting with `orca plugin inspect .`), remove dev-only directories (`rm -rf node_modules .serena .orca .datanoa .vite`) or use `orca plugin dev load .`.
 
 ---
 
@@ -80,7 +80,8 @@ datanoa/
 │   ├── oracledb.js / oracledb.d.ts           # Bundled OracleDB Thin Mode driver
 │   ├── codemirror.js / codemirror.d.ts       # Bundled CodeMirror 6 SQL editor & Lezer highlight
 │   ├── sql-parser-pg-sqlite.js / .d.ts       # Bundled node-sql-parser (PostgreSQL & SQLite AST grammar)
-│   └── sql-parser-mysql-mssql.js / .d.ts     # Bundled node-sql-parser (MySQL & T-SQL AST grammar)
+│   ├── sql-parser-mysql-mssql.js / .d.ts     # Bundled node-sql-parser (MySQL & T-SQL AST grammar)
+│   └── ssh2.js / ssh2.d.ts                   # Bundled pure-JS ssh2 (in-process SSH tunnels with known_hosts verification)
 ├── src/
 │   ├── protocol.ts                       # Canonical IPC contracts & payload sanitizer
 │   ├── shared-ai-ui.js                   # Shared dual-role AI modal, Fix with AI & resizable EXPLAIN panel UI
@@ -127,7 +128,7 @@ datanoa/
 │   │   │   ├── sql-formatter.ts          # SQL formatter & data exporters
 │   │   │   ├── sql-migration.ts          # Table structure migration planner
 │   │   │   ├── sql-tools.ts              # Barrel re-export
-│   │   │   ├── tls-and-tunnel.ts         # Fail-closed TLS/mTLS options, IPv4 bridge & SSH tunnel manager
+│   │   │   ├── tls-and-tunnel.ts         # Fail-closed TLS/mTLS options, IPv4 bridge & in-process ssh2 tunnel manager
 │   │   │   └── update-builder.ts         # Parameterized DML, PK reload, chunked INSERT & pagination
 │   │   ├── sqlite/                       # node:sqlite driver + worker_threads runner
 │   │   ├── postgres/                     # PostgreSQL & CockroachDB driver + Supabase IPv4 bridge

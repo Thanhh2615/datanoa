@@ -1429,7 +1429,7 @@ export function openStudioConnectionModal(
   sshPortInp.value = '22'
   const sshUserInp = createInput('ubuntu')
   const sshAuthSel = createSelect([
-    { value: 'agent', label: 'SSH Agent / ~/.ssh/config' },
+    { value: 'agent', label: 'SSH Agent (SSH_AUTH_SOCK)' },
     { value: 'key', label: 'Private Key File' },
     { value: 'password', label: 'Password' },
   ])

@@ -3,7 +3,7 @@
   "manifestVersion": 2,
   "id": "datanoa",
   "name": "Datanoa Studio",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "license": "MIT",
   "author": {
     "name": "Thanhh2615",
@@ -14,7 +14,7 @@
   "icon": "assets/icon.png",
   "cover": {
     "path": "images/cover.webp",
-    "alt": "Datanoa Studio v1.2.2 database client and SQL studio for Orca with multi-tab SQL editor, AI SQL Assistant, data grid, and schema explorer"
+    "alt": "Datanoa Studio v1.2.3 database client and SQL studio for Orca with multi-tab SQL editor, AI SQL Assistant, data grid, and schema explorer"
   },
   "screenshots": [
     {

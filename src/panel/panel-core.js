@@ -42,7 +42,7 @@ import {
 
 export { analyzeDangerousSql, maskConnectionUriSecret }
 
-export const DATANOA_VERSION = '1.2.2'
+export const DATANOA_VERSION = '1.2.3'
 export const DATANOA_GITHUB_ISSUES_URL = 'https://github.com/Thanhh2615/datanoa/issues/new'
 
 export const ENGINES = [

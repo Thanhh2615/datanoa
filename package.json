@@ -1,6 +1,6 @@
 {
   "name": "datanoa",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Database client and SQL studio for Orca with opt-in AI SQL Assistant, SQL syntax diagnostics, and 7 local BYOD drivers — built-in SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, LibSQL/Turso, Cloudflare D1, SQL Server (MSSQL), Oracle, and MongoDB.",
   "private": true,
   "type": "module",
