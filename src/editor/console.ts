@@ -37,6 +37,7 @@ import {
 } from '../../vendor/codemirror.js'
 import { findStatementAtOffset } from '../drivers/common/sql-tools.js'
 import {
+  isSqlClauseColumnContext,
   resolveSqlExecutionSpan,
   resolveSqlReplacementSpan,
   type SqlExecutionRange,
@@ -45,6 +46,7 @@ import {
 import {
   clearGhostEffect,
   createCmInlineAiExtension,
+  notifyAiAvailabilityChanged,
   type CmInlineAiOptions,
 } from '../shared-cm-inline-ai.js'
 import {
@@ -55,6 +57,14 @@ import {
 } from '../shared-cm-sql-lint.js'
 import type { DatabaseDriverType } from '../protocol.js'
 import { bindCtrlWheelHorizontalScroll } from '../shared-wheel-scroll.js'
+import {
+  createCmKeymapExtension,
+  getVimModeSnapshot,
+  isModalKeymapActive,
+  normalizeShortcutSettings,
+  type EditorKeymapSettings,
+  type VimModeSnapshot,
+} from '../shared-cm-keymap.js'
 
 export type SqlDialectType = DatabaseDriverType
 
@@ -74,6 +84,8 @@ export interface SqlConsoleOptions {
   schema?: Record<string, string[]>
   typography?: EditorTypography
   aiInline?: CmInlineAiOptions
+  keymapSettings?: Partial<EditorKeymapSettings>
+  onVimModeChange?: (snapshot: VimModeSnapshot) => void
   onExecute?: (sql: string) => void
   onExecuteAll?: (sql: string) => void
   onFormatSql?: () => void
@@ -804,7 +816,17 @@ export function computeSmartSqlCompletions(
     prevToken === 'TABLE' ||
     prevToken === 'DESCRIBE'
 
-  if (!word && !isTableContext && !explicit) {
+  const hasSchemaColumns = schema
+    ? Object.values(schema).some((cols) => Array.isArray(cols) && cols.length > 0)
+    : false
+  const isClauseColContext =
+    !word &&
+    !isTableContext &&
+    !explicit &&
+    hasSchemaColumns &&
+    isSqlClauseColumnContext(before, dialect)
+
+  if (!word && !isTableContext && !isClauseColContext && !explicit) {
     return null
   }
 
@@ -1146,14 +1168,17 @@ export class SqlConsoleController {
   private readonly completionCompartment = new Compartment()
   private readonly typographyCompartment = new Compartment()
   private readonly themeModeCompartment = new Compartment()
+  private readonly keymapCompartment = new Compartment()
   private currentDialect: SqlDialectType
   private currentSchema: Record<string, string[]> = {}
   private currentDefaultTable?: string
   private currentTypography: EditorTypography = {}
+  private currentKeymapSettings: EditorKeymapSettings
   private isDarkTheme = true
   private readonly onExecute?: (sql: string) => void
   private readonly onExecuteAll?: (sql: string) => void
   private readonly onFormatSql?: () => void
+  private readonly onVimModeChange?: (snapshot: VimModeSnapshot) => void
   private readonly onChange?: (doc: string) => void
   private detachWheelScroll: (() => void) | null = null
   private readonly aiInline?: CmInlineAiOptions
@@ -1162,6 +1187,7 @@ export class SqlConsoleController {
     this.currentDialect = options.dialect || 'sqlite'
     this.currentSchema = options.schema || {}
     this.currentTypography = options.typography || {}
+    this.currentKeymapSettings = normalizeShortcutSettings(options.keymapSettings)
     this.isDarkTheme = !(
       typeof document !== 'undefined' &&
       (document.documentElement.classList.contains('light') ||
@@ -1170,28 +1196,21 @@ export class SqlConsoleController {
     this.onExecute = options.onExecute
     this.onExecuteAll = options.onExecuteAll
     this.onFormatSql = options.onFormatSql
+    this.onVimModeChange = options.onVimModeChange
     this.onChange = options.onChange
     this.aiInline = options.aiInline
 
     this.initEditor(options.parent, options.initialDoc)
   }
 
-  private initEditor(parent: HTMLElement, initialDoc = '-- Datanoa SQL Console\nSELECT 1;\n'): void {
-    const executeAllKeyBinding = {
-      key: 'Mod-Shift-Enter',
-      run: (target: EditorView) => {
-        const query = target.state.doc.toString().trim()
-        if (this.onExecuteAll && query.length > 0) {
-          this.onExecuteAll(query)
-          return true
-        }
-        return false
-      },
-    }
-
-    const executeKeyBinding = {
-      key: 'Mod-Enter',
-      run: (target: EditorView) => {
+  private buildKeymapExtension(): Extension {
+    return createCmKeymapExtension({
+      editorKeymap: this.currentKeymapSettings.editorKeymap,
+      shortcutRunStatement: this.currentKeymapSettings.shortcutRunStatement,
+      shortcutRunAll: this.currentKeymapSettings.shortcutRunAll,
+      shortcutFormatSql: this.currentKeymapSettings.shortcutFormatSql,
+      showVimPanel: false,
+      onRunStatement: (target) => {
         const query = extractCaretStatementSql(target.state, this.currentDialect)
         if (this.onExecute && query.length > 0) {
           this.onExecute(query)
@@ -1199,19 +1218,28 @@ export class SqlConsoleController {
         }
         return false
       },
-    }
-
-    const formatSqlKeyBinding = {
-      key: 'Shift-Alt-f',
-      run: () => {
+      onRunAll: (target) => {
+        const query = target.state.doc.toString().trim()
+        if (this.onExecuteAll && query.length > 0) {
+          this.onExecuteAll(query)
+          return true
+        }
+        return false
+      },
+      onFormatSql: () => {
         if (this.onFormatSql) {
           this.onFormatSql()
           return true
         }
         return false
       },
-    }
+      onVimModeChange: (snapshot) => {
+        this.onVimModeChange?.(snapshot)
+      },
+    })
+  }
 
+  private initEditor(parent: HTMLElement, initialDoc = '-- Datanoa SQL Console\nSELECT 1;\n'): void {
     const docChangeListener = EditorView.updateListener.of((update) => {
       if (update.docChanged && this.onChange) {
         this.onChange(update.state.doc.toString())
@@ -1229,10 +1257,8 @@ export class SqlConsoleController {
       foldGutter(),
       codeFolding(),
       bracketMatching(),
+      this.keymapCompartment.of(this.buildKeymapExtension()),
       keymap.of([
-        executeAllKeyBinding,
-        executeKeyBinding,
-        formatSqlKeyBinding,
         { key: 'Mod-h', run: openSearchPanel },
         ...completionKeymap,
         ...searchKeymap,
@@ -1341,6 +1367,7 @@ export class SqlConsoleController {
    */
   public setText(text: string): void {
     if (!this.view) return
+    if (this.view.state.doc.toString() === text) return
     this.view.dispatch({
       changes: { from: 0, to: this.view.state.doc.length, insert: text },
     })
@@ -1450,10 +1477,49 @@ export class SqlConsoleController {
   }
 
   /**
+   * Reconfigures keymap/shortcut settings live without recreating the editor view.
+   */
+  public applyKeymapSettings(settings: Partial<EditorKeymapSettings>): void {
+    this.currentKeymapSettings = normalizeShortcutSettings(settings)
+    if (this.view) {
+      this.view.dispatch({
+        effects: this.keymapCompartment.reconfigure(this.buildKeymapExtension()),
+      })
+      this.onVimModeChange?.(getVimModeSnapshot(this.view))
+    }
+  }
+
+  /**
+   * Returns current live Vim/modal mode snapshot.
+   */
+  public getVimModeSnapshot(): VimModeSnapshot {
+    return getVimModeSnapshot(this.view)
+  }
+
+  /**
+   * Returns true when event target resides inside `.cm-content` while Vim keymap is active.
+   */
+  public isVimTargetEvent(target: EventTarget | null): boolean {
+    if (!this.view || !isModalKeymapActive(this.view)) return false
+    if (!(target instanceof Node)) return false
+    const el = target instanceof Element ? target : target.parentElement
+    return Boolean(el && (el.closest?.('.cm-content') || this.view.contentDOM.contains(el)))
+  }
+
+  /**
    * Clears any visible inline AI ghost suggestion.
    */
   public clearAiGhost(): void {
     this.view?.dispatch({ effects: clearGhostEffect.of(undefined) })
+  }
+
+  /**
+   * Notifies inline AI that status or connection availability changed so idle edits can backfill.
+   */
+  public notifyAiAvailabilityChanged(): void {
+    if (this.view) {
+      notifyAiAvailabilityChanged(this.view)
+    }
   }
 
   /**

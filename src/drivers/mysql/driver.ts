@@ -4,12 +4,14 @@ import type {
   ApplyChangesParams,
   ApplyChangesResult,
   ConnectionProfile,
+  ExplainResult,
   FetchPageParams,
   IDatabaseDriver,
   IDatabaseSession,
   PreviewChangesResult,
   QueryResult,
   QueryResultSet,
+  SchemaErGraph,
   SchemaObject,
   SchemaObjectKind,
   TableBrowseResult,
@@ -23,6 +25,14 @@ import {
   attachFailedStatementMeta,
   runDriverConnectionTest,
 } from '../common/driver'
+import {
+  buildSchemaErGraphFromCatalogRows,
+  type RawErColumnRow,
+  type RawErForeignKeyRow,
+  type RawErTableRow,
+  type RawErUniqueSetRow,
+} from '../common/schema-er-graph'
+import { parseExplainPlan } from '../../shared-explain-plan.js'
 import * as net from 'node:net'
 import * as tls from 'node:tls'
 import type { DriverTlsOptions } from '../common/tls-and-tunnel'
@@ -45,9 +55,13 @@ import {
 } from '../common/schema'
 import {
   containsDdlStatement,
+  hasExplainAnalyzeOption,
+  isExplainTargetMutating,
+  isMutatingStatement,
   reconstructTableDdl,
   splitSqlStatements,
 } from '../common/sql-tools'
+import { toSqlBool } from '../common/schema'
 import {
   SQL_STANDALONE_ROLLBACK_RE,
   compactSql,
@@ -273,6 +287,26 @@ function extractAffectedRows(res: unknown, fallback = 0): number {
 
 function asRecordRows(rows: unknown): Record<string, unknown>[] {
   return Array.isArray(rows) ? (rows as Record<string, unknown>[]) : []
+}
+
+function pickMysqlField(row: Record<string, unknown>, ...keys: string[]): unknown {
+  for (const key of keys) {
+    if (key in row && row[key] !== undefined) return row[key]
+  }
+  const lowerMap = new Map<string, unknown>()
+  for (const [k, v] of Object.entries(row)) {
+    lowerMap.set(k.toLowerCase(), v)
+  }
+  for (const key of keys) {
+    const val = lowerMap.get(key.toLowerCase())
+    if (val !== undefined) return val
+  }
+  return undefined
+}
+
+function pickMysqlString(row: Record<string, unknown>, ...keys: string[]): string {
+  const val = pickMysqlField(row, ...keys)
+  return val === null || val === undefined ? '' : String(val).trim()
 }
 
 function resolveMysqlColumnTypeName(columnType: number | undefined): string {
@@ -621,6 +655,356 @@ export class MysqlSession implements IDatabaseSession {
       getObjectDdl: (object) =>
         this.getObjectDdl(object.name, object.kind, object.schema || targetSchema),
     })
+  }
+
+  clearSchemaCache(): void {
+    this.tableDetailsCache.clear()
+  }
+
+  async introspectErGraph(schema?: string): Promise<SchemaErGraph> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    const targetSchema = (schema !== undefined ? schema : this.profile.database || '').trim()
+    const hasFilter = targetSchema.length > 0
+    const params = hasFilter ? [targetSchema] : []
+
+    const tableRows = await this.queryExecutor(
+      hasFilter
+        ? `
+          SELECT
+            table_schema AS \`schema\`,
+            table_name AS \`name\`,
+            CASE WHEN table_type = 'VIEW' THEN 'view' ELSE 'table' END AS \`kind\`
+          FROM information_schema.TABLES
+          WHERE table_schema = ?
+            AND table_type IN ('BASE TABLE', 'VIEW')
+          ORDER BY table_name ASC;
+        `
+        : `
+          SELECT
+            table_schema AS \`schema\`,
+            table_name AS \`name\`,
+            CASE WHEN table_type = 'VIEW' THEN 'view' ELSE 'table' END AS \`kind\`
+          FROM information_schema.TABLES
+          WHERE table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+            AND table_type IN ('BASE TABLE', 'VIEW')
+          ORDER BY table_schema ASC, table_name ASC;
+        `,
+      params
+    )
+
+    const colRows = await this.queryExecutor(
+      hasFilter
+        ? `
+          SELECT
+            table_schema AS \`schema\`,
+            table_name AS \`table\`,
+            column_name AS \`name\`,
+            column_type AS \`type\`,
+            (is_nullable = 'YES') AS \`nullable\`,
+            (column_key = 'PRI') AS \`is_primary_key\`,
+            (column_key = 'UNI') AS \`is_unique\`,
+            ordinal_position AS \`ordinal_position\`
+          FROM information_schema.COLUMNS
+          WHERE table_schema = ?
+          ORDER BY table_name ASC, ordinal_position ASC;
+        `
+        : `
+          SELECT
+            table_schema AS \`schema\`,
+            table_name AS \`table\`,
+            column_name AS \`name\`,
+            column_type AS \`type\`,
+            (is_nullable = 'YES') AS \`nullable\`,
+            (column_key = 'PRI') AS \`is_primary_key\`,
+            (column_key = 'UNI') AS \`is_unique\`,
+            ordinal_position AS \`ordinal_position\`
+          FROM information_schema.COLUMNS
+          WHERE table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+          ORDER BY table_schema ASC, table_name ASC, ordinal_position ASC;
+        `,
+      params
+    )
+
+    const fkRows = await this.queryExecutor(
+      hasFilter
+        ? `
+          SELECT
+            kcu.constraint_name AS \`constraint_name\`,
+            kcu.table_schema AS \`from_schema\`,
+            kcu.table_name AS \`from_table\`,
+            kcu.column_name AS \`from_column\`,
+            kcu.referenced_table_schema AS \`to_schema\`,
+            kcu.referenced_table_name AS \`to_table\`,
+            kcu.referenced_column_name AS \`to_column\`,
+            kcu.ordinal_position AS \`ordinal_position\`,
+            rc.delete_rule AS \`on_delete\`,
+            rc.update_rule AS \`on_update\`
+          FROM information_schema.KEY_COLUMN_USAGE kcu
+          LEFT JOIN information_schema.REFERENTIAL_CONSTRAINTS rc
+            ON rc.constraint_schema = kcu.table_schema
+           AND rc.table_name = kcu.table_name
+           AND rc.constraint_name = kcu.constraint_name
+          WHERE kcu.table_schema = ?
+            AND kcu.referenced_table_name IS NOT NULL
+          ORDER BY kcu.constraint_name ASC, kcu.ordinal_position ASC;
+        `
+        : `
+          SELECT
+            kcu.constraint_name AS \`constraint_name\`,
+            kcu.table_schema AS \`from_schema\`,
+            kcu.table_name AS \`from_table\`,
+            kcu.column_name AS \`from_column\`,
+            kcu.referenced_table_schema AS \`to_schema\`,
+            kcu.referenced_table_name AS \`to_table\`,
+            kcu.referenced_column_name AS \`to_column\`,
+            kcu.ordinal_position AS \`ordinal_position\`,
+            rc.delete_rule AS \`on_delete\`,
+            rc.update_rule AS \`on_update\`
+          FROM information_schema.KEY_COLUMN_USAGE kcu
+          LEFT JOIN information_schema.REFERENTIAL_CONSTRAINTS rc
+            ON rc.constraint_schema = kcu.table_schema
+           AND rc.table_name = kcu.table_name
+           AND rc.constraint_name = kcu.constraint_name
+          WHERE kcu.table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+            AND kcu.referenced_table_name IS NOT NULL
+          ORDER BY kcu.table_schema ASC, kcu.constraint_name ASC, kcu.ordinal_position ASC;
+        `,
+      params
+    )
+
+    const statRows = await this.queryExecutor(
+      hasFilter
+        ? `
+          SELECT
+            TABLE_SCHEMA AS \`schema\`,
+            TABLE_NAME AS \`table\`,
+            INDEX_NAME AS \`index_name\`,
+            COLUMN_NAME AS \`column_name\`,
+            SEQ_IN_INDEX AS \`seq_in_index\`
+          FROM information_schema.STATISTICS
+          WHERE TABLE_SCHEMA = ?
+            AND NON_UNIQUE = 0
+            AND INDEX_NAME <> 'PRIMARY'
+          ORDER BY TABLE_NAME ASC, INDEX_NAME ASC, SEQ_IN_INDEX ASC;
+        `
+        : `
+          SELECT
+            TABLE_SCHEMA AS \`schema\`,
+            TABLE_NAME AS \`table\`,
+            INDEX_NAME AS \`index_name\`,
+            COLUMN_NAME AS \`column_name\`,
+            SEQ_IN_INDEX AS \`seq_in_index\`
+          FROM information_schema.STATISTICS
+          WHERE TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+            AND NON_UNIQUE = 0
+            AND INDEX_NAME <> 'PRIMARY'
+          ORDER BY TABLE_SCHEMA ASC, TABLE_NAME ASC, INDEX_NAME ASC, SEQ_IN_INDEX ASC;
+        `,
+      params
+    )
+
+    const uniqueIndexGroups = new Map<
+      string,
+      { schema: string; table: string; indexName: string; invalid: boolean; cols: Array<{ name: string; seq: number }> }
+    >()
+    for (const r of statRows) {
+      const tblName = pickMysqlString(r, 'table', 'table_name')
+      const idxName = pickMysqlString(r, 'index_name')
+      if (!tblName || !idxName) continue
+      const rowSchema = pickMysqlString(r, 'schema', 'table_schema') || targetSchema || 'default'
+      const uKey = `${rowSchema}\u0000${tblName}\u0000${idxName}`
+      let grp = uniqueIndexGroups.get(uKey)
+      if (!grp) {
+        grp = { schema: rowSchema, table: tblName, indexName: idxName, invalid: false, cols: [] }
+        uniqueIndexGroups.set(uKey, grp)
+      }
+      const colName = pickMysqlString(r, 'column_name')
+      if (!colName) {
+        grp.invalid = true
+        continue
+      }
+      const seqRaw = pickMysqlField(r, 'seq_in_index')
+      const seq = typeof seqRaw === 'number' ? seqRaw : Number(seqRaw)
+      if (!grp.cols.some((c) => c.name === colName)) {
+        grp.cols.push({ name: colName, seq: Number.isFinite(seq) ? seq : grp.cols.length })
+      }
+    }
+    const uniqueSets: RawErUniqueSetRow[] = Array.from(uniqueIndexGroups.values())
+      .filter((grp) => !grp.invalid && grp.cols.length > 0)
+      .map((grp) => ({
+        schema: grp.schema,
+        table: grp.table,
+        indexName: grp.indexName,
+        columns: grp.cols.sort((a, b) => a.seq - b.seq).map((c) => c.name),
+      }))
+
+    const tables: RawErTableRow[] = tableRows
+      .map((r): RawErTableRow | null => {
+        const name = pickMysqlString(r, 'name', 'table_name')
+        if (!name) return null
+        const rowSchema = pickMysqlString(r, 'schema', 'table_schema') || targetSchema || 'default'
+        const rawKind = pickMysqlString(r, 'kind', 'table_type').toLowerCase()
+        return {
+          schema: rowSchema,
+          name,
+          kind: rawKind === 'view' ? 'view' : 'table',
+        }
+      })
+      .filter((item): item is RawErTableRow => item !== null)
+
+    const columns: RawErColumnRow[] = colRows
+      .map((r): RawErColumnRow | null => {
+        const table = pickMysqlString(r, 'table', 'table_name')
+        const name = pickMysqlString(r, 'name', 'column_name')
+        if (!table || !name) return null
+        const rowSchema = pickMysqlString(r, 'schema', 'table_schema') || targetSchema || 'default'
+        const ordRaw = pickMysqlField(r, 'ordinal_position')
+        const ord = typeof ordRaw === 'number' ? ordRaw : Number(ordRaw)
+        return {
+          schema: rowSchema,
+          table,
+          name,
+          type: pickMysqlString(r, 'type', 'column_type', 'data_type'),
+          nullable: toSqlBool(pickMysqlField(r, 'nullable', 'is_nullable')),
+          isPrimaryKey: toSqlBool(pickMysqlField(r, 'is_primary_key', 'column_key')),
+          isUnique: toSqlBool(pickMysqlField(r, 'is_unique')),
+          ...(Number.isFinite(ord) ? { ordinalPosition: ord } : {}),
+        }
+      })
+      .filter((item): item is RawErColumnRow => item !== null)
+
+    const foreignKeys: RawErForeignKeyRow[] = fkRows
+      .map((r): RawErForeignKeyRow | null => {
+        const fromTable = pickMysqlString(r, 'from_table', 'table_name')
+        const fromColumn = pickMysqlString(r, 'from_column', 'column_name')
+        const toTable = pickMysqlString(r, 'to_table', 'referenced_table_name')
+        const toColumn = pickMysqlString(r, 'to_column', 'referenced_column_name')
+        if (!fromTable || !fromColumn || !toTable || !toColumn) return null
+        const fromSchema = pickMysqlString(r, 'from_schema', 'table_schema') || targetSchema || 'default'
+        const toSchema = pickMysqlString(r, 'to_schema', 'referenced_table_schema') || fromSchema
+        const ordRaw = pickMysqlField(r, 'ordinal_position')
+        const ord = typeof ordRaw === 'number' ? ordRaw : Number(ordRaw)
+        const onDelete = pickMysqlString(r, 'on_delete', 'delete_rule').toUpperCase()
+        const onUpdate = pickMysqlString(r, 'on_update', 'update_rule').toUpperCase()
+        const constraintName = pickMysqlString(r, 'constraint_name')
+        return {
+          ...(constraintName ? { constraintName } : {}),
+          fromSchema,
+          fromTable,
+          fromColumn,
+          toSchema,
+          toTable,
+          toColumn,
+          ...(Number.isFinite(ord) ? { ordinalPosition: ord } : {}),
+          ...(onDelete ? { onDelete } : {}),
+          ...(onUpdate ? { onUpdate } : {}),
+        }
+      })
+      .filter((item): item is RawErForeignKeyRow => item !== null)
+
+    return buildSchemaErGraphFromCatalogRows({
+      connectionId: this.profile.id,
+      ...(targetSchema ? { schema: targetSchema } : {}),
+      completeness: 'full',
+      tables,
+      columns,
+      uniqueSets,
+      foreignKeys,
+    })
+  }
+
+  async runExplain(sql: string, signal?: AbortSignal): Promise<ExplainResult | null> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    if (signal?.aborted) {
+      throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', this.driverType)
+    }
+
+    const sqlBody = sql.trim().replace(/;+\s*$/, '').trim()
+    if (!sqlBody) {
+      throw new DatabaseDriverError('SQL statement cannot be empty', 'invalid_params', this.driverType)
+    }
+
+    const leading = stripLeadingSqlComments(sqlBody, this.driverType).trim()
+    const isAlreadyExplain = /^EXPLAIN\b/i.test(leading)
+    const guardTarget = isAlreadyExplain ? sqlBody : `EXPLAIN ${sqlBody}`
+
+    if (
+      hasExplainAnalyzeOption(guardTarget, this.driverType) &&
+      isExplainTargetMutating(guardTarget, this.driverType)
+    ) {
+      throw new DatabaseDriverError(
+        'EXPLAIN ANALYZE is not permitted for mutating statements in Explain mode.',
+        'not_permitted',
+        this.driverType
+      )
+    }
+    if (this.profile.readOnly && isMutatingStatement(guardTarget, this.driverType)) {
+      throw new DatabaseDriverError(
+        'Connection is Read-Only. Uncheck Read-Only in connection settings to modify data.',
+        'read_only',
+        this.driverType
+      )
+    }
+
+    const candidates = isAlreadyExplain
+      ? [sqlBody]
+      : [`EXPLAIN FORMAT=JSON ${sqlBody}`, `EXPLAIN ${sqlBody}`]
+
+    const runSingleCandidate = async (candidateSql: string): Promise<QueryResult> => {
+      const queryId = `explain_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+      const onAbort = (): void => {
+        void this.cancelQuery(queryId).catch(() => {})
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      try {
+        const res = await this.runQuery(queryId, candidateSql, 1000)
+        if (signal?.aborted) {
+          throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', this.driverType)
+        }
+        return res
+      } finally {
+        signal?.removeEventListener('abort', onAbort)
+      }
+    }
+
+    let result: QueryResult
+    try {
+      result = await runSingleCandidate(candidates[0])
+    } catch (err: unknown) {
+      if (
+        candidates.length < 2 ||
+        this.isClosed ||
+        signal?.aborted ||
+        isFatalMysqlConnectionError(err) ||
+        (err instanceof DatabaseDriverError &&
+          (err.code === 'cancelled' || err.code === 'SESSION_CLOSED'))
+      ) {
+        throw err
+      }
+      result = await runSingleCandidate(candidates[1])
+    }
+
+    const rawText =
+      result.columns.length <= 1 && result.rows.length > 0
+        ? result.rows.map((r) => (r[0] !== null && r[0] !== undefined ? String(r[0]) : '')).join('\n')
+        : undefined
+    const explainPlan = parseExplainPlan(
+      { columns: result.columns, rows: result.rows },
+      { dialect: this.driverType }
+    )
+
+    return {
+      columns: result.columns,
+      rows: result.rows,
+      ...(rawText !== undefined ? { rawText } : {}),
+      ...(explainPlan.format ? { formatHint: explainPlan.format } : {}),
+      executionTimeMs: result.executionTimeMs,
+      explainPlan,
+    }
   }
 
   async getTableDetails(table: string, schema?: string): Promise<TableDetails> {
@@ -1489,7 +1873,16 @@ export class MysqlDriver implements IDatabaseDriver {
     const effectiveHost = useTunnelStream ? remoteServername : tunnelHost
     const tunnelStreamFactory = useTunnelStream
       ? (): net.Socket => net.connect({ host: tunnelHost, port: tunnelPort })
-      : undefined
+      : (): net.Socket => {
+          const sock = net.connect({
+            host: tunnelHost,
+            port: tunnelPort,
+            autoSelectFamily: true,
+            autoSelectFamilyAttemptTimeout: 250,
+          })
+          sock.setNoDelay(true)
+          return sock
+        }
     const tlsOverride = await resolveEffectiveTlsOptions(
       profile,
       extraSecrets,
@@ -1540,7 +1933,7 @@ export class MysqlDriver implements IDatabaseDriver {
       password,
       connectTimeout: 5000,
       ssl: sslConfig,
-      ...(tunnelStreamFactory ? { stream: tunnelStreamFactory } : {}),
+      stream: tunnelStreamFactory,
     } as ConnectionOptions
 
     const options = {
@@ -1558,7 +1951,7 @@ export class MysqlDriver implements IDatabaseDriver {
       dateStrings: true,
       flags: ['+FOUND_ROWS'],
       ssl: sslConfig,
-      ...(tunnelStreamFactory ? { stream: tunnelStreamFactory } : {}),
+      stream: tunnelStreamFactory,
     } as PoolOptions
 
     const verifyIpIdentity =

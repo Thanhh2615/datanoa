@@ -40,7 +40,7 @@ export const EDITOR_GRID_STYLE = `
     padding: 0 2px;
   }
 
-  /* DataGrip Grid Filter Toolbar */
+  /* Studio Grid Filter Toolbar */
   .datanoa-grid-toolbar {
     display: flex;
     align-items: center;
@@ -48,7 +48,7 @@ export const EDITOR_GRID_STYLE = `
     gap: 5px;
     padding: 4px 10px;
     border-bottom: 1px solid var(--border);
-    background: var(--card);
+    background: var(--surface);
     flex-shrink: 0;
   }
 
@@ -139,6 +139,7 @@ export const EDITOR_GRID_STYLE = `
     position: relative;
     background: var(--bg);
     min-height: 0;
+    contain: layout style paint;
   }
 
   /* Virtualized Data Grid */
@@ -147,6 +148,7 @@ export const EDITOR_GRID_STYLE = `
     height: 100%;
     overflow: auto;
     position: relative;
+    contain: strict;
   }
 
   .datanoa-grid-container:focus-visible {
@@ -179,6 +181,13 @@ export const EDITOR_GRID_STYLE = `
   }
 
   .datanoa-grid-table.transposed {
+    width: auto;
+    min-width: 0;
+    table-layout: fixed;
+  }
+
+  .datanoa-grid-table.transposed.datanoa-grid-empty-table {
+    width: 100%;
     min-width: 100%;
     table-layout: auto;
   }
@@ -359,12 +368,48 @@ export const EDITOR_GRID_STYLE = `
   .datanoa-th-row-label {
     position: sticky;
     left: 0;
-    z-index: 5;
-    background: var(--card);
+    z-index: 6;
+    background: var(--surface);
     color: var(--text);
+    font-weight: 500;
+    border-right: 2px solid var(--border-strong);
+  }
+
+  .datanoa-th.datanoa-th-row-label {
+    z-index: 16;
+    background: var(--card);
     font-weight: 600;
-    min-width: 160px;
-    max-width: 240px;
+    cursor: default;
+  }
+
+  .datanoa-grid-table.transposed .datanoa-tr:hover .datanoa-td.datanoa-th-row-label {
+    background: color-mix(in srgb, var(--text) 6%, var(--surface));
+  }
+
+  .datanoa-transpose-field-name {
+    color: var(--text);
+    font-weight: 500;
+  }
+
+  .datanoa-transpose-pk {
+    color: var(--info);
+    font-size: 10px;
+    font-weight: 600;
+  }
+
+  .datanoa-transpose-type {
+    color: var(--muted-dim);
+    font-size: 11px;
+    font-weight: 400;
+  }
+
+  .datanoa-grid-table.transposed .datanoa-th-transpose-row {
+    cursor: default;
+  }
+
+  .datanoa-grid-table.transposed .datanoa-th-transpose-row:hover {
+    color: var(--text);
+    background: var(--raised);
   }
 
   .datanoa-th-sort-icon {
@@ -406,6 +451,21 @@ export const EDITOR_GRID_STYLE = `
   .datanoa-resize-handle:hover::after,
   .datanoa-resize-handle.resizing::after {
     background: var(--accent-ring);
+  }
+
+  .datanoa-resize-guide {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 2px;
+    background: var(--accent-ring);
+    pointer-events: none;
+    z-index: 9999;
+    will-change: transform;
+  }
+
+  .datanoa-grid-container.datanoa-grid-resizing tbody {
+    pointer-events: none;
   }
 
   .datanoa-tr {
@@ -454,13 +514,24 @@ export const EDITOR_GRID_STYLE = `
     user-select: none;
     cursor: default;
     box-sizing: border-box;
-    position: relative;
+    contain: style;
+  }
+
+  .datanoa-td.datanoa-h-spacer {
+    padding: 0;
+    border-right: none;
+    background: transparent;
+    pointer-events: none;
   }
 
   .datanoa-td.datanoa-cell-selected {
     outline: 1px solid var(--sel-focus);
     outline-offset: -1px;
     z-index: 2;
+  }
+
+  .datanoa-td.datanoa-cell-selected:not(.datanoa-col-pinned):not(.datanoa-th-row-label):not(.datanoa-td-rownum) {
+    position: relative;
   }
 
   .datanoa-td.datanoa-cell-in-range {
@@ -603,6 +674,12 @@ export const EDITOR_GRID_STYLE = `
   /* Foreign Key Jump Badge inside FK cells */
   .datanoa-td.datanoa-td-has-fk {
     padding-right: 24px;
+  }
+
+  .datanoa-td.datanoa-td-has-fk:not(.datanoa-col-pinned):not(.datanoa-th-row-label):not(.datanoa-td-rownum),
+  .datanoa-td.datanoa-cell-match-active:not(.datanoa-col-pinned):not(.datanoa-th-row-label):not(.datanoa-td-rownum),
+  .datanoa-td.editing:not(.datanoa-col-pinned):not(.datanoa-th-row-label):not(.datanoa-td-rownum) {
+    position: relative;
   }
 
   .datanoa-fk-badge {
@@ -794,6 +871,15 @@ export const EDITOR_GRID_STYLE = `
     background: var(--border-strong);
     transform-origin: center;
     transition: background-color 140ms ease, transform 140ms ease;
+  }
+
+  .datanoa-value-inspector-resizer::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: -3px;
+    bottom: -3px;
   }
 
   .datanoa-value-inspector-resizer:hover::before,
@@ -1029,6 +1115,7 @@ export const EDITOR_GRID_STYLE = `
     display: flex;
     flex-direction: column;
     gap: 2px;
+    contain: layout style;
   }
 
   .datanoa-cols-popover-row {
@@ -1239,5 +1326,133 @@ export const EDITOR_GRID_STYLE = `
       flex: 0 0 115px;
       min-width: 95px;
     }
+  }
+
+  /* Cell Wrapping, Header Drag-Reorder & Conditional Highlighting (v1.3.0) */
+  .datanoa-tr-wrap .datanoa-td,
+  .datanoa-td.datanoa-cell-wrap {
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 16px;
+    vertical-align: top;
+    overflow: hidden;
+  }
+
+  .datanoa-th-drop-target {
+    box-shadow: inset 3px 0 0 var(--accent, var(--orca-primary, #38bdf8));
+  }
+
+  /* Row-level conditional highlights exclude cells with cell-level highlights so cell > row */
+  .datanoa-tr.datanoa-hl-info > .datanoa-td:not(.datanoa-cell-selected):not(.datanoa-cell-in-range):not(.datanoa-hl-cell):not(.datanoa-hl-info):not(.datanoa-hl-ok):not(.datanoa-hl-warn):not(.datanoa-hl-danger):not(.datanoa-hl-accent) {
+    background: color-mix(in srgb, var(--info, #3b82f6) 14%, transparent);
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-tr.datanoa-hl-ok > .datanoa-td:not(.datanoa-cell-selected):not(.datanoa-cell-in-range):not(.datanoa-hl-cell):not(.datanoa-hl-info):not(.datanoa-hl-ok):not(.datanoa-hl-warn):not(.datanoa-hl-danger):not(.datanoa-hl-accent) {
+    background: color-mix(in srgb, var(--ok, #22c55e) 15%, transparent);
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-tr.datanoa-hl-warn > .datanoa-td:not(.datanoa-cell-selected):not(.datanoa-cell-in-range):not(.datanoa-hl-cell):not(.datanoa-hl-info):not(.datanoa-hl-ok):not(.datanoa-hl-warn):not(.datanoa-hl-danger):not(.datanoa-hl-accent) {
+    background: color-mix(in srgb, var(--warn, #f59e0b) 16%, transparent);
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-tr.datanoa-hl-danger > .datanoa-td:not(.datanoa-cell-selected):not(.datanoa-cell-in-range):not(.datanoa-hl-cell):not(.datanoa-hl-info):not(.datanoa-hl-ok):not(.datanoa-hl-warn):not(.datanoa-hl-danger):not(.datanoa-hl-accent) {
+    background: color-mix(in srgb, var(--danger, var(--orca-destructive, #ef4444)) 16%, transparent);
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-tr.datanoa-hl-accent > .datanoa-td:not(.datanoa-cell-selected):not(.datanoa-cell-in-range):not(.datanoa-hl-cell):not(.datanoa-hl-info):not(.datanoa-hl-ok):not(.datanoa-hl-warn):not(.datanoa-hl-danger):not(.datanoa-hl-accent) {
+    background: color-mix(in srgb, var(--accent-ring, var(--orca-primary, #8b5cf6)) 18%, transparent);
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  /* Cell-level conditional highlights override row-level highlights in both Dark & Light themes */
+  .datanoa-tr > .datanoa-td.datanoa-hl-info:not(.datanoa-cell-selected):not(.datanoa-cell-in-range),
+  .datanoa-td.datanoa-hl-cell.datanoa-hl-info:not(.datanoa-cell-selected):not(.datanoa-cell-in-range),
+  .datanoa-td.datanoa-hl-info:not(.datanoa-cell-selected):not(.datanoa-cell-in-range) {
+    background: color-mix(in srgb, var(--info, #3b82f6) 14%, transparent);
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-tr > .datanoa-td.datanoa-hl-ok:not(.datanoa-cell-selected):not(.datanoa-cell-in-range),
+  .datanoa-td.datanoa-hl-cell.datanoa-hl-ok:not(.datanoa-cell-selected):not(.datanoa-cell-in-range),
+  .datanoa-td.datanoa-hl-ok:not(.datanoa-cell-selected):not(.datanoa-cell-in-range) {
+    background: color-mix(in srgb, var(--ok, #22c55e) 15%, transparent);
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-tr > .datanoa-td.datanoa-hl-warn:not(.datanoa-cell-selected):not(.datanoa-cell-in-range),
+  .datanoa-td.datanoa-hl-cell.datanoa-hl-warn:not(.datanoa-cell-selected):not(.datanoa-cell-in-range),
+  .datanoa-td.datanoa-hl-warn:not(.datanoa-cell-selected):not(.datanoa-cell-in-range) {
+    background: color-mix(in srgb, var(--warn, #f59e0b) 16%, transparent);
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-tr > .datanoa-td.datanoa-hl-danger:not(.datanoa-cell-selected):not(.datanoa-cell-in-range),
+  .datanoa-td.datanoa-hl-cell.datanoa-hl-danger:not(.datanoa-cell-selected):not(.datanoa-cell-in-range),
+  .datanoa-td.datanoa-hl-danger:not(.datanoa-cell-selected):not(.datanoa-cell-in-range) {
+    background: color-mix(in srgb, var(--danger, var(--orca-destructive, #ef4444)) 16%, transparent);
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-tr > .datanoa-td.datanoa-hl-accent:not(.datanoa-cell-selected):not(.datanoa-cell-in-range),
+  .datanoa-td.datanoa-hl-cell.datanoa-hl-accent:not(.datanoa-cell-selected):not(.datanoa-cell-in-range),
+  .datanoa-td.datanoa-hl-accent:not(.datanoa-cell-selected):not(.datanoa-cell-in-range) {
+    background: color-mix(in srgb, var(--accent-ring, var(--orca-primary, #8b5cf6)) 18%, transparent);
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-cols-grip {
+    color: var(--muted-dim, #8c8c8c);
+    cursor: grab;
+    font-size: 11px;
+    letter-spacing: -1px;
+    user-select: none;
+  }
+
+  .datanoa-cols-row-drop-target {
+    border-top: 2px solid var(--accent-ring, var(--orca-primary, #38bdf8));
+  }
+
+  .datanoa-cols-popover-section {
+    border-top: 1px solid var(--border, var(--orca-border, #2a2a2a));
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-cols-wrap-label,
+  .datanoa-cols-wrap-lines,
+  .datanoa-cols-hl-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+  }
+
+  .datanoa-cols-lines-input {
+    width: 54px;
+    height: 22px;
+    padding: 0 6px;
+  }
+
+  .datanoa-cols-hl-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 140px;
+    overflow: auto;
+  }
+
+  .datanoa-cols-hl-row {
+    display: grid;
+    grid-template-columns: 1fr 74px 1fr 56px 66px 24px;
+    gap: 4px;
+    align-items: center;
   }
 `

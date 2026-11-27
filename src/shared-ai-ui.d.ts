@@ -10,6 +10,7 @@ import type {
   AiStatusState,
   ConnectionAiPolicy,
   ConnectionColorTag,
+  ParsedExplainPlan,
 } from './protocol.js'
 
 export type AiStatusBadgeTone = 'neutral' | 'success' | 'warn' | 'danger'
@@ -70,6 +71,13 @@ export function getAiPanelMaxHeight(
   edge?: AiPanelResizeEdge
 ): number
 
+export interface ExplainAnalyzeTriggerOptions {
+  confirmed?: boolean
+  activeSchema?: string
+}
+
+export type ExplainPlanViewMode = 'visual' | 'raw' | 'ai'
+
 export interface ExplainAiPanelState {
   phase: 'hidden' | 'idle' | 'loading' | 'ready' | 'error'
   aiEnabled: boolean
@@ -80,14 +88,19 @@ export interface ExplainAiPanelState {
   host?: string
   colorTag?: ConnectionColorTag
   aiPolicy?: ConnectionAiPolicy
+  activeSchema?: string
+  explainPlan?: ParsedExplainPlan | null
+  rawPlanText?: string | null
+  explainViewMode?: ExplainPlanViewMode
   result?: AiExplainAnalysisResult | null
   error?: string | null
   collapsed?: boolean
 }
 
 export interface ExplainAiPanelCallbacks {
-  onAnalyze: () => void
+  onAnalyze: (options?: ExplainAnalyzeTriggerOptions) => void
   onChangeExplainLanguage?: (lang: AiExplainLanguage) => void
+  onExplainViewChange?: (view: ExplainPlanViewMode) => void
   onConfigureAi: () => void
   onCancel: () => void
   onApplySql: (sql: string) => void
@@ -98,14 +111,22 @@ export interface ExplainAiPanelCallbacks {
   onResize?: () => void
 }
 
+export function resolveEffectiveExplainAiPolicy(
+  state: Pick<ExplainAiPanelState, 'aiPolicy' | 'colorTag'> | null | undefined
+): ConnectionAiPolicy
+
 export function renderSharedExplainAiPanel(
   container: HTMLElement | null,
   state: ExplainAiPanelState,
   callbacks: ExplainAiPanelCallbacks
 ): void
 
+export interface AiFixTriggerOptions {
+  confirmed?: boolean
+}
+
 export interface AiFixPanelState {
-  phase: 'hidden' | 'loading' | 'ready' | 'error'
+  phase: 'hidden' | 'idle' | 'loading' | 'ready' | 'error'
   aiEnabled: boolean
   aiReady: boolean
   dialect?: string
@@ -113,6 +134,7 @@ export interface AiFixPanelState {
   host?: string
   colorTag?: ConnectionColorTag
   aiPolicy?: ConnectionAiPolicy
+  pendingConfirm?: boolean
   result?: AiFixQueryResult | null
   error?: string | null
 }
@@ -120,7 +142,8 @@ export interface AiFixPanelState {
 export interface AiFixPanelCallbacks {
   onReplaceQuery: (sql: string) => void
   onCopySql: (sql: string) => void
-  onRetry: () => void
+  onFixQuery?: (options?: AiFixTriggerOptions) => void
+  onRetry: (options?: AiFixTriggerOptions) => void
   onCancel: () => void
   onDismiss: () => void
   onConfigureAi: () => void

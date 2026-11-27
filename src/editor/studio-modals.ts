@@ -14,6 +14,7 @@ import type {
   QueryResult,
   SchemaObject,
   SchemaObjectKind,
+  StudioViewMode,
 } from '../protocol.js'
 import { fuzzyMatchScore, setButtonLoading } from './db-icons.js'
 import { DEFAULT_RPC_TIMEOUT_MS } from '../shared-constants.js'
@@ -90,7 +91,7 @@ export interface StudioCommandPaletteContext extends StudioModalMountContext {
   openExportSchemaDdl?: () => void
   openDriverManagerModal?: () => void
   setSidebarCollapsed: (collapsed: boolean, persist?: boolean) => void
-  switchMode: (mode: 'split' | 'grid' | 'sql' | 'inspector') => void
+  switchMode: (mode: StudioViewMode) => void
   toggleQueryHistory: () => Promise<void>
   handleRefreshAction: () => Promise<void>
   openShortcutsModal: () => void
@@ -762,6 +763,12 @@ export function openStudioCommandPalette(ctx: StudioCommandPaletteContext): void
       category: 'Command',
       searchText: 'view mode schema inspector structure',
       run: () => ctx.switchMode('inspector'),
+    },
+    {
+      label: 'Switch View Mode: ER Diagram',
+      category: 'Command',
+      searchText: 'view mode er diagram entity relationship schema graph',
+      run: () => ctx.switchMode('er'),
     },
     {
       label: 'Toggle Query History',

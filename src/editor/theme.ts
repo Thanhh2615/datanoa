@@ -23,11 +23,11 @@ export const EDITOR_BASE_STYLE = `
     --text: var(--orca-foreground, #e6e6e6);
     --muted: var(--orca-muted-foreground, color-mix(in srgb, var(--text) 68%, var(--bg)));
     --muted-dim: color-mix(in srgb, var(--muted) 78%, var(--bg));
-    --surface: color-mix(in srgb, var(--text) 3.5%, var(--bg));
-    --card: color-mix(in srgb, var(--text) 6%, var(--bg));
-    --raised: color-mix(in srgb, var(--text) 9%, var(--bg));
+    --surface: color-mix(in srgb, var(--text) 2%, var(--bg));
+    --card: color-mix(in srgb, var(--text) 4.5%, var(--bg));
+    --raised: color-mix(in srgb, var(--text) 7.5%, var(--bg));
     --popover: var(--orca-popover, color-mix(in srgb, var(--text) 8%, var(--bg)));
-    --hover: color-mix(in srgb, var(--text) 7%, var(--bg));
+    --hover: color-mix(in srgb, var(--text) 5.5%, var(--bg));
     --border: var(--orca-border, color-mix(in srgb, var(--text) 12%, var(--bg)));
     --border-strong: color-mix(in srgb, var(--text) 20%, var(--bg));
     --input-bg: color-mix(in srgb, var(--bg) 82%, var(--surface));
@@ -42,15 +42,17 @@ export const EDITOR_BASE_STYLE = `
     --ok: #4ade80;
     --warn: #fbbf24;
     --info: #38bdf8;
-    --connect-fg: #38bdf8;
-    --connect-fg-hover: #7dd3fc;
+    --connect-fg: #4cc38a;
+    --connect-fg-hover: #74dfa8;
     --sel-fill: color-mix(in srgb, var(--accent-ring) 12%, transparent);
     --sel-edge: color-mix(in srgb, var(--accent-ring) 55%, transparent);
     --sel-focus: color-mix(in srgb, var(--accent-ring) 78%, transparent);
-    --btn-bg: color-mix(in srgb, var(--text) 6.5%, var(--bg));
-    --btn-border: color-mix(in srgb, var(--text) 16%, var(--bg));
-    --btn-hover-bg: color-mix(in srgb, var(--text) 11%, var(--bg));
-    --btn-hover-border: color-mix(in srgb, var(--text) 26%, var(--bg));
+    --btn-bg: var(--orca-secondary, color-mix(in srgb, var(--text) 6.5%, var(--bg)));
+    --btn-fg: var(--orca-secondary-foreground, var(--text));
+    --btn-border: var(--orca-input, color-mix(in srgb, var(--text) 16%, var(--bg)));
+    --btn-hover-bg: var(--orca-accent, color-mix(in srgb, var(--text) 11%, var(--bg)));
+    --btn-hover-fg: var(--orca-accent-foreground, var(--text));
+    --btn-hover-border: color-mix(in srgb, var(--accent-ring) 38%, var(--btn-border));
     --btn-disabled-bg: color-mix(in srgb, var(--text) 2.5%, var(--bg));
     --btn-disabled-border: color-mix(in srgb, var(--text) 9%, var(--bg));
     --btn-disabled-fg: color-mix(in srgb, var(--text) 36%, var(--bg));
@@ -111,11 +113,11 @@ export const EDITOR_BASE_STYLE = `
     --text: var(--orca-foreground, #0f172a);
     --muted: var(--orca-muted-foreground, color-mix(in srgb, var(--text) 66%, var(--bg)));
     --muted-dim: color-mix(in srgb, var(--muted) 78%, var(--bg));
-    --surface: color-mix(in srgb, var(--text) 3.5%, var(--bg));
-    --card: color-mix(in srgb, var(--text) 6%, var(--bg));
-    --raised: color-mix(in srgb, var(--text) 9%, var(--bg));
+    --surface: color-mix(in srgb, var(--text) 2%, var(--bg));
+    --card: color-mix(in srgb, var(--text) 4.5%, var(--bg));
+    --raised: color-mix(in srgb, var(--text) 7.5%, var(--bg));
     --popover: var(--orca-popover, color-mix(in srgb, var(--text) 4%, var(--bg)));
-    --hover: color-mix(in srgb, var(--text) 7%, var(--bg));
+    --hover: color-mix(in srgb, var(--text) 5.5%, var(--bg));
     --border: var(--orca-border, color-mix(in srgb, var(--text) 14%, var(--bg)));
     --border-strong: color-mix(in srgb, var(--text) 24%, var(--bg));
     --input-bg: var(--bg);
@@ -130,15 +132,17 @@ export const EDITOR_BASE_STYLE = `
     --ok: #15803d;
     --warn: #b45309;
     --info: #0369a1;
-    --connect-fg: #0369a1;
-    --connect-fg-hover: #075985;
+    --connect-fg: #166534;
+    --connect-fg-hover: #14532d;
     --sel-fill: color-mix(in srgb, var(--accent-ring) 10%, transparent);
     --sel-edge: color-mix(in srgb, var(--accent-ring) 55%, transparent);
     --sel-focus: color-mix(in srgb, var(--accent-ring) 78%, transparent);
-    --btn-bg: color-mix(in srgb, var(--text) 5%, var(--bg));
-    --btn-border: color-mix(in srgb, var(--text) 18%, var(--bg));
-    --btn-hover-bg: color-mix(in srgb, var(--text) 9%, var(--bg));
-    --btn-hover-border: color-mix(in srgb, var(--text) 28%, var(--bg));
+    --btn-bg: var(--orca-secondary, color-mix(in srgb, var(--text) 5%, var(--bg)));
+    --btn-fg: var(--orca-secondary-foreground, var(--text));
+    --btn-border: var(--orca-input, color-mix(in srgb, var(--text) 18%, var(--bg)));
+    --btn-hover-bg: color-mix(in srgb, var(--orca-accent, color-mix(in srgb, var(--text) 9%, var(--bg))) 94%, var(--text));
+    --btn-hover-fg: var(--orca-accent-foreground, var(--text));
+    --btn-hover-border: color-mix(in srgb, var(--accent-ring) 38%, var(--btn-border));
     --btn-disabled-bg: color-mix(in srgb, var(--text) 3%, var(--bg));
     --btn-disabled-border: color-mix(in srgb, var(--text) 10%, var(--bg));
     --btn-disabled-fg: color-mix(in srgb, var(--text) 40%, var(--bg));
@@ -190,7 +194,8 @@ export const EDITOR_BASE_STYLE = `
   }
 
   /* Explicit Command Palette theme override stays legible even when host --orca-* tokens use the opposite scheme */
-  html[data-theme-override="light"] {
+  html[data-theme-override="light"],
+  html[data-theme-override="light"] body {
     --bg: #ffffff;
     --text: #0f172a;
     --muted: #475569;
@@ -198,11 +203,21 @@ export const EDITOR_BASE_STYLE = `
     --border: rgba(15, 23, 42, 0.14);
     --primary: #0f172a;
     --primary-fg: #ffffff;
+    --accent: var(--hover);
+    --accent-ring: var(--primary);
+    --btn-bg: color-mix(in srgb, var(--text) 5%, var(--bg));
+    --btn-fg: var(--text);
+    --btn-border: color-mix(in srgb, var(--text) 18%, var(--bg));
+    --btn-hover-bg: color-mix(in srgb, var(--text) 9%, var(--bg));
+    --btn-hover-fg: var(--text);
+    --btn-hover-border: color-mix(in srgb, var(--text) 28%, var(--bg));
     --danger: #b91c1c;
     --danger-fg: #ffffff;
+    color-scheme: light;
   }
 
-  html[data-theme-override="dark"] {
+  html[data-theme-override="dark"],
+  html[data-theme-override="dark"] body {
     --bg: #0b0d10;
     --text: #e6e6e6;
     --muted: #9aa4b2;
@@ -210,8 +225,17 @@ export const EDITOR_BASE_STYLE = `
     --border: rgba(230, 230, 230, 0.12);
     --primary: #e6e6e6;
     --primary-fg: #0b0d10;
+    --accent: var(--hover);
+    --accent-ring: var(--primary);
+    --btn-bg: color-mix(in srgb, var(--text) 6.5%, var(--bg));
+    --btn-fg: var(--text);
+    --btn-border: color-mix(in srgb, var(--text) 16%, var(--bg));
+    --btn-hover-bg: color-mix(in srgb, var(--text) 11%, var(--bg));
+    --btn-hover-fg: var(--text);
+    --btn-hover-border: color-mix(in srgb, var(--text) 26%, var(--bg));
     --danger: #f87171;
     --danger-fg: #1a0606;
+    color-scheme: dark;
   }
 
   .db-svg {
@@ -305,7 +329,7 @@ export const EDITOR_BASE_STYLE = `
     min-height: 40px;
     padding: 5px 10px;
     border-bottom: 1px solid var(--border);
-    background: var(--surface);
+    background: var(--bg);
     flex-shrink: 0;
   }
 
@@ -428,7 +452,7 @@ export const EDITOR_BASE_STYLE = `
     border-radius: var(--radius-control);
     border: 1px solid var(--btn-border);
     background: var(--btn-bg);
-    color: var(--text);
+    color: var(--btn-fg);
     cursor: pointer;
     display: inline-flex;
     align-items: center;
@@ -442,6 +466,7 @@ export const EDITOR_BASE_STYLE = `
   .datanoa-btn:hover:not(:disabled) {
     background: var(--btn-hover-bg);
     border-color: var(--btn-hover-border);
+    color: var(--btn-hover-fg);
   }
 
   .datanoa-btn:disabled {
@@ -649,7 +674,7 @@ export const EDITOR_BASE_STYLE = `
   }
 
   .datanoa-conn-cluster .datanoa-custom-select-trigger {
-    max-width: 245px;
+    max-width: 300px;
   }
 
   .datanoa-conn-field .datanoa-custom-select-trigger {
@@ -681,6 +706,14 @@ export const EDITOR_BASE_STYLE = `
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .datanoa-custom-select-trigger-badges {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    margin-left: 2px;
   }
 
   .datanoa-custom-select-chev {
@@ -746,10 +779,11 @@ export const EDITOR_BASE_STYLE = `
     overflow-x: hidden;
     min-height: 0;
     flex: 1 1 auto;
-    padding-right: 2px;
+    padding: 4px 2px 4px 0;
   }
 
   .datanoa-custom-select-folder-head {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -765,7 +799,7 @@ export const EDITOR_BASE_STYLE = `
     font-weight: 600;
     cursor: pointer;
     text-align: left;
-    transition: background 140ms cubic-bezier(0.22, 1, 0.36, 1), color 140ms cubic-bezier(0.22, 1, 0.36, 1);
+    transition: background 140ms cubic-bezier(0.22, 1, 0.36, 1), color 140ms cubic-bezier(0.22, 1, 0.36, 1), opacity 140ms cubic-bezier(0.22, 1, 0.36, 1);
   }
 
   .datanoa-custom-select-folder-head:first-child {
@@ -808,6 +842,7 @@ export const EDITOR_BASE_STYLE = `
   }
 
   .datanoa-custom-select-item {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -822,11 +857,11 @@ export const EDITOR_BASE_STYLE = `
     cursor: pointer;
     text-align: left;
     min-width: 0;
-    transition: background 140ms cubic-bezier(0.22, 1, 0.36, 1), border-color 140ms cubic-bezier(0.22, 1, 0.36, 1);
+    transition: background 140ms cubic-bezier(0.22, 1, 0.36, 1), border-color 140ms cubic-bezier(0.22, 1, 0.36, 1), opacity 140ms cubic-bezier(0.22, 1, 0.36, 1);
   }
 
   .datanoa-custom-select-item.is-indented {
-    padding-left: 24px;
+    padding-left: 20px;
   }
 
   .datanoa-custom-select-item:hover:not(:disabled) {
@@ -837,6 +872,69 @@ export const EDITOR_BASE_STYLE = `
     background: var(--raised);
     border-color: var(--border-strong);
     font-weight: 600;
+  }
+
+  .datanoa-custom-select-drag-handle,
+  .datanoa-custom-select-drag-spacer {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 12px;
+    height: 16px;
+    margin-left: -2px;
+    flex-shrink: 0;
+  }
+
+  .datanoa-custom-select-drag-handle {
+    color: var(--muted-dim);
+    opacity: 0.34;
+    cursor: grab;
+    transition: opacity 140ms cubic-bezier(0.22, 1, 0.36, 1), color 140ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .datanoa-custom-select-item:hover .datanoa-custom-select-drag-handle,
+  .datanoa-custom-select-item:focus-visible .datanoa-custom-select-drag-handle,
+  .datanoa-custom-select-folder-head:hover .datanoa-custom-select-drag-handle,
+  .datanoa-custom-select-folder-head:focus-visible .datanoa-custom-select-drag-handle,
+  .datanoa-custom-select-item.is-dragging .datanoa-custom-select-drag-handle,
+  .datanoa-custom-select-folder-head.is-dragging .datanoa-custom-select-drag-handle {
+    opacity: 0.9;
+    color: var(--muted);
+  }
+
+  .datanoa-custom-select-item.is-dragging,
+  .datanoa-custom-select-folder-head.is-dragging {
+    opacity: 0.48;
+  }
+
+  .datanoa-custom-select-item.is-dragging .datanoa-custom-select-drag-handle,
+  .datanoa-custom-select-folder-head.is-dragging .datanoa-custom-select-drag-handle {
+    cursor: grabbing;
+  }
+
+  .datanoa-custom-select-item.is-drop-before::before,
+  .datanoa-custom-select-item.is-drop-after::after,
+  .datanoa-custom-select-folder-head.is-drop-before::before,
+  .datanoa-custom-select-folder-head.is-drop-after::after {
+    content: '';
+    position: absolute;
+    left: 4px;
+    right: 4px;
+    height: 2px;
+    border-radius: 2px;
+    background: var(--accent-ring);
+    pointer-events: none;
+    z-index: 4;
+  }
+
+  .datanoa-custom-select-item.is-drop-before::before,
+  .datanoa-custom-select-folder-head.is-drop-before::before {
+    top: -3px;
+  }
+
+  .datanoa-custom-select-item.is-drop-after::after,
+  .datanoa-custom-select-folder-head.is-drop-after::after {
+    bottom: -3px;
   }
 
   .datanoa-custom-select-item-icon {
@@ -850,7 +948,7 @@ export const EDITOR_BASE_STYLE = `
   .datanoa-custom-select-item-text {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: 2px;
     flex: 1 1 auto;
     min-width: 0;
   }
@@ -870,6 +968,95 @@ export const EDITOR_BASE_STYLE = `
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .datanoa-custom-select-item-badges {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+
+  .datanoa-cs-badge {
+    display: inline-flex;
+    align-items: center;
+    height: 18px;
+    padding: 0 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--raised);
+    color: var(--muted);
+    font-family: var(--mono-font);
+    font-size: 11px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .datanoa-custom-select-trigger-badges .datanoa-cs-badge {
+    height: 18px;
+    padding: 0 4px;
+  }
+
+  .datanoa-cs-badge.is-neutral {
+    background: var(--raised);
+    color: var(--muted);
+    border-color: var(--border);
+  }
+
+  .datanoa-cs-badge.is-dev,
+  .datanoa-cs-badge.is-info {
+    background: color-mix(in srgb, var(--info) 12%, var(--bg));
+    color: var(--info);
+    border-color: color-mix(in srgb, var(--info) 38%, var(--border));
+  }
+
+  .datanoa-cs-badge.is-staging,
+  .datanoa-cs-badge.is-warn {
+    background: color-mix(in srgb, var(--warn) 12%, var(--bg));
+    color: var(--warn);
+    border-color: color-mix(in srgb, var(--warn) 38%, var(--border));
+  }
+
+  .datanoa-cs-badge.is-prod {
+    background: color-mix(in srgb, var(--danger) 14%, var(--bg));
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 42%, var(--border));
+  }
+
+  html.light .datanoa-cs-badge.is-neutral,
+  body.light .datanoa-cs-badge.is-neutral {
+    background: var(--surface);
+    color: var(--muted);
+    border-color: var(--border);
+  }
+
+  html.light .datanoa-cs-badge.is-dev,
+  body.light .datanoa-cs-badge.is-dev,
+  html.light .datanoa-cs-badge.is-info,
+  body.light .datanoa-cs-badge.is-info {
+    background: color-mix(in srgb, var(--info) 10%, var(--bg));
+    color: color-mix(in srgb, var(--info) 85%, var(--text));
+    border-color: color-mix(in srgb, var(--info) 36%, var(--border));
+  }
+
+  html.light .datanoa-cs-badge.is-staging,
+  body.light .datanoa-cs-badge.is-staging,
+  html.light .datanoa-cs-badge.is-warn,
+  body.light .datanoa-cs-badge.is-warn {
+    background: color-mix(in srgb, var(--warn) 10%, var(--bg));
+    color: color-mix(in srgb, var(--warn) 82%, var(--text));
+    border-color: color-mix(in srgb, var(--warn) 34%, var(--border));
+  }
+
+  html.light .datanoa-cs-badge.is-prod,
+  body.light .datanoa-cs-badge.is-prod {
+    background: color-mix(in srgb, var(--danger) 10%, var(--bg));
+    color: color-mix(in srgb, var(--danger) 85%, var(--text));
+    border-color: color-mix(in srgb, var(--danger) 36%, var(--border));
   }
 
   .datanoa-custom-select-item-check {
@@ -894,7 +1081,7 @@ export const EDITOR_BASE_STYLE = `
     margin-left: auto;
     padding: 2px;
     border-radius: var(--radius-control);
-    background: var(--bg);
+    background: var(--surface);
     border: 1px solid var(--border);
   }
 
@@ -1023,6 +1210,27 @@ export const EDITOR_BASE_STYLE = `
 
   .datanoa-table-topbar.visible {
     display: flex;
+  }
+
+  .datanoa-topbar-schema-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+
+  .datanoa-topbar-schema-icon {
+    color: var(--muted);
+    flex-shrink: 0;
+    display: block;
+  }
+
+  .datanoa-table-topbar .datanoa-topbar-schema-select {
+    flex: 0 1 auto;
+    height: 24px;
+    min-width: 76px;
+    max-width: 150px;
+    font-size: 12px;
   }
 
   .datanoa-topbar-filter-wrap {
@@ -1728,16 +1936,30 @@ export const EDITOR_BASE_STYLE = `
     overflow: hidden;
     position: relative;
     background: var(--bg);
+    contain: style;
   }
 
   .datanoa-split-resizer {
-    height: 5px;
+    height: 6px;
     flex-shrink: 0;
     cursor: row-resize;
-    background: var(--border);
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
     position: relative;
-    transition: background 0.15s ease;
+    z-index: 4;
+    touch-action: none;
+    transition: background-color 140ms ease, border-color 140ms ease;
     user-select: none;
+  }
+
+  .datanoa-split-resizer::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: -4px;
+    bottom: -4px;
   }
 
   .datanoa-split-resizer::after {
@@ -1746,22 +1968,57 @@ export const EDITOR_BASE_STYLE = `
     left: 50%;
     top: 50%;
     transform: translate(-50%, -50%);
-    width: 32px;
+    width: 36px;
     height: 2px;
-    border-radius: 1px;
-    background: var(--muted-dim);
-    opacity: 0.7;
+    border-radius: 2px;
+    background: var(--border-strong);
+    transition: background-color 140ms ease, transform 140ms ease;
   }
 
   .datanoa-split-resizer:hover,
+  .datanoa-split-resizer:focus-visible,
   .datanoa-split-resizer.resizing {
-    background: var(--accent-ring);
+    background: color-mix(in srgb, var(--accent-ring) 14%, var(--surface));
+    border-color: color-mix(in srgb, var(--accent-ring) 45%, var(--border));
   }
 
   .datanoa-split-resizer:hover::after,
+  .datanoa-split-resizer:focus-visible::after,
   .datanoa-split-resizer.resizing::after {
-    background: var(--primary-fg);
-    opacity: 1;
+    background: var(--accent-ring);
+    transform: translate(-50%, -50%) scaleX(1.35);
+  }
+
+  .datanoa-split-resizer.resizing,
+  .datanoa-split-resizer.resizing::after {
+    transition: none;
+  }
+
+  .datanoa-split-resizer:focus-visible {
+    outline: 1px solid var(--accent-ring);
+    outline-offset: -1px;
+  }
+
+  .datanoa-main-view.datanoa-split-resizing .datanoa-sql-area,
+  .datanoa-main-view.datanoa-split-resizing .datanoa-sql-toolbar,
+  .datanoa-main-view.datanoa-split-resizing .datanoa-console-tabs,
+  .datanoa-main-view.datanoa-split-resizing .datanoa-result-sets-bar,
+  .datanoa-main-view.datanoa-split-resizing .datanoa-grid-area,
+  .datanoa-main-view.datanoa-split-resizing .datanoa-grid-subbar,
+  .datanoa-main-view.datanoa-split-resizing .datanoa-grid-toolbar,
+  .datanoa-main-view.datanoa-split-resizing .datanoa-query-banner,
+  .datanoa-main-view.datanoa-split-resizing .datanoa-dml-preview,
+  .datanoa-main-view.datanoa-split-resizing .datanoa-value-inspector,
+  .datanoa-main-view.datanoa-split-resizing .datanoa-ai-explain-panel,
+  .datanoa-main-view.datanoa-split-resizing .datanoa-ai-fix-panel,
+  .datanoa-main-view.datanoa-split-resizing .datanoa-inspector-area {
+    pointer-events: none;
+  }
+
+  .datanoa-main-view.datanoa-split-resizing .datanoa-split-resizer,
+  .datanoa-main-view.datanoa-split-resizing .datanoa-value-inspector-resizer,
+  .datanoa-main-view.datanoa-split-resizing .datanoa-ai-resizer {
+    pointer-events: auto;
   }
 
   .datanoa-sql-area .cm-editor {
@@ -2688,11 +2945,33 @@ export const EDITOR_BASE_STYLE = `
     animation: datanoa-ai-dot-busy 1.2s cubic-bezier(0.22, 1, 0.36, 1) infinite;
   }
 
+  .datanoa-ai-toolbar-btn .datanoa-ai-robot {
+    width: 13px;
+    height: 13px;
+    color: currentColor;
+    opacity: 0.86;
+  }
+
+  .datanoa-ai-toolbar-btn.tone-neutral .datanoa-ai-robot {
+    opacity: 0.72;
+  }
+
+  .datanoa-ai-toolbar-btn:not(.is-ai-busy) .datanoa-ai-robot-antenna,
+  .datanoa-ai-toolbar-btn:not(.is-ai-busy) .datanoa-ai-robot-eye {
+    animation: none;
+    opacity: 1;
+  }
+
+  .datanoa-ai-toolbar-btn.is-ai-busy .datanoa-ai-robot {
+    color: var(--info);
+    opacity: 1;
+  }
+
   .datanoa-ai-explain-panel {
     border-top: 1px solid var(--border);
     background: var(--surface);
     padding: 0;
-    max-height: 44%;
+    max-height: 52%;
     min-height: 0;
     overflow: hidden;
     flex: 0 1 auto;
@@ -2714,6 +2993,13 @@ export const EDITOR_BASE_STYLE = `
   .datanoa-ai-explain-panel[data-phase='loading'],
   .datanoa-ai-explain-panel[data-collapsed='true'] {
     flex-shrink: 0;
+    min-height: 0;
+  }
+
+  .datanoa-ai-explain-panel[data-explain-view='visual']:not([data-collapsed='true']),
+  .datanoa-ai-explain-panel[data-explain-view='raw']:not([data-collapsed='true']),
+  .datanoa-ai-explain-panel[data-phase='idle']:not([data-collapsed='true']):has(> .datanoa-ai-panel-scroll) {
+    flex-shrink: 1;
     min-height: 0;
   }
 
@@ -2856,7 +3142,7 @@ export const EDITOR_BASE_STYLE = `
 
   .datanoa-ai-explain-title {
     font-size: 12px;
-    font-weight: 600;
+    font-weight: 500;
     color: var(--text);
   }
 
@@ -3031,10 +3317,7 @@ export const EDITOR_BASE_STYLE = `
       width: 36%;
       opacity: 0.75;
     }
-    .datanoa-ai-loading-char {
-      animation: none !important;
-      opacity: 1;
-    }
+    /* datanoa-ai-char-wave uses only color/opacity shimmer with zero spatial motion; keep it visible. */
     .datanoa-ai-toolbar-btn.is-ai-busy .datanoa-ai-dot {
       animation: none !important;
       opacity: 1;
@@ -3079,7 +3362,7 @@ export const EDITOR_BASE_STYLE = `
 
   .datanoa-ai-summary {
     margin: 0;
-    max-width: 78ch;
+    width: 100%;
     font-size: 12.5px;
     color: var(--text);
     line-height: 1.55;

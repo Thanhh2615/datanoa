@@ -6,12 +6,14 @@ import type {
   ApplyChangesParams,
   ApplyChangesResult,
   ConnectionProfile,
+  ExplainResult,
   FetchPageParams,
   IDatabaseDriver,
   IDatabaseSession,
   PreviewChangesResult,
   QueryResult,
   QueryResultSet,
+  SchemaErGraph,
   SchemaObject,
   SchemaObjectKind,
   TableBrowseResult,
@@ -27,8 +29,16 @@ import {
   copyFailedStatementMeta,
   runDriverConnectionTest,
 } from '../common/driver'
+import {
+  buildSchemaErGraphFromCatalogRows,
+  type RawErColumnRow,
+  type RawErForeignKeyRow,
+  type RawErTableRow,
+  type RawErUniqueSetRow,
+} from '../common/schema-er-graph'
+import { parseExplainPlan } from '../../shared-explain-plan.js'
 import type { DriverTlsOptions } from '../common/tls-and-tunnel'
-import { resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
+import { buildDefaultTlsOptions, resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
 import {
   assembleTableBrowseResult,
   buildBatchStatements,
@@ -45,12 +55,16 @@ import {
   introspectMssqlObjects,
   introspectMssqlSchemas,
   introspectMssqlTableDetails,
+  toSqlBool,
 } from '../common/schema'
 import {
   compactSql,
   containsDdlStatement,
+  hasExplainAnalyzeOption,
+  isExplainTargetMutating,
   reconstructTableDdl,
   splitSqlStatements,
+  stripCommentsAndLiterals,
   stripLeadingSqlComments,
 } from '../common/sql-tools'
 
@@ -95,6 +109,7 @@ export interface MssqlRequestLike {
   arrayRowMode?: boolean
   input(name: string, typeOrVal: unknown, maybeVal?: unknown): MssqlRequestLike
   query(command: string): Promise<MssqlQueryResultLike>
+  batch?(command: string): Promise<MssqlQueryResultLike>
   cancel(): void
 }
 
@@ -105,14 +120,31 @@ export interface MssqlTransactionLike {
   request(): MssqlRequestLike
 }
 
+export interface MssqlBorrowedConnectionLike {
+  closed?: boolean
+  hasError?: boolean
+  close?: () => void
+}
+
 export interface MssqlPoolLike {
   readonly connected?: boolean
+  config?: { stream?: boolean; arrayRowMode?: boolean }
   on?(event: string, listener: (err: Error) => void): void
   listenerCount?(event: string): number
   connect(): Promise<unknown>
   close(): Promise<void>
   request(): MssqlRequestLike
   transaction(): MssqlTransactionLike
+  acquire?(
+    requester: unknown,
+    callback: (
+      err: Error | null | undefined,
+      connection?: MssqlBorrowedConnectionLike,
+      config?: unknown
+    ) => void
+  ): unknown
+  release?(connection: MssqlBorrowedConnectionLike): unknown
+  destroy?(connection: MssqlBorrowedConnectionLike): Promise<void> | void
 }
 
 interface ActiveMssqlQuery {
@@ -303,6 +335,55 @@ function normalizeMssqlAffectedCount(rowsAffected: number[] | undefined, fallbac
   return Number(rowsAffected[0] ?? fallback)
 }
 
+function normalizeMssqlErType(row: Record<string, unknown>): string {
+  const rawBase = row.base_type ?? row.system_type
+  const baseRaw =
+    typeof rawBase === 'string'
+      ? rawBase.trim()
+      : rawBase && typeof rawBase === 'object' && 'name' in rawBase
+        ? String(Reflect.get(rawBase, 'name') ?? 'sql_variant').trim()
+        : 'sql_variant'
+  const baseLower = baseRaw.toLowerCase()
+  const maxLength = Number(row.max_length ?? 0)
+  const precision = Number(row.precision ?? 0)
+  const scale = Number(row.scale ?? 0)
+
+  if (baseLower === 'nvarchar' || baseLower === 'nchar') {
+    if (maxLength === -1) return `${baseRaw}(MAX)`
+    if (maxLength > 0) return `${baseRaw}(${Math.floor(maxLength / 2)})`
+  }
+  if (
+    baseLower === 'varchar' ||
+    baseLower === 'char' ||
+    baseLower === 'varbinary' ||
+    baseLower === 'binary'
+  ) {
+    if (maxLength === -1) return `${baseRaw}(MAX)`
+    if (maxLength > 0) return `${baseRaw}(${maxLength})`
+  }
+  if (baseLower === 'decimal' || baseLower === 'numeric') {
+    if (precision > 0) return `${baseRaw}(${precision},${scale})`
+  }
+  if (baseLower === 'datetime2' || baseLower === 'datetimeoffset' || baseLower === 'time') {
+    if (Number.isFinite(scale) && scale >= 0) return `${baseRaw}(${scale})`
+  }
+  if (baseLower === 'float' && precision > 0 && precision !== 53) {
+    return `${baseRaw}(${precision})`
+  }
+  return baseRaw
+}
+
+function normalizeMssqlFkAction(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const normalized = raw.trim().toUpperCase().replace(/_/g, ' ')
+  return normalized.length > 0 ? normalized : undefined
+}
+
+function hasStandaloneBatchGoMssql(sqlBody: string): boolean {
+  const clean = stripCommentsAndLiterals(sqlBody, 'mssql')
+  return /(?:^|\r?\n)[ \t]*GO[ \t]*(?:;|$|\r?\n)/i.test(clean)
+}
+
 function sumMssqlAffectedCount(rowsAffected: number[] | undefined): number {
   if (!Array.isArray(rowsAffected) || rowsAffected.length === 0) return 0
   return rowsAffected.reduce((sum, n) => sum + Number(n || 0), 0)
@@ -459,6 +540,516 @@ export class MssqlSession implements IDatabaseSession {
         throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'mssql')
       }
       return introspectMssqlObjects(this.queryExecutor, schema || 'dbo')
+    })
+  }
+
+  clearSchemaCache(): void {
+    this.tableDetailsCache.clear()
+  }
+
+  async introspectErGraph(schema?: string): Promise<SchemaErGraph> {
+    return this.runScrubbed(async () => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'mssql')
+      }
+      const targetSchema = schema?.trim() || ''
+      const hasFilter = targetSchema.length > 0
+      const params = hasFilter ? [targetSchema] : []
+      const exec = async (qSql: string, qParams?: unknown[]): Promise<Record<string, unknown>[]> => {
+        const req = this.pool.request()
+        await bindMssqlParams(req, qParams)
+        const res = await req.query(qSql)
+        return Array.isArray(res.recordset) ? (res.recordset as Record<string, unknown>[]) : []
+      }
+
+      const schemaFilterSql = hasFilter
+        ? 's.name = @p1'
+        : "s.name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest') AND s.name NOT LIKE 'db[_]%'"
+
+      const tableRows = await exec(
+        `
+        SELECT s.name AS [schema], t.name AS [name], 'table' AS [kind]
+        FROM sys.tables t
+        JOIN sys.schemas s ON s.schema_id = t.schema_id
+        WHERE t.is_ms_shipped = 0 AND ${schemaFilterSql}
+        UNION ALL
+        SELECT s.name AS [schema], v.name AS [name], 'view' AS [kind]
+        FROM sys.views v
+        JOIN sys.schemas s ON s.schema_id = v.schema_id
+        WHERE v.is_ms_shipped = 0 AND ${schemaFilterSql}
+        ORDER BY [schema] ASC, [name] ASC;
+      `,
+        params
+      )
+
+      const colRows = await exec(
+        `
+        SELECT
+          s.name AS [schema],
+          o.name AS [table],
+          c.name AS [name],
+          COALESCE(ut.name, st.name, TYPE_NAME(c.user_type_id), TYPE_NAME(c.system_type_id)) AS base_type,
+          st.name AS system_type,
+          c.max_length AS max_length,
+          c.precision AS precision,
+          c.scale AS scale,
+          c.is_nullable AS is_nullable,
+          c.column_id AS ordinal_position,
+          i.name AS index_name,
+          i.is_primary_key AS is_primary_key,
+          i.is_unique AS is_unique,
+          i.has_filter AS has_filter,
+          ic.key_ordinal AS key_ordinal
+        FROM sys.columns c
+        JOIN sys.objects o ON o.object_id = c.object_id AND o.type IN ('U', 'V') AND o.is_ms_shipped = 0
+        JOIN sys.schemas s ON s.schema_id = o.schema_id
+        LEFT JOIN sys.types ut ON ut.user_type_id = c.user_type_id
+        LEFT JOIN sys.types st ON st.user_type_id = c.system_type_id
+        LEFT JOIN sys.index_columns ic ON ic.object_id = c.object_id AND ic.column_id = c.column_id AND ic.is_included_column = 0
+        LEFT JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id AND i.is_hypothetical = 0
+        WHERE ${schemaFilterSql}
+        ORDER BY s.name ASC, o.name ASC, c.column_id ASC, ic.key_ordinal ASC;
+      `,
+        params
+      )
+
+      const fkFilterSql = hasFilter
+        ? 'ps.name = @p1'
+        : "ps.name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest') AND ps.name NOT LIKE 'db[_]%'"
+      const fkRows = await exec(
+        `
+        SELECT
+          fk.name AS constraint_name,
+          ps.name AS from_schema,
+          pt.name AS from_table,
+          pc.name AS from_column,
+          rs.name AS to_schema,
+          rt.name AS to_table,
+          rc.name AS to_column,
+          fkc.constraint_column_id AS ordinal_position,
+          fk.delete_referential_action_desc AS on_delete,
+          fk.update_referential_action_desc AS on_update
+        FROM sys.foreign_keys fk
+        JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+        JOIN sys.objects pt ON pt.object_id = fk.parent_object_id
+        JOIN sys.schemas ps ON ps.schema_id = pt.schema_id
+        JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
+        JOIN sys.objects rt ON rt.object_id = fk.referenced_object_id
+        JOIN sys.schemas rs ON rs.schema_id = rt.schema_id
+        JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
+        WHERE ${fkFilterSql}
+        ORDER BY fk.name ASC, fkc.constraint_column_id ASC;
+      `,
+        params
+      )
+
+      const tables: RawErTableRow[] = tableRows
+        .map((r): RawErTableRow | null => {
+          const name = typeof r.name === 'string' ? r.name.trim() : ''
+          if (!name) return null
+          const rowSchema =
+            typeof r.schema === 'string' && r.schema.trim()
+              ? r.schema.trim()
+              : targetSchema || 'dbo'
+          return {
+            schema: rowSchema,
+            name,
+            kind: r.kind === 'view' ? 'view' : 'table',
+          }
+        })
+        .filter((item): item is RawErTableRow => item !== null)
+
+      const colDedup = new Map<string, RawErColumnRow>()
+      const uniqueIndexGroups = new Map<
+        string,
+        { schema: string; table: string; indexName: string; cols: Array<{ name: string; ordinal: number }> }
+      >()
+
+      for (const r of colRows) {
+        const colName = typeof r.name === 'string' ? r.name.trim() : ''
+        const tblName = typeof r.table === 'string' ? r.table.trim() : ''
+        if (!colName || !tblName) continue
+        const rowSchema =
+          typeof r.schema === 'string' && r.schema.trim()
+            ? r.schema.trim()
+            : targetSchema || 'dbo'
+        const colKey = `${rowSchema}\u0000${tblName}\u0000${colName}`
+        const isPk = toSqlBool(r.is_primary_key)
+        const idxName = typeof r.index_name === 'string' ? r.index_name.trim() : ''
+        const isUnique = toSqlBool(r.is_unique)
+        const hasFilterIdx = toSqlBool(r.has_filter)
+        const ord = Number(r.ordinal_position ?? 0)
+
+        const existingCol = colDedup.get(colKey)
+        if (!existingCol) {
+          colDedup.set(colKey, {
+            schema: rowSchema,
+            table: tblName,
+            name: colName,
+            type: normalizeMssqlErType(r),
+            nullable: toSqlBool(r.is_nullable),
+            isPrimaryKey: isPk,
+            ...(!idxName && isUnique && !hasFilterIdx ? { isUnique: true } : {}),
+            ...(Number.isFinite(ord) ? { ordinalPosition: ord } : {}),
+          })
+        } else {
+          if (isPk) existingCol.isPrimaryKey = true
+          if (!idxName && isUnique && !hasFilterIdx) existingCol.isUnique = true
+        }
+
+        if (idxName && isUnique && !isPk && !hasFilterIdx) {
+          const uKey = `${rowSchema}\u0000${tblName}\u0000${idxName}`
+          let grp = uniqueIndexGroups.get(uKey)
+          if (!grp) {
+            grp = { schema: rowSchema, table: tblName, indexName: idxName, cols: [] }
+            uniqueIndexGroups.set(uKey, grp)
+          }
+          if (!grp.cols.some((c) => c.name === colName)) {
+            grp.cols.push({
+              name: colName,
+              ordinal: Number.isFinite(Number(r.key_ordinal)) ? Number(r.key_ordinal) : grp.cols.length,
+            })
+          }
+        }
+      }
+
+      const uniqueSets: RawErUniqueSetRow[] = Array.from(uniqueIndexGroups.values()).map((grp) => ({
+        schema: grp.schema,
+        table: grp.table,
+        indexName: grp.indexName,
+        columns: grp.cols.sort((a, b) => a.ordinal - b.ordinal).map((c) => c.name),
+      }))
+
+      const foreignKeys: RawErForeignKeyRow[] = fkRows
+        .map((r): RawErForeignKeyRow | null => {
+          const fromTable = typeof r.from_table === 'string' ? r.from_table.trim() : ''
+          const fromColumn = typeof r.from_column === 'string' ? r.from_column.trim() : ''
+          const toTable = typeof r.to_table === 'string' ? r.to_table.trim() : ''
+          const toColumn = typeof r.to_column === 'string' ? r.to_column.trim() : ''
+          if (!fromTable || !fromColumn || !toTable || !toColumn) return null
+          const fromSchema =
+            typeof r.from_schema === 'string' && r.from_schema.trim()
+              ? r.from_schema.trim()
+              : targetSchema || 'dbo'
+          const toSchema =
+            typeof r.to_schema === 'string' && r.to_schema.trim()
+              ? r.to_schema.trim()
+              : fromSchema
+          const constraintName =
+            typeof r.constraint_name === 'string' ? r.constraint_name.trim() : ''
+          const ord = Number(r.ordinal_position ?? 0)
+          const onDelete = normalizeMssqlFkAction(r.on_delete)
+          const onUpdate = normalizeMssqlFkAction(r.on_update)
+          return {
+            ...(constraintName ? { constraintName } : {}),
+            fromSchema,
+            fromTable,
+            fromColumn,
+            toSchema,
+            toTable,
+            toColumn,
+            ...(Number.isFinite(ord) ? { ordinalPosition: ord } : {}),
+            ...(onDelete ? { onDelete } : {}),
+            ...(onUpdate ? { onUpdate } : {}),
+          }
+        })
+        .filter((item): item is RawErForeignKeyRow => item !== null)
+
+      return buildSchemaErGraphFromCatalogRows({
+        connectionId: this.profile.id,
+        ...(targetSchema ? { schema: targetSchema } : { schema: 'dbo' }),
+        completeness: 'full',
+        tables,
+        columns: Array.from(colDedup.values()),
+        uniqueSets,
+        foreignKeys,
+      })
+    })
+  }
+
+  private async runOnDedicatedExplainConnection<T>(
+    fn: (execBatch: (batchSql: string) => Promise<MssqlQueryResultLike>) => Promise<{ result: T; destroy: boolean }>,
+    signal?: AbortSignal
+  ): Promise<T> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'mssql')
+    }
+    if (signal?.aborted) {
+      throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', 'mssql')
+    }
+
+    const pool = this.pool
+    let activeReq: MssqlRequestLike | null = null
+    const onAbort = (): void => {
+      try {
+        activeReq?.cancel()
+      } catch {
+        // Ignore cancel failure
+      }
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+
+    try {
+      if (typeof pool.acquire === 'function' && typeof pool.release === 'function') {
+        const [{ Request }, borrowedConn] = await Promise.all([
+          loadMssqlVendor(),
+          new Promise<MssqlBorrowedConnectionLike>((resolve, reject) => {
+            pool.acquire?.(this, (err, conn) => {
+              if (err || !conn) {
+                reject(err ?? new Error('Failed to acquire SQL Server pool connection for EXPLAIN'))
+              } else {
+                resolve(conn)
+              }
+            })
+          }),
+        ])
+
+        const pinnedParent = {
+          connected: true,
+          config: pool.config ?? { stream: false, arrayRowMode: false },
+          acquire(
+            _requester: unknown,
+            cb: (
+              err: Error | null,
+              connection: MssqlBorrowedConnectionLike,
+              config?: unknown
+            ) => void
+          ) {
+            cb(null, borrowedConn, pool.config)
+          },
+          release(_connection: MssqlBorrowedConnectionLike) {
+            // Keep borrowedConn pinned across SET SHOWPLAN ON -> stmt -> SET SHOWPLAN OFF
+          },
+        }
+
+        let shouldDestroy = false
+        try {
+          const execBatch = async (batchSql: string): Promise<MssqlQueryResultLike> => {
+            if (signal?.aborted || this.isClosed) {
+              throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', 'mssql')
+            }
+            const req = new Request(pinnedParent as never) as unknown as MssqlRequestLike
+            req.arrayRowMode = true
+            activeReq = req
+            try {
+              const res = typeof req.batch === 'function' ? await req.batch(batchSql) : await req.query(batchSql)
+              if (signal?.aborted) {
+                throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', 'mssql')
+              }
+              return res
+            } catch (err: unknown) {
+              if (signal?.aborted || extractMssqlErrorCode(err) === 'ECANCEL') {
+                throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', 'mssql', err)
+              }
+              throw err
+            } finally {
+              if (activeReq === req) activeReq = null
+            }
+          }
+
+          const out = await fn(execBatch)
+          shouldDestroy = out.destroy
+          return out.result
+        } catch (err: unknown) {
+          shouldDestroy = true
+          throw err
+        } finally {
+          if (shouldDestroy) {
+            borrowedConn.hasError = true
+            try {
+              borrowedConn.close?.()
+            } catch {
+              // Ignore close error on tainted borrowed connection
+            }
+            if (typeof pool.destroy === 'function') {
+              await Promise.resolve(pool.destroy(borrowedConn)).catch(() => {})
+            } else {
+              try {
+                pool.release(borrowedConn)
+              } catch {
+                // Ignore release error after close
+              }
+            }
+          } else {
+            try {
+              pool.release(borrowedConn)
+            } catch {
+              // Ignore release error
+            }
+          }
+        }
+      }
+
+      // Fallback for test mocks without acquire/release: strictly use pool.request(), NEVER this.tx
+      const execBatch = async (batchSql: string): Promise<MssqlQueryResultLike> => {
+        if (signal?.aborted || this.isClosed) {
+          throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', 'mssql')
+        }
+        const req = pool.request()
+        req.arrayRowMode = true
+        activeReq = req
+        try {
+          const res = typeof req.batch === 'function' ? await req.batch(batchSql) : await req.query(batchSql)
+          if (signal?.aborted) {
+            throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', 'mssql')
+          }
+          return res
+        } catch (err: unknown) {
+          if (signal?.aborted || extractMssqlErrorCode(err) === 'ECANCEL') {
+            throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', 'mssql', err)
+          }
+          throw err
+        } finally {
+          if (activeReq === req) activeReq = null
+        }
+      }
+      const out = await fn(execBatch)
+      return out.result
+    } finally {
+      signal?.removeEventListener('abort', onAbort)
+    }
+  }
+
+  async runExplain(sql: string, signal?: AbortSignal): Promise<ExplainResult | null> {
+    return this.runScrubbed(async () => {
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'mssql')
+      }
+      if (signal?.aborted) {
+        throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', 'mssql')
+      }
+
+      const sqlBody = sql.trim().replace(/;+\s*$/, '').trim()
+      if (!sqlBody) {
+        throw new DatabaseDriverError('SQL statement cannot be empty', 'invalid_params', 'mssql')
+      }
+
+      if (hasExplainAnalyzeOption(sqlBody, 'mssql') && isExplainTargetMutating(sqlBody, 'mssql')) {
+        throw new DatabaseDriverError(
+          'EXPLAIN ANALYZE is not permitted for mutating statements in Explain mode.',
+          'not_permitted',
+          'mssql'
+        )
+      }
+
+      const batches = splitMssqlBatches(sqlBody)
+      const checkBatches = batches.length > 0 ? batches : [sqlBody]
+      if (this.profile.readOnly && checkBatches.some((b) => isMssqlReadOnlyBlocked(b))) {
+        this.assertWritable()
+      }
+
+      const showplanOnRe = /^SET\s+(SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+ON\s*;?$/i
+      const showplanOffRe = /^SET\s+(SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+OFF\s*;?$/i
+      const firstLead = stripLeadingSqlComments(checkBatches[0] ?? '', 'mssql')
+        .replace(/;+\s*$/, '')
+        .trim()
+      const onMatch = showplanOnRe.exec(firstLead)
+
+      let explicitMode: 'SHOWPLAN_XML' | 'SHOWPLAN_ALL' | 'SHOWPLAN_TEXT' | null = null
+      let targetStmt = sqlBody
+
+      if (onMatch) {
+        const mode = onMatch[1].toUpperCase() as 'SHOWPLAN_XML' | 'SHOWPLAN_ALL' | 'SHOWPLAN_TEXT'
+        const innerBatch = checkBatches[1] ?? ''
+        const lastLead = stripLeadingSqlComments(checkBatches[2] ?? '', 'mssql')
+          .replace(/;+\s*$/, '')
+          .trim()
+        const offMatch = showplanOffRe.exec(lastLead)
+        const cleanInner = stripCommentsAndLiterals(innerBatch, 'mssql')
+        if (
+          checkBatches.length !== 3 ||
+          !offMatch ||
+          offMatch[1].toUpperCase() !== mode ||
+          splitSqlStatements(innerBatch, 'mssql').length > 1 ||
+          hasStandaloneBatchGoMssql(innerBatch) ||
+          /\bSET\s+(?:SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+(?:ON|OFF)\b/i.test(cleanInner)
+        ) {
+          throw new DatabaseDriverError(
+            'Multi-statement SHOWPLAN is not supported for SQL Server; explain one statement at a time.',
+            'invalid_params',
+            'mssql'
+          )
+        }
+        explicitMode = mode
+        targetStmt = innerBatch.trim().replace(/;+\s*$/, '').trim()
+      } else {
+        const cleanMssql = stripCommentsAndLiterals(sqlBody, 'mssql')
+        if (
+          splitSqlStatements(sqlBody, 'mssql').length > 1 ||
+          hasStandaloneBatchGoMssql(sqlBody) ||
+          /\bSET\s+(?:SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+OFF\b/i.test(cleanMssql)
+        ) {
+          throw new DatabaseDriverError(
+            'Multi-statement SHOWPLAN is not supported for SQL Server; explain one statement at a time.',
+            'invalid_params',
+            'mssql'
+          )
+        }
+      }
+
+      const modesToTry: Array<'SHOWPLAN_XML' | 'SHOWPLAN_ALL' | 'SHOWPLAN_TEXT'> = explicitMode
+        ? [explicitMode]
+        : ['SHOWPLAN_XML', 'SHOWPLAN_ALL']
+
+      const startedAt = performance.now()
+      const executeMode = async (
+        mode: 'SHOWPLAN_XML' | 'SHOWPLAN_ALL' | 'SHOWPLAN_TEXT'
+      ): Promise<MssqlQueryResultLike> =>
+        this.runOnDedicatedExplainConnection(async (execBatch) => {
+          let destroy = false
+          await execBatch(`SET ${mode} ON;`)
+          let res: MssqlQueryResultLike
+          try {
+            res = await execBatch(targetStmt)
+          } finally {
+            try {
+              await execBatch(`SET ${mode} OFF;`)
+            } catch {
+              destroy = true
+            }
+          }
+          return { result: res, destroy }
+        }, signal)
+
+      let rawResult: MssqlQueryResultLike
+      try {
+        rawResult = await executeMode(modesToTry[0])
+      } catch (err: unknown) {
+        if (
+          modesToTry.length < 2 ||
+          this.isClosed ||
+          signal?.aborted ||
+          (err instanceof DatabaseDriverError &&
+            (err.code === 'cancelled' || err.code === 'SESSION_CLOSED'))
+        ) {
+          throw err
+        }
+        rawResult = await executeMode(modesToTry[1])
+      }
+
+      const executionTimeMs = Math.round(performance.now() - startedAt)
+      const recordset =
+        Array.isArray(rawResult.recordsets) && rawResult.recordsets.length > 0
+          ? rawResult.recordsets[rawResult.recordsets.length - 1]
+          : rawResult.recordset ?? []
+      const parsed = extractMssqlColumnsAndRows(recordset, 1000)
+      const rawText =
+        parsed.columns.length <= 1 && parsed.rows.length > 0
+          ? parsed.rows.map((r) => (r[0] !== null && r[0] !== undefined ? String(r[0]) : '')).join('\n')
+          : undefined
+      const explainPlan = parseExplainPlan(
+        { columns: parsed.columns, rows: parsed.rows },
+        { dialect: 'mssql' }
+      )
+
+      return {
+        columns: parsed.columns,
+        rows: parsed.rows,
+        ...(rawText !== undefined ? { rawText } : {}),
+        ...(explainPlan.format ? { formatHint: explainPlan.format } : {}),
+        executionTimeMs,
+        explainPlan,
+      }
     })
   }
 
@@ -1373,6 +1964,23 @@ function parseMssqlUrlBoolParam(rawVal: string | null): boolean | undefined {
   return undefined
 }
 
+function resolveMssqlEndpoint(
+  rawTlsServername?: string
+): { cleanTlsServername?: string; rawServername?: string } {
+  const raw = typeof rawTlsServername === 'string' ? rawTlsServername.trim() : ''
+  if (!raw) return {}
+  const unwrapped =
+    raw.startsWith('[') && raw.endsWith(']') && net.isIP(raw.slice(1, -1)) === 6
+      ? raw.slice(1, -1)
+      : raw
+  const pctIdx = unwrapped.indexOf('%')
+  const stripped = pctIdx >= 0 ? unwrapped.slice(0, pctIdx) : unwrapped
+  return {
+    rawServername: stripped || undefined,
+    cleanTlsServername: stripped.length > 0 && net.isIP(stripped) === 0 ? stripped : undefined,
+  }
+}
+
 export async function buildMssqlPoolConfig(
   profile: ConnectionProfile,
   password?: string,
@@ -1446,18 +2054,7 @@ export async function buildMssqlPoolConfig(
     extraSecrets?.tlsServername
   )
 
-  const rawTlsServername =
-    typeof extraSecrets?.tlsServername === 'string' ? extraSecrets.tlsServername.trim() : ''
-  const unwrappedServername =
-    rawTlsServername.startsWith('[') &&
-    rawTlsServername.endsWith(']') &&
-    net.isIP(rawTlsServername.slice(1, -1)) === 6
-      ? rawTlsServername.slice(1, -1)
-      : rawTlsServername
-  const cleanTlsServername =
-    unwrappedServername.length > 0 && net.isIP(unwrappedServername) === 0
-      ? unwrappedServername
-      : undefined
+  const { cleanTlsServername, rawServername } = resolveMssqlEndpoint(extraSecrets?.tlsServername)
 
   let encrypt: boolean | 'strict'
   let trustServerCertificate: boolean
@@ -1471,7 +2068,7 @@ export async function buildMssqlPoolConfig(
     encrypt = false
     trustServerCertificate = false
   } else if (tlsOverride) {
-    encrypt = urlEncrypt === 'strict' ? 'strict' : true
+    encrypt = profile.sslMode === 'strict' || urlEncrypt === 'strict' ? 'strict' : true
     trustServerCertificate = tlsOverride.rejectUnauthorized === false
     const cryptoDetails: Record<string, unknown> = {}
     if (tlsOverride.ca !== undefined) cryptoDetails.ca = tlsOverride.ca
@@ -1481,6 +2078,9 @@ export async function buildMssqlPoolConfig(
     if (tlsOverride.servername !== undefined) cryptoDetails.servername = tlsOverride.servername
     if (tlsOverride.checkServerIdentity !== undefined) {
       cryptoDetails.checkServerIdentity = tlsOverride.checkServerIdentity
+    }
+    if (tlsOverride.ALPNProtocols !== undefined) {
+      cryptoDetails.ALPNProtocols = tlsOverride.ALPNProtocols
     }
     if (Object.keys(cryptoDetails).length > 0) {
       cryptoCredentialsDetails = cryptoDetails as typeof cryptoCredentialsDetails
@@ -1500,6 +2100,17 @@ export async function buildMssqlPoolConfig(
           : encrypt
             ? false
             : true
+    if (Boolean(encrypt) && !trustServerCertificate && rawServername) {
+      const defTls = buildDefaultTlsOptions(rawServername)
+      const cryptoDetails: Record<string, unknown> = {}
+      if (defTls.servername !== undefined) cryptoDetails.servername = defTls.servername
+      if (defTls.checkServerIdentity !== undefined) {
+        cryptoDetails.checkServerIdentity = defTls.checkServerIdentity
+      }
+      if (Object.keys(cryptoDetails).length > 0) {
+        cryptoCredentialsDetails = cryptoDetails as typeof cryptoCredentialsDetails
+      }
+    }
   }
 
   const effectiveServerName =

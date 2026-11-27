@@ -78,15 +78,41 @@ export const clearGhostEffect: {
   of(value?: undefined): StateEffect<undefined>
 }
 
+export const notifyAiAvailabilityEffect: {
+  of(value?: undefined): StateEffect<undefined>
+}
+
+export function notifyAiAvailabilityChanged(view: EditorView | null | undefined): void
+
+export function isActiveSqlStatementSensitive(
+  prefix: string,
+  suffix: string,
+  dialect?: string,
+  mode?: 'auto' | 'complete' | 'edit'
+): boolean
+
 export const ghostStateField: StateField<GhostSuggestionState | null>
 
 export function acceptGhostFull(view: EditorView): boolean
 export function acceptGhostWord(view: EditorView): boolean
 export function acceptGhostLine(view: EditorView): boolean
 
+export interface CmInlineAiRequestErrorContext {
+  mode: 'complete' | 'edit'
+  manual: boolean
+  prefix: string
+  suffix: string
+  dialect: string | undefined
+  connectionId: string | null | undefined
+}
+
 export interface CmInlineAiOptions {
   isEnabled: () => boolean
   getDialect?: () => string
+  getConnectionId?: () => string | null | undefined
+  connectionId?: string | null
+  isModalMode?: (view: EditorView) => boolean
+  isModalKeymap?: (view: EditorView) => boolean
   requestCompletion: (input: {
     prefix: string
     suffix: string
@@ -102,6 +128,7 @@ export interface CmInlineAiOptions {
     mode?: 'complete' | 'edit'
   } | null>
   onMetric?: (id: number, kind: AiMetricKind) => void
+  onRequestError?: (err: unknown, context?: CmInlineAiRequestErrorContext) => void
 }
 
 export function createCmInlineAiExtension(options: CmInlineAiOptions): Extension

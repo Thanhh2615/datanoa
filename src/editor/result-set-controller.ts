@@ -2,10 +2,14 @@
 // Pure helpers for Studio multi-result-set state initialization, banner generation,
 // combined EXPLAIN aggregation, and view-mode banner visibility.
 
-import type { QueryResult, QueryResultSet } from '../protocol.js'
+import type { QueryResult, QueryResultSet, StudioViewMode } from '../protocol.js'
 import type { ResultBannerState, ResultSetTabRuntimeState } from './console-tabs.js'
 
-export type StudioViewMode = 'split' | 'grid' | 'sql' | 'inspector'
+export type { StudioViewMode }
+
+export function isGridVisibleMode(mode: StudioViewMode): boolean {
+  return mode === 'split' || mode === 'grid' || mode === 'sql'
+}
 
 const toNonNegInt = (raw: unknown): number => {
   const num = Number(raw)
@@ -64,6 +68,7 @@ export function getEffectiveResultSets(res: QueryResult, fallbackSql = ''): Quer
       truncated: Boolean(res.truncated),
       isSelect: Boolean(res.isSelect),
       ...(res.sourceTable ? { sourceTable: res.sourceTable } : {}),
+      ...(res.explainPlan ? { explainPlan: res.explainPlan } : {}),
     },
   ]
 }
@@ -96,6 +101,7 @@ export function buildResultSetQueryResult(res: QueryResult, index: number): Quer
     truncated: rs.truncated,
     isSelect: rs.isSelect,
     ...(rs.sourceTable ? { sourceTable: rs.sourceTable } : {}),
+    ...(rs.explainPlan ? { explainPlan: rs.explainPlan } : {}),
   }
 }
 
@@ -241,6 +247,7 @@ export function buildCombinedExplainResult(
     truncated: false,
     isSelect: true,
   }
+  const leadExplainPlan = firstNonError?.explainPlan ?? collectedSets.find((s) => s.explainPlan)?.explainPlan
   return {
     columns: lead.columns,
     rows: lead.rows,
@@ -248,6 +255,7 @@ export function buildCombinedExplainResult(
     executionTimeMs: totalMs,
     truncated: lead.truncated,
     isSelect: true,
+    ...(leadExplainPlan ? { explainPlan: leadExplainPlan } : {}),
     ...(collectedSets.length > 1 || collectedSets.some((s) => s.isError)
       ? { resultSets: collectedSets }
       : {}),
@@ -263,7 +271,7 @@ export function shouldShowQueryBannerForMode(
   banner: ResultBannerState | null
 ): boolean {
   if (!banner || banner.dismissed) return false
-  if (viewMode === 'inspector') return false
+  if (!isGridVisibleMode(viewMode)) return false
   if (viewMode === 'grid' && !isShowingSqlResult && banner.kind === 'success') {
     return false
   }

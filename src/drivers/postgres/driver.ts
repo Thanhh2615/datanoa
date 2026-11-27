@@ -1,5 +1,7 @@
 import * as dns from 'node:dns'
+import * as net from 'node:net'
 import type { Pool, PoolConfig, PoolClient } from '../../../vendor/pg.js'
+import { parseExplainPlan } from '../../shared-explain-plan.js'
 import {
   isCloudDatabaseHost,
   isSupabaseDirectHost,
@@ -9,12 +11,16 @@ import type {
   ApplyChangesParams,
   ApplyChangesResult,
   ConnectionProfile,
+  CopyImportOpenOptions,
+  CopyImportStreamHandle,
+  ExplainResult,
   FetchPageParams,
   IDatabaseDriver,
   IDatabaseSession,
   PreviewChangesResult,
   QueryResult,
   QueryResultSet,
+  SchemaErGraph,
   SchemaObject,
   SchemaObjectKind,
   TableBrowseResult,
@@ -23,6 +29,19 @@ import type {
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
+import {
+  buildSchemaErGraphFromCatalogRows,
+  type RawErColumnRow,
+  type RawErForeignKeyRow,
+  type RawErTableRow,
+  type RawErUniqueSetRow,
+} from '../common/schema-er-graph'
+import {
+  PostgresCopyInStream,
+  buildPostgresCopyFromStdinSql,
+  openPostgresCopyInStream,
+  type PgCopyQueryableClient,
+} from './copy-in-stream'
 import {
   DatabaseDriverError,
   attachFailedStatementMeta,
@@ -49,6 +68,7 @@ import {
   introspectPostgresSchemaDependencies,
   introspectPostgresSchemas,
   introspectPostgresTableDetails,
+  toSqlBool,
 } from '../common/schema'
 import type { SchemaDependencyEdge } from '../common/schema'
 import {
@@ -59,6 +79,9 @@ import {
 import {
   SQL_STANDALONE_ROLLBACK_RE,
   compactSql,
+  hasExplainAnalyzeOption,
+  isExplainTargetMutating,
+  isMutatingStatement,
   stripLeadingSqlComments,
 } from '../common/sql-lexer'
 
@@ -349,6 +372,99 @@ export function normalizePostgresOperationError(
   return copyFailedStatementMeta(err, wrapped)
 }
 
+function createPostgresHappyEyeballsSocket(): net.Socket {
+  const socket = new net.Socket()
+  const baseConnect = (): ((...callArgs: unknown[]) => net.Socket) =>
+    net.Socket.prototype.connect as unknown as (...callArgs: unknown[]) => net.Socket
+  socket.connect = ((...args: unknown[]): net.Socket => {
+    if (typeof args[0] === 'number' && typeof args[1] === 'string') {
+      const port = args[0]
+      const host = args[1]
+      const cb = typeof args[2] === 'function' ? (args[2] as () => void) : undefined
+      const connectOpts: net.TcpSocketConnectOpts = {
+        port,
+        host,
+        autoSelectFamily: true,
+        autoSelectFamilyAttemptTimeout: 250,
+      }
+      return Reflect.apply(baseConnect(), socket, cb ? [connectOpts, cb] : [connectOpts])
+    }
+    if (args[0] && typeof args[0] === 'object' && !Array.isArray(args[0])) {
+      const opts = args[0] as net.SocketConnectOpts
+      if ('port' in opts && typeof opts.port === 'number') {
+        const merged: net.TcpSocketConnectOpts = {
+          ...opts,
+          autoSelectFamily: opts.autoSelectFamily ?? true,
+          autoSelectFamilyAttemptTimeout: opts.autoSelectFamilyAttemptTimeout ?? 250,
+        }
+        const cb = typeof args[1] === 'function' ? (args[1] as () => void) : undefined
+        return Reflect.apply(baseConnect(), socket, cb ? [merged, cb] : [merged])
+      }
+    }
+    return Reflect.apply(baseConnect(), socket, args)
+  }) as net.Socket['connect']
+  return socket
+}
+
+function parsePgArrayField(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    return raw.map((item) => String(item ?? '')).filter((s) => s.length > 0)
+  }
+  if (typeof raw !== 'string') return []
+  const trimmed = raw.trim()
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return []
+  const inner = trimmed.slice(1, -1).trim()
+  if (!inner) return []
+  const out: string[] = []
+  let i = 0
+  while (i < inner.length) {
+    if (inner[i] === '"') {
+      i += 1
+      let val = ''
+      while (i < inner.length) {
+        if (inner[i] === '\\' && i + 1 < inner.length) {
+          val += inner[i + 1]
+          i += 2
+          continue
+        }
+        if (inner[i] === '"') {
+          i += 1
+          break
+        }
+        val += inner[i]
+        i += 1
+      }
+      out.push(val)
+      if (inner[i] === ',') i += 1
+    } else {
+      const comma = inner.indexOf(',', i)
+      const token = (comma < 0 ? inner.slice(i) : inner.slice(i, comma)).trim()
+      if (token && token !== 'NULL') out.push(token)
+      if (comma < 0) break
+      i = comma + 1
+    }
+  }
+  return out
+}
+
+function mapPgConstraintAction(raw: unknown): string | undefined {
+  const code = typeof raw === 'string' ? raw.trim().toLowerCase() : ''
+  switch (code) {
+    case 'c':
+      return 'CASCADE'
+    case 'n':
+      return 'SET NULL'
+    case 'd':
+      return 'SET DEFAULT'
+    case 'r':
+      return 'RESTRICT'
+    case 'a':
+      return 'NO ACTION'
+    default:
+      return undefined
+  }
+}
+
 export class PostgresSession implements IDatabaseSession {
   readonly driverType: PostgresEngineType
   readonly profile: ConnectionProfile
@@ -363,6 +479,9 @@ export class PostgresSession implements IDatabaseSession {
   private readonly oidTableCache = new Map<number, { schema: string; table: string }>()
   private isClosed = false
   private txLease: PgLease | null = null
+  private activeCopyOpening = false
+  private activeCopyLease: PgLease | null = null
+  private activeCopyAbort: ((reason?: string) => Promise<void>) | null = null
   private txClientBroken = false
   private txAborted = false
   private txClientErrorHandler: ((...args: unknown[]) => void) | null = null
@@ -383,6 +502,21 @@ export class PostgresSession implements IDatabaseSession {
 
   isAlive(): boolean {
     return !this.isClosed
+  }
+
+  clearSchemaCache(): void {
+    this.tableDetailsCache.clear()
+    this.oidTableCache.clear()
+  }
+
+  private assertNoCopyInProgress(): void {
+    if (this.activeCopyOpening || this.activeCopyLease !== null) {
+      throw new DatabaseDriverError(
+        'Cannot run session operation while a COPY import stream is active.',
+        'COPY_IN_PROGRESS',
+        this.driverType
+      )
+    }
   }
 
   private get txClient(): PoolClient | null {
@@ -638,8 +772,22 @@ export class PostgresSession implements IDatabaseSession {
 
   async close(): Promise<void> {
     this.tableDetailsCache.clear()
+    this.oidTableCache.clear()
     if (this.isClosed) return
     this.isClosed = true
+
+    if (this.activeCopyAbort) {
+      const abortFn = this.activeCopyAbort
+      this.activeCopyAbort = null
+      await abortFn('Session is closing').catch(() => {})
+    }
+    if (this.activeCopyLease !== null) {
+      const copyLease = this.activeCopyLease
+      this.activeCopyLease = null
+      if (copyLease !== this.txLease) {
+        copyLease.release(true)
+      }
+    }
 
     // Wake checkout waiters promptly; pg-pool otherwise holds them until its timeout
     const waiters = Array.from(this.closeWaiters)
@@ -791,10 +939,697 @@ export class PostgresSession implements IDatabaseSession {
     return details
   }
 
+  async introspectErGraph(schema?: string): Promise<SchemaErGraph> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    const targetSchema = (schema || 'public').trim() || 'public'
+
+    const tablesSql = `
+      SELECT n.nspname AS schema_name,
+             c.relname AS table_name,
+             CASE WHEN c.relkind IN ('v', 'm') THEN 'view' ELSE 'table' END AS kind
+      FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = $1
+        AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+      ORDER BY c.relname ASC;
+    `
+    const columnsSql = `
+      SELECT n.nspname AS schema_name,
+             c.relname AS table_name,
+             a.attnum AS attnum,
+             a.attname AS column_name,
+             pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+             NOT a.attnotnull AS nullable
+      FROM pg_catalog.pg_attribute a
+      JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = $1
+        AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+        AND a.attnum > 0
+        AND NOT a.attisdropped
+      ORDER BY c.relname ASC, a.attnum ASC;
+    `
+    const constraintsSql = `
+      SELECT con.conname AS constraint_name,
+             con.contype AS contype,
+             n_from.nspname AS from_schema,
+             c_from.relname AS from_table,
+             ARRAY(
+               SELECT a.attname
+               FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+               JOIN pg_catalog.pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+               ORDER BY k.ord
+             ) AS from_columns,
+             n_to.nspname AS to_schema,
+             c_to.relname AS to_table,
+             ARRAY(
+               SELECT a.attname
+               FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord)
+               JOIN pg_catalog.pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum
+               ORDER BY k.ord
+             ) AS to_columns,
+             con.confdeltype AS confdeltype,
+             con.confupdtype AS confupdtype
+      FROM pg_catalog.pg_constraint con
+      JOIN pg_catalog.pg_class c_from ON c_from.oid = con.conrelid
+      JOIN pg_catalog.pg_namespace n_from ON n_from.oid = c_from.relnamespace
+      LEFT JOIN pg_catalog.pg_class c_to ON c_to.oid = con.confrelid
+      LEFT JOIN pg_catalog.pg_namespace n_to ON n_to.oid = c_to.relnamespace
+      WHERE n_from.nspname = $1
+        AND con.contype IN ('p', 'f', 'u')
+      UNION ALL
+      SELECT ic.relname AS constraint_name,
+             'u' AS contype,
+             n_from.nspname AS from_schema,
+             c_from.relname AS from_table,
+             ARRAY(
+               SELECT a.attname
+               FROM unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord)
+               JOIN pg_catalog.pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.attnum
+               WHERE k.attnum > 0
+                 AND k.ord <= ix.indnkeyatts
+               ORDER BY k.ord
+             ) AS from_columns,
+             NULL AS to_schema,
+             NULL AS to_table,
+             ARRAY[]::text[] AS to_columns,
+             NULL AS confdeltype,
+             NULL AS confupdtype
+      FROM pg_catalog.pg_index ix
+      JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid
+      JOIN pg_catalog.pg_class c_from ON c_from.oid = ix.indrelid
+      JOIN pg_catalog.pg_namespace n_from ON n_from.oid = c_from.relnamespace
+      WHERE n_from.nspname = $1
+        AND ix.indisunique = true
+        AND ix.indisprimary = false
+        AND ix.indnkeyatts > 0
+        AND ix.indpred IS NULL
+        AND ix.indexprs IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_constraint con2
+          WHERE con2.conindid = ix.indexrelid
+            AND con2.conrelid = ix.indrelid
+            AND con2.contype IN ('p', 'u')
+        )
+      ORDER BY constraint_name ASC;
+    `
+
+    const [tableRows, colRows, conRows] = await Promise.all([
+      this.queryExecutor(tablesSql, [targetSchema]),
+      this.queryExecutor(columnsSql, [targetSchema]),
+      this.queryExecutor(constraintsSql, [targetSchema]),
+    ])
+
+    const pkColKeys = new Set<string>()
+    const uniqueSets: RawErUniqueSetRow[] = []
+    const foreignKeys: RawErForeignKeyRow[] = []
+
+    for (const row of conRows) {
+      const contype = typeof row.contype === 'string' ? row.contype.trim().toLowerCase() : ''
+      const fromSchema = String(row.from_schema || targetSchema)
+      const fromTable = String(row.from_table || '')
+      const fromCols = parsePgArrayField(row.from_columns)
+      if (!fromTable) continue
+
+      if (contype === 'p') {
+        for (const colName of fromCols) {
+          pkColKeys.add(`${fromSchema}.${fromTable}.${colName}`)
+        }
+      } else if (contype === 'u' && fromCols.length > 0) {
+        uniqueSets.push({
+          schema: fromSchema,
+          table: fromTable,
+          indexName: typeof row.constraint_name === 'string' ? row.constraint_name : undefined,
+          columns: fromCols,
+        })
+      } else if (contype === 'f') {
+        const toSchema = String(row.to_schema || fromSchema)
+        const toTable = String(row.to_table || '')
+        const toCols = parsePgArrayField(row.to_columns)
+        if (!toTable) continue
+        const onDelete = mapPgConstraintAction(row.confdeltype)
+        const onUpdate = mapPgConstraintAction(row.confupdtype)
+        const pairCount = Math.min(fromCols.length, toCols.length)
+        for (let i = 0; i < pairCount; i++) {
+          foreignKeys.push({
+            constraintName:
+              typeof row.constraint_name === 'string' ? row.constraint_name : undefined,
+            fromSchema,
+            fromTable,
+            fromColumn: fromCols[i],
+            toSchema,
+            toTable,
+            toColumn: toCols[i],
+            ordinalPosition: i,
+            ...(onDelete ? { onDelete } : {}),
+            ...(onUpdate ? { onUpdate } : {}),
+          })
+        }
+      }
+    }
+
+    const tables: RawErTableRow[] = tableRows
+      .filter((r) => typeof r.table_name === 'string' && r.table_name.length > 0)
+      .map((r) => ({
+        schema: String(r.schema_name || targetSchema),
+        name: String(r.table_name),
+        kind: r.kind === 'view' ? 'view' : 'table',
+      }))
+
+    const columns: RawErColumnRow[] = colRows
+      .filter((r) => typeof r.table_name === 'string' && typeof r.column_name === 'string')
+      .map((r) => {
+        const colSchema = String(r.schema_name || targetSchema)
+        const colTable = String(r.table_name)
+        const colName = String(r.column_name)
+        return {
+          schema: colSchema,
+          table: colTable,
+          name: colName,
+          type: String(r.data_type || ''),
+          nullable: toSqlBool(r.nullable),
+          isPrimaryKey: pkColKeys.has(`${colSchema}.${colTable}.${colName}`),
+          ordinalPosition: typeof r.attnum === 'number' ? r.attnum : Number(r.attnum ?? 0),
+        }
+      })
+
+    return buildSchemaErGraphFromCatalogRows({
+      connectionId: this.profile.id,
+      schema: targetSchema,
+      completeness: 'full',
+      tables,
+      columns,
+      uniqueSets,
+      foreignKeys,
+    })
+  }
+
+  async runExplain(sql: string, signal?: AbortSignal): Promise<ExplainResult | null> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    this.assertNoCopyInProgress()
+    if (signal?.aborted) {
+      throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', this.driverType)
+    }
+
+    const trimmed = sql.trim()
+    if (!trimmed) {
+      throw new DatabaseDriverError('SQL statement cannot be empty', 'invalid_params', this.driverType)
+    }
+
+    const normalized = stripLeadingSqlComments(trimmed, this.driverType).trim()
+    const alreadyExplain = /^EXPLAIN\b/i.test(normalized)
+    const sqlBody = trimmed.replace(/;+\s*$/, '')
+    const guardTarget = alreadyExplain ? sqlBody : `EXPLAIN ${sqlBody}`
+
+    if (
+      hasExplainAnalyzeOption(guardTarget, this.driverType) &&
+      isExplainTargetMutating(guardTarget, this.driverType)
+    ) {
+      throw new DatabaseDriverError(
+        'EXPLAIN ANALYZE is not permitted for mutating statements in Explain mode.',
+        'not_permitted',
+        this.driverType
+      )
+    }
+    if (this.profile.readOnly && isMutatingStatement(guardTarget, this.driverType)) {
+      throw new DatabaseDriverError(
+        'Connection is Read-Only. Uncheck Read-Only in connection settings to modify data.',
+        'read_only',
+        this.driverType
+      )
+    }
+
+    const start = performance.now()
+
+    const executeRaw = async (
+      explainSql: string,
+      useSavepointIfTx: boolean
+    ): Promise<PgRawResult> => {
+      const execWithLease = async (client: PoolClient): Promise<PgRawResult> => {
+        let abortListener: (() => void) | null = null
+        const pid = (client as unknown as { processID?: number }).processID ?? 0
+        if (signal) {
+          abortListener = () => {
+            if (pid > 0) {
+              void this.sendCancelBackend(pid).catch(() => {})
+            }
+          }
+          if (signal.aborted) {
+            throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', this.driverType)
+          }
+          signal.addEventListener('abort', abortListener, { once: true })
+        }
+        try {
+          if (useSavepointIfTx) {
+            await client.query('SAVEPOINT datanoa_explain;')
+            try {
+              const res = (await client.query({
+                text: explainSql,
+                rowMode: 'array',
+              })) as unknown as PgRawResult
+              await client.query('RELEASE SAVEPOINT datanoa_explain;')
+              return res
+            } catch (err) {
+              if (!this.txClientBroken) {
+                await client.query('ROLLBACK TO SAVEPOINT datanoa_explain;').catch(() => {})
+                await client.query('RELEASE SAVEPOINT datanoa_explain;').catch(() => {})
+              }
+              throw err
+            }
+          }
+          return (await client.query({
+            text: explainSql,
+            rowMode: 'array',
+          })) as unknown as PgRawResult
+        } finally {
+          if (signal && abortListener) {
+            signal.removeEventListener('abort', abortListener)
+          }
+        }
+      }
+
+      if (this.txLease !== null) {
+        return await this.runExclusiveTxOp(async () => {
+          if (this.isClosed) {
+            throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+          }
+          this.discardBrokenPinnedClient()
+          const pinned = this.txLease
+          if (pinned !== null) {
+            return await execWithLease(pinned.client)
+          }
+          const lease = await this.acquireLease()
+          try {
+            return await execWithLease(lease.client)
+          } finally {
+            lease.release(false)
+          }
+        })
+      }
+
+      const lease = await this.acquireLease()
+      const guard = attachClientErrorGuard(lease.client)
+      let failed = false
+      try {
+        return await execWithLease(lease.client)
+      } catch (err) {
+        failed = true
+        throw err
+      } finally {
+        guard.cleanup()
+        lease.release(failed || guard.hasError())
+      }
+    }
+
+    let rawRes: PgRawResult
+    let usedJsonFormat = false
+    if (alreadyExplain) {
+      rawRes = await executeRaw(trimmed, this.txLease !== null)
+    } else {
+      const jsonSql = `EXPLAIN (FORMAT JSON) ${sqlBody}`
+      try {
+        rawRes = await executeRaw(jsonSql, this.txLease !== null)
+        usedJsonFormat = true
+      } catch (jsonErr: unknown) {
+        if (signal?.aborted || (jsonErr instanceof DatabaseDriverError && jsonErr.code === 'cancelled')) {
+          throw jsonErr
+        }
+        const fallbackSql = `EXPLAIN ${sqlBody}`
+        rawRes = await executeRaw(fallbackSql, this.txLease !== null)
+      }
+    }
+
+    const executionTimeMs = Math.round(performance.now() - start)
+    const parsed = parsePgQueryResult(rawRes, 1000)
+    const columns = parsed.isSelect ? parsed.result.columns : [{ name: 'QUERY PLAN', type: 'text' }]
+    let rows: unknown[][] = parsed.isSelect ? parsed.result.rows : []
+    if (rows.length === 0 && Array.isArray(rawRes.rows) && rawRes.rows.length > 0) {
+      rows = rawRes.rows.map((r) =>
+        Array.isArray(r) ? r : columns.map((c) => (r as Record<string, unknown>)[c.name] ?? Object.values(r)[0])
+      )
+    }
+    const firstCell = rows[0]?.[0]
+    let rawText: string
+    let parseInput: unknown
+    if (usedJsonFormat && firstCell !== undefined && firstCell !== null) {
+      rawText = typeof firstCell === 'string' ? firstCell : JSON.stringify(firstCell)
+      parseInput = firstCell
+    } else {
+      rawText = rows
+        .map((r) => {
+          const cell = r[0]
+          return typeof cell === 'string' ? cell : cell !== undefined && cell !== null ? JSON.stringify(cell) : ''
+        })
+        .join('\n')
+      parseInput = rawText
+    }
+
+    const explainPlan = parseExplainPlan(parseInput, { dialect: this.driverType })
+    return {
+      columns,
+      rows,
+      rawText,
+      formatHint: explainPlan.format,
+      executionTimeMs,
+      explainPlan,
+    }
+  }
+
+  async openCopyImport(opts: CopyImportOpenOptions): Promise<CopyImportStreamHandle> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+    }
+    if (this.profile.readOnly) {
+      throw new DatabaseDriverError('Connection is configured as read-only', 'READ_ONLY', this.driverType)
+    }
+    this.assertNoCopyInProgress()
+    // Validate table/schema/column COPY SQL before reserving activeCopyOpening or borrowing a lease/TX
+    buildPostgresCopyFromStdinSql(opts)
+    this.activeCopyOpening = true
+
+    if (this.driverType === 'cockroachdb') {
+      this.activeCopyOpening = false
+      return {
+        supported: false,
+        fallbackReason: 'CockroachDB does not support PostgreSQL COPY FROM STDIN streaming',
+        writeRows: async () => {
+          throw new DatabaseDriverError(
+            'CockroachDB does not support PostgreSQL COPY FROM STDIN streaming',
+            'NOT_SUPPORTED',
+            this.driverType
+          )
+        },
+        commit: async () => {
+          throw new DatabaseDriverError(
+            'CockroachDB does not support PostgreSQL COPY FROM STDIN streaming',
+            'NOT_SUPPORTED',
+            this.driverType
+          )
+        },
+        abort: async () => {},
+      }
+    }
+
+    const usePinnedTx = !this.autoCommit || this.txLease !== null
+    let lease: PgLease
+    let copyErrorGuard: ReturnType<typeof attachClientErrorGuard> | null = null
+
+    try {
+      if (usePinnedTx) {
+        lease = await this.runExclusiveTxOp(async () => {
+          if (this.isClosed) {
+            throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+          }
+          this.discardBrokenPinnedClient()
+          if (!this.autoCommit && this.txClient === null) {
+            await this.beginTransactionLocked()
+          }
+          const pinned = this.txLease
+          if (!pinned) {
+            throw new DatabaseDriverError('Pinned transaction client unavailable for COPY', 'NO_ACTIVE_TX', this.driverType)
+          }
+          await pinned.client.query('SAVEPOINT datanoa_copy_import;')
+          if (this.isClosed) {
+            await pinned.client.query('ROLLBACK TO SAVEPOINT datanoa_copy_import;').catch(() => {})
+            await pinned.client.query('RELEASE SAVEPOINT datanoa_copy_import;').catch(() => {})
+            throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+          }
+          return pinned
+        })
+      } else {
+        lease = await this.acquireLease()
+        copyErrorGuard = attachClientErrorGuard(lease.client)
+        if (this.isClosed) {
+          copyErrorGuard.cleanup()
+          copyErrorGuard = null
+          lease.release(true)
+          throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+        }
+        try {
+          await lease.client.query('BEGIN;')
+        } catch (err) {
+          copyErrorGuard.cleanup()
+          copyErrorGuard = null
+          lease.release(true)
+          throw normalizePostgresOperationError(err, this.driverType, this.profile)
+        }
+        if (this.isClosed) {
+          await lease.client.query('ROLLBACK;').catch(() => {})
+          copyErrorGuard.cleanup()
+          copyErrorGuard = null
+          lease.release(true)
+          throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+        }
+      }
+    } catch (err) {
+      this.activeCopyOpening = false
+      throw err
+    }
+
+    this.activeCopyLease = lease
+    this.activeCopyOpening = false
+
+    type CopyTerminalState = 'active' | 'committing' | 'aborted' | 'committed'
+    let copyTerminalState: CopyTerminalState = 'active'
+    let commitInFlight = false
+    let commitSettlementPromise: Promise<void> | null = null
+    let cleanupPromise: Promise<void> | null = null
+    let leaseReleased = false
+
+    const releaseLeaseOnce = (destroy: boolean): void => {
+      if (leaseReleased) return
+      leaseReleased = true
+      lease.release(destroy)
+    }
+
+    const releaseCopyLease = (): void => {
+      if (this.activeCopyLease === lease) {
+        this.activeCopyLease = null
+      }
+      this.activeCopyAbort = null
+      if (copyErrorGuard) {
+        copyErrorGuard.cleanup()
+        copyErrorGuard = null
+      }
+    }
+
+    let copyStream: PostgresCopyInStream | null = null
+    const cleanupOnAbortOrError = async (reason?: string): Promise<void> => {
+      if (copyTerminalState === 'committed') {
+        return
+      }
+      if (copyTerminalState === 'committing' && commitSettlementPromise) {
+        await commitSettlementPromise
+        return
+      }
+      if (cleanupPromise) {
+        return cleanupPromise
+      }
+      copyTerminalState = 'aborted'
+      cleanupPromise = (async () => {
+        try {
+          if (copyStream) {
+            await copyStream.abortWithCleanup(reason, {
+              onReadyForQueryTimeout: () => {
+                if (usePinnedTx) {
+                  this.txClientBroken = true
+                }
+              },
+            })
+          }
+          if (usePinnedTx) {
+            if (this.txClientBroken) {
+              this.clearPinnedTxClient()
+              releaseLeaseOnce(true)
+            } else {
+              try {
+                await lease.client.query('ROLLBACK TO SAVEPOINT datanoa_copy_import;')
+                await lease.client.query('RELEASE SAVEPOINT datanoa_copy_import;')
+              } catch {
+                this.txClientBroken = true
+                this.clearPinnedTxClient()
+                releaseLeaseOnce(true)
+              }
+            }
+          } else {
+            let shouldDestroy = Boolean(copyErrorGuard?.hasError()) || this.txClientBroken
+            if (!shouldDestroy) {
+              try {
+                await lease.client.query('ROLLBACK;')
+              } catch {
+                shouldDestroy = true
+              }
+              if (copyErrorGuard?.hasError() || this.txClientBroken) {
+                shouldDestroy = true
+              }
+            }
+            releaseLeaseOnce(shouldDestroy)
+          }
+        } finally {
+          releaseCopyLease()
+        }
+      })()
+      return cleanupPromise
+    }
+
+    this.activeCopyAbort = cleanupOnAbortOrError
+
+    try {
+      if (this.isClosed) {
+        await cleanupOnAbortOrError('Session is closing').catch(() => {})
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+
+      copyStream = new PostgresCopyInStream(lease.client as unknown as PgCopyQueryableClient, {
+        table: opts.table,
+        schema: opts.schema,
+        columns: opts.columns,
+        signal: opts.signal,
+        onIdleTimeout: async () => {
+          await cleanupOnAbortOrError('COPY stream idle timeout exceeded (>30s)')
+        },
+      })
+
+      await copyStream.open()
+      if (this.isClosed) {
+        await cleanupOnAbortOrError('Session is closing').catch(() => {})
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+    } catch (err: unknown) {
+      await cleanupOnAbortOrError(this.isClosed ? 'Session is closing' : 'COPY open rejected').catch(() => {})
+      if (this.isClosed) {
+        throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
+      }
+      if (extractErrorCode(err) === '0A000') {
+        const msg = extractErrorMessage(err) || 'COPY FROM STDIN is not supported by this server'
+        return {
+          supported: false,
+          fallbackReason: msg,
+          writeRows: async () => {
+            throw new DatabaseDriverError(msg, 'NOT_SUPPORTED', this.driverType)
+          },
+          commit: async () => {
+            throw new DatabaseDriverError(msg, 'NOT_SUPPORTED', this.driverType)
+          },
+          abort: async () => {},
+        }
+      }
+      throw normalizePostgresOperationError(err, this.driverType, this.profile)
+    }
+
+    const activeStream = copyStream
+    return {
+      supported: true,
+      writeRows: async (rows) => {
+        try {
+          return await activeStream.writeRows(rows)
+        } catch (err: unknown) {
+          await cleanupOnAbortOrError(extractErrorMessage(err) || 'COPY write failed').catch(() => {})
+          throw err
+        }
+      },
+      commit: async () => {
+        if (copyTerminalState === 'aborted') {
+          if (cleanupPromise) {
+            await cleanupPromise.catch(() => {})
+          }
+          throw new DatabaseDriverError('COPY import was already aborted', 'cancelled', this.driverType)
+        }
+        if (copyTerminalState !== 'active' || commitInFlight) {
+          throw new DatabaseDriverError('COPY stream is not open for commit', 'INVALID_STATE', this.driverType)
+        }
+        commitInFlight = true
+        try {
+          const result = await activeStream.commit()
+          if (copyTerminalState !== 'active') {
+            if (cleanupPromise) {
+              await cleanupPromise.catch(() => {})
+            }
+            throw new DatabaseDriverError('COPY import was already aborted', 'cancelled', this.driverType)
+          }
+          if (!usePinnedTx && (copyErrorGuard?.hasError() || this.txClientBroken)) {
+            throw new DatabaseDriverError(
+              'PostgreSQL connection failed during COPY import',
+              'CONNECTION_ERROR',
+              this.driverType
+            )
+          }
+
+          copyTerminalState = 'committing'
+          let commitErr: unknown = null
+          let hasCommitErr = false
+          commitSettlementPromise = (async () => {
+            try {
+              if (usePinnedTx) {
+                if (this.txClientBroken) {
+                  throw new DatabaseDriverError(
+                    'PostgreSQL transaction connection failed during COPY import',
+                    'CONNECTION_ERROR',
+                    this.driverType
+                  )
+                }
+                await lease.client.query('RELEASE SAVEPOINT datanoa_copy_import;')
+                this.statementCount += 1
+                if (this.txClientBroken) {
+                  this.clearPinnedTxClient()
+                  releaseLeaseOnce(true)
+                }
+                copyTerminalState = 'committed'
+                releaseCopyLease()
+              } else {
+                await lease.client.query('COMMIT;')
+                const shouldDestroy = Boolean(copyErrorGuard?.hasError()) || this.txClientBroken
+                copyTerminalState = 'committed'
+                releaseLeaseOnce(shouldDestroy)
+                releaseCopyLease()
+                if (shouldDestroy) {
+                  throw new DatabaseDriverError(
+                    'PostgreSQL connection reset during COPY commit',
+                    'CONNECTION_ERROR',
+                    this.driverType
+                  )
+                }
+              }
+            } catch (err: unknown) {
+              commitErr = err
+              hasCommitErr = true
+              if (copyTerminalState !== 'committed') {
+                copyTerminalState = 'active'
+                await cleanupOnAbortOrError(extractErrorMessage(err) || 'COPY commit failed').catch(() => {})
+              }
+            }
+          })()
+          await commitSettlementPromise
+          if (hasCommitErr) {
+            throw commitErr
+          }
+          return result
+        } catch (err: unknown) {
+          if (copyTerminalState === 'active') {
+            await cleanupOnAbortOrError(extractErrorMessage(err) || 'COPY commit failed').catch(() => {})
+          } else if (cleanupPromise) {
+            await cleanupPromise.catch(() => {})
+          }
+          throw err
+        } finally {
+          commitInFlight = false
+        }
+      },
+      abort: async (reason?: string) => {
+        await cleanupOnAbortOrError(reason)
+      },
+    }
+  }
+
   async fetchPage(params: FetchPageParams): Promise<TableBrowseResult> {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
     }
+    this.assertNoCopyInProgress()
     const schema = params.schema || 'public'
 
     if (!params.bypassTransaction && (!this.autoCommit || this.txLease !== null)) {
@@ -902,6 +1737,7 @@ export class PostgresSession implements IDatabaseSession {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
     }
+    this.assertNoCopyInProgress()
     const schema = params.schema || 'public'
     const originalColumnType = this.tableDetailsCache.findColumnType(
       schema,
@@ -1071,6 +1907,7 @@ export class PostgresSession implements IDatabaseSession {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
     }
+    this.assertNoCopyInProgress()
     const schema = params.schema || 'public'
     const batch = buildBatchStatements({
       driver: this.driverType,
@@ -1277,6 +2114,7 @@ export class PostgresSession implements IDatabaseSession {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
     }
+    this.assertNoCopyInProgress()
 
     const stmts = splitSqlStatements(sql, this.driverType).map((s) => s.text)
     const execList = stmts.length <= 1 ? [sql] : stmts
@@ -1592,6 +2430,7 @@ export class PostgresSession implements IDatabaseSession {
   }
 
   async setAutoCommit(enabled: boolean): Promise<TransactionState> {
+    this.assertNoCopyInProgress()
     return this.runExclusiveTxOp(async () => {
       if (this.isClosed) {
         throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
@@ -1643,10 +2482,12 @@ export class PostgresSession implements IDatabaseSession {
   }
 
   async beginTransaction(): Promise<TransactionState> {
+    this.assertNoCopyInProgress()
     return this.runExclusiveTxOp(() => this.beginTransactionLocked())
   }
 
   async commitTransaction(): Promise<TransactionState> {
+    this.assertNoCopyInProgress()
     return this.runExclusiveTxOp(async () => {
       if (this.isClosed) {
         throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
@@ -1685,6 +2526,7 @@ export class PostgresSession implements IDatabaseSession {
   }
 
   async rollbackTransaction(): Promise<TransactionState> {
+    this.assertNoCopyInProgress()
     return this.runExclusiveTxOp(async () => {
       if (this.isClosed) {
         throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', this.driverType)
@@ -1873,6 +2715,7 @@ export class PostgresDriver implements IDatabaseDriver {
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 10000,
       ssl: sslConfig,
+      stream: createPostgresHappyEyeballsSocket,
       ...(effectiveOptions ? { options: effectiveOptions } : {}),
     }
 

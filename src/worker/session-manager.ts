@@ -1,5 +1,14 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { createHash } from 'node:crypto'
 import type { JsonValue, OrcaWorkerApi } from 'orca/worker'
-import type { ConnectionProfile, DatabaseDriverType } from '../protocol'
+import type {
+  ConnectionProfile,
+  DatabaseDriverType,
+  SshHostKeyChallenge,
+  SshJumpHopSecret,
+  SshJumpHostProfile,
+  TlsFailure,
+} from '../protocol'
 import { SAVED_CONNECTIONS_STORAGE_KEY, sanitizeJsonPayload } from '../protocol'
 import {
   HealthPolicy,
@@ -11,11 +20,19 @@ import {
 import { loadBuiltinDriver } from '../drivers/lazy-loader'
 import { getByodDefaultPort, isByodDriverId } from '../drivers/driver-manager'
 import type { DriverTlsOptions, SshTunnelHandle } from '../drivers/common/tls-and-tunnel'
-import { openSshTunnel } from '../drivers/common/tls-and-tunnel'
+import { openSshTunnel, SshHostKeyVerificationError } from '../drivers/common/tls-and-tunnel'
+import {
+  copyHopSecrets as copyHopSecretsVault,
+  deleteSecret as deleteAllConnectionSecrets,
+  getHopSecrets as getHopSecretsVault,
+  saveHopSecrets as saveHopSecretsVault,
+} from '../drivers/common/ssh-hop-secrets'
+import { diagnoseTlsFailure } from '../drivers/common/tls-prober'
 import {
   BUILTIN_ENGINE_CATALOG,
   getDefaultPortForDriver,
 } from '../drivers/common/engine-catalog'
+import type { SshHostKeyChallengeStore } from './ssh-host-key-challenge-store'
 import { appendActionableTlsErrorHint, scrubCredentialsInText } from './worker-utils'
 
 /** TCP engines that can be reached through an SSH bastion */
@@ -23,20 +40,43 @@ const SSH_TUNNEL_ENGINES: ReadonlySet<DatabaseDriverType> = new Set(
   BUILTIN_ENGINE_CATALOG.filter((engine) => engine.supportsSshTunnel).map((engine) => engine.id)
 )
 
+const TCP_TLS_PROBE_DRIVERS: ReadonlySet<DatabaseDriverType> = new Set([
+  'postgres',
+  'cockroachdb',
+  'mysql',
+  'mariadb',
+  'mssql',
+  'oracle',
+  'redis',
+  'mongodb',
+  'clickhouse',
+])
+
 /** Secrets held only in `orca.secrets` (never persisted on the ConnectionProfile) */
 export interface ExtendedSecrets {
   sslKeyPassphrase?: string
   sshPassphrase?: string
   sshPassword?: string
+  sshJumpHopSecrets?: Record<string, SshJumpHopSecret>
+  sshRetryToken?: string
+  panelId?: string
 }
 
 export interface SessionManagerHostApi {
-  storage: Pick<OrcaWorkerApi['storage'], 'get' | 'set'>
+  storage: Pick<OrcaWorkerApi['storage'], 'get' | 'set'> & {
+    delete?: OrcaWorkerApi['storage']['delete']
+  }
   secrets: Pick<OrcaWorkerApi['secrets'], 'get' | 'set' | 'delete'> & {
     protection?: () => Promise<string | { status?: string }>
   }
   host?: Pick<OrcaWorkerApi['host'], 'call' | 'has'>
+  panels?: Pick<OrcaWorkerApi['panels'], 'post'>
   log: OrcaWorkerApi['log']
+}
+
+export interface SessionManagerOptions {
+  challengeStore?: SshHostKeyChallengeStore
+  onSessionClosed?: (connectionId: string) => Promise<void> | void
 }
 
 /** Default port for URL-based engines when the URL does not spell one out */
@@ -394,12 +434,20 @@ export class SessionManager {
   private readonly tunnelOwners = new Map<SshTunnelHandle, string>()
   private readonly healthPolicies = new Map<string, HealthPolicy>()
   private readonly generations = new Map<string, number>()
+  private readonly connectionMutationChains = new Map<string, Promise<void>>()
+  private readonly activeMutationContext = new AsyncLocalStorage<Set<string>>()
+  private storageOpChain: Promise<void> = Promise.resolve()
+  private readonly storageLockContext = new AsyncLocalStorage<boolean>()
   private globalGeneration = 0
   private readonly orca: SessionManagerHostApi
+  private readonly challengeStore?: SshHostKeyChallengeStore
+  private readonly onSessionClosed?: (connectionId: string) => Promise<void> | void
   private driverManager?: { resolveVerifiedAdapter(driverId: string): Promise<IDatabaseDriver> }
 
-  constructor(orca: SessionManagerHostApi) {
+  constructor(orca: SessionManagerHostApi, options?: SessionManagerOptions) {
     this.orca = orca
+    this.challengeStore = options?.challengeStore
+    this.onSessionClosed = options?.onSessionClosed
   }
 
   setDriverManager(driverManager: {
@@ -427,9 +475,102 @@ export class SessionManager {
   }
 
   /**
-   * Retrieves all user-persisted connection profiles from Orca storage.
+   * Serializes profile/secret mutations and atomic connect-snapshot reads per `connectionId`
+   * while bumping the connection generation so concurrent connects fail closed cleanly.
+   */
+  async withConnectionMutation<T>(connectionId: string, fn: () => Promise<T>): Promise<T> {
+    this.bumpGeneration(connectionId)
+    const prev = this.connectionMutationChains.get(connectionId) ?? Promise.resolve()
+    let release!: () => void
+    const next = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const tail = prev.then(() => next)
+    this.connectionMutationChains.set(connectionId, tail)
+    await prev.catch(() => {})
+    const activeIds = new Set(this.activeMutationContext.getStore())
+    activeIds.add(connectionId)
+    try {
+      this.bumpGeneration(connectionId)
+      return await this.activeMutationContext.run(activeIds, fn)
+    } finally {
+      this.bumpGeneration(connectionId)
+      release()
+      if (this.connectionMutationChains.get(connectionId) === tail) {
+        this.connectionMutationChains.delete(connectionId)
+      }
+    }
+  }
+
+  /**
+   * Serializes multi-key connection storage writes/rollbacks so concurrent reads never
+   * observe partially written or uncommitted connection profiles.
+   */
+  async withConnectionStorageLock<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.storageLockContext.getStore() === true) {
+      return await fn()
+    }
+    const prev = this.storageOpChain
+    let release!: () => void
+    const next = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    this.storageOpChain = prev.then(() => next)
+    await prev.catch(() => {})
+    try {
+      return await this.storageLockContext.run(true, fn)
+    } finally {
+      release()
+    }
+  }
+
+  private async snapshotConnectionForConnect(connectionId: string): Promise<{
+    expectedGen: number
+    profile: ConnectionProfile
+    secret: string | undefined
+    extraSecrets: ExtendedSecrets
+  }> {
+    const pendingMutation = this.connectionMutationChains.get(connectionId)
+    if (pendingMutation) {
+      await pendingMutation.catch(() => {})
+    }
+    const expectedGen = this.getGeneration(connectionId)
+    const profile = await this.findProfile(connectionId)
+    if (!profile) {
+      const err = new Error(`Connection '${connectionId}' not found in storage`) as Error & {
+        code: string
+      }
+      err.code = 'invalid_params'
+      throw err
+    }
+
+    const shouldFetchSecret =
+      profile.driver === 'libsql' || profile.driver === 'd1'
+        ? profile.hasAuthToken !== false
+        : Boolean(profile.hasPassword)
+    const [secret, extraSecrets, hopSecrets] = await Promise.all([
+      shouldFetchSecret ? this.getSecret(connectionId, profile.driver) : Promise.resolve(undefined),
+      this.getExtendedSecrets(connectionId),
+      profile.sshJumpHosts && profile.sshJumpHosts.length > 0
+        ? this.getHopSecrets(connectionId, profile.sshJumpHosts)
+        : Promise.resolve(undefined),
+    ])
+    if (hopSecrets) {
+      extraSecrets.sshJumpHopSecrets = hopSecrets
+    }
+    if (this.getGeneration(connectionId) !== expectedGen) {
+      throw new Error(`Session initialization for '${connectionId}' was superseded by close/update`)
+    }
+    return { expectedGen, profile, secret, extraSecrets }
+  }
+
+  /**
+   * Retrieves all user-persisted connection profiles from Orca storage after any in-flight write settles.
    */
   async getStoredConnections(): Promise<ConnectionProfile[]> {
+    if (this.storageLockContext.getStore() !== true) {
+      await this.storageOpChain.catch(() => {})
+    }
     const primary = (await this.orca.storage.get(
       SAVED_CONNECTIONS_STORAGE_KEY
     )) as ConnectionProfile[] | null
@@ -442,12 +583,33 @@ export class SessionManager {
   }
 
   /**
-   * Persists connection profiles to Orca storage.
+   * Persists connection profiles to Orca storage atomically across both primary and legacy keys.
    */
   async saveStoredConnections(connections: ConnectionProfile[]): Promise<void> {
-    const sanitized = sanitizeJsonPayload(connections) as unknown as JsonValue
-    await this.orca.storage.set(SAVED_CONNECTIONS_STORAGE_KEY, sanitized)
-    await this.orca.storage.set('connections', sanitized)
+    return await this.withConnectionStorageLock(async () => {
+      const sanitized = sanitizeJsonPayload(connections) as unknown as JsonValue
+      const prevPrimary = await this.orca.storage.get(SAVED_CONNECTIONS_STORAGE_KEY)
+      await this.orca.storage.get('connections')
+      await this.orca.storage.set(SAVED_CONNECTIONS_STORAGE_KEY, sanitized)
+      try {
+        await this.orca.storage.set('connections', sanitized)
+      } catch (err) {
+        try {
+          if (prevPrimary === null || prevPrimary === undefined) {
+            if (typeof this.orca.storage.delete === 'function') {
+              await this.orca.storage.delete(SAVED_CONNECTIONS_STORAGE_KEY)
+            } else {
+              await this.orca.storage.set(SAVED_CONNECTIONS_STORAGE_KEY, null as unknown as JsonValue)
+            }
+          } else {
+            await this.orca.storage.set(SAVED_CONNECTIONS_STORAGE_KEY, prevPrimary)
+          }
+        } catch {
+          // Best-effort rollback of primary storage key
+        }
+        throw err
+      }
+    })
   }
 
   /**
@@ -561,14 +723,55 @@ export class SessionManager {
   }
 
   /**
-   * Purges `pwd_`, `tok_`, `sslkey_`, `sshpass_` and `sshpwd_` secrets for a deleted connection.
+   * Reads per-hop SSH secrets (`sshhop_pwd_`, `sshhop_pass_`) for a profile's jump hosts.
    */
-  async deleteSecret(connectionId: string): Promise<void> {
-    await Promise.all(
-      ['pwd', 'tok', 'sslkey', 'sshpass', 'sshpwd'].map(async (prefix) => {
-        await this.orca.secrets.delete(`${prefix}_${connectionId}`)
-      })
+  async getHopSecrets(
+    connectionId: string,
+    jumpHosts: readonly SshJumpHostProfile[] | undefined
+  ): Promise<Record<string, SshJumpHopSecret>> {
+    return await getHopSecretsVault(this.orca.secrets, connectionId, jumpHosts)
+  }
+
+  /**
+   * Persists or clears per-hop SSH secrets (`sshhop_pwd_`, `sshhop_pass_`) for the given `hopIds`.
+   */
+  async saveHopSecrets(
+    connectionId: string,
+    hopIds: readonly string[],
+    secretsMap: Readonly<Record<string, SshJumpHopSecret>> | undefined
+  ): Promise<void> {
+    await saveHopSecretsVault(
+      this.orca.secrets,
+      connectionId,
+      hopIds,
+      secretsMap,
+      () => this.assertSecureSecretStorage()
     )
+  }
+
+  /**
+   * Copies per-hop SSH secrets from one connection profile to another.
+   */
+  async copyHopSecrets(
+    sourceConnectionId: string,
+    targetConnectionId: string,
+    hopIds: readonly string[]
+  ): Promise<void> {
+    await copyHopSecretsVault(
+      this.orca.secrets,
+      sourceConnectionId,
+      targetConnectionId,
+      hopIds,
+      () => this.assertSecureSecretStorage()
+    )
+  }
+
+  /**
+   * Purges `pwd_`, `tok_`, `sslkey_`, `sshpass_`, `sshpwd_`, and all `sshhop_pwd_`/`sshhop_pass_`
+   * secrets for a deleted or rolled-back connection.
+   */
+  async deleteSecret(connectionId: string, hopIds: readonly string[] = []): Promise<void> {
+    await deleteAllConnectionSecrets(this.orca.secrets, connectionId, hopIds)
   }
 
   /**
@@ -591,13 +794,17 @@ export class SessionManager {
     const toWrite = values.filter((entry) => Boolean(entry.value))
     if (toWrite.length === 0) return
     await this.assertSecureSecretStorage()
-    await Promise.all(
+    const results = await Promise.allSettled(
       toWrite.map(async ({ prefix, value }) => {
         if (value) {
           await this.orca.secrets.set(`${prefix}_${targetConnectionId}`, value)
         }
       })
     )
+    const rejected = results.find((r): r is PromiseRejectedResult => r.status === 'rejected')
+    if (rejected) {
+      throw rejected.reason
+    }
   }
 
   /**
@@ -606,6 +813,12 @@ export class SessionManager {
   async findProfile(connectionId: string): Promise<ConnectionProfile | null> {
     if (!connectionId || connectionId.startsWith('ws_')) {
       return null
+    }
+    if (!this.activeMutationContext.getStore()?.has(connectionId)) {
+      const pendingMutation = this.connectionMutationChains.get(connectionId)
+      if (pendingMutation) {
+        await pendingMutation.catch(() => {})
+      }
     }
     const list = await this.getStoredConnections()
     return list.find((c) => c.id === connectionId) ?? null
@@ -645,7 +858,10 @@ export class SessionManager {
    * Returns an active database session for the connection ID, creating and caching it if needed.
    * Deduplicates concurrent in-flight creation requests for the same connectionId.
    */
-  async getSession(connectionId: string): Promise<IDatabaseSession> {
+  async getSession(
+    connectionId: string,
+    opts?: { sshRetryToken?: string }
+  ): Promise<IDatabaseSession> {
     const existing = this.activeSessions.get(connectionId)
     if (existing) {
       if (typeof existing.isAlive !== 'function' || existing.isAlive()) {
@@ -657,32 +873,23 @@ export class SessionManager {
       void existing.close().catch(() => {})
     }
 
-    const inFlight = this.pendingSessions.get(connectionId)
+    const retryToken =
+      typeof opts?.sshRetryToken === 'string' && opts.sshRetryToken.trim()
+        ? opts.sshRetryToken.trim()
+        : undefined
+    const inFlight = !retryToken ? this.pendingSessions.get(connectionId) : undefined
     if (inFlight) {
       return inFlight
     }
 
-    const expectedGen = this.getGeneration(connectionId)
     const createPromise = (async () => {
       try {
-        const profile = await this.findProfile(connectionId)
-        if (!profile) {
-          const err = new Error(`Connection '${connectionId}' not found in storage`) as Error & {
-            code: string
-          }
-          err.code = 'invalid_params'
-          throw err
-        }
-
-        const shouldFetchSecret =
-          profile.driver === 'libsql' || profile.driver === 'd1'
-            ? profile.hasAuthToken !== false
-            : Boolean(profile.hasPassword)
-        const secret = shouldFetchSecret
-          ? await this.getSecret(connectionId, profile.driver)
-          : undefined
-        const extraSecrets = await this.getExtendedSecrets(connectionId)
-        const session = await this.openSessionWithTunnel(profile, secret, extraSecrets)
+        const { expectedGen, profile, secret, extraSecrets } =
+          await this.snapshotConnectionForConnect(connectionId)
+        const extraWithRetry = retryToken
+          ? { ...extraSecrets, sshRetryToken: retryToken }
+          : extraSecrets
+        const session = await this.openSessionWithTunnel(profile, secret, extraWithRetry)
         if (this.getGeneration(connectionId) !== expectedGen) {
           await session.close().catch(() => {})
           throw new Error(`Session initialization for '${connectionId}' was superseded by close/update`)
@@ -691,13 +898,17 @@ export class SessionManager {
         this.getOrCreateHealthPolicy(connectionId).recordSuccess()
         return session
       } catch (err: unknown) {
-        const msg = scrubCredentialsInText(err instanceof Error ? err.message : String(err))
-        this.getOrCreateHealthPolicy(connectionId).recordFailure(msg)
+        if (!(err instanceof SshHostKeyVerificationError)) {
+          const msg = scrubCredentialsInText(err instanceof Error ? err.message : String(err))
+          this.getOrCreateHealthPolicy(connectionId).recordFailure(msg)
+        }
         throw err
       }
     })()
 
-    this.pendingSessions.set(connectionId, createPromise)
+    if (!retryToken) {
+      this.pendingSessions.set(connectionId, createPromise)
+    }
     try {
       return await createPromise
     } finally {
@@ -765,32 +976,247 @@ export class SessionManager {
     await Promise.all(owned.map(async (tunnel) => await this.releaseTunnel(tunnel)))
   }
 
+  private isLikelyNonTlsAuthError(err: unknown): boolean {
+    if (!err || typeof err !== 'object') return false
+    const rec = err as { code?: unknown; message?: unknown }
+    const code = typeof rec.code === 'string' || typeof rec.code === 'number' ? String(rec.code).trim() : ''
+    const msg = typeof rec.message === 'string' ? rec.message : ''
+    if (
+      code === '28P01' ||
+      code === '1045' ||
+      code === '18456' ||
+      code === 'ORA-01017'
+    ) {
+      return true
+    }
+    return /password authentication failed|invalid username\/password|access denied for user|login failed for user/i.test(
+      msg
+    )
+  }
+
+  private hasExplicitTlsErrorSignal(err: unknown): boolean {
+    if (!err || typeof err !== 'object') return false
+    const rec = err as { code?: unknown; cause?: unknown }
+    const codes = [
+      typeof rec.code === 'string' ? rec.code : '',
+      rec.cause && typeof rec.cause === 'object' && 'code' in rec.cause
+        ? String((rec.cause as { code?: unknown }).code ?? '')
+        : '',
+    ]
+    return codes.some((c) =>
+      /^(?:ERR_TLS_|ERR_SSL_|CERT_|DEPTH_ZERO_|SELF_SIGNED_|UNABLE_TO_VERIFY_|UNABLE_TO_GET_ISSUER_|HOSTNAME_MISMATCH|EPROTO|TLS\.)/i.test(
+        c.trim()
+      )
+    )
+  }
+
+  private async maybeDiagnoseConnectionTlsFailure(
+    profile: ConnectionProfile,
+    probeHost: string,
+    probePort: number,
+    originalServername: string | undefined,
+    err: unknown
+  ): Promise<TlsFailure | undefined> {
+    if (!TCP_TLS_PROBE_DRIVERS.has(profile.driver)) return undefined
+    if (err instanceof SshHostKeyVerificationError) return undefined
+    if (this.isLikelyNonTlsAuthError(err)) return undefined
+    if (!probeHost || !Number.isInteger(probePort) || probePort < 1 || probePort > 65535) {
+      return undefined
+    }
+    try {
+      const diagnosed = await diagnoseTlsFailure({
+        driver: profile.driver,
+        host: probeHost,
+        port: probePort,
+        originalServername: originalServername || probeHost,
+        sslMode: profile.sslMode,
+        error: err,
+      })
+      if (
+        diagnosed.kind !== 'Other' ||
+        Boolean(diagnosed.fingerprintSha256) ||
+        this.hasExplicitTlsErrorSignal(err)
+      ) {
+        return diagnosed
+      }
+      return undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  private buildSshHopChainSignature(profile: ConnectionProfile): string {
+    const target = this.resolveTunnelTarget(profile)
+    const hops = (profile.sshJumpHosts ?? []).map((h) => [
+      h.hopId,
+      h.host.trim().toLowerCase(),
+      h.port ?? 22,
+      h.user ?? '',
+      h.authMethod ?? '',
+      h.privateKeyPath ?? '',
+    ])
+    return createHash('sha256')
+      .update(
+        JSON.stringify([
+          profile.driver,
+          target.targetHost.toLowerCase(),
+          target.targetPort,
+          (profile.sshHost ?? '').trim().toLowerCase(),
+          profile.sshPort ?? 22,
+          profile.sshUser ?? '',
+          profile.sshAuthMethod ?? '',
+          profile.sshPrivateKeyPath ?? '',
+          hops,
+        ])
+      )
+      .digest('hex')
+      .slice(0, 24)
+  }
+
+  private resolveSshPinScopeKey(
+    profile: ConnectionProfile,
+    extraSecrets?: ExtendedSecrets
+  ): string {
+    const explicitId = typeof profile.id === 'string' ? profile.id.trim() : ''
+    if (explicitId) return explicitId
+    const hopSignature = this.buildSshHopChainSignature(profile)
+    const digest = createHash('sha256')
+      .update(JSON.stringify([extraSecrets?.panelId ?? '', hopSignature]))
+      .digest('hex')
+      .slice(0, 24)
+    return `unsaved_${digest}`
+  }
+
+  private mintHostKeyChallengeError(
+    err: SshHostKeyVerificationError,
+    panelId?: string,
+    scopeKey?: string,
+    hopSignature?: string,
+    retryToken?: string
+  ): SshHostKeyVerificationError {
+    if (!this.challengeStore) return err
+    const minted = err.sshChallenge.challengeId
+      ? retryToken && !err.sshChallenge.retryToken
+        ? { ...err.sshChallenge, retryToken }
+        : err.sshChallenge
+      : this.challengeStore.mint(err.sshChallenge, panelId, {
+          scopeKey,
+          hopSignature,
+          retryToken,
+        })
+    if (!err.sshChallenge.challengeId) {
+      try {
+        this.orca.panels?.post?.('ssh.hostKeyChallenge', sanitizeJsonPayload(minted))
+      } catch {
+        // Ignore broadcast error in minimal hosts
+      }
+    }
+    return new SshHostKeyVerificationError(err.message, minted)
+  }
+
+  private async openTrackedSshTunnel(
+    profile: ConnectionProfile,
+    target: { targetHost: string; targetPort: number },
+    extraSecrets: ExtendedSecrets | undefined,
+    retryToken?: string
+  ): Promise<SshTunnelHandle> {
+    const store = this.challengeStore
+    const scopeKey = this.resolveSshPinScopeKey(profile, extraSecrets)
+    const hopSignature = this.buildSshHopChainSignature(profile)
+    const effectiveRetryToken = retryToken ?? extraSecrets?.sshRetryToken
+    try {
+      const tunnel = await openSshTunnel(profile, target.targetHost, target.targetPort, {
+        secrets: {
+          sshPassphrase: extraSecrets?.sshPassphrase,
+          sshPassword: extraSecrets?.sshPassword,
+        },
+        hopSecrets: extraSecrets?.sshJumpHopSecrets,
+        consumeTrustedHostKeyPin: store
+          ? (host: string, port: number, exactFingerprint: string) =>
+              store.consumePin(
+                scopeKey,
+                host,
+                port,
+                exactFingerprint,
+                hopSignature,
+                effectiveRetryToken
+              )
+          : undefined,
+        connectionId: profile.id,
+        panelId: extraSecrets?.panelId,
+      })
+      return tunnel
+    } catch (err: unknown) {
+      if (err instanceof SshHostKeyVerificationError) {
+        throw this.mintHostKeyChallengeError(
+          err,
+          extraSecrets?.panelId,
+          scopeKey,
+          hopSignature,
+          effectiveRetryToken
+        )
+      }
+      throw err
+    }
+  }
+
   /**
    * Runs `task` against either the direct profile or a `127.0.0.1:<localPort>` proxied profile,
-   * always closing the temporary SSH tunnel afterwards (used by `connection.test`).
+   * running credential-less TLS probes INSIDE the tunnel when `sshEnabled: true` before closing
+   * the temporary SSH tunnel afterwards (used by `connection.test`).
    */
   private async withTunnel<T>(
     profile: ConnectionProfile,
     extraSecrets: ExtendedSecrets | undefined,
-    task: (target: ConnectionProfile, tlsOptions: DriverTlsOptions | undefined) => Promise<T>
+    task: (target: ConnectionProfile, tlsOptions: DriverTlsOptions | undefined) => Promise<T>,
+    retryToken?: string
   ): Promise<T> {
     if (!this.shouldTunnel(profile)) {
-      return await task(profile, this.buildDriverTlsOptions(extraSecrets))
+      const target = TCP_TLS_PROBE_DRIVERS.has(profile.driver)
+        ? this.resolveTunnelTarget(profile)
+        : null
+      const profileSni = profile.tlsServername?.trim() || undefined
+      try {
+        return await task(profile, this.buildDriverTlsOptions(extraSecrets, profileSni))
+      } catch (err: unknown) {
+        if (target) {
+          const tlsFailure = await this.maybeDiagnoseConnectionTlsFailure(
+            profile,
+            target.targetHost,
+            target.targetPort,
+            profileSni || target.targetHost,
+            err
+          )
+          if (tlsFailure && err instanceof Error) {
+            ;(err as Error & { tlsFailure?: TlsFailure }).tlsFailure = tlsFailure
+          }
+        }
+        throw err
+      }
     }
 
     const target = this.resolveTunnelTarget(profile)
-    const tunnel = await openSshTunnel(profile, target.targetHost, target.targetPort, {
-      secrets: {
-        sshPassphrase: extraSecrets?.sshPassphrase,
-        sshPassword: extraSecrets?.sshPassword,
-      },
-    })
+    const tunnelSni = profile.tlsServername?.trim() || target.targetHost
+    const tunnel = await this.openTrackedSshTunnel(profile, target, extraSecrets, retryToken)
     this.trackTunnel(tunnel, profile.id)
     try {
-      return await task(
-        this.buildProxiedProfile(profile, tunnel),
-        this.buildDriverTlsOptions(extraSecrets, target.targetHost)
-      )
+      const proxied = this.buildProxiedProfile(profile, tunnel)
+      const tlsOpts = this.buildDriverTlsOptions(extraSecrets, tunnelSni)
+      try {
+        return await task(proxied, tlsOpts)
+      } catch (err: unknown) {
+        const tlsFailure = await this.maybeDiagnoseConnectionTlsFailure(
+          profile,
+          tunnel.localHost,
+          tunnel.localPort,
+          tunnelSni,
+          err
+        )
+        if (tlsFailure && err instanceof Error) {
+          ;(err as Error & { tlsFailure?: TlsFailure }).tlsFailure = tlsFailure
+        }
+        throw err
+      }
     } finally {
       await this.releaseTunnel(tunnel)
     }
@@ -807,22 +1233,64 @@ export class SessionManager {
   ): Promise<IDatabaseSession> {
     const driver = await this.resolveDriver(profile.driver)
     if (!this.shouldTunnel(profile)) {
-      return await driver.createSession(profile, secret, this.buildDriverTlsOptions(extraSecrets))
+      const profileSni = profile.tlsServername?.trim() || undefined
+      try {
+        return await driver.createSession(
+          profile,
+          secret,
+          this.buildDriverTlsOptions(extraSecrets, profileSni)
+        )
+      } catch (err: unknown) {
+        if (TCP_TLS_PROBE_DRIVERS.has(profile.driver)) {
+          const target = this.resolveTunnelTarget(profile)
+          const tlsFailure = await this.maybeDiagnoseConnectionTlsFailure(
+            profile,
+            target.targetHost,
+            target.targetPort,
+            profileSni || target.targetHost,
+            err
+          )
+          if (tlsFailure && err instanceof Error) {
+            ;(err as Error & { tlsFailure?: TlsFailure }).tlsFailure = tlsFailure
+          }
+        }
+        throw err
+      }
     }
 
     const expectedGen = this.getGeneration(profile.id)
     const target = this.resolveTunnelTarget(profile)
-    const tunnel: SshTunnelHandle = await openSshTunnel(
-      profile,
-      target.targetHost,
-      target.targetPort,
-      {
-        secrets: {
-          sshPassphrase: extraSecrets?.sshPassphrase,
-          sshPassword: extraSecrets?.sshPassword,
-        },
-      }
+    const tunnelSni = profile.tlsServername?.trim() || target.targetHost
+    const scopeKey = this.resolveSshPinScopeKey(profile, extraSecrets)
+    const hopSignature = this.buildSshHopChainSignature(profile)
+    const retryToken = this.challengeStore?.beginRetryScope(
+      scopeKey,
+      hopSignature,
+      extraSecrets?.sshRetryToken
     )
+    let keepRetryPins = false
+    let tunnel: SshTunnelHandle
+    try {
+      tunnel = await this.openTrackedSshTunnel(profile, target, extraSecrets, retryToken)
+    } catch (err: unknown) {
+      if (err instanceof SshHostKeyVerificationError) {
+        keepRetryPins = true
+        throw this.mintHostKeyChallengeError(
+          err,
+          extraSecrets?.panelId,
+          scopeKey,
+          hopSignature,
+          retryToken
+        )
+      }
+      throw err
+    } finally {
+      this.challengeStore?.endRetryScope(scopeKey, {
+        keepPins: keepRetryPins,
+        hopSignature,
+        retryToken,
+      })
+    }
     this.trackTunnel(tunnel, profile.id)
     const superseded = (): Error =>
       new Error(`SSH tunnel for '${profile.id}' was superseded by close/update`)
@@ -838,9 +1306,19 @@ export class SessionManager {
       session = await driver.createSession(
         this.buildProxiedProfile(profile, tunnel),
         secret,
-        this.buildDriverTlsOptions(extraSecrets, target.targetHost)
+        this.buildDriverTlsOptions(extraSecrets, tunnelSni)
       )
-    } catch (err) {
+    } catch (err: unknown) {
+      const tlsFailure = await this.maybeDiagnoseConnectionTlsFailure(
+        profile,
+        tunnel.localHost,
+        tunnel.localPort,
+        tunnelSni,
+        err
+      )
+      if (tlsFailure && err instanceof Error) {
+        ;(err as Error & { tlsFailure?: TlsFailure }).tlsFailure = tlsFailure
+      }
       await this.releaseTunnel(tunnel)
       throw err
     }
@@ -869,39 +1347,124 @@ export class SessionManager {
 
   /**
    * Tests a connection (without caching a session), keeping any temporary SSH tunnel scoped
-   * to the duration of the test while preserving per-driver error messages.
+   * to the duration of the test while diagnosing TLS failures inside the active tunnel and
+   * preserving `SshHostKeyVerificationError` without penalizing `HealthPolicy`.
    */
   async testConnection(
     profile: ConnectionProfile,
     secret?: string,
     extraSecrets?: ExtendedSecrets
-  ): Promise<{ ok: boolean; message?: string }> {
+  ): Promise<{
+    ok: boolean
+    message?: string
+    tlsFailure?: TlsFailure
+    sshChallenge?: SshHostKeyChallenge
+  }> {
+    const useRetryScope = this.shouldTunnel(profile)
+    const scopeKey = useRetryScope ? this.resolveSshPinScopeKey(profile, extraSecrets) : ''
+    const hopSignature = useRetryScope ? this.buildSshHopChainSignature(profile) : ''
+    const retryToken =
+      useRetryScope && this.challengeStore
+        ? this.challengeStore.beginRetryScope(scopeKey, hopSignature, extraSecrets?.sshRetryToken)
+        : undefined
+    let keepRetryPins = false
     try {
       const driver = await this.resolveDriver(profile.driver)
-      const result = await this.withTunnel(profile, extraSecrets, async (target, tlsOptions) =>
-        await driver.testConnection(target, secret, tlsOptions)
+      const outcome = await this.withTunnel(
+        profile,
+        extraSecrets,
+        async (target, tlsOptions) => {
+          const res = await driver.testConnection(target, secret, tlsOptions)
+          if (res.ok) {
+            return res as { ok: boolean; message?: string; tlsFailure?: TlsFailure }
+          }
+          const probeHost =
+            typeof target.host === 'string' && target.host.trim()
+              ? target.host.trim()
+              : TCP_TLS_PROBE_DRIVERS.has(profile.driver)
+                ? this.resolveTunnelTarget(profile).targetHost
+                : ''
+          const probePort =
+            typeof target.port === 'number' && target.port > 0
+              ? target.port
+              : TCP_TLS_PROBE_DRIVERS.has(profile.driver)
+                ? this.resolveTunnelTarget(profile).targetPort
+                : 0
+          const tlsFailure = await this.maybeDiagnoseConnectionTlsFailure(
+            profile,
+            probeHost,
+            probePort,
+            tlsOptions?.tlsServername ?? probeHost,
+            new Error(res.message || 'Connection test failed')
+          )
+          return {
+            ...res,
+            ...(tlsFailure ? { tlsFailure } : {}),
+          }
+        },
+        retryToken
       )
+
       if (profile.id) {
-        if (result.ok) {
+        if (outcome.ok) {
           this.getOrCreateHealthPolicy(profile.id).recordSuccess()
         } else {
-          const msg = typeof result.message === 'string' ? scrubCredentialsInText(result.message) : 'Connection test failed'
+          const msg =
+            typeof outcome.message === 'string'
+              ? scrubCredentialsInText(outcome.message)
+              : 'Connection test failed'
           this.getOrCreateHealthPolicy(profile.id).recordFailure(msg)
         }
       }
-      if (!result.ok && typeof result.message === 'string') {
+      if (!outcome.ok && typeof outcome.message === 'string') {
         return {
-          ...result,
-          message: appendActionableTlsErrorHint(scrubCredentialsInText(result.message)),
+          ...outcome,
+          message: appendActionableTlsErrorHint(scrubCredentialsInText(outcome.message)),
         }
       }
-      return result
+      return outcome
     } catch (err: unknown) {
+      if (err instanceof SshHostKeyVerificationError) {
+        keepRetryPins = true
+        // Skip HealthPolicy.recordFailure on interactive host-key verification challenges
+        const enhanced = this.mintHostKeyChallengeError(
+          err,
+          extraSecrets?.panelId,
+          scopeKey,
+          hopSignature,
+          retryToken
+        )
+        return {
+          ok: false,
+          message: scrubCredentialsInText(enhanced.message),
+          sshChallenge: enhanced.sshChallenge,
+        }
+      }
       if (profile.id) {
         const msg = scrubCredentialsInText(err instanceof Error ? err.message : String(err))
         this.getOrCreateHealthPolicy(profile.id).recordFailure(msg)
       }
+      const tlsFailure =
+        err && typeof err === 'object' && 'tlsFailure' in err
+          ? (err as { tlsFailure?: TlsFailure }).tlsFailure
+          : undefined
+      if (tlsFailure) {
+        const rawMsg = err instanceof Error ? err.message : String(err)
+        return {
+          ok: false,
+          message: appendActionableTlsErrorHint(scrubCredentialsInText(rawMsg)),
+          tlsFailure,
+        }
+      }
       throw err
+    } finally {
+      if (useRetryScope) {
+        this.challengeStore?.endRetryScope(scopeKey, {
+          keepPins: keepRetryPins,
+          hopSignature,
+          retryToken,
+        })
+      }
     }
   }
 
@@ -937,6 +1500,13 @@ export class SessionManager {
     this.bumpGeneration(connectionId)
     this.pendingSessions.delete(connectionId)
     this.healthPolicies.delete(connectionId)
+    if (this.onSessionClosed) {
+      try {
+        await this.onSessionClosed(connectionId)
+      } catch {
+        // Best-effort pre-close cleanup
+      }
+    }
     const session = this.activeSessions.get(connectionId)
     if (session) {
       this.activeSessions.delete(connectionId)
@@ -979,6 +1549,16 @@ export class SessionManager {
    */
   async closeAll(): Promise<void> {
     this.globalGeneration += 1
+    const activeIds = Array.from(this.activeSessions.keys())
+    if (this.onSessionClosed) {
+      for (const connId of activeIds) {
+        try {
+          await this.onSessionClosed(connId)
+        } catch {
+          // Best-effort pre-close cleanup
+        }
+      }
+    }
     this.pendingSessions.clear()
     this.healthPolicies.clear()
     const sessions = Array.from(this.activeSessions.values())

@@ -86,17 +86,20 @@ export class ValueInspectorController {
     }
   }
 
-  private clampHeight(px: number): number {
+  private getMaxAllowedHeight(): number {
     const parentH = this.rootEl?.parentElement?.getBoundingClientRect?.().height
-    const maxAllowed =
-      parentH && Number.isFinite(parentH) && parentH > 0
-        ? Math.max(MIN_INSPECTOR_HEIGHT_PX, Math.floor(parentH * MAX_INSPECTOR_HEIGHT_RATIO))
-        : FALLBACK_MAX_INSPECTOR_HEIGHT_PX
+    return parentH && Number.isFinite(parentH) && parentH > 0
+      ? Math.max(MIN_INSPECTOR_HEIGHT_PX, Math.floor(parentH * MAX_INSPECTOR_HEIGHT_RATIO))
+      : FALLBACK_MAX_INSPECTOR_HEIGHT_PX
+  }
+
+  private clampHeight(px: number, cachedMaxAllowed?: number): number {
+    const maxAllowed = cachedMaxAllowed ?? this.getMaxAllowedHeight()
     return Math.max(MIN_INSPECTOR_HEIGHT_PX, Math.min(maxAllowed, Math.round(px)))
   }
 
-  private applyHeight(px: number, notifyGrid: boolean): void {
-    const clamped = this.clampHeight(px)
+  private applyHeight(px: number, notifyGrid: boolean, cachedMaxAllowed?: number): void {
+    const clamped = this.clampHeight(px, cachedMaxAllowed)
     this.heightPx = clamped
     if (this.rootEl) {
       this.rootEl.style.height = `${clamped}px`
@@ -108,59 +111,94 @@ export class ValueInspectorController {
   }
 
   private startResizeDrag(e: MouseEvent): void {
+    if (e.button !== undefined && e.button !== 0) return
     if (!this.rootEl || typeof window === 'undefined') return
     e.preventDefault()
     this.resizeDragCleanup?.()
 
     const startY = e.clientY
+    const parentEl = this.rootEl.parentElement
+    const cachedMaxAllowed = this.getMaxAllowedHeight()
     const rectH = this.rootEl.getBoundingClientRect?.().height
     const startHeight = this.clampHeight(
-      rectH && Number.isFinite(rectH) && rectH > 0 ? rectH : this.heightPx
+      rectH && Number.isFinite(rectH) && rectH > 0 ? rectH : this.heightPx,
+      cachedMaxAllowed
     )
+    let pendingPx = startHeight
+    let lastAppliedPx = -1
+    let rafPending = false
+
     this.resizerEl?.classList.add('resizing')
+    parentEl?.classList?.add?.('datanoa-split-resizing')
+    this.host.getDataGrid()?.setViewportResizing?.(true)
     if (typeof document !== 'undefined' && document.body) {
       document.body.style.cursor = 'row-resize'
       document.body.style.userSelect = 'none'
     }
 
-    const scheduleApply = (nextPx: number) => {
-      if (typeof requestAnimationFrame === 'function') {
-        if (this.resizeRafId !== null && typeof cancelAnimationFrame === 'function') {
-          cancelAnimationFrame(this.resizeRafId)
-        }
-        this.resizeRafId = requestAnimationFrame(() => {
-          this.resizeRafId = null
-          this.applyHeight(nextPx, true)
-        })
-      } else {
-        this.applyHeight(nextPx, true)
-      }
+    const applyPendingHeight = () => {
+      rafPending = false
+      this.resizeRafId = null
+      if (pendingPx === lastAppliedPx) return
+      lastAppliedPx = pendingPx
+      this.applyHeight(pendingPx, typeof ResizeObserver !== 'function', cachedMaxAllowed)
     }
 
     const onMove = (moveEv: MouseEvent) => {
-      scheduleApply(startHeight + (startY - moveEv.clientY))
+      if (moveEv.isTrusted && moveEv.buttons === 0) {
+        onEnd()
+        return
+      }
+      const nextPx = this.clampHeight(startHeight + (startY - moveEv.clientY), cachedMaxAllowed)
+      if (nextPx === pendingPx) return
+      pendingPx = nextPx
+      if (typeof requestAnimationFrame === 'function') {
+        if (!rafPending) {
+          rafPending = true
+          const id = requestAnimationFrame(applyPendingHeight)
+          this.resizeRafId = rafPending ? id : null
+        }
+      } else {
+        applyPendingHeight()
+      }
+    }
+
+    const onKeyDown = (keyEv: KeyboardEvent) => {
+      if (keyEv.key === 'Escape') {
+        keyEv.preventDefault()
+        cleanup()
+      }
     }
 
     const cleanup = () => {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onEnd)
       window.removeEventListener('blur', onEnd)
+      window.removeEventListener('keydown', onKeyDown)
+      rafPending = false
       if (this.resizeRafId !== null && typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(this.resizeRafId)
         this.resizeRafId = null
       }
       this.resizerEl?.classList.remove('resizing')
+      parentEl?.classList?.remove?.('datanoa-split-resizing')
       if (typeof document !== 'undefined' && document.body) {
         document.body.style.cursor = ''
         document.body.style.userSelect = ''
       }
+      this.host.getDataGrid()?.setViewportResizing?.(false)
       if (this.resizeDragCleanup === cleanup) {
         this.resizeDragCleanup = null
       }
     }
 
     const onEnd = () => {
+      const hadPending = pendingPx !== lastAppliedPx
       cleanup()
+      if (hadPending) {
+        lastAppliedPx = pendingPx
+        this.applyHeight(pendingPx, false, cachedMaxAllowed)
+      }
       this.persistHeight(this.heightPx)
       this.host.getDataGrid()?.handleViewportResize()
     }
@@ -169,6 +207,7 @@ export class ValueInspectorController {
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onEnd)
     window.addEventListener('blur', onEnd)
+    window.addEventListener('keydown', onKeyDown)
   }
 
   private addListener<K extends keyof HTMLElementEventMap>(
@@ -379,6 +418,7 @@ export class ValueInspectorController {
   }
 
   public close(): void {
+    this.resizeDragCleanup?.()
     const wasOpen = this.openState
     this.openState = false
     if (this.rootEl) {

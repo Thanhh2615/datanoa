@@ -9,6 +9,7 @@ import {
   autoMapImportColumns,
   buildImportPreviewSql,
   buildMappedImportRecords,
+  chunkRowsByJsonByteLimit,
   parseImportBytes,
   validateImportMapping,
   type BuildImportRowsResult,
@@ -184,6 +185,21 @@ export function buildImportCommandPreview(
       .join('\n')
   }
   return buildImportPreviewSql(rows, opts)
+}
+
+function isUnsupportedCopyImportHandlerError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') {
+    const text = String(err ?? '')
+    return /unknown\s+(?:rpc\s+)?(?:handler|method)|handler\s+not\s+(?:registered|found)|method\s+not\s+(?:found|implemented)|not\s+implemented|unsupported\s+(?:handler|method|rpc|operation|copy)/i.test(
+      text
+    )
+  }
+  const code = 'code' in err ? String((err as { code?: unknown }).code ?? '') : ''
+  if (/^(?:method_not_found|not_implemented|unsupported)$/i.test(code)) return true
+  const msg = err instanceof Error ? err.message : String(err)
+  return /unknown\s+(?:rpc\s+)?(?:handler|method)|handler\s+not\s+(?:registered|found)|method\s+not\s+(?:found|implemented)|not\s+implemented|unsupported\s+(?:handler|method|rpc|operation|copy)/i.test(
+    msg
+  )
 }
 
 export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
@@ -1079,42 +1095,208 @@ export function openStudioImportModal(ctx: StudioImportDataModalContext): void {
       let currentBatch = Math.floor(startOffset / DEFAULT_IMPORT_CHUNK_SIZE)
       let batchSucceeded = false
       let abortedByClose = false
+      let activeCopyImportId: string | null = null
       try {
-        for (let offset = startOffset; offset < totalRows; offset += DEFAULT_IMPORT_CHUNK_SIZE) {
-          if (isClosed || !modal.isConnected) {
-            abortedByClose = true
-            break
+        let usedCopyStreaming = false
+        let sentRowCount = startOffset
+        if (driver === 'postgres' && startOffset === 0) {
+          const columnOrder = effectiveCols
+            .map((c) => c.name)
+            .filter((name) =>
+              mapping.some((m) => m.targetColumn === name)
+            )
+          const copyColumns =
+            columnOrder.length > 0
+              ? columnOrder
+              : Object.keys(recordsToImport[0] ?? {})
+          if (copyColumns.length > 0) {
+            const orderedRecords = recordsToImport.map((rec) => {
+              const rowObj: Record<string, unknown> = {}
+              for (const colName of copyColumns) {
+                if (Object.prototype.hasOwnProperty.call(rec, colName)) {
+                  rowObj[colName] = rec[colName]
+                }
+              }
+              return rowObj
+            })
+            // Pre-validate full JSON-RPC envelope size BEFORE opening a database COPY stream
+            const preValidatedChunks = chunkRowsByJsonByteLimit(orderedRecords)
+
+            let openRes:
+              | {
+                  ok?: boolean
+                  importId?: string
+                  fallbackReason?: string
+                  useLegacyBatch?: boolean
+                }
+              | null
+              | undefined = null
+            let unsupportedCopyOpen = false
+            try {
+              openRes = await ctx.requestPlugin<{
+                ok?: boolean
+                importId?: string
+                fallbackReason?: string
+                useLegacyBatch?: boolean
+              }>(
+                'data.copyImport.open',
+                {
+                  connectionId: connId,
+                  table: ctx.targetTable,
+                  ...(ctx.targetSchema ? { schema: ctx.targetSchema } : {}),
+                  columns: copyColumns,
+                },
+                { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
+              )
+            } catch (openErr: unknown) {
+              if (!isUnsupportedCopyImportHandlerError(openErr)) {
+                throw openErr
+              }
+              unsupportedCopyOpen = true
+              openRes = null
+            }
+
+            if (unsupportedCopyOpen) {
+              // Unimplemented RPC handler (method_not_found / not_implemented) falls back to legacy batch
+              usedCopyStreaming = false
+            } else if (
+              openRes &&
+              typeof openRes === 'object' &&
+              openRes.ok === true &&
+              typeof openRes.importId === 'string' &&
+              openRes.importId.length > 0
+            ) {
+              usedCopyStreaming = true
+              activeCopyImportId = openRes.importId
+              let commitAttempted = false
+              try {
+                const byteChunks =
+                  openRes.importId.length <= 44
+                    ? preValidatedChunks
+                    : chunkRowsByJsonByteLimit(orderedRecords, undefined, openRes.importId)
+                for (const byteChunk of byteChunks) {
+                  if (isClosed || !modal.isConnected) {
+                    abortedByClose = true
+                    await ctx
+                      .requestPlugin('data.copyImport.abort', {
+                        importId: activeCopyImportId,
+                        reason: 'Import cancelled by user',
+                      })
+                      .catch(() => {})
+                    activeCopyImportId = null
+                    break
+                  }
+                  currentBatch++
+                  const writeRes = await ctx.requestPlugin<{
+                    ok: boolean
+                    bytesWritten: number
+                    rowCount: number
+                  }>(
+                    'data.copyImport.write',
+                    {
+                      importId: activeCopyImportId,
+                      rows: byteChunk,
+                    },
+                    { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
+                  )
+                  if (!writeRes?.ok) {
+                    throw new Error('Postgres COPY chunk write failed.')
+                  }
+                  sentRowCount += byteChunk.length
+                  insertedTotal = sentRowCount
+                  setButtonLoading(
+                    importBtn,
+                    true,
+                    `Importing ${sentRowCount}/${totalRows}... ${latestElapsed}`
+                  )
+                }
+                if (!abortedByClose && activeCopyImportId) {
+                  commitAttempted = true
+                  const commitRes = await ctx.requestPlugin<{
+                    ok: boolean
+                    inserted: number
+                  }>(
+                    'data.copyImport.commit',
+                    { importId: activeCopyImportId },
+                    { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
+                  )
+                  activeCopyImportId = null
+                  if (!commitRes?.ok) {
+                    throw new Error('Postgres COPY commit failed.')
+                  }
+                  committedRowCount = commitRes.inserted ?? sentRowCount
+                  insertedTotal = committedRowCount
+                }
+              } catch (copyErr: unknown) {
+                if (activeCopyImportId && !commitAttempted) {
+                  await ctx
+                    .requestPlugin('data.copyImport.abort', {
+                      importId: activeCopyImportId,
+                      reason: copyErr instanceof Error ? copyErr.message : String(copyErr),
+                    })
+                    .catch(() => {})
+                }
+                activeCopyImportId = null
+                throw copyErr
+              }
+            } else if (
+              openRes &&
+              typeof openRes === 'object' &&
+              openRes.ok === false &&
+              openRes.useLegacyBatch === true
+            ) {
+              // Explicit pre-first-byte legacy batch fallback signaled by worker
+              usedCopyStreaming = false
+            } else {
+              const reason =
+                openRes &&
+                typeof openRes === 'object' &&
+                typeof openRes.fallbackReason === 'string' &&
+                openRes.fallbackReason
+                  ? openRes.fallbackReason
+                  : 'Failed to open Postgres COPY stream.'
+              throw new Error(reason)
+            }
           }
-          currentBatch++
-          const chunk = recordsToImport.slice(offset, offset + DEFAULT_IMPORT_CHUNK_SIZE)
-          const res = await ctx.requestPlugin<{
-            ok: boolean
-            inserted: number
-            updated: number
-            deleted: number
-            statements: string[]
-          }>(
-            'data.applyChanges',
-            {
-              connectionId: connId,
-              table: ctx.targetTable,
-              ...(ctx.targetSchema ? { schema: ctx.targetSchema } : {}),
-              inserts: chunk,
-              updates: [],
-              deletes: [],
-            },
-            { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
-          )
-          if (!res?.ok) {
-            throw new Error('The database rejected this import batch.')
+        }
+
+        if (!usedCopyStreaming) {
+          for (let offset = startOffset; offset < totalRows; offset += DEFAULT_IMPORT_CHUNK_SIZE) {
+            if (isClosed || !modal.isConnected) {
+              abortedByClose = true
+              break
+            }
+            currentBatch++
+            const chunk = recordsToImport.slice(offset, offset + DEFAULT_IMPORT_CHUNK_SIZE)
+            const res = await ctx.requestPlugin<{
+              ok: boolean
+              inserted: number
+              updated: number
+              deleted: number
+              statements: string[]
+            }>(
+              'data.applyChanges',
+              {
+                connectionId: connId,
+                table: ctx.targetTable,
+                ...(ctx.targetSchema ? { schema: ctx.targetSchema } : {}),
+                inserts: chunk,
+                updates: [],
+                deletes: [],
+              },
+              { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
+            )
+            if (!res?.ok) {
+              throw new Error('The database rejected this import batch.')
+            }
+            committedRowCount = Math.min(totalRows, offset + chunk.length)
+            insertedTotal += res.inserted ?? chunk.length
+            setButtonLoading(
+              importBtn,
+              true,
+              `Importing ${insertedTotal}/${totalRows}... ${latestElapsed}`
+            )
           }
-          committedRowCount = Math.min(totalRows, offset + chunk.length)
-          insertedTotal += res.inserted ?? chunk.length
-          setButtonLoading(
-            importBtn,
-            true,
-            `Importing ${insertedTotal}/${totalRows}... ${latestElapsed}`
-          )
         }
         batchSucceeded = !abortedByClose
       } catch (err: unknown) {

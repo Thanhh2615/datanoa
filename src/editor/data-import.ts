@@ -1034,3 +1034,72 @@ export function buildImportPreviewSql(
   }
   return lines.join('\n')
 }
+
+export const COPY_IMPORT_MAX_CHUNK_BYTES = 512 * 1024
+const SAFE_COPY_IMPORT_CHUNK_BYTES = 440 * 1024
+const DEFAULT_COPY_IMPORT_ID_PLACEHOLDER = 'imp_' + '0'.repeat(40)
+
+function measureUtf8Bytes(text: string): number {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(text).byteLength
+  }
+  return text.length * 2
+}
+
+/**
+ * Measures the full JSON-RPC `data.copyImport.write` envelope byte size (`{ importId, rows }`).
+ */
+export function measureCopyWriteEnvelopeBytes<T>(
+  rows: readonly T[],
+  importId = DEFAULT_COPY_IMPORT_ID_PLACEHOLDER
+): number {
+  return measureUtf8Bytes(JSON.stringify({ importId, rows }))
+}
+
+/**
+ * Splits mapped import records into JSON batches strictly bounded under Postgres COPY IPC limit (512 KiB),
+ * measuring the full JSON-RPC envelope and failing fast when a single row exceeds 512 KiB.
+ */
+export function chunkRowsByJsonByteLimit<T>(
+  rows: readonly T[],
+  maxBytes = SAFE_COPY_IMPORT_CHUNK_BYTES,
+  importId = DEFAULT_COPY_IMPORT_ID_PLACEHOLDER
+): T[][] {
+  if (rows.length === 0) return []
+  const hardEnvelopeLimit = COPY_IMPORT_MAX_CHUNK_BYTES
+  const effectiveEnvelopeLimit = Math.min(
+    Math.max(1024, maxBytes),
+    hardEnvelopeLimit
+  )
+  const envelopeOverheadBytes = measureUtf8Bytes(JSON.stringify({ importId, rows: [] }))
+  const chunks: T[][] = []
+  let current: T[] = []
+  let currentArrayContentBytes = 0
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]
+    const serialized = JSON.stringify(row)
+    const rowBytes = measureUtf8Bytes(serialized)
+    const singleRowEnvelopeBytes = envelopeOverheadBytes + rowBytes
+    if (singleRowEnvelopeBytes > hardEnvelopeLimit) {
+      throw new Error(
+        `Row #${i + 1} serialized COPY JSON-RPC payload (${singleRowEnvelopeBytes} B) exceeds the 512 KiB (${hardEnvelopeLimit} B) limit.`
+      )
+    }
+
+    const addedBytes = current.length === 0 ? rowBytes : 1 + rowBytes
+    const nextEnvelopeBytes = envelopeOverheadBytes + currentArrayContentBytes + addedBytes
+    if (current.length > 0 && nextEnvelopeBytes > effectiveEnvelopeLimit) {
+      chunks.push(current)
+      current = [row]
+      currentArrayContentBytes = rowBytes
+    } else {
+      current.push(row)
+      currentArrayContentBytes += addedBytes
+    }
+  }
+  if (current.length > 0) {
+    chunks.push(current)
+  }
+  return chunks
+}

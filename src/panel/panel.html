@@ -7,33 +7,35 @@
   <style>
     /* @panel-css-tokens — Critical Adaptive Dark/Light tokens & sticky rules (full stylesheet in ./panel.css) */
     :root {
-      --bg: var(--orca-background, #000000);
+      --bg: var(--panel-bg, var(--orca-background, #000000));
       --fg: var(--orca-foreground, #e6e6e6);
       --t1: var(--orca-foreground, #e6e6e6);
-      --surface: color-mix(in srgb, var(--t1) 3.5%, var(--bg));
-      --card: color-mix(in srgb, var(--t1) 6%, var(--bg));
+      --surface: color-mix(in srgb, var(--t1) 2.5%, var(--bg));
+      --card: color-mix(in srgb, var(--t1) 5%, var(--bg));
       --border-strong: color-mix(in srgb, var(--t1) 24%, var(--bg));
       --primary: var(--orca-primary, #e6e6e6);
       --primary-fg: var(--orca-primary-foreground, #000000);
       --accent-ring: var(--orca-ring, var(--primary));
       --sel-row-bg: color-mix(in srgb, var(--t1) 5%, var(--bg));
-      --btn-bg: color-mix(in srgb, var(--t1) 6.5%, var(--bg));
-      --btn-border: color-mix(in srgb, var(--t1) 16%, var(--bg));
+      --btn-bg: var(--orca-secondary, color-mix(in srgb, var(--t1) 6.5%, var(--bg)));
+      --btn-fg: var(--orca-secondary-foreground, var(--t1));
+      --btn-border: var(--orca-input, color-mix(in srgb, var(--t1) 16%, var(--bg)));
       --btn-disabled-bg: color-mix(in srgb, var(--t1) 2.5%, var(--bg));
     }
     html.light, body.light {
-      --bg: var(--orca-background, #ffffff);
+      --bg: var(--panel-bg, var(--orca-background, #ffffff));
       --fg: var(--orca-foreground, #0f172a);
       --t1: var(--orca-foreground, #0f172a);
-      --surface: color-mix(in srgb, var(--t1) 3.5%, var(--bg));
-      --card: color-mix(in srgb, var(--t1) 6%, var(--bg));
+      --surface: color-mix(in srgb, var(--t1) 2.5%, var(--bg));
+      --card: color-mix(in srgb, var(--t1) 5%, var(--bg));
       --border-strong: color-mix(in srgb, var(--t1) 28%, var(--bg));
       --primary: var(--orca-primary, #0f172a);
       --primary-fg: var(--orca-primary-foreground, #ffffff);
       --accent-ring: var(--orca-ring, var(--primary));
       --sel-row-bg: color-mix(in srgb, var(--t1) 5%, var(--bg));
-      --btn-bg: color-mix(in srgb, var(--t1) 5%, var(--bg));
-      --btn-border: color-mix(in srgb, var(--t1) 18%, var(--bg));
+      --btn-bg: var(--orca-secondary, color-mix(in srgb, var(--t1) 5%, var(--bg)));
+      --btn-fg: var(--orca-secondary-foreground, var(--t1));
+      --btn-border: var(--orca-input, color-mix(in srgb, var(--t1) 18%, var(--bg)));
       --btn-disabled-bg: color-mix(in srgb, var(--t1) 3%, var(--bg));
     }
     .header { display: flex; flex-direction: row; align-items: center; justify-content: space-between; }
@@ -120,7 +122,19 @@
         <span id="activeDriverBadge" class="badge badge-neutral">SQLITE</span>
       </div>
       <div id="connMetaRow" class="conn-meta">
-        <span id="connSubLabel" class="conn-sub"></span>
+        <span id="connSubLabel" class="conn-sub" hidden></span>
+        <div id="activeSchemaBar" class="schema-switcher-bar schema-switcher-inline" hidden>
+          <label class="schema-picker-label" for="panelSchemaSelect" title="Active Schema">
+            <svg class="schema-picker-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+              <polyline points="2 17 12 22 22 17"></polyline>
+              <polyline points="2 12 12 17 22 12"></polyline>
+            </svg>
+            <span class="sr-only">Schema</span>
+          </label>
+          <select id="panelSchemaSelect" class="select" aria-label="Active Schema"></select>
+          <span id="activeSchemaCount" class="badge badge-neutral schema-count-badge" hidden></span>
+        </div>
         <div class="conn-quick-actions">
           <button id="editActiveBtn" class="btn btn-ghost btn-sm" type="button">Edit</button>
           <button id="dupActiveBtn" class="btn btn-ghost btn-sm" type="button">Duplicate</button>
@@ -162,13 +176,66 @@
           <span id="formNoticeText" class="banner-text"></span>
           <button id="formNoticeClose" class="btn btn-ghost btn-icon btn-sm" type="button" aria-label="Dismiss">&times;</button>
         </div>
+        <div id="formTlsRemedyBox" class="tls-remedy-box" role="region" aria-label="TLS Remediation" hidden></div>
 
-        <!-- Paste Connection URI Bar -->
-        <div class="field">
-          <span class="field-label">Paste Connection URI</span>
-          <div class="input-group">
-            <input id="uriInput" class="input" type="text" aria-label="Paste Connection URI" placeholder="postgres://, mysql://, mssql://, mongodb://, redis://, libsql://, clickhouse://, sqlite://..." />
-            <button id="parseUriBtn" class="btn" type="button">Parse URI</button>
+        <!-- Quick Import: Paste URI + Local Workspace & Docker Auto-Discovery -->
+        <div class="conn-quick-card">
+          <div class="field">
+            <span class="field-label">Quick Connect (Paste URI)</span>
+            <div class="input-group">
+              <input id="uriInput" class="input" type="text" aria-label="Paste Connection URI" placeholder="postgres://, mysql://, mssql://, mongodb://, redis://, libsql://, clickhouse://, sqlite://..." />
+              <button id="parseUriBtn" class="btn" type="button">Parse URI</button>
+            </div>
+          </div>
+
+          <div id="discoveredFieldWrap" class="field" style="gap: 4px;">
+            <div class="field-label conn-discovery-bar">
+              <span>Auto-Discovery</span>
+              <div class="input-group input-wrap-wrap" style="gap: 4px;">
+                <button id="quickBrowseDbFileBtn" class="btn btn-sm" type="button" title="Browse and pick a local SQLite database file (.db, .sqlite, .sqlite3)">Browse DB File...</button>
+                <button id="quickScanFolderBtn" class="btn btn-sm" type="button" title="Browse a folder on disk and scan it for .env, Docker Compose, and .db files">Scan Folder...</button>
+                <button id="detectWorkspaceBtn" class="btn btn-sm" type="button" title="Scan current workspace folder(s) for .env &amp; .db files plus local Docker Compose containers">Auto-Detect (.env, Docker, .db)</button>
+              </div>
+            </div>
+            <div id="discoveredScopeHint" class="discovery-scope-hint">Scans local workspace folders for .env / .db files &middot; Plus local Docker containers.</div>
+            <div id="discoveredBox" class="discovery-box" hidden>
+              <input id="discoveredSearchInput" class="input discovery-search" type="search" aria-label="Search discovered connections" placeholder="Search .env, Docker Compose &amp; .db files..." />
+              <div id="discoveredGroupsWrap" class="discovery-groups">
+                <div id="discoveredEnvGroup" class="discovery-group" data-group="env" hidden>
+                  <button id="discoveredEnvToggle" class="discovery-group-head" type="button" aria-expanded="true" aria-controls="discoveredEnvBody">
+                    <span class="discovery-chevron" aria-hidden="true">&#9656;</span>
+                    <span class="discovery-source-pill is-env">.env</span>
+                    <span class="discovery-group-title">.env Connections</span>
+                    <span id="discoveredEnvCount" class="discovery-group-count"></span>
+                  </button>
+                  <div id="discoveredEnvBody" class="discovery-group-body">
+                    <div id="discoveredEnvList" class="chip-list"></div>
+                  </div>
+                </div>
+                <div id="discoveredDockerGroup" class="discovery-group" data-group="docker" hidden>
+                  <button id="discoveredDockerToggle" class="discovery-group-head" type="button" aria-expanded="true" aria-controls="discoveredDockerBody">
+                    <span class="discovery-chevron" aria-hidden="true">&#9656;</span>
+                    <span class="discovery-source-pill is-docker">Docker</span>
+                    <span class="discovery-group-title">Docker Compose</span>
+                    <span id="discoveredDockerCount" class="discovery-group-count"></span>
+                  </button>
+                  <div id="discoveredDockerBody" class="discovery-group-body">
+                    <div id="discoveredDockerList" class="chip-list"></div>
+                  </div>
+                </div>
+                <div id="discoveredFileGroup" class="discovery-group" data-group="sqlite" hidden>
+                  <button id="discoveredFileToggle" class="discovery-group-head" type="button" aria-expanded="true" aria-controls="discoveredFileBody">
+                    <span class="discovery-chevron" aria-hidden="true">&#9656;</span>
+                    <span class="discovery-source-pill is-sqlite">SQLite</span>
+                    <span class="discovery-group-title">SQLite Files (.db)</span>
+                    <span id="discoveredCount" class="discovery-group-count"></span>
+                  </button>
+                  <div id="discoveredFileBody" class="discovery-group-body">
+                    <div id="discoveredList" class="chip-list"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -200,195 +267,184 @@
           </div>
         </div>
 
-        <!-- Workspace Auto-Discovery (.env, Docker Compose & .db) -->
-        <div id="discoveredFieldWrap" class="field" style="gap: 6px;">
-          <div class="field-label" style="flex-shrink: 0; flex-wrap: wrap;">
-            <span>Local Workspace &amp; Docker Auto-Discovery</span>
-            <div class="input-group input-wrap-wrap" style="gap: 4px;">
-              <button id="quickBrowseDbFileBtn" class="btn btn-sm" type="button" title="Browse and pick a local SQLite database file (.db, .sqlite, .sqlite3)">Browse DB File...</button>
-              <button id="quickScanFolderBtn" class="btn btn-sm" type="button" title="Browse a folder on disk and scan it for .env, Docker Compose, and .db files">Scan Folder...</button>
-              <button id="detectWorkspaceBtn" class="btn btn-sm" type="button" title="Scan current workspace folder(s) for .env &amp; .db files plus local Docker Compose containers">Auto-Detect (.env, Docker, .db)</button>
-            </div>
+        <!-- Primary Focal Card: Connection Details -->
+        <div id="connDetailsCard" class="conn-details-card">
+          <div class="conn-details-head">
+            <span class="conn-details-title">Connection Details</span>
+            <span id="connDetailsSourcePill" class="conn-source-pill" hidden></span>
           </div>
-          <div id="discoveredScopeHint" class="discovery-scope-hint">Scans local workspace folders for .env / .db files &middot; Plus local Docker containers (non-workspace labeled &ldquo;Other Local Docker&rdquo;).</div>
-          <div id="discoveredBox" class="discovery-box" hidden>
-            <input id="discoveredSearchInput" class="input discovery-search" type="search" aria-label="Search discovered connections" placeholder="Search .env, Docker Compose &amp; .db files..." />
-            <div id="discoveredGroupsWrap" class="discovery-groups">
-              <div id="discoveredEnvGroup" class="discovery-group" data-group="env" hidden>
-                <button id="discoveredEnvToggle" class="discovery-group-head" type="button" aria-expanded="true" aria-controls="discoveredEnvBody">
-                  <span class="discovery-chevron" aria-hidden="true">&#9656;</span>
-                  <span class="discovery-source-pill is-env">.env</span>
-                  <span class="discovery-group-title">.env Connections</span>
-                  <span id="discoveredEnvCount" class="discovery-group-count"></span>
-                </button>
-                <div id="discoveredEnvBody" class="discovery-group-body">
-                  <div id="discoveredEnvList" class="chip-list"></div>
-                </div>
-              </div>
-              <div id="discoveredDockerGroup" class="discovery-group" data-group="docker" hidden>
-                <button id="discoveredDockerToggle" class="discovery-group-head" type="button" aria-expanded="true" aria-controls="discoveredDockerBody">
-                  <span class="discovery-chevron" aria-hidden="true">&#9656;</span>
-                  <span class="discovery-source-pill is-docker">Docker</span>
-                  <span class="discovery-group-title">Docker Compose</span>
-                  <span id="discoveredDockerCount" class="discovery-group-count"></span>
-                </button>
-                <div id="discoveredDockerBody" class="discovery-group-body">
-                  <div id="discoveredDockerList" class="chip-list"></div>
-                </div>
-              </div>
-              <div id="discoveredFileGroup" class="discovery-group" data-group="sqlite" hidden>
-                <button id="discoveredFileToggle" class="discovery-group-head" type="button" aria-expanded="true" aria-controls="discoveredFileBody">
-                  <span class="discovery-chevron" aria-hidden="true">&#9656;</span>
-                  <span class="discovery-source-pill is-sqlite">SQLite</span>
-                  <span class="discovery-group-title">SQLite Files (.db)</span>
-                  <span id="discoveredCount" class="discovery-group-count"></span>
-                </button>
-                <div id="discoveredFileBody" class="discovery-group-body">
-                  <div id="discoveredList" class="chip-list"></div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
 
-        <label class="field">
-          <span class="field-label">Connection Name</span>
-          <input id="formName" class="input" type="text" placeholder="e.g. Production Analytics" />
-        </label>
-
-        <!-- Folder / Group & Workspace Scope Pin -->
-        <div class="field" style="gap: 5px;">
-          <span class="field-label">Folder / Group (Organize Connections)</span>
-          <input id="formFolder" class="input" type="text" maxlength="64" aria-label="Folder or Group Name" placeholder="Create or enter a folder name (optional)" />
-          <div id="formFolderChips" class="input-group input-wrap-wrap" style="gap: 4px;" hidden></div>
-        </div>
-
-        <label class="field">
-          <span class="field-label">Workspace Scope (Pin to Workspace)</span>
-          <select id="formWorkspaceScope" class="select" aria-label="Workspace Scope">
-            <option value="">Global — Available in All Workspaces (No Pin)</option>
-          </select>
-        </label>
-
-        <!-- SQLite / DuckDB File Fields -->
-        <div id="sqliteFields" class="field" style="gap: 8px;">
-          <div class="field">
-            <span class="field-label">Database File or Folder Path</span>
-            <div class="input-group">
-              <input id="formFilePath" class="input" type="text" aria-label="Database File or Folder Path" placeholder="D:\project\data.db or folder path" />
-              <button id="browseSqliteFileBtn" class="btn btn-sm" type="button">Browse File...</button>
-            </div>
-          </div>
-        </div>
-
-        <!-- LibSQL Fields -->
-        <div id="libsqlFields" class="field" style="gap: 8px;" hidden>
           <label class="field">
-            <span class="field-label">LibSQL / Turso URL</span>
-            <input id="formLibsqlUrl" class="input" type="text" placeholder="libsql://your-db.turso.io or https://..." />
+            <span class="field-label">Connection Name</span>
+            <input id="formName" class="input" type="text" placeholder="e.g. Production Analytics" />
           </label>
-          <div class="field-row">
+
+          <!-- SQLite / DuckDB File Fields -->
+          <div id="sqliteFields" class="field" style="gap: 8px;">
+            <div class="field">
+              <span class="field-label">Database File or Folder Path</span>
+              <div class="input-group">
+                <input id="formFilePath" class="input" type="text" aria-label="Database File or Folder Path" placeholder="D:\project\data.db or folder path" />
+                <button id="browseSqliteFileBtn" class="btn btn-sm" type="button">Browse File...</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- LibSQL Fields -->
+          <div id="libsqlFields" class="field" style="gap: 8px;" hidden>
             <label class="field">
-              <span class="field-label">Auth Token</span>
-              <input id="formAuthToken" class="input" type="password" placeholder="Optional Bearer token" />
+              <span class="field-label">LibSQL / Turso URL</span>
+              <input id="formLibsqlUrl" class="input" type="text" placeholder="libsql://your-db.turso.io or https://..." />
             </label>
+            <div class="field-row">
+              <label class="field">
+                <span class="field-label">Auth Token</span>
+                <input id="formAuthToken" class="input" type="password" placeholder="Optional Bearer token" />
+              </label>
+              <label class="field">
+                <span class="field-label">Database Label</span>
+                <input id="formLibsqlDb" class="input" type="text" placeholder="default" />
+              </label>
+            </div>
+          </div>
+
+          <!-- Network Fields (PostgreSQL / MySQL / MariaDB / CockroachDB / ClickHouse / Redis / MongoDB / MSSQL / Oracle) -->
+          <div id="serverFields" class="field" style="gap: 8px;" hidden>
+            <div class="field-row">
+              <label class="field">
+                <span class="field-label">Host</span>
+                <input id="formHost" class="input" type="text" value="localhost" />
+              </label>
+              <label class="field">
+                <span class="field-label">Port</span>
+                <input id="formPort" class="input" type="text" value="5432" />
+              </label>
+            </div>
+
+            <div id="clickhouseUrlRow" class="field" hidden>
+              <label class="field">
+                <span class="field-label">HTTP(S) Endpoint URL (Optional)</span>
+                <input id="formClickhouseUrl" class="input" type="text" placeholder="http://localhost:8123" />
+              </label>
+            </div>
+
+            <div id="pgOptionsRow" class="field" hidden>
+              <label class="field">
+                <span class="field-label">Connection Options (Optional)</span>
+                <input id="formOptions" class="input" type="text" placeholder="e.g. --cluster=... or endpoint=..." />
+              </label>
+            </div>
+
+            <div id="sqlDbRow" class="field">
+              <label class="field">
+                <span class="field-label">Database Name</span>
+                <input id="formDatabase" class="input" type="text" placeholder="postgres" />
+              </label>
+            </div>
+
+            <div id="redisDbRow" class="field" hidden>
+              <label class="field">
+                <span class="field-label">Redis DB Index (0–15)</span>
+                <select id="formRedisDb" class="select" aria-label="Redis Database Index"></select>
+              </label>
+            </div>
+
+            <div class="field-row">
+              <label class="field">
+                <span class="field-label">User</span>
+                <input id="formUser" class="input" type="text" value="postgres" placeholder="Optional" />
+              </label>
+              <label class="field">
+                <span class="field-label">Password</span>
+                <input id="formPassword" class="input" type="password" placeholder="Optional" />
+              </label>
+            </div>
+
+            <div class="conn-inline-checks">
+              <label id="sslRow" class="checkbox-row">
+                <input id="formSsl" type="checkbox" />
+                <span>Enable SSL / TLS</span>
+              </label>
+              <label id="sslVerifyRow" class="checkbox-row" hidden>
+                <input id="formSslVerify" type="checkbox" checked />
+                <span>Verify TLS certificate</span>
+              </label>
+            </div>
+
+            <div id="tlsServernameRow" class="field" hidden>
+              <label class="field">
+                <span class="field-label">TLS Server Name (SNI, Optional)</span>
+                <input id="formTlsServername" class="input" type="text" placeholder="Optional certificate hostname for SNI" />
+              </label>
+            </div>
+
+            <div id="sslCaPathRow" class="field" hidden>
+              <span class="field-label">Custom CA Certificate Path (Optional)</span>
+              <div class="input-group">
+                <input id="formSslCaPath" class="input" type="text" aria-label="Custom CA Certificate Path" placeholder="Path to .pem / .crt CA bundle" />
+                <button id="browseSslCaBtn" class="btn btn-sm" type="button">Browse...</button>
+              </div>
+            </div>
+
+            <div id="sshStatusRow" class="field" style="gap: 6px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;" hidden>
+              <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+                <span id="sshStatusText" class="field-label" style="margin: 0;">SSH Tunnel configured</span>
+                <button id="disableSshBtn" class="btn btn-sm" type="button">Disable SSH</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Collapsible Secondary Options: Organization & Safety -->
+        <div id="connOrgSafetyGroup" class="conn-collapsible">
+          <button id="connOrgSafetyToggle" class="conn-collapsible-head" type="button" aria-expanded="false" aria-controls="connOrgSafetyBody">
+            <span class="conn-collapsible-chevron" aria-hidden="true">&#9656;</span>
+            <span class="conn-collapsible-title">Organization &amp; Safety</span>
+            <span id="connOrgSafetySummary" class="conn-collapsible-summary" hidden></span>
+          </button>
+          <div id="connOrgSafetyBody" class="conn-collapsible-body" hidden>
+            <div class="field" style="gap: 4px;">
+              <span class="field-label">Folder / Group</span>
+              <input id="formFolder" class="input" type="text" maxlength="64" aria-label="Folder or Group Name" placeholder="Create or enter a folder name (optional)" />
+              <div id="formFolderChips" class="input-group input-wrap-wrap" style="gap: 4px;" hidden></div>
+            </div>
+
             <label class="field">
-              <span class="field-label">Database Label</span>
-              <input id="formLibsqlDb" class="input" type="text" placeholder="default" />
+              <span class="field-label">Workspace Scope</span>
+              <select id="formWorkspaceScope" class="select" aria-label="Workspace Scope">
+                <option value="">Global — Available in All Workspaces (No Pin)</option>
+              </select>
+            </label>
+
+            <div class="field">
+              <span class="field-label">Environment Tag</span>
+              <div id="envPills" class="env-pills" role="group" aria-label="Environment Color Tag">
+                <button class="env-pill active" data-env="none" type="button">None</button>
+                <button class="env-pill" data-env="dev" type="button"><span class="env-dot env-dev"></span>Dev</button>
+                <button class="env-pill" data-env="staging" type="button"><span class="env-dot env-staging"></span>Staging</button>
+                <button class="env-pill" data-env="prod" type="button"><span class="env-dot env-prod"></span>Prod</button>
+              </div>
+            </div>
+
+            <label class="checkbox-row">
+              <input id="formReadOnly" type="checkbox" />
+              <span>Read-Only Mode (block INSERT / UPDATE / DELETE / DDL)</span>
+            </label>
+
+            <label class="field">
+              <span class="field-label">AI Access Policy</span>
+              <select id="formAiPolicy" class="select" aria-label="AI Access Policy">
+                <option value="">Default (Auto)</option>
+                <option value="allow">Allow</option>
+                <option value="ask">Ask before sending</option>
+                <option value="never">Never</option>
+              </select>
+              <span id="formAiPolicyHint" class="field-hint" hidden>Production connections default to fail-closed protection for remote AI unless explicitly overridden.</span>
             </label>
           </div>
         </div>
 
-        <!-- Network Fields (PostgreSQL / MySQL / MariaDB / CockroachDB / ClickHouse / Redis) -->
-        <div id="serverFields" class="field" style="gap: 8px;" hidden>
-          <div class="field-row">
-            <label class="field">
-              <span class="field-label">Host</span>
-              <input id="formHost" class="input" type="text" value="localhost" />
-            </label>
-            <label class="field">
-              <span class="field-label">Port</span>
-              <input id="formPort" class="input" type="text" value="5432" />
-            </label>
-          </div>
-
-          <div id="clickhouseUrlRow" class="field" hidden>
-            <label class="field">
-              <span class="field-label">HTTP(S) Endpoint URL (Optional)</span>
-              <input id="formClickhouseUrl" class="input" type="text" placeholder="http://localhost:8123" />
-            </label>
-          </div>
-
-          <div id="pgOptionsRow" class="field" hidden>
-            <label class="field">
-              <span class="field-label">Connection Options (Optional)</span>
-              <input id="formOptions" class="input" type="text" placeholder="e.g. --cluster=... or endpoint=..." />
-            </label>
-          </div>
-
-          <div id="sqlDbRow" class="field">
-            <label class="field">
-              <span class="field-label">Database Name</span>
-              <input id="formDatabase" class="input" type="text" placeholder="postgres" />
-            </label>
-          </div>
-
-          <div id="redisDbRow" class="field" hidden>
-            <label class="field">
-              <span class="field-label">Redis DB Index (0–15)</span>
-              <select id="formRedisDb" class="select" aria-label="Redis Database Index"></select>
-            </label>
-          </div>
-
-          <div class="field-row">
-            <label class="field">
-              <span class="field-label">User</span>
-              <input id="formUser" class="input" type="text" value="postgres" placeholder="Optional" />
-            </label>
-            <label class="field">
-              <span class="field-label">Password</span>
-              <input id="formPassword" class="input" type="password" placeholder="Optional" />
-            </label>
-          </div>
-
-          <label id="sslRow" class="checkbox-row">
-            <input id="formSsl" type="checkbox" />
-            <span>Enable SSL / TLS</span>
-          </label>
-          <label id="sslVerifyRow" class="checkbox-row" hidden>
-            <input id="formSslVerify" type="checkbox" checked />
-            <span>Verify TLS certificate</span>
-          </label>
-        </div>
-
-        <!-- Environment Color Tag & Read-Only Mode -->
-        <div class="field">
-          <span class="field-label">Environment Tag</span>
-          <div id="envPills" class="env-pills" role="group" aria-label="Environment Color Tag">
-            <button class="env-pill active" data-env="none" type="button">None</button>
-            <button class="env-pill" data-env="dev" type="button"><span class="env-dot env-dev"></span>Dev</button>
-            <button class="env-pill" data-env="staging" type="button"><span class="env-dot env-staging"></span>Staging</button>
-            <button class="env-pill" data-env="prod" type="button"><span class="env-dot env-prod"></span>Prod</button>
-          </div>
-        </div>
-
-        <label class="checkbox-row">
-          <input id="formReadOnly" type="checkbox" />
-          <span>Read-Only Mode (block INSERT / UPDATE / DELETE / DDL)</span>
-        </label>
-
-        <label class="field">
-          <span class="field-label">AI Access Policy</span>
-          <select id="formAiPolicy" class="select" aria-label="AI Access Policy">
-            <option value="">Default (Auto)</option>
-            <option value="allow">Allow</option>
-            <option value="ask">Ask before sending</option>
-            <option value="never">Never</option>
-          </select>
-          <span id="formAiPolicyHint" class="field-hint" hidden>Production connections default to fail-closed protection for remote AI unless explicitly overridden.</span>
-        </label>
-
-        <div class="input-group" style="justify-content: flex-end; flex-shrink: 0; padding-right: 34px;">
+        <div class="conn-form-actions">
           <button id="testFormBtn" class="btn" type="button">Test</button>
           <button id="saveFormBtn" class="btn btn-primary" type="button">Save &amp; Connect</button>
         </div>
@@ -452,6 +508,9 @@
             </button>
             <button id="editTableStructureBtn" class="btn btn-sm" type="button" title="Edit Table Structure (ALTER TABLE)">
               <span>Edit Table</span>
+            </button>
+            <button id="importDataBtn" class="btn btn-sm" type="button" title="Import CSV/JSON/TSV into this table in Full Studio">
+              <span>Import</span>
             </button>
             <select id="exportFormatSelect" class="select" style="height: 24px; width: auto; flex: 0 0 auto;" aria-label="Export Format (Current Page)" title="Copy Current Page as...">
               <option value="">Export...</option>
@@ -611,7 +670,10 @@
             <button id="toggleHistoryBtn" class="btn btn-ghost btn-sm" type="button">History</button>
             <button id="sqlAiBtn" class="btn btn-ghost btn-sm datanoa-ai-toolbar-btn tone-neutral" type="button" title="Configure AI SQL Assistant">AI · Off</button>
           </div>
-          <span id="sqlMetaBadge" class="badge badge-neutral" hidden></span>
+          <div class="input-group">
+            <span id="sqlVimModePill" class="datanoa-vim-mode-pill" data-vim-mode="normal" hidden>NORMAL</span>
+            <span id="sqlMetaBadge" class="badge badge-neutral" hidden></span>
+          </div>
         </div>
 
         <!-- Collapsible Query History Drawer -->
@@ -784,10 +846,28 @@
   <div id="dataColsPopover" class="col-popover" role="dialog" aria-label="Columns" hidden>
     <div class="drawer-head">
       <span class="drawer-title">Columns</span>
+      <button id="dataColsResetDisplayBtn" class="btn btn-ghost btn-sm" type="button" title="Reset column layout, wrap, and highlight rules">Reset</button>
       <button id="dataColsShowAllBtn" class="btn btn-ghost btn-sm" type="button">Show All</button>
     </div>
     <input id="dataColsSearchInput" class="input" type="search" aria-label="Filter columns" placeholder="Filter columns..." style="height: 24px;" />
     <div id="dataColsList" class="col-popover-list"></div>
+    <div class="col-popover-section">
+      <label class="col-popover-wrap-row">
+        <input id="dataColsWrapToggle" type="checkbox" />
+        <span>Wrap multi-line cells</span>
+      </label>
+      <label class="col-popover-maxlines-row">
+        <span>Max lines</span>
+        <input id="dataColsWrapMaxLines" class="input" type="number" min="1" max="10" value="4" aria-label="Wrap max lines" />
+      </label>
+    </div>
+    <div class="col-popover-section">
+      <div class="drawer-head">
+        <span class="drawer-title">Highlight Rules</span>
+        <button id="dataColsAddHighlightBtn" class="btn btn-ghost btn-sm" type="button">+ Rule</button>
+      </div>
+      <div id="dataColsHighlightList" class="col-highlight-list"></div>
+    </div>
   </div>
 
   <!-- Bulk Fill Value Modal -->

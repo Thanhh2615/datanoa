@@ -30,9 +30,14 @@ import {
   setDbLogoElement,
   rpc,
   syncThemeFromTokens,
+  syncSidebarBackgroundFromTokens,
   applyTypographySnapshot,
   syncOrcaTypography,
   makeTableKey,
+  makeLegacyTableKey,
+  canUseLegacyTableKeyFallback,
+  normalizeTableKey,
+  tableKeyMatchesConnection,
   encodeTableSelectValue,
   decodeTableSelectValue,
   setButtonLoading,
@@ -44,6 +49,7 @@ import {
   syncSelectTooltip,
   isCustomDropdownOpen,
   closeActiveCustomDropdown,
+  openPanelFilePickerModal,
   writeTextToClipboard,
 } from './panel-utils.js'
 import { PanelGridSelection } from './panel-selection.js'
@@ -60,26 +66,81 @@ import {
   openSharedAiConfigModal,
   saveOrcaSettingsPatch,
 } from '../shared-ai-ui.js'
+import {
+  openSharedSshHostKeyModal,
+  closeByChallengeId,
+  closeAllSshHostKeyModals,
+  renderSharedTlsFailureRemedy,
+  runWithSshHostKeyRetry,
+} from '../shared-ssh-hostkey-modal.js'
+import {
+  HIGHLIGHT_TONES,
+  HIGHLIGHT_CSS_CLASSES,
+  CONDITIONAL_HIGHLIGHT_OPERATORS,
+  areHighlightRulesEqual,
+  areTableDisplayStateEntriesEquivalent,
+  buildColumnKeyResolver,
+  parseOccurrenceColumnKey,
+  resolveEffectiveColumnLayout,
+  reorderColumnInEntry,
+  setUserColumnWidthInEntry,
+  normalizeTableDisplayStateEntry,
+  rebaseTableDisplayStateEntry,
+  scrubSensitiveTableFilterText,
+} from '../shared-table-display.js'
+import {
+  clampWrapMaxLines,
+  DEFAULT_WRAP_MAX_LINES,
+} from '../shared-row-height-index.js'
 import { formatJsonPreservingNumbers } from '../shared-grid-paste.js'
 import {
   containsSensitiveSqlText,
   sanitizeSqlResultForStorage,
   scrubConnectionNameForStorage,
 } from '../shared-sql-safety.js'
+import {
+  UNGROUPED_FOLDER_ORDER_KEY,
+  normalizeConnectionFolderKey,
+  normalizeFolderOrder,
+  sortFoldersByOrder,
+  getConnectionFolderOrderKeys,
+  reconcileFolderOrder,
+  reorderConnectionsWithinFolder,
+} from '../shared-connection-order.js'
 import { createPanelStructureController } from './panel-structure.js'
 import { createPanelFeedbackAndPaletteController } from './panel-feedback-palette.js'
 import { createPanelDataGridController } from './panel-data-grid.js'
 
 const QUERY_TIMEOUT_MS = 115000
+const MULTI_SCHEMA_DRIVERS = new Set([
+  'postgres',
+  'cockroachdb',
+  'mssql',
+  'oracle',
+  'mysql',
+  'mariadb',
+  'clickhouse',
+  'snowflake',
+  'bigquery',
+  'duckdb',
+  'mongodb',
+])
 
 // Application state
 const state = {
   tab: 'explorer',
   connections: [],
+  folderOrder: [],
   activeConnectionId: null,
   schemaObjects: {},
+  schemaObjectsByConnSchema: {},
+  schemaStaleByConn: {},
   schemaLoading: new Set(),
   schemaErrors: {},
+  availableSchemasByConn: {},
+  defaultSchemaByConn: {},
+  selectedSchemaByConn: {},
+  selectedSchemaUpdatedAtByConn: {},
   tableDetails: {},
   tableDetailsErrors: {},
   structDraftKey: null,
@@ -106,9 +167,14 @@ const state = {
   inspectorOpen: false,
   inspectorCollapsed: false,
   rowNumWidth: 56,
+  transposeFieldWidth: 180,
   columnWidthsByTable: {},
+  userResizedColKeysByTable: {},
+  transposeWidthsByTable: {},
   hiddenColsByTable: {},
   pinnedColsByTable: {},
+  tableDisplayByTable: {},
+  tableDisplayRevisionByTable: {},
   findQuery: '',
   findMatches: [],
   findMatchSet: new Set(),
@@ -132,6 +198,9 @@ const state = {
   formSslMode: undefined,
   formSslRejectUnauthorized: undefined,
   formSslTouched: false,
+  formTlsServernameTouched: false,
+  formSslCaPathTouched: false,
+  sshExplicitlyDisabled: false,
   lastAutoFilledSqliteName: '',
   discoveredFiles: [],
   discoveredEnvs: [],
@@ -162,6 +231,9 @@ const state = {
   historyEntries: [],
   restoringViewState: false,
   hasRestoredViewState: false,
+  hasRestoredExpandedConns: false,
+  restoredViewStateUpdatedAt: 0,
+  hasUserInteraction: false,
   silentDataRefresh: false,
   restoredPage: 1,
   restoredSqlDraft: '',
@@ -177,6 +249,11 @@ const PANEL_WARM_CACHE_STORAGE_KEY = 'datanoa.panelWarmCache'
 const PANEL_WARM_CACHE_FRESH_MS = 60_000
 const VIRT_ROW_HEIGHT_PX = 26
 const VIRT_OVERSCAN_ROWS = 10
+const ownDocument = typeof document !== 'undefined' ? document : null
+let panelDisposed = false
+function isPanelActive() {
+  return !panelDisposed && typeof document !== 'undefined' && document === ownDocument
+}
 let dataPageLoadSeq = 0
 let dmlPreviewSeq = 0
 let lastLoadedPanelTableKey = null
@@ -197,6 +274,14 @@ let schemaFilterDebounceTimer = null
 let previewingDml = false
 let submittingChanges = false
 let inspectorUserModified = false
+let reorderQueueChain = Promise.resolve()
+let reorderSeq = 0
+let connReorderSeq = 0
+let folderReorderSeq = 0
+let pendingReorderCount = 0
+let expectedSelfChangedEvents = 0
+let consumedSelfChangedEvents = 0
+let refreshConnectionsAfterReorder = false
 
 function isAnyModalOpen() {
   if (document.querySelector('.datanoa-ai-backdrop')) return true
@@ -230,6 +315,20 @@ function sanitizeWarmPanelConnections(list) {
     delete copy.sshPassword
     delete copy.sshPassphrase
     delete copy.sslKeyPassphrase
+    delete copy.sshJumpHopSecrets
+    if (Array.isArray(copy.sshJumpHosts)) {
+      copy.sshJumpHosts = copy.sshJumpHosts.map((hop) => {
+        if (!hop || typeof hop !== 'object') return hop
+        const cleanHop = { ...hop }
+        delete cleanHop.sshPassword
+        delete cleanHop.sshPassphrase
+        delete cleanHop.password
+        delete cleanHop.passphrase
+        delete cleanHop.authToken
+        delete cleanHop.secret
+        return cleanHop
+      })
+    }
     if (typeof copy.name === 'string') {
       copy.name = scrubConnectionNameForStorage(copy.name)
     }
@@ -274,6 +373,7 @@ function restorePendingScrollPositions(clearAfter = false) {
   const sc = state.pendingScrollState
   if (!sc || typeof sc !== 'object') return
   const apply = () => {
+    if (!isPanelActive()) return
     const viewport = document.querySelector('.viewport')
     const dataWrap = $('dataGridWrap')
     const sqlWrap = $('sqlResultWrap')
@@ -301,8 +401,161 @@ function restorePendingScrollPositions(clearAfter = false) {
   }
 }
 
+function sanitizeStringRecord(raw) {
+  const out = {}
+  if (!raw || typeof raw !== 'object') return out
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof k === 'string' && k.length > 0 && typeof v === 'string' && v.trim().length > 0) {
+      out[k] = v.trim()
+    }
+  }
+  return out
+}
+
+function sanitizeStringArrayRecord(raw) {
+  const out = {}
+  if (!raw || typeof raw !== 'object') return out
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof k === 'string' && k.length > 0 && Array.isArray(v)) {
+      const cleaned = Array.from(
+        new Set(v.map((item) => (typeof item === 'string' ? item.trim() : '')).filter(Boolean))
+      )
+      out[k] = cleaned
+    }
+  }
+  return out
+}
+
+function makeConnSchemaKey(connectionId, schema) {
+  return `${encodeURIComponent(String(connectionId || '').trim())}:${encodeURIComponent(String(schema || '').trim())}`
+}
+
+function sanitizeNumberRecord(raw) {
+  const out = {}
+  if (!raw || typeof raw !== 'object') return out
+  for (const [k, v] of Object.entries(raw)) {
+    if (
+      typeof k === 'string' &&
+      k.length > 0 &&
+      typeof v === 'number' &&
+      Number.isFinite(v) &&
+      v >= 0
+    ) {
+      out[k] = v
+    }
+  }
+  return out
+}
+
+function recordSelectedSchema(connectionId, schema, explicit) {
+  const cleanConn = typeof connectionId === 'string' ? connectionId.trim() : ''
+  const cleanSchema = typeof schema === 'string' ? schema.trim() : ''
+  if (!cleanConn || !cleanSchema) return
+  state.selectedSchemaByConn[cleanConn] = cleanSchema
+  if (explicit) {
+    state.selectedSchemaUpdatedAtByConn[cleanConn] = Math.max(
+      Date.now(),
+      (state.selectedSchemaUpdatedAtByConn[cleanConn] || 0) + 1
+    )
+  } else if (!Object.prototype.hasOwnProperty.call(state.selectedSchemaUpdatedAtByConn, cleanConn)) {
+    state.selectedSchemaUpdatedAtByConn[cleanConn] = 0
+  }
+}
+
+function clearConnectionSchemaCache(connectionId) {
+  if (!connectionId) return
+  delete state.schemaObjects[connectionId]
+  delete state.schemaErrors[connectionId]
+  delete state.availableSchemasByConn[connectionId]
+  delete state.defaultSchemaByConn[connectionId]
+  delete state.selectedSchemaByConn[connectionId]
+  delete state.selectedSchemaUpdatedAtByConn[connectionId]
+  const prefix = `${encodeURIComponent(String(connectionId).trim())}:`
+  for (const key of Object.keys(state.schemaObjectsByConnSchema)) {
+    if (key.startsWith(prefix)) {
+      delete state.schemaObjectsByConnSchema[key]
+    }
+  }
+}
+
+function sanitizeSchemaObjectList(raw) {
+  if (!Array.isArray(raw)) return []
+  return raw.filter((o) => o && typeof o === 'object' && typeof o.name === 'string')
+}
+
+function serializeSchemaObjectsByConnSchema() {
+  const entries = Object.entries(state.schemaObjectsByConnSchema || {})
+  if (entries.length === 0) return null
+  const recent = entries.slice(Math.max(0, entries.length - 16))
+  const out = {}
+  for (const [k, list] of recent) {
+    if (Array.isArray(list)) {
+      out[k] = sanitizeSchemaObjectList(list)
+        .slice(0, 250)
+        .map((o) => ({ ...o }))
+    }
+  }
+  return Object.keys(out).length > 0 ? out : null
+}
+
+function reconcilePanelSelectedSchemasFromSnapshot(saved, forceOverwrite) {
+  if (!saved || typeof saved !== 'object') return false
+  const savedSchemas = sanitizeStringRecord(saved.selectedSchemaByConn)
+  const hasTsMap =
+    saved.selectedSchemaUpdatedAtByConn !== undefined &&
+    saved.selectedSchemaUpdatedAtByConn !== null &&
+    typeof saved.selectedSchemaUpdatedAtByConn === 'object' &&
+    !Array.isArray(saved.selectedSchemaUpdatedAtByConn)
+  const savedTsMap = hasTsMap ? sanitizeNumberRecord(saved.selectedSchemaUpdatedAtByConn) : {}
+  const fallbackTs =
+    !hasTsMap && typeof saved.updatedAt === 'number' && Number.isFinite(saved.updatedAt) && saved.updatedAt >= 0
+      ? saved.updatedAt
+      : 0
+  let upgradedActiveSchema = false
+  for (const [cid, schema] of Object.entries(savedSchemas)) {
+    const savedTs = hasTsMap ? (savedTsMap[cid] ?? 0) : fallbackTs
+    const currentTs = state.selectedSchemaUpdatedAtByConn[cid] ?? -1
+    if (forceOverwrite || !state.selectedSchemaByConn[cid] || savedTs > currentTs) {
+      state.selectedSchemaByConn[cid] = schema
+      state.selectedSchemaUpdatedAtByConn[cid] = Math.max(0, savedTs)
+      if (!state.hasUserInteraction && cid === state.activeConnectionId && state.activeSchema !== schema) {
+        const hadDifferentSchema = Boolean(state.activeSchema)
+        state.activeSchema = schema
+        if (hadDifferentSchema) {
+          state.activeTable = null
+          state.pageData = null
+        }
+        const cached = state.schemaObjectsByConnSchema[makeConnSchemaKey(cid, schema)]
+        if (Array.isArray(cached)) {
+          state.schemaObjects[cid] = cached.slice()
+        } else if (hadDifferentSchema) {
+          delete state.schemaObjects[cid]
+        }
+        upgradedActiveSchema = true
+      }
+    }
+  }
+  return upgradedActiveSchema
+}
+
+function isUnrestoredPanelBootState() {
+  return (
+    state.initialBootLoading &&
+    !state.hasRestoredViewState &&
+    !state.hasUserInteraction &&
+    !state.activeConnectionId &&
+    Object.keys(state.selectedSchemaByConn).length === 0
+  )
+}
+
+function shouldShowActiveSchemaBar(activeConn, schemas) {
+  if (state.formOpen || !activeConn || activeConn.driver === 'redis') return false
+  if (!Array.isArray(schemas)) return false
+  return schemas.length > 1 || (schemas.length === 1 && MULTI_SCHEMA_DRIVERS.has(activeConn.driver))
+}
+
 function savePanelDataCache() {
-  if (state.restoringViewState) return
+  if (state.restoringViewState || isUnrestoredPanelBootState()) return
   const activeKey =
     state.activeConnectionId && state.activeTable
       ? makeTableKey(state.activeConnectionId, state.activeTable, state.activeSchema)
@@ -313,6 +566,7 @@ function savePanelDataCache() {
   const activeDetails = activeKey ? state.tableDetails[activeKey] : null
 
   const now = Date.now()
+  const schemaObjectsByConnSchema = serializeSchemaObjectsByConnSchema()
   const cache = {
     updatedAt: now,
     activeConnectionId: state.activeConnectionId,
@@ -322,7 +576,11 @@ function savePanelDataCache() {
     pageSize: state.pageSize,
     whereClause: containsSensitiveSqlText(state.whereClause || '') ? '' : state.whereClause || '',
     orderByClause: state.orderByClause || '',
+    availableSchemasByConn: sanitizeStringArrayRecord(state.availableSchemasByConn),
+    defaultSchemaByConn: sanitizeStringRecord(state.defaultSchemaByConn),
+    selectedSchemaByConn: sanitizeStringRecord(state.selectedSchemaByConn),
     schemaObjects: activeSchemaObjs ? { [state.activeConnectionId]: activeSchemaObjs } : null,
+    ...(schemaObjectsByConnSchema ? { schemaObjectsByConnSchema } : {}),
     tableDetails: activeDetails && activeKey ? { [activeKey]: activeDetails } : null,
     pageData: state.pageData || null,
     lastSqlResult: state.lastSqlResult ? sanitizeSqlResultForStorage(state.lastSqlResult) : null,
@@ -332,6 +590,7 @@ function savePanelDataCache() {
     const localWarm = {
       ...cache,
       connections: sanitizeWarmPanelConnections(state.connections),
+      folderOrder: normalizeFolderOrder(state.folderOrder),
     }
     let localJson = JSON.stringify(localWarm)
     if (measureUtf8Bytes(localJson) > MAX_PANEL_LOCAL_WARM_BYTES && localWarm.lastSqlResult) {
@@ -344,6 +603,13 @@ function savePanelDataCache() {
     }
     if (measureUtf8Bytes(localJson) > MAX_PANEL_LOCAL_WARM_BYTES && localWarm.tableDetails) {
       localWarm.tableDetails = null
+      localJson = JSON.stringify(localWarm)
+    }
+    if (
+      measureUtf8Bytes(localJson) > MAX_PANEL_LOCAL_WARM_BYTES &&
+      localWarm.schemaObjectsByConnSchema
+    ) {
+      delete localWarm.schemaObjectsByConnSchema
       localJson = JSON.stringify(localWarm)
     }
     if (measureUtf8Bytes(localJson) <= MAX_PANEL_LOCAL_WARM_BYTES) {
@@ -365,6 +631,10 @@ function savePanelDataCache() {
       cache.tableDetails = null
       bytes = measureUtf8Bytes(JSON.stringify(cache))
     }
+    if (bytes > MAX_PANEL_DATA_CACHE_BYTES && cache.schemaObjectsByConnSchema) {
+      delete cache.schemaObjectsByConnSchema
+      bytes = measureUtf8Bytes(JSON.stringify(cache))
+    }
     if (bytes > MAX_PANEL_DATA_CACHE_BYTES && cache.schemaObjects) {
       cache.schemaObjects = null
     }
@@ -380,7 +650,7 @@ function savePanelViewState() {
     clearTimeout(saveViewStateTimer)
     saveViewStateTimer = null
   }
-  if (state.restoringViewState) return
+  if (state.restoringViewState || isUnrestoredPanelBootState()) return
   const rawSqlDraft = typeof getSqlText === 'function' ? getSqlText() : ''
   const safeSqlDraft = sqlDraftLooksSensitive(rawSqlDraft) ? '' : rawSqlDraft
   const consoleTabsSnapshot =
@@ -388,6 +658,7 @@ function savePanelViewState() {
       ? getConsoleTabsPersistedState(sqlDraftLooksSensitive)
       : null
   const snapshot = {
+    updatedAt: Date.now(),
     tab: state.tab,
     activeConnectionId: state.activeConnectionId,
     activeTable: state.activeTable,
@@ -403,6 +674,8 @@ function savePanelViewState() {
     expandedConns: Array.from(state.expandedConns),
     expandedTables: Array.from(state.expandedTables),
     expandedMeta: Array.from(state.expandedMeta),
+    selectedSchemaByConn: sanitizeStringRecord(state.selectedSchemaByConn),
+    selectedSchemaUpdatedAtByConn: sanitizeNumberRecord(state.selectedSchemaUpdatedAtByConn),
     filter: state.filter,
     sqlDraft: safeSqlDraft,
     ...(typeof getSqlEditorHeight === 'function' && Number.isFinite(getSqlEditorHeight())
@@ -476,19 +749,27 @@ function flushPendingSavePanelViewState() {
   savePanelViewState()
 }
 
-function applyPanelViewStateSnapshot(saved) {
+function applyPanelViewStateSnapshot(saved, options = {}) {
   if (!saved || typeof saved !== 'object') return
+  const forceOverwrite = Boolean(options?.forceOverwrite)
   state.hasRestoredViewState = true
   state.restoringViewState = true
   try {
+    if (typeof saved.updatedAt === 'number' && Number.isFinite(saved.updatedAt)) {
+      state.restoredViewStateUpdatedAt = Math.max(state.restoredViewStateUpdatedAt, saved.updatedAt)
+    }
     if (saved.activeConnectionId && typeof saved.activeConnectionId === 'string') {
       state.activeConnectionId = saved.activeConnectionId
     }
     if (saved.activeTable && typeof saved.activeTable === 'string') {
       state.activeTable = saved.activeTable
+    } else if (forceOverwrite) {
+      state.activeTable = null
     }
     if (saved.activeSchema && typeof saved.activeSchema === 'string') {
       state.activeSchema = saved.activeSchema
+    } else if (forceOverwrite) {
+      state.activeSchema = undefined
     }
     if (Number.isFinite(saved.page) && saved.page >= 1) {
       state.page = Math.floor(saved.page)
@@ -526,9 +807,20 @@ function applyPanelViewStateSnapshot(saved) {
       state.transposed = saved.transposed
     }
     if (Array.isArray(saved.collapsedFolders)) {
-      state.collapsedFolders = new Set(saved.collapsedFolders.filter((x) => typeof x === 'string'))
+      state.collapsedFolders = new Set(
+        saved.collapsedFolders
+          .filter((x) => typeof x === 'string' && x.length > 0)
+          .map((x) => {
+            if (x.startsWith('folder:') || x.startsWith('builtin:')) return x
+            if (x === UNGROUPED_FOLDER_ORDER_KEY || x === 'General (Ungrouped)') {
+              return `builtin:${UNGROUPED_FOLDER_ORDER_KEY}`
+            }
+            return `folder:${x}`
+          })
+      )
     }
     if (Array.isArray(saved.expandedConns)) {
+      state.hasRestoredExpandedConns = true
       state.expandedConns = new Set(saved.expandedConns.filter((x) => typeof x === 'string'))
     }
     if (Array.isArray(saved.expandedTables)) {
@@ -536,6 +828,12 @@ function applyPanelViewStateSnapshot(saved) {
     }
     if (Array.isArray(saved.expandedMeta)) {
       state.expandedMeta = new Set(saved.expandedMeta.filter((x) => typeof x === 'string'))
+    }
+    if (saved.selectedSchemaByConn && typeof saved.selectedSchemaByConn === 'object') {
+      reconcilePanelSelectedSchemasFromSnapshot(saved, forceOverwrite)
+    }
+    if (state.activeConnectionId && state.selectedSchemaByConn[state.activeConnectionId] && !state.activeSchema) {
+      state.activeSchema = state.selectedSchemaByConn[state.activeConnectionId]
     }
     if (typeof saved.filter === 'string') {
       state.filter = saved.filter
@@ -620,6 +918,7 @@ function applyPanelViewStateSnapshot(saved) {
         $('panelByodFolderInput').dataset.driver = state.formDriver
         $('panelByodFolderInput').value = fd.byodFolder
       }
+      connFormCtrl.syncOrgSafetyState?.()
     }
     if (typeof saved.editingId === 'string' || saved.editingId === null) {
       state.editingId = saved.editingId
@@ -655,6 +954,9 @@ function restorePanelWarmCacheFromLocal() {
       return false
     }
     state.connections = dc.connections
+    if (Array.isArray(dc.folderOrder)) {
+      state.folderOrder = normalizeFolderOrder(dc.folderOrder)
+    }
     state.initialBootLoading = false
     state.warmBootHydrated = true
     state.warmBootUpdatedAt = Number.isFinite(dc.updatedAt) ? dc.updatedAt : 0
@@ -664,7 +966,35 @@ function restorePanelWarmCacheFromLocal() {
     if (dc.schemaObjects && typeof dc.schemaObjects === 'object') {
       for (const [cid, objs] of Object.entries(dc.schemaObjects)) {
         if (Array.isArray(objs) && !state.schemaObjects[cid]) {
-          state.schemaObjects[cid] = objs
+          state.schemaObjects[cid] = sanitizeSchemaObjectList(objs)
+        }
+      }
+    }
+    if (dc.availableSchemasByConn && typeof dc.availableSchemasByConn === 'object') {
+      for (const [cid, schemas] of Object.entries(sanitizeStringArrayRecord(dc.availableSchemasByConn))) {
+        if (!state.availableSchemasByConn[cid]) {
+          state.availableSchemasByConn[cid] = schemas
+        }
+      }
+    }
+    if (dc.defaultSchemaByConn && typeof dc.defaultSchemaByConn === 'object') {
+      for (const [cid, schemaName] of Object.entries(sanitizeStringRecord(dc.defaultSchemaByConn))) {
+        if (!state.defaultSchemaByConn[cid]) {
+          state.defaultSchemaByConn[cid] = schemaName
+        }
+      }
+    }
+    if (dc.selectedSchemaByConn && typeof dc.selectedSchemaByConn === 'object') {
+      for (const [cid, schemaName] of Object.entries(sanitizeStringRecord(dc.selectedSchemaByConn))) {
+        if (!state.selectedSchemaByConn[cid]) {
+          recordSelectedSchema(cid, schemaName, false)
+        }
+      }
+    }
+    if (dc.schemaObjectsByConnSchema && typeof dc.schemaObjectsByConnSchema === 'object') {
+      for (const [k, objs] of Object.entries(dc.schemaObjectsByConnSchema)) {
+        if (Array.isArray(objs) && !state.schemaObjectsByConnSchema[k]) {
+          state.schemaObjectsByConnSchema[k] = sanitizeSchemaObjectList(objs)
         }
       }
     }
@@ -762,6 +1092,7 @@ function clearStagedChanges() {
   state.stagedInserts = []
   state.stagedUpdates.clear()
   state.stagedDeletes.clear()
+  bumpAllHighlightRevisions?.()
   $('dmlPreviewDrawer').hidden = true
   if ($('dataRemoteChangeBanner')) $('dataRemoteChangeBanner').hidden = true
   renderStagingBar()
@@ -905,12 +1236,206 @@ function showFormNotice(text, tone = 'neutral') {
 
 function clearFormNotice() {
   $('formNotice').hidden = true
+  clearPanelTlsRemedy()
+}
+
+function getPanelInstanceId() {
+  const pid = window.orca?.panel?.id ?? window.orca?.panelId
+  return typeof pid === 'string' && pid.trim() ? pid.trim() : undefined
+}
+
+let activeHostKeyRetryConnId = null
+
+function clearPanelTlsRemedy() {
+  const box = $('formTlsRemedyBox')
+  if (!box) return
+  box.textContent = ''
+  box.classList.remove('is-hard-error')
+  box.hidden = true
+}
+
+function applyPanelSslMode(mode) {
+  state.formSslTouched = true
+  state.formSslMode = mode
+  if ($('formSsl')) $('formSsl').checked = mode !== 'disable'
+  if (mode === 'require') {
+    state.formSslRejectUnauthorized = false
+  } else if (mode === 'verify-ca' || mode === 'verify-full' || mode === 'strict') {
+    state.formSslRejectUnauthorized = true
+  } else if (mode === 'disable') {
+    state.formSslRejectUnauthorized = undefined
+  }
+  connFormCtrl.syncSslVerifyUi?.()
+}
+
+function promptUnverifiedTlsConfirmation(box, onConfirmRequire, onUseVerified) {
+  if (!box) return
+  let confirmBox = box.querySelector('[data-tls-unverified-confirm]')
+  if (!confirmBox) {
+    confirmBox = document.createElement('div')
+    confirmBox.dataset.tlsUnverifiedConfirm = 'true'
+    confirmBox.className = 'tls-remedy-hint'
+    confirmBox.style.marginTop = '6px'
+    confirmBox.style.padding = '6px 8px'
+    confirmBox.style.border = '1px solid var(--warn, #f59e0b)'
+    confirmBox.style.borderRadius = '6px'
+    box.appendChild(confirmBox)
+  }
+  confirmBox.textContent = ''
+  const msg = document.createElement('div')
+  msg.textContent =
+    'Mode "require" encrypts traffic WITHOUT verifying the server certificate (MITM risk). Confirm disabling certificate verification?'
+  const acts = document.createElement('div')
+  acts.className = 'tls-remedy-actions'
+  acts.style.marginTop = '6px'
+
+  const verifiedBtn = document.createElement('button')
+  verifiedBtn.type = 'button'
+  verifiedBtn.className = 'btn btn-sm btn-primary'
+  verifiedBtn.dataset.tlsUseVerified = 'true'
+  verifiedBtn.textContent = 'Use Verified TLS (verify-full)'
+  verifiedBtn.addEventListener('click', onUseVerified)
+
+  const confirmBtn = document.createElement('button')
+  confirmBtn.type = 'button'
+  confirmBtn.className = 'btn btn-sm'
+  confirmBtn.dataset.tlsConfirmUnverified = 'true'
+  confirmBtn.textContent = 'Confirm Unverified TLS & Retest'
+  confirmBtn.addEventListener('click', onConfirmRequire)
+
+  acts.append(verifiedBtn, confirmBtn)
+  confirmBox.append(msg, acts)
+}
+
+function renderPanelTlsFailureRemedy(failure) {
+  const box = $('formTlsRemedyBox')
+  const triggerRetest = () => {
+    clearPanelTlsRemedy()
+    void runPanelConnectionTest()
+  }
+  renderSharedTlsFailureRemedy(box, failure, {
+    displayMode: 'hidden',
+    hintClass: 'tls-remedy-hint',
+    actionsClass: 'tls-remedy-actions',
+    buttonClass: 'btn btn-sm',
+    allowAutoSuggestedMode: false,
+    onInspectCaCert: (kind) => {
+      if ($('sslCaPathRow')) $('sslCaPathRow').hidden = false
+      void openPanelFilePickerModal({
+        title: 'Select CA Certificate',
+        mode: 'file',
+        initialDir: $('formSslCaPath')?.value.trim() || undefined,
+        extensions: ['.pem', '.crt', '.cer', '.ca-bundle'],
+      })
+        .then((res) => {
+          if (!isPanelActive() || !state.formOpen) return
+          if (res?.ok && res.path) {
+            if ($('formSslCaPath')) $('formSslCaPath').value = res.path
+            state.formSslCaPathTouched = true
+            if ($('formSsl')) $('formSsl').checked = true
+            if (
+              state.formSslMode === 'disable' ||
+              state.formSslMode === 'require' ||
+              !state.formSslMode
+            ) {
+              applyPanelSslMode('verify-ca')
+            } else {
+              connFormCtrl.syncSslVerifyUi?.()
+            }
+            savePanelViewState?.()
+            clearPanelTlsRemedy()
+            showFormNotice('CA certificate selected. Click Test or Save & Connect to verify.', 'neutral')
+            $('formSslCaPath')?.focus?.()
+            return
+          }
+          if (kind === 'CaFileInvalid') {
+            showFormNotice('Select a valid CA certificate file or clear the CA path and retry.', 'warn')
+          }
+          $('formSslCaPath')?.focus?.()
+        })
+        .catch(() => {
+          $('formSslCaPath')?.focus?.()
+        })
+    },
+    onInspectClientCert: () => {
+      showFormNotice('Update client certificate & key paths in Full Studio and retry.', 'warn')
+      $('formSslVerify')?.focus?.()
+    },
+    onApplySslMode: (mode, retest) => {
+      if (mode === 'require') {
+        promptUnverifiedTlsConfirmation(
+          box,
+          () => {
+            applyPanelSslMode('require')
+            if (retest) triggerRetest()
+          },
+          () => {
+            applyPanelSslMode('verify-full')
+            if (retest) triggerRetest()
+          }
+        )
+        return
+      }
+      applyPanelSslMode(mode)
+      if (retest) triggerRetest()
+    },
+    onSetServerName: (targetServerName) => {
+      if ($('tlsServernameRow')) $('tlsServernameRow').hidden = false
+      if ($('formTlsServername')) $('formTlsServername').value = targetServerName
+      state.formTlsServernameTouched = true
+      if ($('formSsl')) $('formSsl').checked = true
+      connFormCtrl.syncSslVerifyUi?.()
+      savePanelViewState?.()
+      triggerRetest()
+    },
+    onVerifyCaOnly: () => {
+      applyPanelSslMode('verify-ca')
+    },
+    onInspectTls: () => {
+      $('formSslVerify')?.focus?.()
+    },
+  })
+}
+
+async function resolvePanelSshHostKeyDecision(input) {
+  const res = await rpc('ssh.hostKey.resolve', input)
+  return {
+    ok: Boolean(res?.ok),
+    decision: res?.decision ?? input.decision,
+    savedPath: res?.savedPath,
+    ...(typeof res?.retryToken === 'string' && res.retryToken
+      ? { retryToken: res.retryToken }
+      : {}),
+  }
+}
+
+async function executeConnectionTestWithHostKeyRetry(sub) {
+  const connId = sub?.profile?.id || state.editingId || undefined
+  const prevConnId = activeHostKeyRetryConnId
+  activeHostKeyRetryConnId = connId || null
+  try {
+    return await runWithSshHostKeyRetry({
+      connectionId: connId,
+      panelId: getPanelInstanceId(),
+      jumpHosts: sub?.profile?.sshJumpHosts,
+      isActive: isPanelActive,
+      runAttempt: (retryCtx) =>
+        rpc(
+          'connection.test',
+          retryCtx?.sshRetryToken ? { ...sub, sshRetryToken: retryCtx.sshRetryToken } : sub,
+          { timeoutMs: QUERY_TIMEOUT_MS }
+        ),
+      resolveDecision: resolvePanelSshHostKeyDecision,
+    })
+  } finally {
+    activeHostKeyRetryConnId = prevConnId
+  }
 }
 
 async function copyText(text, successMsg, triggerBtn) {
   const copied = await writeTextToClipboard(text)
 
-  if (triggerBtn instanceof HTMLButtonElement) {
+  if (copied && triggerBtn instanceof HTMLButtonElement) {
     const origLabel = triggerBtn.dataset.origLabel || triggerBtn.textContent || 'Copy'
     triggerBtn.dataset.origLabel = origLabel
     if (triggerBtn._copyResetTimer) {
@@ -935,7 +1460,20 @@ function updateViewportLayout() {
   const active = getActiveConn()
   $('connFormBox').hidden = !state.formOpen
   $('activeConnCard').hidden = state.formOpen || !active
+  if ($('activeConnCard').hidden) {
+    $('connSelect')?._customDropdownApi?.close?.()
+  }
   $('connMetaRow').hidden = state.formOpen || !active
+  if ($('activeSchemaBar')) {
+    const schemas =
+      active && Array.isArray(state.availableSchemasByConn[active.id])
+        ? state.availableSchemasByConn[active.id]
+        : []
+    $('activeSchemaBar').hidden = !shouldShowActiveSchemaBar(active, schemas)
+    if ($('activeSchemaBar').hidden) {
+      $('panelSchemaSelect')?._customDropdownApi?.close?.()
+    }
+  }
   if ($('structureTableBar')) {
     $('structureTableBar').hidden = state.formOpen || !active || state.tab !== 'structure'
   }
@@ -959,6 +1497,10 @@ function updateViewportLayout() {
 function setFormOpen(open) {
   closeActiveCustomDropdown()
   state.formOpen = Boolean(open)
+  if (!state.formOpen) {
+    clearUriPasteTimer()
+    connFormCtrl.clearFormImportSpotlight?.(true)
+  }
   updateViewportLayout()
   if (state.formOpen) {
     const viewport = document.querySelector('.viewport')
@@ -971,6 +1513,20 @@ function switchTab(nextTab) {
   closeActiveCustomDropdown()
   closePanelComboPopover()
   hideBanner()
+  if (state.formOpen) {
+    clearUriPasteTimer()
+    connFormCtrl.clearFormImportSpotlight?.(true)
+  }
+  if (typeof activeResizeCleanup === 'function') {
+    activeResizeCleanup()
+    activeResizeCleanup = null
+  }
+  if (typeof inspectorResizeCleanup === 'function') {
+    inspectorResizeCleanup()
+  }
+  if (typeof cancelSqlEditorDrag === 'function') {
+    cancelSqlEditorDrag()
+  }
   if (state.formOpen) {
     state.formOpen = false
   }
@@ -1020,6 +1576,7 @@ const connFormCtrl = createPanelConnectionFormController({
   updateViewportLayout: () => updateViewportLayout(),
   savePanelViewState: () => scheduleSavePanelViewState(80),
   copyText: (...a) => copyText(...a),
+  clearUriPasteTimer: () => clearUriPasteTimer(),
 })
 const {
   initStaticSelectors,
@@ -1033,6 +1590,7 @@ const {
   renderPanelFolderChips,
   setFormControlsBusy,
   ensureUriParsedBeforeAction,
+  ensureValidFolderBeforeSubmit,
   ensureRequiredPasswordBeforeSubmit,
 } = connFormCtrl
 
@@ -1049,7 +1607,11 @@ const dataGridCtrl = createPanelDataGridController({
   getOrderedVisibleColumns: () => getOrderedVisibleColumns(),
   getPinnedColsSet: (k) => getPinnedColsSet(k),
   getHiddenColsSet: (k) => getHiddenColsSet(k),
+  getActiveTableDisplayEntry: (k) => getActiveTableDisplayEntry(k),
+  patchTableDisplayState: (patch, opts) => patchTableDisplayState(patch, opts),
+  reorderColumnByDrop: (fromCol, toCol, placement) => reorderColumnByDrop(fromCol, toCol, placement),
   getActiveForeignKeyMap: () => getActiveForeignKeyMap(),
+  getColKeyResolver: (cols) => getPanelColKeyResolver(cols),
   getLastPanelCopiedText: () => lastPanelCopiedText,
   setLastPanelCopiedText: (v) => { lastPanelCopiedText = v },
   getSuppressSortClickUntil: () => suppressSortClickUntil,
@@ -1065,6 +1627,8 @@ const dataGridCtrl = createPanelDataGridController({
 })
 const {
   dataVirt,
+  bumpAllHighlightRevisions,
+  recomputePinnedForViewport,
   computeVirtualRange,
   isActiveDataObjectView,
   renderDataToolbar,
@@ -1122,6 +1686,7 @@ const sqlCtrl = createPanelSqlController({
   getAiStatus: () => state.aiStatus,
   openAiSettingsModal: (initialRole) => openAiSettingsModal(initialRole),
   onRefreshAiStatus: () => hydrateAiStatus(),
+  setPanelViewportResizing: (active) => setPanelViewportResizing(active),
 })
 const {
   sqlVirt,
@@ -1159,6 +1724,7 @@ const {
   getSqlEditorHeight,
   setSqlEditorHeight,
   applyClampedSqlEditorHeight,
+  cancelSqlEditorDrag,
 } = sqlCtrl
 
 const structCtrl = createPanelStructureController({
@@ -1194,7 +1760,7 @@ const explorerCtrl = createPanelExplorerController({
   getActiveTableKey: () => getActiveTableKey(),
   getPinnedColsSet: (k) => getPinnedColsSet(k),
   activateConnection: (id) => activateConnection(id),
-  loadSchema: (id) => loadSchema(id),
+  loadSchema: (...a) => loadSchema(...a),
   selectTableAndOpen: (...a) => selectTableAndOpen(...a),
   showBanner: (...a) => showBanner(...a),
   showConnectionBanner: (...a) => showConnectionBanner(...a),
@@ -1230,6 +1796,8 @@ const explorerCtrl = createPanelExplorerController({
   populateFormFromProfile: (...a) => populateFormFromProfile(...a),
   openDeleteConfirmModal: (...a) => openDeleteConfirmModal(...a),
   savePanelViewState: () => savePanelViewState(),
+  reorderConnectionsInFolder: (folder, orderedIds) => reorderConnectionsInFolder(folder, orderedIds),
+  reorderFolders: (orderedFolders) => reorderFolders(orderedFolders),
 })
 const {
   renderExplorer,
@@ -1264,6 +1832,12 @@ const {
 } = feedbackPaletteCtrl
 
 async function refreshConnections(options = {}) {
+  if (!isPanelActive()) return
+  const bypassReorderGuard = Boolean(options?.bypassReorderGuard)
+  if (!bypassReorderGuard && pendingReorderCount > 0) {
+    refreshConnectionsAfterReorder = true
+    return
+  }
   if (state.refreshingConns) {
     refreshConnectionsPending = true
     return
@@ -1283,14 +1857,26 @@ async function refreshConnections(options = {}) {
   }
   try {
     const shouldFetchBootSnap = isBoot || state.initialBootLoading
-    const [list, sessionSnap] = await Promise.all([
+    const [list, folderOrderRes, sessionSnap] = await Promise.all([
       rpc('connections.list'),
+      rpc('folders.order.get').catch(() => null),
       shouldFetchBootSnap
         ? rpc('ui.getSessionSnapshot', { surface: 'panel' }).catch(() => null)
         : Promise.resolve(null),
     ])
-    const prevConnSignature = JSON.stringify(state.connections)
+    if (!isPanelActive()) return
+    if (!bypassReorderGuard && pendingReorderCount > 0) {
+      refreshConnectionsAfterReorder = true
+      return
+    }
+    const prevConnSignature = JSON.stringify({
+      connections: state.connections,
+      folderOrder: state.folderOrder,
+    })
     state.connections = Array.isArray(list) ? list : []
+    if (folderOrderRes && Array.isArray(folderOrderRes.folderOrder)) {
+      state.folderOrder = normalizeFolderOrder(folderOrderRes.folderOrder)
+    }
     for (const cid of Object.keys(state.schemaErrors)) {
       if (!state.connections.some((c) => c.id === cid)) {
         delete state.schemaErrors[cid]
@@ -1299,15 +1885,37 @@ async function refreshConnections(options = {}) {
     if (bannerActionContext?.source === 'schema') {
       syncSchemaErrorBanner()
     }
-    const connsChanged = prevConnSignature !== JSON.stringify(state.connections)
+    const connsChanged =
+      prevConnSignature !==
+      JSON.stringify({
+        connections: state.connections,
+        folderOrder: state.folderOrder,
+      })
     state.initialBootLoading = false
-    if (!state.hasRestoredViewState && sessionSnap?.viewState && typeof sessionSnap.viewState === 'object') {
-      applyPanelViewStateSnapshot(sessionSnap.viewState)
+    const workerView =
+      sessionSnap?.viewState && typeof sessionSnap.viewState === 'object'
+        ? sessionSnap.viewState
+        : null
+    const workerViewUpdatedAt = workerView
+      ? Number.isFinite(workerView.updatedAt)
+        ? workerView.updatedAt
+        : Number.isFinite(sessionSnap?.updatedAt)
+          ? sessionSnap.updatedAt
+          : 0
+      : 0
+    if (
+      workerView &&
+      (!state.hasRestoredViewState ||
+        (workerViewUpdatedAt > state.restoredViewStateUpdatedAt && !state.hasUserInteraction))
+    ) {
+      applyPanelViewStateSnapshot(workerView, { forceOverwrite: true })
+    } else if (workerView && !state.hasUserInteraction) {
+      reconcilePanelSelectedSchemasFromSnapshot(workerView, false)
     } else if (!state.activeConnectionId && typeof window.orca?.storage?.get === 'function') {
       try {
         const hostSaved = await window.orca.storage.get(PANEL_VIEW_STATE_STORAGE_KEY)
         if (hostSaved && typeof hostSaved === 'object') {
-          applyPanelViewStateSnapshot(hostSaved)
+          applyPanelViewStateSnapshot(hostSaved, { forceOverwrite: true })
         }
       } catch {}
     }
@@ -1320,10 +1928,38 @@ async function refreshConnections(options = {}) {
         (Number.isFinite(sessionSnap.updatedAt) && sessionSnap.updatedAt) ||
         0
       if (snapUpdatedAt > effectiveWarmAt) effectiveWarmAt = snapUpdatedAt
+      if (dc.schemaObjectsByConnSchema && typeof dc.schemaObjectsByConnSchema === 'object') {
+        for (const [k, objs] of Object.entries(dc.schemaObjectsByConnSchema)) {
+          if (Array.isArray(objs) && (!state.schemaObjectsByConnSchema[k] || snapUpdatedAt > (state.warmBootUpdatedAt || 0))) {
+            state.schemaObjectsByConnSchema[k] = sanitizeSchemaObjectList(objs)
+          }
+        }
+      }
       if (dc.schemaObjects && typeof dc.schemaObjects === 'object') {
         for (const [cid, objs] of Object.entries(dc.schemaObjects)) {
-          if (Array.isArray(objs) && !state.schemaObjects[cid]) {
-            state.schemaObjects[cid] = objs
+          if (Array.isArray(objs) && (!state.schemaObjects[cid] || snapUpdatedAt > (state.warmBootUpdatedAt || 0))) {
+            state.schemaObjects[cid] = sanitizeSchemaObjectList(objs)
+          }
+        }
+      }
+      if (dc.availableSchemasByConn && typeof dc.availableSchemasByConn === 'object') {
+        for (const [cid, schemas] of Object.entries(sanitizeStringArrayRecord(dc.availableSchemasByConn))) {
+          if (!state.availableSchemasByConn[cid]) {
+            state.availableSchemasByConn[cid] = schemas
+          }
+        }
+      }
+      if (dc.defaultSchemaByConn && typeof dc.defaultSchemaByConn === 'object') {
+        for (const [cid, schemaName] of Object.entries(sanitizeStringRecord(dc.defaultSchemaByConn))) {
+          if (!state.defaultSchemaByConn[cid]) {
+            state.defaultSchemaByConn[cid] = schemaName
+          }
+        }
+      }
+      if (dc.selectedSchemaByConn && typeof dc.selectedSchemaByConn === 'object') {
+        for (const [cid, schemaName] of Object.entries(sanitizeStringRecord(dc.selectedSchemaByConn))) {
+          if (!state.selectedSchemaByConn[cid]) {
+            recordSelectedSchema(cid, schemaName, false)
           }
         }
       }
@@ -1350,6 +1986,26 @@ async function refreshConnections(options = {}) {
       ) {
         state.lastSqlResult = dc.lastSqlResult
         restoredSqlResult = true
+      }
+    }
+    const liveConnIds = new Set(state.connections.map((c) => c.id))
+    for (const mapObj of [
+      state.availableSchemasByConn,
+      state.defaultSchemaByConn,
+      state.selectedSchemaByConn,
+      state.selectedSchemaUpdatedAtByConn,
+    ]) {
+      for (const cid of Object.keys(mapObj)) {
+        if (!liveConnIds.has(cid)) {
+          delete mapObj[cid]
+        }
+      }
+    }
+    for (const key of Object.keys(state.schemaObjectsByConnSchema)) {
+      const sepIdx = key.indexOf(':')
+      const rawCid = sepIdx >= 0 ? decodeURIComponent(key.slice(0, sepIdx)) : ''
+      if (!rawCid || !liveConnIds.has(rawCid)) {
+        delete state.schemaObjectsByConnSchema[key]
       }
     }
     const isFreshWarmResume =
@@ -1383,6 +2039,7 @@ async function refreshConnections(options = {}) {
     )
     if (!hasActive) {
       const persistedId = await readPersistedActiveConnectionId()
+      if (!isPanelActive()) return
       const hasPersisted = Boolean(
         persistedId && state.connections.some((c) => c.id === persistedId)
       )
@@ -1390,7 +2047,13 @@ async function refreshConnections(options = {}) {
         ? persistedId
         : (state.connections.length > 0 ? state.connections[0].id : null)
       state.activeTable = null
-      state.activeSchema = undefined
+      state.activeSchema = state.activeConnectionId
+        ? state.selectedSchemaByConn[state.activeConnectionId] ||
+          state.defaultSchemaByConn[state.activeConnectionId]
+        : undefined
+      if (workerView && !state.hasUserInteraction) {
+        reconcilePanelSelectedSchemasFromSnapshot(workerView, false)
+      }
       state.pageData = null
       state.page = 1
       state.sortCol = null
@@ -1402,8 +2065,21 @@ async function refreshConnections(options = {}) {
         void persistActiveConnectionId(null)
       }
     }
-    if (state.activeConnectionId && state.expandedConns.size === 0 && !state.hasRestoredViewState) {
+    if (state.activeConnectionId && state.expandedConns.size === 0 && !state.hasRestoredExpandedConns) {
       state.expandedConns.add(state.activeConnectionId)
+    }
+    if (state.activeConnectionId) {
+      const activeTargetSchema =
+        state.selectedSchemaByConn[state.activeConnectionId] ||
+        state.activeSchema ||
+        state.defaultSchemaByConn[state.activeConnectionId] ||
+        ''
+      const cachedActiveObjs = activeTargetSchema
+        ? state.schemaObjectsByConnSchema[makeConnSchemaKey(state.activeConnectionId, activeTargetSchema)]
+        : undefined
+      if (Array.isArray(cachedActiveObjs)) {
+        state.schemaObjects[state.activeConnectionId] = cachedActiveObjs.slice()
+      }
     }
     if (!isSilentWarmBoot || connsChanged || !hasActive) {
       renderPanelFolderChips()
@@ -1422,29 +2098,51 @@ async function refreshConnections(options = {}) {
     } else if (restoredSqlResult && state.lastSqlResult) {
       renderQueryResult(state.lastSqlResult, { preserveScroll: true, skipCache: true })
     }
-    for (const cid of state.expandedConns) {
-      if (!state.connections.some((c) => c.id === cid)) continue
-      const hasCachedSchema =
-        Array.isArray(state.schemaObjects[cid]) && state.schemaObjects[cid].length > 0
+    sqlCtrl?.onAiStatusChanged?.()
+    const connsToLoad = new Set(state.expandedConns)
+    if (state.activeConnectionId) {
+      connsToLoad.add(state.activeConnectionId)
+    }
+    for (const cid of connsToLoad) {
+      const conn = state.connections.find((c) => c.id === cid)
+      if (!conn) continue
+      const targetSchema =
+        state.selectedSchemaByConn[cid] ||
+        (cid === state.activeConnectionId ? state.activeSchema : undefined) ||
+        state.defaultSchemaByConn[cid] ||
+        ''
+      const cachedForTarget = targetSchema
+        ? state.schemaObjectsByConnSchema[makeConnSchemaKey(cid, targetSchema)]
+        : undefined
+      const activeObjs = state.schemaObjects[cid]
+      const hasSchemaMatchedObjs =
+        Array.isArray(cachedForTarget) ||
+        (Array.isArray(activeObjs) &&
+          activeObjs.length > 0 &&
+          (!targetSchema || activeObjs.every((o) => !o?.schema || o.schema === targetSchema)))
       const activeNeedsPage =
         cid === state.activeConnectionId &&
         Boolean(state.activeTable) &&
         !state.pageData
-      if (isFreshWarmResume && hasCachedSchema && !activeNeedsPage) {
+      const needsMultiSchemaList =
+        MULTI_SCHEMA_DRIVERS.has(conn.driver) && !Array.isArray(state.availableSchemasByConn[cid])
+      if (isFreshWarmResume && hasSchemaMatchedObjs && !activeNeedsPage && !needsMultiSchemaList) {
         continue
       }
-      void loadSchema(cid)
+      void loadSchema(cid, hasSchemaMatchedObjs ? { silent: true } : {})
     }
     if (connsChanged) {
       savePanelDataCache()
     }
   } catch (err) {
+    if (!isPanelActive()) return
     state.initialBootLoading = false
     showBanner(err?.message || 'Failed to load connections', 'danger')
     renderExplorer()
   } finally {
     state.initialBootLoading = false
     state.refreshingConns = false
+    if (!isPanelActive()) return
     if (refBtn && !isSilentWarmBoot) {
       refBtn.disabled = false
       refBtn.classList.remove('is-spinning')
@@ -1457,29 +2155,241 @@ async function refreshConnections(options = {}) {
   }
 }
 
+function reorderConnectionsInFolder(folder, orderedIds) {
+  if (!isPanelActive()) {
+    return Promise.resolve({ ok: false, changed: false })
+  }
+  const plan = reorderConnectionsWithinFolder(state.connections, folder, orderedIds)
+  if (!plan.ok || !plan.changed) {
+    return Promise.resolve({ ok: plan.ok, changed: false })
+  }
+
+  const mySeq = ++reorderSeq
+  const myConnSeq = ++connReorderSeq
+  pendingReorderCount++
+  const orderedSnapshot = Array.isArray(orderedIds) ? orderedIds.slice() : []
+  state.connections = plan.connections
+  renderConnectionsBar()
+  renderExplorer()
+  savePanelDataCache()
+
+  const runPersist = async () => {
+    if (!isPanelActive()) {
+      pendingReorderCount = Math.max(0, pendingReorderCount - 1)
+      if (pendingReorderCount === 0) {
+        expectedSelfChangedEvents = 0
+        consumedSelfChangedEvents = 0
+      }
+      return { ok: false, changed: false }
+    }
+    const consumedBefore = consumedSelfChangedEvents
+    expectedSelfChangedEvents++
+    try {
+      const res = await rpc('connections.reorder', {
+        folder: plan.folder,
+        orderedIds: orderedSnapshot,
+      })
+      if (!isPanelActive()) return { ok: false, changed: false }
+      if (!res?.changed) {
+        if (expectedSelfChangedEvents > 0) {
+          expectedSelfChangedEvents--
+        } else if (consumedSelfChangedEvents > consumedBefore) {
+          refreshConnectionsAfterReorder = true
+        }
+      }
+      if (myConnSeq === connReorderSeq && Array.isArray(res?.connections)) {
+        const prevSig = JSON.stringify(state.connections)
+        state.connections = res.connections
+        if (prevSig !== JSON.stringify(state.connections)) {
+          renderConnectionsBar()
+          renderExplorer()
+          savePanelDataCache()
+        }
+      }
+      return { ok: true, changed: Boolean(res?.changed) }
+    } catch (err) {
+      if (expectedSelfChangedEvents > 0) {
+        expectedSelfChangedEvents--
+      } else if (consumedSelfChangedEvents > consumedBefore) {
+        refreshConnectionsAfterReorder = true
+      }
+      if (!isPanelActive()) return { ok: false, changed: false }
+      showBanner(err?.message || 'Failed to reorder connections', 'danger')
+      if (mySeq === reorderSeq) {
+        await refreshConnections({ forceLive: true, bypassReorderGuard: true })
+      } else {
+        refreshConnectionsAfterReorder = true
+      }
+      return { ok: false, changed: false }
+    } finally {
+      pendingReorderCount = Math.max(0, pendingReorderCount - 1)
+      if (pendingReorderCount === 0) {
+        expectedSelfChangedEvents = 0
+        consumedSelfChangedEvents = 0
+        if (refreshConnectionsAfterReorder && isPanelActive()) {
+          refreshConnectionsAfterReorder = false
+          void refreshConnections({ forceLive: true })
+        }
+      }
+    }
+  }
+
+  const task = reorderQueueChain.then(runPersist)
+  reorderQueueChain = task.then(
+    () => undefined,
+    () => undefined
+  )
+  return task
+}
+
+function reorderFolders(orderedFolders) {
+  if (!isPanelActive()) {
+    return Promise.resolve({ ok: false, changed: false, folderOrder: state.folderOrder.slice() })
+  }
+  const currentFolderNames = getConnectionFolderOrderKeys(state.connections)
+  const plan = reconcileFolderOrder(state.folderOrder, orderedFolders, currentFolderNames)
+  if (!plan.ok || !plan.changed) {
+    return Promise.resolve({ ok: plan.ok, changed: false, folderOrder: state.folderOrder.slice() })
+  }
+
+  const mySeq = ++reorderSeq
+  const myFolderSeq = ++folderReorderSeq
+  pendingReorderCount++
+  const orderedSnapshot = Array.isArray(orderedFolders) ? orderedFolders.slice() : []
+  state.folderOrder = plan.folderOrder
+  renderConnectionsBar()
+  renderExplorer()
+  savePanelDataCache()
+
+  const runPersist = async () => {
+    if (!isPanelActive()) {
+      pendingReorderCount = Math.max(0, pendingReorderCount - 1)
+      if (pendingReorderCount === 0) {
+        expectedSelfChangedEvents = 0
+        consumedSelfChangedEvents = 0
+      }
+      return { ok: false, changed: false, folderOrder: state.folderOrder.slice() }
+    }
+    const consumedBefore = consumedSelfChangedEvents
+    expectedSelfChangedEvents++
+    try {
+      const res = await rpc('folders.reorder', {
+        orderedFolders: orderedSnapshot,
+      })
+      if (!isPanelActive()) {
+        return { ok: false, changed: false, folderOrder: state.folderOrder.slice() }
+      }
+      if (!res?.changed) {
+        if (expectedSelfChangedEvents > 0) {
+          expectedSelfChangedEvents--
+        } else if (consumedSelfChangedEvents > consumedBefore) {
+          refreshConnectionsAfterReorder = true
+        }
+      }
+      if (myFolderSeq === folderReorderSeq && Array.isArray(res?.folderOrder)) {
+        const nextOrder = normalizeFolderOrder(res.folderOrder)
+        if (JSON.stringify(state.folderOrder) !== JSON.stringify(nextOrder)) {
+          state.folderOrder = nextOrder
+          renderConnectionsBar()
+          renderExplorer()
+          savePanelDataCache()
+        }
+      }
+      return {
+        ok: true,
+        changed: Boolean(res?.changed),
+        folderOrder: state.folderOrder.slice(),
+      }
+    } catch (err) {
+      if (expectedSelfChangedEvents > 0) {
+        expectedSelfChangedEvents--
+      } else if (consumedSelfChangedEvents > consumedBefore) {
+        refreshConnectionsAfterReorder = true
+      }
+      if (!isPanelActive()) {
+        return { ok: false, changed: false, folderOrder: state.folderOrder.slice() }
+      }
+      showBanner(err?.message || 'Failed to reorder folders', 'danger')
+      if (mySeq === reorderSeq) {
+        await refreshConnections({ forceLive: true, bypassReorderGuard: true })
+      } else {
+        refreshConnectionsAfterReorder = true
+      }
+      return { ok: false, changed: false, folderOrder: state.folderOrder.slice() }
+    } finally {
+      pendingReorderCount = Math.max(0, pendingReorderCount - 1)
+      if (pendingReorderCount === 0) {
+        expectedSelfChangedEvents = 0
+        consumedSelfChangedEvents = 0
+        if (refreshConnectionsAfterReorder && isPanelActive()) {
+          refreshConnectionsAfterReorder = false
+          void refreshConnections({ forceLive: true })
+        }
+      }
+    }
+  }
+
+  const task = reorderQueueChain.then(runPersist)
+  reorderQueueChain = task.then(
+    () => undefined,
+    () => undefined
+  )
+  return task
+}
+
+function getConnectionTlsBadgeLabel(conn) {
+  if (!conn) return ''
+  if (conn.sslCertPath || conn.sslKeyPath) return 'mTLS'
+  if (
+    conn.sslCaPath ||
+    (conn.sslMode && conn.sslMode !== 'auto' && conn.sslMode !== 'disable') ||
+    (conn.ssl && conn.sslMode !== 'disable')
+  ) {
+    return 'TLS'
+  }
+  return ''
+}
+
+function buildConnectionSelectorBadges(conn) {
+  const badges = []
+  const engineLabel = ENGINE_BY_ID[conn.driver]?.label || conn.driver
+  if (engineLabel) {
+    badges.push({ text: engineLabel, tone: 'neutral' })
+  }
+  if (conn.colorTag === 'prod' || conn.colorTag === 'staging' || conn.colorTag === 'dev') {
+    badges.push({ text: conn.colorTag.toUpperCase(), tone: conn.colorTag })
+  }
+  if (conn.readOnly) {
+    badges.push({ text: 'RO', tone: 'warn' })
+  }
+  if (conn.sshEnabled) {
+    badges.push({ text: 'SSH', tone: 'neutral' })
+  }
+  const tlsLabel = getConnectionTlsBadgeLabel(conn)
+  if (tlsLabel) {
+    badges.push({ text: tlsLabel, tone: 'info' })
+  }
+  return badges
+}
+
 function renderConnectionsBar() {
   $('connCountBadge').textContent = String(state.connections.length)
+  const envDot = $('envTagDot')
+  if (envDot) envDot.hidden = true
+  const roBadge = $('roBadge')
+  if (roBadge) roBadge.hidden = true
+  const activeDriverBadge = $('activeDriverBadge')
+  if (activeDriverBadge) activeDriverBadge.hidden = true
+
   const active = getActiveConn()
   updateViewportLayout()
   if (!active) {
+    closeActiveCustomDropdown()
+    renderActiveSchemaBar()
     renderStructureTableSelect()
     return
   }
   setDbLogoElement($('activeConnLogo'), active.driver, 16)
-
-  const envDot = $('envTagDot')
-  if (active.colorTag && active.colorTag !== 'none') {
-    envDot.className = `env-dot env-${active.colorTag}`
-    envDot.title = `Environment: ${active.colorTag.toUpperCase()}`
-    envDot.hidden = false
-  } else {
-    envDot.hidden = true
-  }
-
-  $('roBadge').hidden = !active.readOnly
-  const badge = $('activeDriverBadge')
-  badge.className = 'badge badge-neutral'
-  badge.textContent = (ENGINE_BY_ID[active.driver]?.label || active.driver).toUpperCase()
 
   const sel = $('connSelect')
   sel.textContent = ''
@@ -1488,21 +2398,41 @@ function renderConnectionsBar() {
     opt.value = c.id
     const tagText = c.colorTag && c.colorTag !== 'none' ? ` [${c.colorTag.toUpperCase()}]` : ''
     const roText = c.readOnly ? ' [RO]' : ''
+    const sshText = c.sshEnabled ? ' [SSH]' : ''
+    const tlsLabel = getConnectionTlsBadgeLabel(c)
+    const tlsText = tlsLabel ? ` [${tlsLabel}]` : ''
     const sub = formatConnSubtitle(c)
-    opt.textContent = `${c.name} (${c.driver})${tagText}${roText}`
+    const engineLabel = ENGINE_BY_ID[c.driver]?.label || c.driver
+    const badges = buildConnectionSelectorBadges(c)
+    opt.textContent = `${c.name} (${c.driver})${tagText}${roText}${sshText}${tlsText}`
     opt.dataset.driver = c.driver
-    opt.dataset.fullTitle = `${c.name} (${c.driver})${tagText}${roText}${c.folder ? ` — Folder: ${c.folder}` : ''}${sub ? ` — ${sub}` : ''}`
+    opt.dataset.displayName = c.name
+    opt.dataset.badges = JSON.stringify(badges)
+    opt.dataset.searchText = [
+      c.name,
+      c.driver,
+      engineLabel,
+      c.colorTag && c.colorTag !== 'none' ? c.colorTag : '',
+      c.readOnly ? 'ro readonly read-only' : '',
+      c.sshEnabled ? 'ssh' : '',
+      tlsLabel,
+      c.folder || '',
+      sub,
+    ]
+      .filter(Boolean)
+      .join(' ')
+    opt.dataset.fullTitle = `${c.name} (${c.driver})${tagText}${roText}${sshText}${tlsText}${c.folder ? ` — Folder: ${c.folder}` : ''}${sub ? ` — ${sub}` : ''}`
     if (c.id === active.id) opt.selected = true
     return opt
   }
-  const hasGrouping = state.connections.some((c) => Boolean((c.folder || '').trim()))
+  const hasGrouping = state.connections.some((c) => Boolean(normalizeConnectionFolderKey(c.folder)))
   if (!hasGrouping) {
     for (const c of state.connections) sel.appendChild(buildOpt(c))
   } else {
     const byFolder = new Map()
     const general = []
     for (const c of state.connections) {
-      const f = (c.folder || '').trim()
+      const f = normalizeConnectionFolderKey(c.folder)
       if (f) {
         if (!byFolder.has(f)) byFolder.set(f, [])
         byFolder.get(f).push(c)
@@ -1510,22 +2440,33 @@ function renderConnectionsBar() {
         general.push(c)
       }
     }
-    for (const folder of Array.from(byFolder.keys()).sort((a, b) => a.localeCompare(b))) {
+    const sectionKeys = [
+      ...byFolder.keys(),
+      ...(general.length > 0 ? [UNGROUPED_FOLDER_ORDER_KEY] : []),
+    ]
+    const sortedSectionKeys = sortFoldersByOrder(sectionKeys, state.folderOrder)
+    for (const sectionKey of sortedSectionKeys) {
+      const isUngrouped = sectionKey === UNGROUPED_FOLDER_ORDER_KEY
+      const label = isUngrouped ? 'General (Ungrouped)' : sectionKey
+      const items = isUngrouped ? general : byFolder.get(sectionKey)
       const grp = document.createElement('optgroup')
-      grp.label = folder
-      for (const c of byFolder.get(folder)) grp.appendChild(buildOpt(c))
-      sel.appendChild(grp)
-    }
-    if (general.length > 0) {
-      const grp = document.createElement('optgroup')
-      grp.label = 'General (Ungrouped)'
-      for (const c of general) grp.appendChild(buildOpt(c))
+      grp.label = label
+      grp.setAttribute('label', label)
+      grp.dataset.folderKey = isUngrouped ? '' : sectionKey
+      grp.dataset.folderOrderKey = sectionKey
+      grp.dataset.sectionKey = isUngrouped
+        ? `builtin:${UNGROUPED_FOLDER_ORDER_KEY}`
+        : `folder:${sectionKey}`
+      grp.dataset.reorderableFolder = '1'
+      grp.dataset.reorderableItems = '1'
+      for (const c of items) grp.appendChild(buildOpt(c))
       sel.appendChild(grp)
     }
   }
   const activeSub = formatConnSubtitle(active)
   $('connSubLabel').textContent = activeSub
   $('connSubLabel').title = activeSub
+  $('connSubLabel').hidden = true
   enhanceCollapsibleSelectDropdown(sel, {
     tooltipPrefix: 'Active Database Connection',
     searchPlaceholder: 'Search connections or folders...',
@@ -1534,8 +2475,80 @@ function renderConnectionsBar() {
       savePanelViewState()
       renderExplorer()
     },
+    reorderConnections: true,
+    reorderFolders: true,
+    onReorderConnections: (folderKey, orderedIds) => reorderConnectionsInFolder(folderKey, orderedIds),
+    onReorderFolders: (orderedFolders) => reorderFolders(orderedFolders),
   })
+  renderActiveSchemaBar()
   renderStructureTableSelect()
+}
+
+function renderActiveSchemaBar() {
+  const bar = $('activeSchemaBar')
+  const sel = $('panelSchemaSelect')
+  const countBadge = $('activeSchemaCount')
+  if (!bar || !sel) return
+
+  const activeConn = getActiveConn()
+  const cid = activeConn?.id
+  const schemas =
+    cid && Array.isArray(state.availableSchemasByConn[cid]) ? state.availableSchemasByConn[cid] : []
+
+  if (!shouldShowActiveSchemaBar(activeConn, schemas)) {
+    sel._customDropdownApi?.close?.()
+    bar.hidden = true
+    if (countBadge) {
+      countBadge.hidden = true
+      countBadge.textContent = ''
+    }
+    sel.textContent = ''
+    sel.disabled = true
+    sel._customDropdownSync?.()
+    return
+  }
+
+  const selected = state.selectedSchemaByConn[cid]
+  const fallback = state.defaultSchemaByConn[cid]
+  const activeSchemaName =
+    (selected && schemas.includes(selected) ? selected : null) ||
+    (fallback && schemas.includes(fallback) ? fallback : null) ||
+    schemas[0]
+
+  sel.textContent = ''
+  for (const schemaName of schemas) {
+    const opt = document.createElement('option')
+    opt.value = schemaName
+    opt.textContent = schemaName
+    opt.dataset.displayName = schemaName
+    opt.dataset.fullTitle = `Schema: ${schemaName}`
+    if (schemaName === activeSchemaName) {
+      opt.selected = true
+      opt.dataset.isCurrent = '1'
+    }
+    sel.appendChild(opt)
+  }
+  sel.value = activeSchemaName
+  sel.disabled = false
+  bar.hidden = false
+
+  if (countBadge) {
+    if (schemas.length > 1) {
+      countBadge.textContent = String(schemas.length)
+      countBadge.title = `${schemas.length} schemas available`
+      countBadge.hidden = false
+    } else {
+      countBadge.hidden = true
+      countBadge.textContent = ''
+    }
+  }
+
+  enhanceCollapsibleSelectDropdown(sel, {
+    tooltipPrefix: 'Active Schema',
+    searchPlaceholder: 'Search schemas...',
+    popoverMinWidth: 240,
+    popoverMaxHeight: 320,
+  })
 }
 
 let structureSchemaPrefetchSeq = 0
@@ -1679,8 +2692,12 @@ async function prefetchPanelAutocompleteSchema(connectionId) {
   const objs = (state.schemaObjects[connectionId] || []).filter(
     (o) => !o.kind || o.kind === 'table' || o.kind === 'view' || o.kind === 'materialized_view'
   )
+  const activeTblKey = state.activeTable ? getActiveTableKey() : ''
   const missing = objs
-    .filter((o) => !state.tableDetails[makeTableKey(connectionId, o.name, o.schema)])
+    .filter((o) => {
+      const k = makeTableKey(connectionId, o.name, o.schema)
+      return k !== activeTblKey && !state.tableDetails[k]
+    })
     .slice(0, 60)
   if (missing.length === 0) return
 
@@ -1704,7 +2721,12 @@ async function prefetchPanelAutocompleteSchema(connectionId) {
         )
         if (seq !== structureSchemaPrefetchSeq || state.activeConnectionId !== connectionId) return
         if (det) {
+          const prevFksJson = JSON.stringify(state.tableDetails[key]?.foreignKeys || [])
+          const nextFksJson = JSON.stringify(det.foreignKeys || [])
           state.tableDetails[key] = det
+          if (key === getActiveTableKey() && state.pageData && prevFksJson !== nextFksJson) {
+            renderDataGrid()
+          }
         }
       } catch {}
     }
@@ -1715,65 +2737,236 @@ async function prefetchPanelAutocompleteSchema(connectionId) {
   }
 }
 
+async function fetchCatalogObjects(connectionId, schema, forceRefresh = false) {
+  const input = {
+    connectionId,
+    ...(schema ? { schema } : {}),
+    ...(forceRefresh ? { forceRefresh: true } : {}),
+  }
+  try {
+    const res = await rpc('schema.listObjectsCatalog', input, { timeoutMs: QUERY_TIMEOUT_MS })
+    if (res && typeof res === 'object' && Array.isArray(res.data)) {
+      return {
+        objects: res.data,
+        stale: Boolean(res.stale),
+        staleReason: typeof res.staleReason === 'string' ? res.staleReason : undefined,
+        cachedAt: typeof res.cachedAt === 'number' ? res.cachedAt : undefined,
+      }
+    }
+    if (Array.isArray(res)) {
+      return { objects: res, stale: false }
+    }
+  } catch {
+    // Fallback to legacy schema.listObjects when catalog endpoint is unsupported
+  }
+  const fallback = await rpc(
+    'schema.listObjects',
+    { connectionId, ...(schema ? { schema } : {}) },
+    { timeoutMs: QUERY_TIMEOUT_MS }
+  )
+  return {
+    objects: Array.isArray(fallback) ? fallback : [],
+    stale: false,
+  }
+}
+
 async function loadSchema(connectionId, loadOpts = {}) {
-  if (!connectionId) return
+  if (!connectionId || !isPanelActive()) return
   if (state.schemaLoading.has(connectionId) && !loadOpts?.force) {
     schemaRefreshPending.add(connectionId)
     return
   }
   const loadSeq = (schemaLoadSeqByConn.get(connectionId) || 0) + 1
   schemaLoadSeqByConn.set(connectionId, loadSeq)
-  state.schemaLoading.add(connectionId)
-  renderExplorer()
+  const isSilentLoad = Boolean(
+    loadOpts?.silent &&
+      Array.isArray(state.schemaObjects[connectionId]) &&
+      state.schemaObjects[connectionId].length > 0
+  )
+  if (!isSilentLoad) {
+    state.schemaLoading.add(connectionId)
+    renderExplorer()
+  }
   let releasedLoading = false
   const releaseLoadingIfCurrent = () => {
     if (releasedLoading) return
     releasedLoading = true
     if (schemaLoadSeqByConn.get(connectionId) === loadSeq) {
-      state.schemaLoading.delete(connectionId)
-      renderExplorer()
+      const hadLoading = state.schemaLoading.delete(connectionId)
+      if (hadLoading && isPanelActive()) {
+        renderExplorer()
+      }
     }
   }
   try {
-    const objects = await rpc('schema.listObjects', { connectionId }, { timeoutMs: QUERY_TIMEOUT_MS })
-    if (schemaLoadSeqByConn.get(connectionId) !== loadSeq || !getConnById(connectionId)) return
+    const requestedSchema =
+      typeof loadOpts?.schema === 'string'
+        ? loadOpts.schema
+        : state.selectedSchemaByConn[connectionId] ||
+          (connectionId === state.activeConnectionId ? state.activeSchema : undefined)
+    const forceRefresh = Boolean(loadOpts?.forceRefresh)
+    const [schemasResult, objectsOutcome] = await Promise.all([
+      rpc('schema.listSchemas', { connectionId }, { timeoutMs: QUERY_TIMEOUT_MS }).catch(() => null),
+      fetchCatalogObjects(connectionId, requestedSchema, forceRefresh).then(
+        (value) => ({ ok: true, value }),
+        (error) => ({ ok: false, error })
+      ),
+    ])
+    if (!isPanelActive() || schemaLoadSeqByConn.get(connectionId) !== loadSeq || !getConnById(connectionId)) return
+
+    let catalogMeta = objectsOutcome.ok ? objectsOutcome.value : null
+    let finalObjects = Array.isArray(catalogMeta?.objects) ? catalogMeta.objects : []
+    const listedSchemas =
+      schemasResult && Array.isArray(schemasResult.schemas)
+        ? Array.from(
+            new Set(
+              schemasResult.schemas
+                .map((s) => (typeof s === 'string' ? s.trim() : ''))
+                .filter(Boolean)
+            )
+          )
+        : []
+    const derivedSchemas = Array.from(
+      new Set(
+        finalObjects
+          .map((o) => (typeof o?.schema === 'string' ? o.schema.trim() : ''))
+          .filter(Boolean)
+      )
+    )
+    const availableSchemas = listedSchemas.length > 0 ? listedSchemas : derivedSchemas
+    const defaultSchema =
+      (typeof schemasResult?.defaultSchema === 'string' && schemasResult.defaultSchema.trim()) ||
+      availableSchemas[0] ||
+      undefined
+
+    state.availableSchemasByConn[connectionId] = availableSchemas
+    if (defaultSchema) {
+      state.defaultSchemaByConn[connectionId] = defaultSchema
+    } else {
+      delete state.defaultSchemaByConn[connectionId]
+    }
+
+    let didResetStaleSchema = false
+    let didRecoverFromStaleThrow = false
+    const currentSelected = state.selectedSchemaByConn[connectionId]
+    if (availableSchemas.length > 0) {
+      const candidate = requestedSchema || currentSelected
+      if (candidate && !availableSchemas.includes(candidate)) {
+        const nextFallback =
+          defaultSchema && availableSchemas.includes(defaultSchema)
+            ? defaultSchema
+            : availableSchemas[0]
+        if (nextFallback) {
+          recordSelectedSchema(connectionId, nextFallback, true)
+          didResetStaleSchema = true
+          if (connectionId === state.activeConnectionId) {
+            state.activeSchema = nextFallback
+          }
+          if (
+            (!objectsOutcome.ok || finalObjects.length === 0) &&
+            nextFallback !== requestedSchema &&
+            !loadOpts?._retriedDefault
+          ) {
+            const fallbackMeta = await fetchCatalogObjects(
+              connectionId,
+              nextFallback,
+              forceRefresh
+            )
+            if (!isPanelActive() || schemaLoadSeqByConn.get(connectionId) !== loadSeq || !getConnById(connectionId)) {
+              return
+            }
+            catalogMeta = fallbackMeta
+            finalObjects = Array.isArray(fallbackMeta?.objects) ? fallbackMeta.objects : []
+            if (!objectsOutcome.ok) {
+              didRecoverFromStaleThrow = true
+            }
+          }
+        } else {
+          delete state.selectedSchemaByConn[connectionId]
+          delete state.selectedSchemaUpdatedAtByConn[connectionId]
+        }
+      } else {
+        const resolved = candidate || defaultSchema
+        if (resolved) {
+          recordSelectedSchema(connectionId, resolved, false)
+        }
+      }
+    } else if (requestedSchema) {
+      recordSelectedSchema(connectionId, requestedSchema, false)
+    } else if (defaultSchema) {
+      recordSelectedSchema(connectionId, defaultSchema, false)
+    }
+
+    if (!objectsOutcome.ok && !didRecoverFromStaleThrow) {
+      throw objectsOutcome.error
+    }
+
+    const resolvedConnSchema = state.selectedSchemaByConn[connectionId] || defaultSchema || undefined
+    if (connectionId === state.activeConnectionId) {
+      state.activeSchema = resolvedConnSchema
+    }
+
+    if (catalogMeta?.stale) {
+      state.schemaStaleByConn[connectionId] = {
+        stale: true,
+        staleReason: catalogMeta.staleReason,
+        cachedAt: catalogMeta.cachedAt,
+      }
+    } else {
+      delete state.schemaStaleByConn[connectionId]
+    }
+
     const hadSchemaError = Object.prototype.hasOwnProperty.call(state.schemaErrors, connectionId)
     delete state.schemaErrors[connectionId]
-    state.schemaObjects[connectionId] = Array.isArray(objects) ? objects : []
+    state.schemaObjects[connectionId] = finalObjects
+    state.schemaObjectsByConnSchema[makeConnSchemaKey(connectionId, resolvedConnSchema || '')] =
+      finalObjects.slice()
+    if (connectionId === state.activeConnectionId) {
+      renderActiveSchemaBar()
+    }
     releaseLoadingIfCurrent()
     if (hadSchemaError && bannerActionContext?.source === 'schema') {
       syncSchemaErrorBanner()
     }
     if (connectionId === state.activeConnectionId) {
       savePanelDataCache()
+      if (didResetStaleSchema) {
+        savePanelViewState()
+      }
       const objs = state.schemaObjects[connectionId]
       const tabularObjs = objs.filter(
         (o) => !o.kind || o.kind === 'table' || o.kind === 'view' || o.kind === 'materialized_view'
       )
       const firstObj = tabularObjs.find((o) => o.kind === 'table') || tabularObjs[0] || objs[0]
       const matchedActive = state.activeTable
-        ? tabularObjs.find((o) => o.name === state.activeTable && (!state.activeSchema || (o.schema || '') === state.activeSchema)) ||
-          tabularObjs.find((o) => o.name === state.activeTable)
+        ? tabularObjs.find(
+            (o) =>
+              o.name === state.activeTable &&
+              (!state.activeSchema || (o.schema || '') === state.activeSchema)
+          ) || tabularObjs.find((o) => o.name === state.activeTable)
         : null
       if ((!state.activeTable || !matchedActive) && firstObj) {
         state.activeTable = firstObj.name
-        state.activeSchema = firstObj.schema
+        state.activeSchema = firstObj.schema || resolvedConnSchema
         renderStructureTableSelect()
         syncPanelSqlSchema(connectionId)
         void prefetchPanelAutocompleteSchema(connectionId)
         renderDataToolbar()
         renderExplorer()
+        savePanelViewState()
+        savePanelDataCache()
         await Promise.all([
           loadTablePage(connectionId, firstObj.name, 1, firstObj.schema),
           loadTableDetails(connectionId, firstObj.name, firstObj.schema),
         ])
       } else if (state.activeTable && matchedActive) {
-        if (!state.activeSchema && matchedActive.schema) {
-          state.activeSchema = matchedActive.schema
+        if (!state.activeSchema) {
+          state.activeSchema = matchedActive.schema || resolvedConnSchema
         }
         renderStructureTableSelect()
         syncPanelSqlSchema(connectionId)
         void prefetchPanelAutocompleteSchema(connectionId)
+        renderExplorer()
         const targetPage = state.restoredPage || state.page || 1
         state.restoredPage = 1
         const canSilentRefresh = Boolean(state.pageData && state.pageData.columns?.length > 0)
@@ -1786,7 +2979,7 @@ async function loadSchema(connectionId, loadOpts = {}) {
         ])
       } else {
         state.activeTable = null
-        state.activeSchema = undefined
+        state.activeSchema = resolvedConnSchema
         state.pageData = null
         state.selectedRowKey = null
         state.selectedCol = null
@@ -1798,14 +2991,17 @@ async function loadSchema(connectionId, loadOpts = {}) {
         clearStagedChanges()
         renderStructureTableSelect()
         syncPanelSqlSchema(connectionId)
+        renderExplorer()
         renderDataToolbar()
         renderDataGrid()
         renderStructure()
         renderValueInspector()
+        savePanelViewState()
+        savePanelDataCache()
       }
     }
   } catch (err) {
-    if (schemaLoadSeqByConn.get(connectionId) !== loadSeq) return
+    if (!isPanelActive() || schemaLoadSeqByConn.get(connectionId) !== loadSeq) return
     const conn = getConnById(connectionId)
     if (conn) {
       const rawMsg = String(err?.message || '').trim() || 'Failed to inspect schema'
@@ -1814,7 +3010,7 @@ async function loadSchema(connectionId, loadOpts = {}) {
     }
   } finally {
     releaseLoadingIfCurrent()
-    if (schemaLoadSeqByConn.get(connectionId) === loadSeq && schemaRefreshPending.has(connectionId)) {
+    if (isPanelActive() && schemaLoadSeqByConn.get(connectionId) === loadSeq && schemaRefreshPending.has(connectionId)) {
       schemaRefreshPending.delete(connectionId)
       if (getConnById(connectionId)) {
         void loadSchema(connectionId)
@@ -1849,6 +3045,7 @@ function cancelPendingDataAndSchemaLoads() {
 }
 
 function activateConnection(connectionId) {
+  state.hasUserInteraction = true
   cancelPendingDataAndSchemaLoads()
   resetSqlSafetyBannerDismissal()
   if (connectionId && state.schemaErrors[connectionId]) {
@@ -1861,7 +3058,23 @@ function activateConnection(connectionId) {
   }
   state.activeConnectionId = connectionId || null
   state.activeTable = null
-  state.activeSchema = undefined
+  state.activeSchema =
+    (connectionId &&
+      (state.selectedSchemaByConn[connectionId] || state.defaultSchemaByConn[connectionId])) ||
+    undefined
+  if (connectionId) {
+    const cachedBySchema =
+      state.schemaObjectsByConnSchema[makeConnSchemaKey(connectionId, state.activeSchema || '')]
+    if (Array.isArray(cachedBySchema)) {
+      state.schemaObjects[connectionId] = cachedBySchema.slice()
+    } else if (
+      state.activeSchema &&
+      Array.isArray(state.schemaObjects[connectionId]) &&
+      state.schemaObjects[connectionId].some((o) => o?.schema && o.schema !== state.activeSchema)
+    ) {
+      delete state.schemaObjects[connectionId]
+    }
+  }
   state.pageData = null
   state.page = 1
   state.sortCol = null
@@ -1894,15 +3107,61 @@ function activateConnection(connectionId) {
   renderStructure()
   if (state.activeConnectionId) {
     const cached = state.schemaObjects[state.activeConnectionId]
+    const hasSchemas = Array.isArray(state.availableSchemasByConn[state.activeConnectionId])
     if (cached && cached.length > 0) {
       const firstObj = cached.find((o) => o.kind === 'table') || cached[0]
       if (firstObj) {
         selectTableAndOpen(state.activeConnectionId, firstObj.name, firstObj.schema, false)
-        return
       }
+      if (!hasSchemas) {
+        void loadSchema(state.activeConnectionId, { silent: true })
+      }
+      return
     }
     void loadSchema(state.activeConnectionId)
   }
+}
+
+function handlePanelSchemaChange(nextSchema) {
+  const cid = state.activeConnectionId
+  if (!cid) return
+  const trimmed = typeof nextSchema === 'string' ? nextSchema.trim() : ''
+  if (!trimmed) return
+  state.hasUserInteraction = true
+  cancelPendingDataAndSchemaLoads()
+  resetSqlSafetyBannerDismissal()
+  recordSelectedSchema(cid, trimmed, true)
+  state.activeSchema = trimmed
+  state.activeTable = null
+  state.pageData = null
+  state.page = 1
+  state.sortCol = null
+  state.selectedRowKey = null
+  state.selectedCol = null
+  state.inspectorOpen = false
+  state.structDraftKey = null
+  state.structDraft = null
+  state.structPreviewOpen = false
+  state.structureLoading = false
+  state.structureError = null
+  const cachedObjs = state.schemaObjectsByConnSchema[makeConnSchemaKey(cid, trimmed)]
+  const hasCachedNonEmpty = Array.isArray(cachedObjs) && cachedObjs.length > 0
+  state.schemaObjects[cid] = Array.isArray(cachedObjs) ? cachedObjs.slice() : []
+  state.expandedConns.add(cid)
+  dataVirt.active = false
+  dataGridSel?.clear(true)
+  clearStagedChanges()
+  savePanelViewState()
+  savePanelDataCache()
+  renderActiveSchemaBar()
+  renderExplorer()
+  renderDataToolbar()
+  renderDataGrid()
+  renderStructureTableSelect()
+  renderStructure()
+  renderValueInspector()
+  syncPanelSqlSchema(cid)
+  void loadSchema(cid, { force: true, schema: trimmed, silent: hasCachedNonEmpty })
 }
 
 async function loadTableDetails(connectionId, table, schema) {
@@ -2075,6 +3334,9 @@ async function loadTablePage(connectionId, table, page = 1, schema = state.activ
     state.silentDataRefresh = false
     state.pageData = res
     state.page = page
+    if (state.tableDisplayByTable[targetTableKey]) {
+      syncLegacySetsFromDisplayEntry(targetTableKey, state.tableDisplayByTable[targetTableKey])
+    }
     savePanelViewState()
     savePanelDataCache()
     lastLoadedPanelTableKey = targetTableKey
@@ -2173,15 +3435,494 @@ function getPinnedColsSet(tblKey = getActiveTableKey()) {
   return state.pinnedColsByTable[tblKey]
 }
 
+function getActiveTableDisplayEntry(tblKey = getActiveTableKey()) {
+  return state.tableDisplayByTable[tblKey] || null
+}
+
+function normalizeBareColName(rawKey) {
+  const parsed = parseOccurrenceColumnKey(rawKey)
+  return parsed ? parsed.name : rawKey
+}
+
+let cachedPanelColResolverCols = null
+let cachedPanelColResolverLen = -1
+let cachedPanelColResolverFirst = undefined
+let cachedPanelColResolverLast = undefined
+let cachedPanelColResolver = null
+
+function getPanelColKeyResolver(columnsOrHeaders = state.pageData?.columns) {
+  if (!Array.isArray(columnsOrHeaders) || columnsOrHeaders.length === 0) return null
+  const len = columnsOrHeaders.length
+  const first = columnsOrHeaders[0]
+  const last = columnsOrHeaders[len - 1]
+  if (
+    cachedPanelColResolver &&
+    cachedPanelColResolverCols === columnsOrHeaders &&
+    cachedPanelColResolverLen === len &&
+    cachedPanelColResolverFirst === first &&
+    cachedPanelColResolverLast === last
+  ) {
+    return cachedPanelColResolver
+  }
+  const headers =
+    typeof first === 'string' ? columnsOrHeaders : columnsOrHeaders.map((c) => c.name)
+  const resolver = buildColumnKeyResolver(headers)
+  cachedPanelColResolverCols = columnsOrHeaders
+  cachedPanelColResolverLen = len
+  cachedPanelColResolverFirst = first
+  cachedPanelColResolverLast = last
+  cachedPanelColResolver = resolver
+  return resolver
+}
+
+function buildColumnOccurrenceKeyMap(columns) {
+  const map = new Map()
+  const resolver = getPanelColKeyResolver(columns)
+  if (!resolver || !Array.isArray(columns)) return map
+  const occKeys = resolver.occKeys
+  for (let i = 0; i < columns.length; i++) {
+    map.set(columns[i], occKeys[i])
+  }
+  return map
+}
+
+function resolveDisplayKeySet(rawKeys, headers) {
+  const list = Array.isArray(rawKeys) ? rawKeys : Array.from(rawKeys || [])
+  if (!Array.isArray(headers) || headers.length === 0) {
+    return new Set(list.filter((k) => typeof k === 'string' && k.length > 0))
+  }
+  const pdCols = state.pageData?.columns
+  const resolver =
+    Array.isArray(pdCols) && pdCols.length === headers.length
+      ? getPanelColKeyResolver(pdCols)
+      : getPanelColKeyResolver(headers)
+  const out = new Set()
+  for (const k of list) {
+    if (typeof k !== 'string' || !k) continue
+    const resolved = resolver ? resolver.resolveKey(k) : null
+    if (resolved) out.add(resolved)
+  }
+  return out
+}
+
+function syncLegacySetsFromDisplayEntry(tblKey, entry) {
+  const pd = tblKey === getActiveTableKey() ? state.pageData : null
+  const resolver = pd && Array.isArray(pd.columns) ? getPanelColKeyResolver(pd.columns) : null
+  const headers = resolver ? pd.columns.map((c) => c.name) : []
+  const hidden = resolveDisplayKeySet(entry?.hiddenColumns, headers)
+  const pinned = resolveDisplayKeySet(entry?.pinnedColumns, headers)
+  if (resolver && resolver.occKeys.length > 0 && hidden.size >= resolver.occKeys.length) {
+    const orderedKeys = []
+    const seenOrder = new Set()
+    for (const rawKey of entry?.columnOrder ?? []) {
+      const resolved = resolver.resolveKey(rawKey)
+      if (resolved && resolver.occKeySet.has(resolved) && !seenOrder.has(resolved)) {
+        seenOrder.add(resolved)
+        orderedKeys.push(resolved)
+      }
+    }
+    for (const k of resolver.occKeys) {
+      if (!seenOrder.has(k)) {
+        seenOrder.add(k)
+        orderedKeys.push(k)
+      }
+    }
+    if (orderedKeys.length > 0 && orderedKeys.every((k) => hidden.has(k))) {
+      const keepKey = orderedKeys[0]
+      hidden.delete(keepKey)
+      if (entry && Array.isArray(entry.hiddenColumns)) {
+        entry.hiddenColumns = entry.hiddenColumns.filter((raw) => {
+          const resolved = resolver.resolveKey(raw)
+          return resolved ? resolved !== keepKey : raw !== keepKey
+        })
+      }
+    }
+  }
+  state.hiddenColsByTable[tblKey] = hidden
+  state.pinnedColsByTable[tblKey] = pinned
+  if (resolver && entry?.columnWidths) {
+    const curWidths = Array.isArray(state.columnWidthsByTable[tblKey])
+      ? state.columnWidthsByTable[tblKey]
+      : null
+    const occKeys = resolver.occKeys
+    const resizedSet = new Set()
+    for (const [rawKey, w] of Object.entries(entry.columnWidths)) {
+      const idx = resolver.resolveIndex(rawKey)
+      if (idx >= 0 && typeof w === 'number' && Number.isFinite(w) && w > 0) {
+        if (curWidths) curWidths[idx] = w
+        resizedSet.add(occKeys[idx])
+      }
+    }
+    state.userResizedColKeysByTable[tblKey] = resizedSet
+  }
+}
+
+const panelTableDisplayQueues = new Map()
+
+function getPanelTableDisplayQueue(tblKey) {
+  let queue = panelTableDisplayQueues.get(tblKey)
+  if (!queue) {
+    queue = {
+      inFlight: false,
+      dirty: false,
+      overwrittenByRemoteWhileInFlight: false,
+      pendingPatch: null,
+      inFlightSentSnapshot: null,
+      hasPendingRemoteRebase: false,
+      pendingRemoteRebaseEntry: null,
+      pendingRemoteRebaseRev: 0,
+      recentSelfRevisions: new Set(),
+    }
+    panelTableDisplayQueues.set(tblKey, queue)
+  }
+  return queue
+}
+
+function setPanelPendingRemoteRebase(queue, entry, rev) {
+  const cleanRev = typeof rev === 'number' && Number.isFinite(rev) && rev > 0 ? Math.floor(rev) : 0
+  if (!queue.hasPendingRemoteRebase || cleanRev >= queue.pendingRemoteRebaseRev) {
+    queue.hasPendingRemoteRebase = true
+    queue.pendingRemoteRebaseEntry = entry
+    queue.pendingRemoteRebaseRev = cleanRev
+  }
+}
+
+function clearPanelPendingRemoteRebase(queue) {
+  queue.hasPendingRemoteRebase = false
+  queue.pendingRemoteRebaseEntry = null
+  queue.pendingRemoteRebaseRev = 0
+}
+
+function buildTableDisplayFullSnapshotPatch(entry) {
+  return {
+    columnOrder: entry?.columnOrder ?? [],
+    hiddenColumns: entry?.hiddenColumns ?? [],
+    pinnedColumns: entry?.pinnedColumns ?? [],
+    columnWidths: entry?.columnWidths ?? {},
+    wrapCells: Boolean(entry?.wrapCells),
+    wrapMaxLines: entry?.wrapMaxLines ?? DEFAULT_WRAP_MAX_LINES,
+    highlightRules: entry?.highlightRules ?? [],
+  }
+}
+
+function recordPanelSelfTableDisplayRevision(queue, rev) {
+  if (!(rev > 0)) return
+  queue.recentSelfRevisions.delete(rev)
+  queue.recentSelfRevisions.add(rev)
+  while (queue.recentSelfRevisions.size > 16) {
+    const oldest = queue.recentSelfRevisions.values().next().value
+    if (oldest === undefined) break
+    queue.recentSelfRevisions.delete(oldest)
+  }
+}
+
+function resolveIncomingTableDisplayRevision(rawEntry, incomingRevision) {
+  if (typeof incomingRevision === 'number' && Number.isFinite(incomingRevision) && incomingRevision > 0) {
+    return Math.floor(incomingRevision)
+  }
+  const entryRev = rawEntry?.revision
+  if (typeof entryRev === 'number' && Number.isFinite(entryRev) && entryRev > 0) {
+    return Math.floor(entryRev)
+  }
+  return 0
+}
+
+function applyTableDisplayEntryForKey(tblKey, rawEntry, incomingRevision) {
+  if (!tblKey) return false
+  const nextRev = resolveIncomingTableDisplayRevision(rawEntry, incomingRevision)
+  const prevRev = state.tableDisplayRevisionByTable[tblKey] || 0
+  if (nextRev > 0 && nextRev <= prevRev) {
+    return false
+  }
+  if (nextRev > 0) {
+    state.tableDisplayRevisionByTable[tblKey] = nextRev
+  }
+  const normalized = normalizeTableDisplayStateEntry(rawEntry ?? null)
+  if (normalized) {
+    state.tableDisplayByTable[tblKey] = normalized
+    const resizedSet = new Set(Object.keys(normalized.columnWidths || {}))
+    state.userResizedColKeysByTable[tblKey] = resizedSet
+  } else {
+    delete state.tableDisplayByTable[tblKey]
+    delete state.userResizedColKeysByTable[tblKey]
+    delete state.columnWidthsByTable[tblKey]
+  }
+  return true
+}
+
+function syncActiveTableDisplayUi(tblKey) {
+  if (tblKey !== getActiveTableKey()) return
+  syncLegacySetsFromDisplayEntry(tblKey, state.tableDisplayByTable[tblKey] || null)
+  if (state.pageData) renderDataGrid({ layoutOnly: true })
+  if ($('dataColsPopover') && !$('dataColsPopover').hidden) renderDataColsPopoverList()
+}
+
+async function loadTableDisplayState(connectionId, tableName, schemaName) {
+  if (!connectionId || !tableName) return
+  const tblKey = makeTableKey(connectionId, tableName, schemaName)
+  try {
+    let res = await rpc(
+      'ui.tableDisplayState.get',
+      {
+        tableKey: tblKey,
+        connectionId,
+        ...(schemaName ? { schema: schemaName } : {}),
+        table: tableName,
+      },
+      { timeoutMs: 10000 }
+    )
+    if (!isPanelActive()) return
+    const queue = getPanelTableDisplayQueue(tblKey)
+    if (queue.inFlight || queue.dirty || queue.pendingPatch) return
+    if (!res?.entry && canUseLegacyTableKeyFallback(connectionId, tableName, schemaName)) {
+      const legacyKey = makeLegacyTableKey(connectionId, tableName, schemaName)
+      if (legacyKey !== tblKey) {
+        const legacyRes = await rpc(
+          'ui.tableDisplayState.get',
+          {
+            tableKey: legacyKey,
+            connectionId,
+            ...(schemaName ? { schema: schemaName } : {}),
+            table: tableName,
+          },
+          { timeoutMs: 10000 }
+        ).catch(() => null)
+        if (!isPanelActive()) return
+        if (queue.inFlight || queue.dirty || queue.pendingPatch) return
+        if (legacyRes?.entry) {
+          res = legacyRes
+        }
+      }
+    }
+    const applied = applyTableDisplayEntryForKey(tblKey, res?.entry ?? null, res?.revision)
+    if (applied) {
+      syncActiveTableDisplayUi(tblKey)
+    }
+  } catch {
+    // Graceful fallback when running against mock backends without ui.tableDisplayState
+  }
+}
+
+async function flushPanelTableDisplayQueue(tblKey, connectionId, tableName, schemaName) {
+  const queue = getPanelTableDisplayQueue(tblKey)
+  if (queue.inFlight) return
+  queue.inFlight = true
+  let consecutiveFailures = 0
+  try {
+    while (isPanelActive() && (queue.pendingPatch || queue.dirty || queue.hasPendingRemoteRebase)) {
+      let patchToSend =
+        queue.pendingPatch || buildTableDisplayFullSnapshotPatch(state.tableDisplayByTable[tblKey] || null)
+      queue.pendingPatch = null
+      queue.dirty = false
+
+      if (queue.hasPendingRemoteRebase) {
+        const pendingEntry = queue.pendingRemoteRebaseEntry
+        clearPanelPendingRemoteRebase(queue)
+        const rebased = rebaseTableDisplayStateEntry(
+          queue.inFlightSentSnapshot,
+          state.tableDisplayByTable[tblKey] || null,
+          pendingEntry
+        )
+        if (rebased) {
+          state.tableDisplayByTable[tblKey] = rebased
+          patchToSend = buildTableDisplayFullSnapshotPatch(rebased)
+          syncActiveTableDisplayUi(tblKey)
+        } else {
+          delete state.tableDisplayByTable[tblKey]
+          delete state.userResizedColKeysByTable[tblKey]
+          delete state.columnWidthsByTable[tblKey]
+          patchToSend = buildTableDisplayFullSnapshotPatch(null)
+          syncActiveTableDisplayUi(tblKey)
+        }
+      }
+
+      const sentSnapshot = normalizeTableDisplayStateEntry(state.tableDisplayByTable[tblKey] || null)
+      queue.inFlightSentSnapshot = sentSnapshot
+      queue.overwrittenByRemoteWhileInFlight = false
+      const baseRevision =
+        state.tableDisplayRevisionByTable[tblKey] ||
+        state.tableDisplayByTable[tblKey]?.revision ||
+        undefined
+
+      try {
+        const res = await rpc(
+          'ui.tableDisplayState.patch',
+          {
+            tableKey: tblKey,
+            connectionId,
+            ...(schemaName ? { schema: schemaName } : {}),
+            table: tableName,
+            patch: patchToSend,
+            ...(typeof baseRevision === 'number' && baseRevision > 0 ? { baseRevision } : {}),
+          },
+          { timeoutMs: 10000 }
+        )
+        if (!isPanelActive()) break
+        consecutiveFailures = 0
+        if (res && 'entry' in res) {
+          const nextRev = resolveIncomingTableDisplayRevision(res.entry, res.revision)
+          const prevRev = state.tableDisplayRevisionByTable[tblKey] || 0
+          if (nextRev > 0) {
+            recordPanelSelfTableDisplayRevision(queue, nextRev)
+            if (nextRev > prevRev) {
+              state.tableDisplayRevisionByTable[tblKey] = nextRev
+            }
+          }
+          if (!(nextRev > 0 && nextRev < prevRev)) {
+            const sameAsSent = areTableDisplayStateEntriesEquivalent(res.entry, sentSnapshot)
+            if (!sameAsSent || queue.overwrittenByRemoteWhileInFlight) {
+              if (queue.dirty || queue.pendingPatch) {
+                if (!sameAsSent) {
+                  setPanelPendingRemoteRebase(queue, res.entry, nextRev)
+                }
+              } else {
+                const normalizedRemote = normalizeTableDisplayStateEntry(res.entry ?? null)
+                if (normalizedRemote) {
+                  state.tableDisplayByTable[tblKey] = normalizedRemote
+                  state.userResizedColKeysByTable[tblKey] = new Set(
+                    Object.keys(normalizedRemote.columnWidths || {})
+                  )
+                } else {
+                  delete state.tableDisplayByTable[tblKey]
+                  delete state.userResizedColKeysByTable[tblKey]
+                  delete state.columnWidthsByTable[tblKey]
+                }
+                syncActiveTableDisplayUi(tblKey)
+              }
+            } else if (state.tableDisplayByTable[tblKey] && nextRev > 0) {
+              state.tableDisplayByTable[tblKey].revision = nextRev
+            }
+          }
+        }
+        if (!queue.dirty && !queue.pendingPatch && !queue.hasPendingRemoteRebase) break
+      } catch {
+        consecutiveFailures += 1
+        if (consecutiveFailures >= 2 || (!queue.dirty && !queue.pendingPatch)) {
+          queue.dirty = false
+          queue.pendingPatch = null
+          clearPanelPendingRemoteRebase(queue)
+          break
+        }
+        const fullSnap = buildTableDisplayFullSnapshotPatch(state.tableDisplayByTable[tblKey] || null)
+        queue.pendingPatch = queue.pendingPatch ? { ...fullSnap, ...queue.pendingPatch } : fullSnap
+      }
+    }
+  } finally {
+    queue.inFlight = false
+    queue.overwrittenByRemoteWhileInFlight = false
+    queue.inFlightSentSnapshot = null
+  }
+}
+
+async function patchTableDisplayState(patch, opts = {}) {
+  const connectionId = opts.connectionId || state.activeConnectionId
+  const tableName = opts.table || state.activeTable
+  const schemaName = opts.schema !== undefined ? opts.schema : state.activeSchema
+  if (!connectionId || !tableName || !patch) return
+  const tblKey = makeTableKey(connectionId, tableName, schemaName)
+  const prev = state.tableDisplayByTable[tblKey] || {}
+  const optimistic = normalizeTableDisplayStateEntry({ ...prev, ...patch })
+  if (optimistic) {
+    state.tableDisplayByTable[tblKey] = optimistic
+  } else {
+    delete state.tableDisplayByTable[tblKey]
+  }
+  if (tblKey === getActiveTableKey() && opts.rerender) {
+    syncLegacySetsFromDisplayEntry(tblKey, optimistic)
+    if (state.pageData) renderDataGrid({ layoutOnly: true })
+    if ($('dataColsPopover') && !$('dataColsPopover').hidden) renderDataColsPopoverList()
+  }
+  const queue = getPanelTableDisplayQueue(tblKey)
+  queue.pendingPatch = queue.pendingPatch ? { ...queue.pendingPatch, ...patch } : { ...patch }
+  if (queue.inFlight) {
+    queue.dirty = true
+    return
+  }
+  await flushPanelTableDisplayQueue(tblKey, connectionId, tableName, schemaName)
+}
+
+async function resetTableDisplayState() {
+  const connectionId = state.activeConnectionId
+  const tableName = state.activeTable
+  const schemaName = state.activeSchema
+  if (!connectionId || !tableName) return
+  const tblKey = getActiveTableKey()
+  const queue = getPanelTableDisplayQueue(tblKey)
+  queue.dirty = false
+  queue.overwrittenByRemoteWhileInFlight = false
+  queue.pendingPatch = null
+  clearPanelPendingRemoteRebase(queue)
+  queue.recentSelfRevisions.clear()
+  delete state.tableDisplayByTable[tblKey]
+  delete state.tableDisplayRevisionByTable[tblKey]
+  delete state.hiddenColsByTable[tblKey]
+  delete state.pinnedColsByTable[tblKey]
+  delete state.columnWidthsByTable[tblKey]
+  delete state.userResizedColKeysByTable[tblKey]
+  dataGridSel?.clear(true)
+  if (state.pageData) renderDataGrid({ layoutOnly: true })
+  if ($('dataColsPopover') && !$('dataColsPopover').hidden) renderDataColsPopoverList()
+  try {
+    await rpc(
+      'ui.tableDisplayState.reset',
+      {
+        tableKey: tblKey,
+        connectionId,
+        ...(schemaName ? { schema: schemaName } : {}),
+        table: tableName,
+      },
+      { timeoutMs: 10000 }
+    )
+  } catch {}
+}
+
+function getOrderedAllColumns(tblKey = getActiveTableKey()) {
+  const pd = state.pageData
+  if (!pd || !Array.isArray(pd.columns)) return []
+  const entry = getActiveTableDisplayEntry(tblKey)
+  if (!entry || !Array.isArray(entry.columnOrder) || entry.columnOrder.length === 0) {
+    return pd.columns
+  }
+  const resolver = getPanelColKeyResolver(pd.columns)
+  const headers = pd.columns.map((c) => c.name)
+  const occKeys = resolver ? resolver.occKeys : []
+  const layout = resolveEffectiveColumnLayout({
+    headers,
+    entry,
+  })
+  const byOccKey = new Map()
+  pd.columns.forEach((c, idx) => {
+    byOccKey.set(occKeys[idx], c)
+    if (!byOccKey.has(c.name)) byOccKey.set(c.name, c)
+  })
+  return layout.orderedKeys.map((k) => byOccKey.get(k) || byOccKey.get(normalizeBareColName(k))).filter(Boolean)
+}
+
+function reorderColumnByDrop(fromCol, toCol, placement = 'before') {
+  const pd = state.pageData
+  if (!pd || !Array.isArray(pd.columns) || !fromCol || !toCol || fromCol === toCol) return
+  const tblKey = getActiveTableKey()
+  const headers = pd.columns.map((c) => c.name)
+  const nextEntry = reorderColumnInEntry(getActiveTableDisplayEntry(tblKey), fromCol, toCol, placement, headers)
+  const nextOrder = Array.isArray(nextEntry?.columnOrder) ? nextEntry.columnOrder : []
+  void patchTableDisplayState({ columnOrder: nextOrder }, { rerender: true })
+}
+
 function getOrderedVisibleColumns() {
   const pd = state.pageData
   if (!pd || !Array.isArray(pd.columns)) return []
   const tblKey = getActiveTableKey()
-  const hiddenSet = getHiddenColsSet(tblKey)
-  const pinnedSet = getPinnedColsSet(tblKey)
-  const visible = pd.columns.filter((c) => !hiddenSet.has(c.name))
-  const pinned = visible.filter((c) => pinnedSet.has(c.name))
-  const unpinned = visible.filter((c) => !pinnedSet.has(c.name))
+  const headers = pd.columns.map((c) => c.name)
+  const colToOccKey = buildColumnOccurrenceKeyMap(pd.columns)
+  const orderedAll = getOrderedAllColumns(tblKey)
+  const hiddenSet = resolveDisplayKeySet(getHiddenColsSet(tblKey), headers)
+  const pinnedSet = resolveDisplayKeySet(getPinnedColsSet(tblKey), headers)
+  const visible = orderedAll.filter((c) => !hiddenSet.has(colToOccKey.get(c) || c.name))
+  if (visible.length === 0 && orderedAll.length > 0) {
+    visible.push(orderedAll[0])
+  }
+  const pinned = visible.filter((c) => pinnedSet.has(colToOccKey.get(c) || c.name))
+  const unpinned = visible.filter((c) => !pinnedSet.has(colToOccKey.get(c) || c.name))
   return [...pinned, ...unpinned]
 }
 
@@ -2213,6 +3954,7 @@ function jumpToForeignKeyTarget(refTable, refCol, rawVal) {
 }
 
 function selectTableAndOpen(connectionId, tableName, schemaName, switchToData, options = {}) {
+  state.hasUserInteraction = true
   const tableChanged =
     state.activeConnectionId !== connectionId ||
     state.activeTable !== tableName ||
@@ -2243,6 +3985,19 @@ function selectTableAndOpen(connectionId, tableName, schemaName, switchToData, o
   }
   state.activeTable = tableName
   state.activeSchema = schemaName
+  if (typeof schemaName === 'string' && schemaName.trim()) {
+    const trimmedSchema = schemaName.trim()
+    const targetConn = getConnById(connectionId)
+    const knownSchemas = state.availableSchemasByConn[connectionId]
+    if (
+      (targetConn && MULTI_SCHEMA_DRIVERS.has(targetConn.driver)) ||
+      (Array.isArray(knownSchemas) && knownSchemas.includes(trimmedSchema))
+    ) {
+      const prevSelectedSchema = state.selectedSchemaByConn[connectionId]
+      recordSelectedSchema(connectionId, trimmedSchema, prevSelectedSchema !== trimmedSchema)
+    }
+  }
+  renderActiveSchemaBar()
   state.sortCol = null
   state.whereClause = typeof options.whereClause === 'string' ? options.whereClause : ''
   state.orderByClause = ''
@@ -2274,6 +4029,7 @@ function selectTableAndOpen(connectionId, tableName, schemaName, switchToData, o
   savePanelViewState()
   if (state.activeConnectionId) {
     void loadTableDetails(state.activeConnectionId, tableName, schemaName)
+    void loadTableDisplayState(state.activeConnectionId, tableName, schemaName)
     void loadTablePage(state.activeConnectionId, tableName, 1, schemaName)
   }
   if (switchToData) switchTab('data')
@@ -2283,7 +4039,6 @@ async function deleteConnectionById(id) {
   if (!id) return
   try {
     await rpc('connection.delete', { id })
-    const prefix = `${id}:`
     if (state.activeConnectionId === id) {
       cancelPendingDataAndSchemaLoads()
       state.activeConnectionId = null
@@ -2301,10 +4056,10 @@ async function deleteConnectionById(id) {
       clearStagedChanges()
       void persistActiveConnectionId(null)
     }
+    state.hasUserInteraction = true
     state.expandedConns.delete(id)
     schemaRefreshPending.delete(id)
-    delete state.schemaObjects[id]
-    delete state.schemaErrors[id]
+    clearConnectionSchemaCache(id)
     if (bannerActionContext?.source === 'schema') {
       syncSchemaErrorBanner()
     } else if (bannerActionContext?.connectionId === id) {
@@ -2314,21 +4069,25 @@ async function deleteConnectionById(id) {
       state.tableDetails,
       state.tableDetailsErrors,
       state.columnWidthsByTable,
+      state.userResizedColKeysByTable,
+      state.transposeWidthsByTable,
       state.hiddenColsByTable,
       state.pinnedColsByTable,
+      state.tableDisplayByTable,
+      state.tableDisplayRevisionByTable,
     ]) {
       if (!mapObj) continue
       for (const k of Object.keys(mapObj)) {
-        if (k.startsWith(prefix)) delete mapObj[k]
+        if (tableKeyMatchesConnection(k, id)) delete mapObj[k]
       }
     }
     for (const k of Array.from(state.expandedTables)) {
-      if (k.startsWith(prefix)) state.expandedTables.delete(k)
+      if (tableKeyMatchesConnection(k, id)) state.expandedTables.delete(k)
     }
     for (const k of Array.from(tableDetailsSeqByKey.keys())) {
-      if (k.startsWith(prefix)) tableDetailsSeqByKey.delete(k)
+      if (tableKeyMatchesConnection(k, id)) tableDetailsSeqByKey.delete(k)
     }
-    if (state.structDraftKey && state.structDraftKey.startsWith(prefix)) {
+    if (state.structDraftKey && tableKeyMatchesConnection(state.structDraftKey, id)) {
       state.structDraftKey = null
       state.structDraft = null
       state.structPreviewOpen = false
@@ -2369,14 +4128,30 @@ async function openFullStudio(override) {
 
   try {
     const cid = override?.connectionId ?? state.activeConnectionId
-    const tbl = override?.table ?? state.activeTable
-    const sch = override?.schema ?? state.activeSchema
+    const isSameActiveConn = Boolean(cid && cid === state.activeConnectionId)
+    const tbl = override?.table ?? (isSameActiveConn ? state.activeTable : null)
+    const knownSchemas = cid ? state.availableSchemasByConn[cid] : undefined
+    let sch =
+      override?.schema ??
+      (cid ? state.selectedSchemaByConn[cid] : undefined) ??
+      (isSameActiveConn ? state.activeSchema : undefined)
+    if (
+      !override?.schema &&
+      sch &&
+      Array.isArray(knownSchemas) &&
+      knownSchemas.length > 0 &&
+      !knownSchemas.includes(sch)
+    ) {
+      sch = (cid && state.defaultSchemaByConn[cid]) || knownSchemas[0]
+    }
     const res = await rpc(
       'studio.open',
       {
         ...(cid ? { connectionId: cid } : {}),
         ...(tbl ? { table: tbl } : {}),
         ...(sch ? { schema: sch } : {}),
+        ...(override?.viewMode ? { viewMode: override.viewMode } : {}),
+        ...(override?.action ? { action: override.action } : {}),
       },
       { timeoutMs: QUERY_TIMEOUT_MS }
     )
@@ -2421,44 +4196,320 @@ function closeDataColsPopover() {
   if (pop) pop.hidden = true
 }
 
+function renderDataColsHighlightList() {
+  const listEl = $('dataColsHighlightList')
+  const pd = state.pageData
+  if (!listEl || !pd) return
+  listEl.textContent = ''
+  const entry = getActiveTableDisplayEntry()
+  const rules = Array.isArray(entry?.highlightRules) ? entry.highlightRules : []
+  const colNames = (pd.columns || []).map((c) => c.name)
+  if (rules.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'meta-muted'
+    empty.style.fontSize = '11px'
+    empty.textContent = 'No rules yet.'
+    listEl.appendChild(empty)
+    return
+  }
+  const commitRules = (nextRules) => {
+    void patchTableDisplayState({ highlightRules: nextRules }, { rerender: true })
+  }
+  rules.forEach((rule, idx) => {
+    const card = document.createElement('div')
+    card.className = 'col-highlight-row'
+
+    const colSel = document.createElement('select')
+    colSel.className = 'input'
+    for (const cName of colNames) {
+      const opt = document.createElement('option')
+      opt.value = cName
+      opt.textContent = cName
+      colSel.appendChild(opt)
+    }
+    colSel.value = colNames.includes(rule.column) ? rule.column : (colNames[0] || '')
+    colSel.addEventListener('change', () => {
+      const next = rules.map((r, i) => (i === idx ? { ...r, column: colSel.value } : r))
+      commitRules(next)
+    })
+
+    const opSel = document.createElement('select')
+    opSel.className = 'input'
+    for (const op of CONDITIONAL_HIGHLIGHT_OPERATORS) {
+      const opt = document.createElement('option')
+      opt.value = op
+      opt.textContent = op
+      opSel.appendChild(opt)
+    }
+    opSel.value = rule.operator || 'eq'
+    opSel.addEventListener('change', () => {
+      const next = rules.map((r, i) => (i === idx ? { ...r, operator: opSel.value } : r))
+      commitRules(next)
+    })
+
+    const valInp = document.createElement('input')
+    valInp.className = 'input'
+    valInp.type = 'text'
+    valInp.placeholder = 'Value...'
+    valInp.value = rule.value || ''
+    valInp.addEventListener('change', () => {
+      const next = rules.map((r, i) => (i === idx ? { ...r, value: valInp.value } : r))
+      commitRules(next)
+    })
+
+    const toneSel = document.createElement('select')
+    toneSel.className = 'input'
+    for (const t of HIGHLIGHT_TONES) {
+      const opt = document.createElement('option')
+      opt.value = t
+      opt.textContent = t
+      toneSel.appendChild(opt)
+    }
+    toneSel.value = rule.tone || 'info'
+    toneSel.addEventListener('change', () => {
+      const next = rules.map((r, i) => (i === idx ? { ...r, tone: toneSel.value } : r))
+      commitRules(next)
+    })
+
+    const actRow = document.createElement('div')
+    actRow.className = 'col-highlight-row-actions'
+    const targetSel = document.createElement('select')
+    targetSel.className = 'input'
+    for (const tgt of ['cell', 'row']) {
+      const opt = document.createElement('option')
+      opt.value = tgt
+      opt.textContent = tgt === 'row' ? 'Row' : 'Cell'
+      targetSel.appendChild(opt)
+    }
+    targetSel.value = rule.target === 'row' ? 'row' : 'cell'
+    targetSel.addEventListener('change', () => {
+      const next = rules.map((r, i) => (i === idx ? { ...r, target: targetSel.value } : r))
+      commitRules(next)
+    })
+
+    const delBtn = document.createElement('button')
+    delBtn.type = 'button'
+    delBtn.className = 'mini-btn'
+    delBtn.textContent = 'Remove'
+    delBtn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      commitRules(rules.filter((_, i) => i !== idx))
+    })
+
+    actRow.append(targetSel, delBtn)
+    card.append(colSel, opSel, valInp, toneSel, actRow)
+    listEl.appendChild(card)
+  })
+}
+
+const colsPopoverRenderState = {
+  tblKey: null,
+  renderedKeys: [],
+  rowMap: new Map(),
+  lastHlRules: [],
+}
+
+function syncDataColsPopoverRowsInPlace(targetKeys, hiddenSet, pinnedSet, entry) {
+  const list = $('dataColsList')
+  if (!list || targetKeys.length === 0) return false
+  if (
+    colsPopoverRenderState.renderedKeys.length !== targetKeys.length ||
+    list.childElementCount !== targetKeys.length
+  ) {
+    return false
+  }
+  for (let i = 0; i < targetKeys.length; i++) {
+    const k = targetKeys[i]
+    if (colsPopoverRenderState.renderedKeys[i] !== k) return false
+    const view = colsPopoverRenderState.rowMap.get(k)
+    if (!view || view.row.parentElement !== list) return false
+  }
+  for (let i = 0; i < targetKeys.length; i++) {
+    const colKey = targetKeys[i]
+    const view = colsPopoverRenderState.rowMap.get(colKey)
+    const isHidden = hiddenSet.has(colKey)
+    const isPinned = pinnedSet.has(colKey)
+    if (view.cb.checked !== !isHidden) {
+      view.cb.checked = !isHidden
+    }
+    view.pinBtn.className = `mini-btn${isPinned ? ' btn-active' : ''}`
+    const nextPinText = isPinned ? 'Unpin' : 'Pin'
+    if (view.pinBtn.textContent !== nextPinText) {
+      view.pinBtn.textContent = nextPinText
+    }
+    view.pinBtn.disabled = isHidden
+  }
+  const wrapToggle = $('dataColsWrapToggle')
+  if (wrapToggle) wrapToggle.checked = Boolean(entry?.wrapCells)
+  const maxLinesInp = $('dataColsWrapMaxLines')
+  if (maxLinesInp) {
+    maxLinesInp.value = String(clampWrapMaxLines(entry?.wrapMaxLines ?? DEFAULT_WRAP_MAX_LINES))
+    maxLinesInp.disabled = !entry?.wrapCells
+  }
+  const nextRules = Array.isArray(entry?.highlightRules) ? entry.highlightRules : []
+  if (!areHighlightRulesEqual(colsPopoverRenderState.lastHlRules, nextRules)) {
+    colsPopoverRenderState.lastHlRules = nextRules.map((r) => ({ ...r }))
+    renderDataColsHighlightList()
+  }
+  return true
+}
+
 function renderDataColsPopoverList() {
   const list = $('dataColsList')
   const pd = state.pageData
   if (!list || !pd) return
-  list.textContent = ''
   const tblKey = getActiveTableKey()
-  const hiddenSet = getHiddenColsSet(tblKey)
-  const pinnedSet = getPinnedColsSet(tblKey)
+  const resolver = getPanelColKeyResolver(pd.columns)
+  const headers = pd.columns.map((c) => c.name)
+  const colToOccKey = buildColumnOccurrenceKeyMap(pd.columns)
+  const hiddenSet = resolveDisplayKeySet(getHiddenColsSet(tblKey), headers)
+  const pinnedSet = resolveDisplayKeySet(getPinnedColsSet(tblKey), headers)
+  const entry = getActiveTableDisplayEntry(tblKey)
+  const orderedCols = getOrderedAllColumns(tblKey)
   const q = ($('dataColsSearchInput')?.value || '').trim().toLowerCase()
   const cols = q
-    ? pd.columns.filter((c) => c.name.toLowerCase().includes(q))
-    : pd.columns
-  for (const col of cols) {
+    ? orderedCols.filter((c) => c.name.toLowerCase().includes(q))
+    : orderedCols
+  const targetKeys = cols.map((c) => colToOccKey.get(c) || c.name)
+
+  if (
+    colsPopoverRenderState.tblKey === tblKey &&
+    syncDataColsPopoverRowsInPlace(targetKeys, hiddenSet, pinnedSet, entry)
+  ) {
+    return
+  }
+
+  colsPopoverRenderState.tblKey = tblKey
+  colsPopoverRenderState.renderedKeys = targetKeys
+  colsPopoverRenderState.rowMap.clear()
+  list.textContent = ''
+
+  const nameCounts = resolver ? resolver.nameCounts : new Map()
+
+  let draggedPopoverCol = null
+  const movePopoverCol = (colKey, delta) => {
+    const keys = orderedCols.map((c) => colToOccKey.get(c) || c.name)
+    const idx = keys.indexOf(colKey)
+    const targetIdx = idx + delta
+    if (idx < 0 || targetIdx < 0 || targetIdx >= keys.length) return
+    const targetKey = keys[targetIdx]
+    reorderColumnByDrop(colKey, targetKey, delta < 0 ? 'before' : 'after')
+  }
+
+  for (let ci = 0; ci < cols.length; ci++) {
+    const col = cols[ci]
+    const colKey = targetKeys[ci]
+    const parsedKey = parseOccurrenceColumnKey(colKey)
+    const displayLabel =
+      (nameCounts.get(col.name) || 0) > 1 && parsedKey
+        ? `${col.name} (#${parsedKey.occurrence})`
+        : col.name
     const row = document.createElement('div')
     row.className = 'col-popover-row'
+    row.draggable = true
+    row.tabIndex = 0
+    row.dataset.colName = col.name
+    row.dataset.colKey = colKey
     const lbl = document.createElement('label')
     lbl.className = 'col-popover-name'
     const cb = document.createElement('input')
     cb.type = 'checkbox'
-    cb.checked = !hiddenSet.has(col.name)
-    cb.addEventListener('change', () => toggleColumnHidden(col.name))
+    cb.checked = !hiddenSet.has(colKey)
+    cb.addEventListener('change', () => toggleColumnHidden(colKey))
     const sp = document.createElement('span')
-    sp.textContent = col.name
+    sp.textContent = displayLabel
     lbl.append(cb, sp)
 
+    const actions = document.createElement('div')
+    actions.className = 'col-popover-actions'
+
+    // Keep Pin/Unpin as the FIRST <button> inside each .col-popover-row
     const pinBtn = document.createElement('button')
     pinBtn.type = 'button'
-    const isPinned = pinnedSet.has(col.name)
+    const isPinned = pinnedSet.has(colKey)
     pinBtn.className = `mini-btn${isPinned ? ' btn-active' : ''}`
     pinBtn.textContent = isPinned ? 'Unpin' : 'Pin'
-    pinBtn.disabled = hiddenSet.has(col.name)
+    pinBtn.disabled = hiddenSet.has(colKey)
     pinBtn.addEventListener('click', (e) => {
       e.stopPropagation()
-      toggleColumnPinned(col.name)
+      toggleColumnPinned(colKey)
     })
-    row.append(lbl, pinBtn)
+
+    const upBtn = document.createElement('button')
+    upBtn.type = 'button'
+    upBtn.className = 'mini-btn'
+    upBtn.textContent = '↑'
+    upBtn.title = 'Move column up (Alt+ArrowUp)'
+    upBtn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      movePopoverCol(colKey, -1)
+    })
+
+    const downBtn = document.createElement('button')
+    downBtn.type = 'button'
+    downBtn.className = 'mini-btn'
+    downBtn.textContent = '↓'
+    downBtn.title = 'Move column down (Alt+ArrowDown)'
+    downBtn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      movePopoverCol(colKey, 1)
+    })
+
+    row.addEventListener('keydown', (e) => {
+      if (e.altKey && e.key === 'ArrowUp') {
+        e.preventDefault()
+        movePopoverCol(colKey, -1)
+      } else if (e.altKey && e.key === 'ArrowDown') {
+        e.preventDefault()
+        movePopoverCol(colKey, 1)
+      }
+    })
+    row.addEventListener('dragstart', (e) => {
+      draggedPopoverCol = colKey
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move'
+        e.dataTransfer.setData('text/plain', colKey)
+      }
+    })
+    row.addEventListener('dragover', (e) => {
+      const src = draggedPopoverCol || e.dataTransfer?.getData('text/plain')
+      if (!src || src === colKey) return
+      e.preventDefault()
+      row.classList.add('is-drop-target')
+    })
+    row.addEventListener('dragleave', () => {
+      row.classList.remove('is-drop-target')
+    })
+    row.addEventListener('drop', (e) => {
+      e.preventDefault()
+      row.classList.remove('is-drop-target')
+      const src = draggedPopoverCol || e.dataTransfer?.getData('text/plain')
+      draggedPopoverCol = null
+      if (src && src !== colKey) {
+        reorderColumnByDrop(src, colKey, 'before')
+      }
+    })
+    row.addEventListener('dragend', () => {
+      draggedPopoverCol = null
+      list.querySelectorAll('.is-drop-target').forEach((el) => el.classList.remove('is-drop-target'))
+    })
+
+    actions.append(pinBtn, upBtn, downBtn)
+    row.append(lbl, actions)
     list.appendChild(row)
+    colsPopoverRenderState.rowMap.set(colKey, { row, cb, pinBtn })
   }
+
+  const wrapToggle = $('dataColsWrapToggle')
+  if (wrapToggle) wrapToggle.checked = Boolean(entry?.wrapCells)
+  const maxLinesInp = $('dataColsWrapMaxLines')
+  if (maxLinesInp) {
+    maxLinesInp.value = String(clampWrapMaxLines(entry?.wrapMaxLines ?? DEFAULT_WRAP_MAX_LINES))
+    maxLinesInp.disabled = !entry?.wrapCells
+  }
+  const nextRules = Array.isArray(entry?.highlightRules) ? entry.highlightRules : []
+  colsPopoverRenderState.lastHlRules = nextRules.map((r) => ({ ...r }))
+  renderDataColsHighlightList()
 }
 
 // Bulk Fill Value Modal Controller
@@ -2696,17 +4747,22 @@ dataGridSel = new PanelGridSelection({
   tableEl: $('dataTable'),
   editable: true,
   isTransposed: () => Boolean(state.transposed),
-  getDimensions: () => ({
-    rows: (dataVirt.active ? dataVirt.allRows : getAllDisplayRows()).length,
-    cols: (dataVirt.active ? dataVirt.visCols : getOrderedVisibleColumns()).length,
-  }),
+  getDimensions: () => {
+    const allRows = dataVirt.active ? dataVirt.allRows : getAllDisplayRows()
+    return {
+      rows: state.transposed ? Math.min(allRows.length, 100) : allRows.length,
+      cols: (dataVirt.active ? dataVirt.visCols : getOrderedVisibleColumns()).length,
+    }
+  },
   getSnapshot: () => {
     const allRows = dataVirt.active ? dataVirt.allRows : getAllDisplayRows()
     const visCols = dataVirt.active ? dataVirt.visCols : getOrderedVisibleColumns()
+    const rowCount = state.transposed ? Math.min(allRows.length, 100) : allRows.length
     return {
-      rows: allRows.length,
+      rows: rowCount,
       cols: visCols.length,
       getValue: (r, c) => {
+        if (r < 0 || r >= rowCount) return null
         const entry = allRows[r]
         const col = visCols[c]
         if (!entry || !col) return null
@@ -2716,6 +4772,8 @@ dataGridSel = new PanelGridSelection({
   },
   getValueAt: (r, c) => {
     const allRows = dataVirt.active ? dataVirt.allRows : getAllDisplayRows()
+    const rowCount = state.transposed ? Math.min(allRows.length, 100) : allRows.length
+    if (r < 0 || r >= rowCount) return null
     const visCols = dataVirt.active ? dataVirt.visCols : getOrderedVisibleColumns()
     const entry = allRows[r]
     const col = visCols[c]
@@ -2725,17 +4783,18 @@ dataGridSel = new PanelGridSelection({
   onSelectionChange: (sel) => {
     if (sel.focus) {
       const allRows = dataVirt.active ? dataVirt.allRows : getAllDisplayRows()
+      const rowCount = state.transposed ? Math.min(allRows.length, 100) : allRows.length
       const visCols = dataVirt.active ? dataVirt.visCols : getOrderedVisibleColumns()
-      const entry = allRows[sel.focus.r]
+      const entry = sel.focus.r >= 0 && sel.focus.r < rowCount ? allRows[sel.focus.r] : null
       const col = visCols[sel.focus.c]
       state.selectedRowKey = entry?.rowKey || null
       state.selectedCol = col?.name || null
+      if (!state.transposed) {
+        ensureDataVirtualRowVisible(sel.focus.r, sel.focus.c)
+      }
     } else {
       state.selectedRowKey = null
       state.selectedCol = null
-    }
-    if (state.transposed) {
-      updateGridSelectionHighlight()
     }
     renderStagingBar()
     renderValueInspector()
@@ -2758,11 +4817,11 @@ dataGridSel = new PanelGridSelection({
     jumpToForeignKeyTarget(fkInfo.referencedTable, fkInfo.referencedColumn, val)
     return true
   },
-  onEnsureCellVisible: (r) => {
-    ensureDataVirtualRowVisible(r)
+  onEnsureCellVisible: (r, c) => {
+    ensureDataVirtualRowVisible(state.transposed ? c : r, state.transposed ? r : c)
   },
   onStartEdit: (r, c) => {
-    ensureDataVirtualRowVisible(r)
+    ensureDataVirtualRowVisible(state.transposed ? c : r, state.transposed ? r : c)
     const allRows = dataVirt.active ? dataVirt.allRows : getAllDisplayRows()
     const visCols = dataVirt.active ? dataVirt.visCols : getOrderedVisibleColumns()
     const entry = allRows[r]
@@ -2887,11 +4946,6 @@ $('dataTable')?.addEventListener('click', (e) => {
       }
     }
   }
-  state.selectedRowKey = rowKey
-  state.selectedCol = colName
-  updateGridSelectionHighlight()
-  renderStagingBar()
-  renderValueInspector()
 })
 
 $('dataTable')?.addEventListener('dblclick', (e) => {
@@ -2917,24 +4971,63 @@ $('dataTable')?.addEventListener('dblclick', (e) => {
 })
 
 // Virtualized 60fps scroll & ResizeObserver handlers for #dataGridWrap & #sqlResultWrap
+const scheduleDataVirtRender = () => {
+  if (!dataVirt.active) return
+  if (dataVirt.rafId !== null) return
+  const run = () => {
+    dataVirt.rafId = null
+    renderDataVirtualWindow(false)
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    let ranSync = false
+    const id = requestAnimationFrame(() => {
+      ranSync = true
+      run()
+    })
+    if (!ranSync) dataVirt.rafId = id
+  } else {
+    run()
+  }
+}
+
+const scheduleSqlVirtRender = () => {
+  if (!sqlVirt.active) return
+  if (sqlVirt.rafId !== null) return
+  const run = () => {
+    sqlVirt.rafId = null
+    renderSqlVirtualWindow(false)
+  }
+  if (typeof requestAnimationFrame === 'function') {
+    let ranSync = false
+    const id = requestAnimationFrame(() => {
+      ranSync = true
+      run()
+    })
+    if (!ranSync) sqlVirt.rafId = id
+  } else {
+    run()
+  }
+}
+
 const dataGridWrapEl = $('dataGridWrap')
+let lastDataVirtScrollLeft = -1
 if (dataGridWrapEl) {
   dataGridWrapEl.addEventListener('scroll', () => {
-    if (!dataVirt.active || state.transposed) return
-    const total = dataVirt.allRows.length
+    if (!dataVirt.active) return
+    const total = dataVirt.transposed ? dataVirt.visCols.length : dataVirt.allRows.length
     if (total === 0) return
-    const { start, end } = computeVirtualRange(dataGridWrapEl.scrollTop, dataGridWrapEl.clientHeight, total)
-    if (start === dataVirt.start && end === dataVirt.end) return
-    if (dataVirt.rafId !== null) return
-    const run = () => {
-      dataVirt.rafId = null
-      renderDataVirtualWindow(false)
-    }
-    if (typeof requestAnimationFrame === 'function') {
-      dataVirt.rafId = requestAnimationFrame(run)
-    } else {
-      run()
-    }
+    const { start, end } = computeVirtualRange(
+      dataGridWrapEl.scrollTop,
+      dataGridWrapEl.clientHeight,
+      total,
+      dataVirt.transposed ? 4 : VIRT_OVERSCAN_ROWS
+    )
+    const vertChanged = start !== dataVirt.start || end !== dataVirt.end
+    const curLeft = dataGridWrapEl.scrollLeft
+    const horizChanged = Boolean(dataVirt.transposed && curLeft !== lastDataVirtScrollLeft)
+    if (!vertChanged && !horizChanged) return
+    lastDataVirtScrollLeft = curLeft
+    scheduleDataVirtRender()
   }, { passive: true })
 }
 
@@ -2946,27 +5039,79 @@ if (sqlResultWrapEl) {
     if (total === 0) return
     const { start, end } = computeVirtualRange(sqlResultWrapEl.scrollTop, sqlResultWrapEl.clientHeight, total)
     if (start === sqlVirt.start && end === sqlVirt.end) return
-    if (sqlVirt.rafId !== null) return
-    const run = () => {
-      sqlVirt.rafId = null
-      renderSqlVirtualWindow(false)
-    }
-    if (typeof requestAnimationFrame === 'function') {
-      sqlVirt.rafId = requestAnimationFrame(run)
-    } else {
-      run()
-    }
+    scheduleSqlVirtRender()
   }, { passive: true })
+}
+
+let isPanelViewportResizing = false
+let lastObservedDataWrapH = 0
+let lastObservedDataWrapW = 0
+let lastObservedSqlWrapH = 0
+
+function setPanelViewportResizing(active) {
+  const next = Boolean(active)
+  if (isPanelViewportResizing === next) return
+  isPanelViewportResizing = next
+  if (next) {
+    if (dataGridWrapEl && dataGridWrapEl.clientHeight > 0) {
+      lastObservedDataWrapH = dataGridWrapEl.clientHeight
+    }
+    if (dataGridWrapEl && dataGridWrapEl.clientWidth > 0) {
+      lastObservedDataWrapW = dataGridWrapEl.clientWidth
+    }
+    if (sqlResultWrapEl && sqlResultWrapEl.clientHeight > 0) {
+      lastObservedSqlWrapH = sqlResultWrapEl.clientHeight
+    }
+  } else {
+    if (
+      dataGridWrapEl &&
+      dataGridWrapEl.clientWidth > 0 &&
+      dataGridWrapEl.clientWidth !== lastObservedDataWrapW
+    ) {
+      lastObservedDataWrapW = dataGridWrapEl.clientWidth
+      recomputePinnedForViewport()
+    }
+    if (dataVirt.active) scheduleDataVirtRender()
+    if (sqlVirt.active) scheduleSqlVirtRender()
+  }
 }
 
 let gridResizeObserver = null
 if (typeof ResizeObserver !== 'undefined') {
   gridResizeObserver = new ResizeObserver((entries) => {
     for (const entry of entries) {
-      if (entry.target === dataGridWrapEl && dataVirt.active && !state.transposed) {
-        renderDataVirtualWindow(false)
+      if (entry.target === dataGridWrapEl) {
+        const nextW = entry.contentRect?.width ?? dataGridWrapEl?.clientWidth ?? 0
+        if (nextW > 0 && nextW !== lastObservedDataWrapW) {
+          lastObservedDataWrapW = nextW
+          recomputePinnedForViewport()
+        }
+        if (!dataVirt.active) continue
+        const nextH = entry.contentRect?.height ?? dataGridWrapEl?.clientHeight ?? 0
+        if (isPanelViewportResizing) {
+          if (nextH <= lastObservedDataWrapH) continue
+          const total = dataVirt.transposed ? dataVirt.visCols.length : dataVirt.allRows.length
+          const neededEnd = Math.ceil(((dataGridWrapEl?.scrollTop || 0) + nextH) / VIRT_ROW_HEIGHT_PX) + 1
+          if (dataVirt.end >= Math.min(total, neededEnd)) {
+            lastObservedDataWrapH = nextH
+            continue
+          }
+        }
+        if (nextH > 0) lastObservedDataWrapH = nextH
+        scheduleDataVirtRender()
       } else if (entry.target === sqlResultWrapEl && sqlVirt.active) {
-        renderSqlVirtualWindow(false)
+        const nextH = entry.contentRect?.height ?? sqlResultWrapEl?.clientHeight ?? 0
+        if (isPanelViewportResizing) {
+          if (nextH <= lastObservedSqlWrapH) continue
+          const total = sqlVirt.sortedRows.length
+          const neededEnd = Math.ceil(((sqlResultWrapEl?.scrollTop || 0) + nextH) / VIRT_ROW_HEIGHT_PX) + 1
+          if (sqlVirt.end >= Math.min(total, neededEnd)) {
+            lastObservedSqlWrapH = nextH
+            continue
+          }
+        }
+        if (nextH > 0) lastObservedSqlWrapH = nextH
+        scheduleSqlVirtRender()
       }
     }
   })
@@ -3006,20 +5151,51 @@ $('discoveredSearchInput')?.addEventListener('input', () => {
   renderDiscoveredItems()
 })
 
-$('uriInput').addEventListener('input', () => {
+let uriPasteTimer = null
+let suppressUriPasteInputCancel = false
+function clearUriPasteTimer() {
+  suppressUriPasteInputCancel = false
+  if (uriPasteTimer !== null) {
+    clearTimeout(uriPasteTimer)
+    uriPasteTimer = null
+  }
+}
+$('uriInput').addEventListener('input', (e) => {
+  const inputType = typeof e?.inputType === 'string' ? e.inputType : ''
+  const isPasteOriginated =
+    inputType === 'insertFromPaste' || (inputType === '' && suppressUriPasteInputCancel)
+  if (isPasteOriginated) {
+    suppressUriPasteInputCancel = false
+  } else {
+    clearUriPasteTimer()
+  }
   connFormCtrl.clearActiveAutoUri?.()
 })
-$('parseUriBtn').addEventListener('click', () => void handleParseUri())
+$('parseUriBtn').addEventListener('click', () => {
+  clearUriPasteTimer()
+  void handleParseUri()
+})
 $('uriInput').addEventListener('paste', (e) => {
+  clearUriPasteTimer()
   connFormCtrl.clearActiveAutoUri?.()
   const pasted = e.clipboardData?.getData('text')
-  if (pasted) {
-    setTimeout(() => void handleParseUri($('uriInput').value || pasted), 0)
+  if (pasted && pasted.trim()) {
+    const seqAtPaste = connFormCtrl.getParseUriSeq?.() ?? 0
+    suppressUriPasteInputCancel = true
+    uriPasteTimer = setTimeout(() => {
+      uriPasteTimer = null
+      suppressUriPasteInputCancel = false
+      if (!isPanelActive() || !state.formOpen || state.formBusy) return
+      if ((connFormCtrl.getParseUriSeq?.() ?? 0) !== seqAtPaste) return
+      const nextVal = ($('uriInput')?.value || '').trim() || pasted.trim()
+      if (nextVal) void handleParseUri(nextVal)
+    }, 0)
   }
 })
 $('uriInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
     e.preventDefault()
+    clearUriPasteTimer()
     void handleParseUri()
   }
 })
@@ -3055,10 +5231,11 @@ $('formPassword').addEventListener('input', () => {
       : 'Optional'
 })
 
-$('testFormBtn').addEventListener('click', async () => {
+async function runPanelConnectionTest() {
   if (state.formBusy) return
   state.formBusy = true
   setFormControlsBusy(true)
+  clearPanelTlsRemedy()
   const testBtn = $('testFormBtn')
   setButtonLoading(testBtn, true, 'Testing... 0.0s')
   const stopTimer = createElapsedTimer((elapsed) => {
@@ -3066,26 +5243,42 @@ $('testFormBtn').addEventListener('click', async () => {
   })
   try {
     if (!(await ensureUriParsedBeforeAction())) return
+    if (!ensureValidFolderBeforeSubmit()) return
     const targetId = state.editingId || `conn_test_${Date.now()}`
     if (!ensureRequiredPasswordBeforeSubmit(state.editingId || state.sourceSecretConnId || '')) return
     showFormNotice('Testing connection...', 'neutral')
     const sub = buildFormSubmission(targetId)
-    const res = await rpc('connection.test', sub, { timeoutMs: QUERY_TIMEOUT_MS })
+    const res = await executeConnectionTestWithHostKeyRetry(sub)
+    if (!isPanelActive()) return
+    if (res?.tlsFailure) {
+      renderPanelTlsFailureRemedy(res.tlsFailure)
+    }
     showFormNotice(res?.message || (res?.ok ? 'Connection verified' : 'Connection test failed.'), res?.ok ? 'success' : 'danger')
   } catch (err) {
+    if (!isPanelActive()) return
+    if (err && typeof err === 'object' && err.tlsFailure) {
+      renderPanelTlsFailureRemedy(err.tlsFailure)
+    }
     showFormNotice(`Error: ${err?.message || err}`, 'danger')
   } finally {
     stopTimer()
-    setButtonLoading(testBtn, false)
     state.formBusy = false
-    setFormControlsBusy(false)
+    if (isPanelActive()) {
+      setButtonLoading(testBtn, false)
+      setFormControlsBusy(false)
+    }
   }
+}
+
+$('testFormBtn').addEventListener('click', () => {
+  void runPanelConnectionTest()
 })
 
 $('saveFormBtn').addEventListener('click', async () => {
   if (state.formBusy) return
   state.formBusy = true
   setFormControlsBusy(true)
+  clearPanelTlsRemedy()
   const saveBtn = $('saveFormBtn')
   let savePhase = 'Testing...'
   setButtonLoading(saveBtn, true, 'Testing... 0.0s')
@@ -3094,6 +5287,7 @@ $('saveFormBtn').addEventListener('click', async () => {
   })
   try {
     if (!(await ensureUriParsedBeforeAction())) return
+    if (!ensureValidFolderBeforeSubmit()) return
     if ((state.formDriver === 'sqlite' || state.formDriver === 'duckdb') && !$('formFilePath').value.trim()) {
       showFormNotice(
         state.formDriver === 'duckdb'
@@ -3112,12 +5306,18 @@ $('saveFormBtn').addEventListener('click', async () => {
     showFormNotice('Verifying & saving connection...', 'neutral')
     const sub = buildFormSubmission(targetId)
     try {
-      const testRes = await rpc('connection.test', sub, { timeoutMs: QUERY_TIMEOUT_MS })
+      const testRes = await executeConnectionTestWithHostKeyRetry(sub)
       if (testRes && testRes.ok === false) {
+        if (testRes.tlsFailure) {
+          renderPanelTlsFailureRemedy(testRes.tlsFailure)
+        }
         showFormNotice(testRes.message || 'Connection test failed.', 'danger')
         return
       }
     } catch (testErr) {
+      if (testErr && typeof testErr === 'object' && testErr.tlsFailure) {
+        renderPanelTlsFailureRemedy(testErr.tlsFailure)
+      }
       showFormNotice(`Connection failed: ${testErr?.message || testErr}`, 'danger')
       return
     }
@@ -3125,6 +5325,7 @@ $('saveFormBtn').addEventListener('click', async () => {
     updateButtonLoadingLabel(saveBtn, 'Saving...')
     const res = await rpc('connection.save', sub, { timeoutMs: QUERY_TIMEOUT_MS })
     if (res?.ok) {
+      state.hasUserInteraction = true
       const savedId = res.id || targetId
       cancelPendingDataAndSchemaLoads()
       resetSqlSafetyBannerDismissal()
@@ -3135,8 +5336,7 @@ $('saveFormBtn').addEventListener('click', async () => {
       schemaLoadSeqByConn.set(savedId, (schemaLoadSeqByConn.get(savedId) || 0) + 1)
       state.schemaLoading.delete(savedId)
       schemaRefreshPending.delete(savedId)
-      delete state.schemaObjects[savedId]
-      delete state.schemaErrors[savedId]
+      clearConnectionSchemaCache(savedId)
       state.activeTable = null
       state.activeSchema = undefined
       state.pageData = null
@@ -3166,6 +5366,10 @@ $('connSelect').addEventListener('change', (e) => {
   activateConnection(e.target.value || null)
 })
 
+$('panelSchemaSelect')?.addEventListener('change', (e) => {
+  handlePanelSchemaChange(e.target.value)
+})
+
 $('testActiveBtn').addEventListener('click', async () => {
   const active = getActiveConn()
   if (!active || state.testingActiveConn) return
@@ -3178,7 +5382,7 @@ $('testActiveBtn').addEventListener('click', async () => {
     updateButtonLoadingLabel(testBtn, `Testing... ${elapsed}`)
   })
   try {
-    const res = await rpc('connection.test', { profile: active }, { timeoutMs: QUERY_TIMEOUT_MS })
+    const res = await executeConnectionTestWithHostKeyRetry({ profile: active })
     if (state.activeConnectionId === targetConnId) {
       showConnectionBanner(
         targetConnId,
@@ -3289,8 +5493,39 @@ $('dataColsSearchInput')?.addEventListener('input', renderDataColsPopoverList)
 $('dataColsShowAllBtn')?.addEventListener('click', () => {
   getHiddenColsSet().clear()
   dataGridSel?.clear(true)
-  renderDataGrid()
+  renderDataGrid({ layoutOnly: true })
   renderDataColsPopoverList()
+  void patchTableDisplayState({ hiddenColumns: [] })
+})
+$('dataColsWrapToggle')?.addEventListener('change', (e) => {
+  const checked = Boolean(e.target?.checked)
+  const maxLines = clampWrapMaxLines(Number($('dataColsWrapMaxLines')?.value || DEFAULT_WRAP_MAX_LINES))
+  void patchTableDisplayState({ wrapCells: checked, wrapMaxLines: maxLines }, { rerender: true })
+})
+$('dataColsWrapMaxLines')?.addEventListener('change', (e) => {
+  const maxLines = clampWrapMaxLines(Number(e.target?.value || DEFAULT_WRAP_MAX_LINES))
+  if ($('dataColsWrapMaxLines')) $('dataColsWrapMaxLines').value = String(maxLines)
+  void patchTableDisplayState({ wrapMaxLines: maxLines }, { rerender: true })
+})
+$('dataColsResetDisplayBtn')?.addEventListener('click', () => {
+  void resetTableDisplayState()
+})
+$('dataColsAddHighlightBtn')?.addEventListener('click', () => {
+  const pd = state.pageData
+  const firstCol = pd?.columns?.[0]?.name
+  if (!firstCol) return
+  const entry = getActiveTableDisplayEntry()
+  const prevRules = Array.isArray(entry?.highlightRules) ? entry.highlightRules : []
+  const newRule = {
+    id: `hl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    enabled: true,
+    column: firstCol,
+    operator: 'eq',
+    value: '',
+    target: 'cell',
+    tone: 'info',
+  }
+  void patchTableDisplayState({ highlightRules: [...prevRules, newRule] }, { rerender: true })
 })
 
 $('dataFindInput')?.addEventListener('input', (e) => {
@@ -3525,12 +5760,31 @@ $('dangerTableExecuteBtn')?.addEventListener('click', async () => {
 $('transposeBtn').addEventListener('click', () => {
   state.transposed = !state.transposed
   dataGridSel?.clear(true)
+  const wrap = $('dataGridWrap')
+  if (wrap) {
+    wrap.scrollTop = 0
+    wrap.scrollLeft = 0
+  }
   savePanelViewState()
   renderDataGrid()
 })
 
 $('editTableStructureBtn')?.addEventListener('click', () => {
   switchTab('structure')
+})
+
+$('importDataBtn')?.addEventListener('click', () => {
+  const conn = getActiveConn()
+  if (!state.activeConnectionId || !state.activeTable || conn?.readOnly || conn?.driver === 'redis') {
+    return
+  }
+  void openFullStudio({
+    connectionId: state.activeConnectionId,
+    table: state.activeTable,
+    schema: state.activeSchema,
+    viewMode: 'grid',
+    action: 'import',
+  })
 })
 
 $('structureTableNameInput')?.addEventListener('input', (e) => {
@@ -3922,65 +6176,105 @@ let inspectorResizeCleanup = null
   const STEP_PX = 24
   let rafId = null
 
-  const clampPx = (px) => {
+  const getMaxPx = () => {
     const parentH = drawer.parentElement?.getBoundingClientRect?.().height
-    const maxPx = parentH && Number.isFinite(parentH) && parentH > 0 ? Math.max(MIN_PX, Math.floor(parentH * 0.76)) : 560
+    return parentH && Number.isFinite(parentH) && parentH > 0
+      ? Math.max(MIN_PX, Math.floor(parentH * 0.76))
+      : 560
+  }
+  const clampPx = (px, cachedMaxPx = null) => {
+    const maxPx = cachedMaxPx !== null ? cachedMaxPx : getMaxPx()
     return Math.max(MIN_PX, Math.min(maxPx, Math.round(px)))
   }
-  const applyPx = (px, persist) => {
-    const clamped = clampPx(px)
+  const applyPx = (px, persist, cachedMaxPx = null, notifyVirt = true) => {
+    const clamped = clampPx(px, cachedMaxPx)
     drawer.style.height = `${clamped}px`
     resizer.setAttribute('aria-valuenow', String(clamped))
     if (persist) {
       try { window.localStorage?.setItem(STORAGE_KEY, String(clamped)) } catch {}
     }
-    if (typeof requestAnimationFrame === 'function') {
-      if (rafId !== null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(rafId)
-      rafId = requestAnimationFrame(() => {
-        rafId = null
-        if (dataVirt?.active) renderDataVirtualWindow(false)
-      })
-    } else if (dataVirt?.active) {
-      renderDataVirtualWindow(false)
+    if (notifyVirt && dataVirt?.active) {
+      scheduleDataVirtRender()
     }
+    return clamped
   }
 
   resizer.addEventListener('mousedown', (e) => {
     if (state.inspectorCollapsed) return
+    if (e.button !== undefined && e.button !== 0) return
     e.preventDefault()
     inspectorResizeCleanup?.()
     const startY = e.clientY
-    const startH = clampPx(drawer.getBoundingClientRect?.().height || DEFAULT_PX)
+    const parentEl = drawer.parentElement
+    const cachedMaxPx = getMaxPx()
+    const startH = clampPx(drawer.getBoundingClientRect?.().height || DEFAULT_PX, cachedMaxPx)
     let currentH = startH
+    let lastAppliedH = -1
+    let dragRafPending = false
     resizer.classList.add('is-resizing')
+    parentEl?.classList?.add('is-split-resizing')
+    setPanelViewportResizing(true)
     document.body.style.cursor = 'row-resize'
     document.body.style.userSelect = 'none'
 
+    const flushDragHeight = () => {
+      dragRafPending = false
+      rafId = null
+      if (currentH === lastAppliedH) return
+      lastAppliedH = currentH
+      applyPx(currentH, false, cachedMaxPx, typeof ResizeObserver === 'undefined')
+    }
+
     const onMove = (ev) => {
-      currentH = clampPx(startH + (startY - ev.clientY))
-      applyPx(currentH, false)
+      if (ev.isTrusted && ev.buttons === 0) {
+        onEnd()
+        return
+      }
+      const nextH = clampPx(startH + (startY - ev.clientY), cachedMaxPx)
+      if (nextH === currentH) return
+      currentH = nextH
+      if (typeof requestAnimationFrame === 'function') {
+        if (!dragRafPending) {
+          dragRafPending = true
+          const id = requestAnimationFrame(flushDragHeight)
+          rafId = dragRafPending ? id : null
+        }
+      } else {
+        flushDragHeight()
+      }
+    }
+    const onKeyDown = (keyEv) => {
+      if (keyEv.key === 'Escape') {
+        keyEv.preventDefault()
+        cleanup()
+      }
     }
     const cleanup = () => {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onEnd)
       window.removeEventListener('blur', onEnd)
+      window.removeEventListener('keydown', onKeyDown)
+      dragRafPending = false
       if (rafId !== null && typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(rafId)
         rafId = null
       }
       resizer.classList.remove('is-resizing')
+      parentEl?.classList?.remove('is-split-resizing')
       document.body.style.cursor = ''
       document.body.style.userSelect = ''
+      setPanelViewportResizing(false)
       if (inspectorResizeCleanup === cleanup) inspectorResizeCleanup = null
     }
     const onEnd = () => {
       cleanup()
-      applyPx(currentH, true)
+      applyPx(currentH, true, cachedMaxPx, true)
     }
     inspectorResizeCleanup = cleanup
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onEnd)
     window.addEventListener('blur', onEnd)
+    window.addEventListener('keydown', onKeyDown)
   })
 
   resizer.addEventListener('dblclick', () => applyPx(DEFAULT_PX, true))
@@ -3999,6 +6293,7 @@ let inspectorResizeCleanup = null
   })
 })()
 $('closeInspectorBtn').addEventListener('click', () => {
+  inspectorResizeCleanup?.()
   state.inspectorOpen = false
   renderValueInspector()
   renderStagingBar()
@@ -4335,9 +6630,21 @@ document.addEventListener('keydown', (e) => {
     }
     return
   }
-  if (document.querySelector('.panel-fp-backdrop')) return
+  if (
+    document.querySelector('.panel-fp-backdrop') ||
+    document.querySelector('.datanoa-bind-params-modal') ||
+    document.querySelector('.datanoa-ssh-trust-modal')
+  ) {
+    return
+  }
   const activeEl = document.activeElement
   if (activeEl instanceof HTMLInputElement && activeEl.classList.contains('cell-edit-input')) {
+    return
+  }
+  if (
+    !getActivePanelModalEl() &&
+    (sqlCtrl?.isSqlVimEscapeTarget?.(e.target) || sqlCtrl?.isSqlVimEscapeTarget?.(activeEl))
+  ) {
     return
   }
   if (isCustomDropdownOpen()) {
@@ -4496,13 +6803,15 @@ function trackOrcaDisposable(d) {
 if (window.orca?.on) {
   try {
     trackOrcaDisposable(window.orca.on('theme', (payload) => {
-      if (payload?.colorScheme) {
+      document.documentElement.removeAttribute('data-theme-override')
+      if (payload?.colorScheme === 'light' || payload?.colorScheme === 'dark') {
         const isLight = payload.colorScheme === 'light'
         const isDark = payload.colorScheme === 'dark'
         document.documentElement.classList.toggle('light', isLight)
         document.documentElement.classList.toggle('dark', isDark)
         document.body?.classList.toggle('light', isLight)
         document.body?.classList.toggle('dark', isDark)
+        syncSidebarBackgroundFromTokens()
         setSqlColorScheme(isLight)
       } else {
         syncThemeFromTokens()
@@ -4517,12 +6826,38 @@ if (window.orca?.on) {
 }
 if (window.orca?.plugin?.on) {
   try {
-    trackOrcaDisposable(window.orca.plugin.on('connections.changed', () => void refreshConnections()))
+    trackOrcaDisposable(
+      window.orca.plugin.on('connections.changed', () => {
+        if (pendingReorderCount > 0) {
+          if (expectedSelfChangedEvents > 0) {
+            expectedSelfChangedEvents--
+            consumedSelfChangedEvents++
+            return
+          }
+          refreshConnectionsAfterReorder = true
+          return
+        }
+        void refreshConnections()
+      })
+    )
     trackOrcaDisposable(window.orca.plugin.on('ai.status.changed', (snapshot) => applyAiStatus(snapshot)))
     if (typeof window.orca.settings?.onDidChange === 'function') {
       trackOrcaDisposable(window.orca.settings.onDidChange((change) => {
         if (typeof change?.key === 'string' && change.key.startsWith('ai')) {
           void hydrateAiStatus()
+        }
+        const k = change?.key
+        if (
+          !k ||
+          k === 'all' ||
+          k === 'editorKeymap' ||
+          k === 'shortcutRunStatement' ||
+          k === 'shortcutRunAll' ||
+          k === 'shortcutFormatSql' ||
+          k.startsWith('datanoa.editorKeymap') ||
+          k.startsWith('datanoa.shortcut')
+        ) {
+          void hydratePanelKeymapSettings()
         }
       }))
     }
@@ -4543,7 +6878,137 @@ if (window.orca?.plugin?.on) {
       }
       void loadTablePage(state.activeConnectionId, state.activeTable, state.page, state.activeSchema)
     }))
+    trackOrcaDisposable(window.orca.plugin.on('ui.tableDisplayState.changed', (payload) => {
+      if (!payload || typeof payload !== 'object') return
+      const activeKey = getActiveTableKey()
+      if (payload.bulkReset === true) {
+        let activeUpdated = false
+        if (Array.isArray(payload.tableKeys) && payload.tableKeys.length > 0) {
+          for (const rawKey of payload.tableKeys) {
+            if (typeof rawKey !== 'string' || !rawKey) continue
+            const k = normalizeTableKey(rawKey)
+            const rev =
+              typeof payload.revisions?.[rawKey] === 'number'
+                ? payload.revisions[rawKey]
+                : typeof payload.revisions?.[k] === 'number'
+                  ? payload.revisions[k]
+                  : payload.revision
+            const cleanRev = resolveIncomingTableDisplayRevision(null, rev)
+            const prevRev = state.tableDisplayRevisionByTable[k] || 0
+            if (cleanRev > 0 && cleanRev <= prevRev) continue
+            const q = getPanelTableDisplayQueue(k)
+            q.dirty = false
+            q.overwrittenByRemoteWhileInFlight = false
+            q.pendingPatch = null
+            clearPanelPendingRemoteRebase(q)
+            q.recentSelfRevisions.clear()
+            const applied = applyTableDisplayEntryForKey(k, null, rev)
+            if (applied && k === activeKey) activeUpdated = true
+          }
+        } else {
+          const targetConnId =
+            typeof payload.connectionId === 'string' && payload.connectionId
+              ? payload.connectionId
+              : null
+          const matchesBulkTarget = (k) =>
+            payload.all === true ||
+            (targetConnId !== null && tableKeyMatchesConnection(k, targetConnId))
+          const candidateKeys = new Set([
+            ...Object.keys(state.tableDisplayByTable || {}),
+            ...Array.from(panelTableDisplayQueues.keys()),
+            ...(activeKey ? [activeKey] : []),
+          ])
+          const cleanRev = resolveIncomingTableDisplayRevision(null, payload.revision)
+          for (const k of candidateKeys) {
+            if (!matchesBulkTarget(k)) continue
+            const prevRev = state.tableDisplayRevisionByTable[k] || 0
+            if (cleanRev > 0 && cleanRev <= prevRev) continue
+            const q = getPanelTableDisplayQueue(k)
+            q.dirty = false
+            q.overwrittenByRemoteWhileInFlight = false
+            q.pendingPatch = null
+            clearPanelPendingRemoteRebase(q)
+            q.recentSelfRevisions.clear()
+            const applied = applyTableDisplayEntryForKey(k, null, payload.revision)
+            if (applied && k === activeKey) activeUpdated = true
+          }
+        }
+        if (activeUpdated) {
+          syncActiveTableDisplayUi(activeKey)
+        }
+        return
+      }
+      const rawTblKey =
+        typeof payload.tableKey === 'string' && payload.tableKey.trim().length > 0
+          ? payload.tableKey
+          : payload.connectionId && payload.table
+            ? makeTableKey(payload.connectionId, payload.table, payload.schema)
+            : ''
+      const tblKey = normalizeTableKey(rawTblKey)
+      if (!tblKey) return
+      const nextRev = resolveIncomingTableDisplayRevision(payload.entry ?? null, payload.revision)
+      const prevRev = state.tableDisplayRevisionByTable[tblKey] || 0
+      if (nextRev > 0 && nextRev <= prevRev) return
+      const queue = getPanelTableDisplayQueue(tblKey)
+      if (nextRev > 0 && queue.recentSelfRevisions.has(nextRev)) {
+        state.tableDisplayRevisionByTable[tblKey] = Math.max(prevRev, nextRev)
+        return
+      }
+      if (queue.inFlight) {
+        if (areTableDisplayStateEntriesEquivalent(payload.entry ?? null, queue.inFlightSentSnapshot)) {
+          if (nextRev > 0) {
+            recordPanelSelfTableDisplayRevision(queue, nextRev)
+            state.tableDisplayRevisionByTable[tblKey] = Math.max(prevRev, nextRev)
+          }
+          return
+        }
+        if (queue.dirty || queue.pendingPatch) {
+          if (nextRev > 0) {
+            state.tableDisplayRevisionByTable[tblKey] = Math.max(prevRev, nextRev)
+          }
+          setPanelPendingRemoteRebase(queue, payload.entry ?? null, nextRev)
+          return
+        }
+      }
+      const applied = applyTableDisplayEntryForKey(tblKey, payload.entry ?? null, payload.revision)
+      if (applied) {
+        if (queue.inFlight) {
+          queue.overwrittenByRemoteWhileInFlight = true
+        }
+        syncActiveTableDisplayUi(tblKey)
+      }
+    }))
+    trackOrcaDisposable(window.orca.plugin.on('ssh.hostKeyChallenge', (challenge) => {
+      if (!isPanelActive() || !challenge || typeof challenge !== 'object') return
+      void openSharedSshHostKeyModal({
+        challenge,
+        panelId: getPanelInstanceId(),
+        connectionId:
+          activeHostKeyRetryConnId ||
+          (state.formOpen && state.editingId ? state.editingId : undefined) ||
+          state.activeConnectionId ||
+          undefined,
+        resolveDecision: resolvePanelSshHostKeyDecision,
+      })
+    }))
+    trackOrcaDisposable(window.orca.plugin.on('ssh.hostKeyResolved', (ev) => {
+      if (!ev || typeof ev !== 'object' || typeof ev.challengeId !== 'string') return
+      closeByChallengeId(ev.challengeId, ev.decision)
+    }))
   } catch {}
+}
+
+const onPanelVisibilityChange = () => {
+  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+    flushPendingSavePanelViewState()
+    savePanelDataCache()
+  }
+}
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', onPanelVisibilityChange)
+  trackOrcaDisposable(() => {
+    document.removeEventListener('visibilitychange', onPanelVisibilityChange)
+  })
 }
 
 window.addEventListener('beforeunload', () => {
@@ -4555,6 +7020,20 @@ window.addEventListener('pagehide', () => {
   closeActiveCustomDropdown()
   flushPendingSavePanelViewState()
   savePanelDataCache()
+  panelDisposed = true
+  clearUriPasteTimer()
+  connFormCtrl.clearFormImportSpotlight?.(true)
+  refreshConnectionsPending = false
+  refreshConnectionsAfterReorder = false
+  expectedSelfChangedEvents = 0
+  consumedSelfChangedEvents = 0
+  reorderSeq++
+  connReorderSeq++
+  folderReorderSeq++
+  schemaRefreshPending.clear()
+  for (const [cid, seq] of schemaLoadSeqByConn.entries()) {
+    schemaLoadSeqByConn.set(cid, seq + 1)
+  }
   cancelPendingDataAndSchemaLoads()
   if (findDebounceTimer !== null) { clearTimeout(findDebounceTimer); findDebounceTimer = null }
   if (schemaFilterDebounceTimer !== null) { clearTimeout(schemaFilterDebounceTimer); schemaFilterDebounceTimer = null }
@@ -4582,6 +7061,7 @@ window.addEventListener('pagehide', () => {
   sqlGridSel?.destroy?.()
   aiSettingsModalOpenSeq += 1
   closeExistingAiSettingsBackdrops()
+  closeAllSshHostKeyModals()
   destroySqlEditor()
   while (orcaDisposables.length > 0) {
     const d = orcaDisposables.pop()
@@ -4600,9 +7080,32 @@ function applyAiStatus(snapshot) {
 async function hydrateAiStatus() {
   try {
     const snapshot = await rpc('ai.status.get')
+    if (!isPanelActive()) return
     applyAiStatus(snapshot)
   } catch {
     // Non-blocking when worker is booting or under minimal mock
+  }
+}
+
+async function hydratePanelKeymapSettings() {
+  try {
+    const getter = window.orca?.settings?.get
+    if (typeof getter !== 'function') return
+    const [editorKeymap, shortcutRunStatement, shortcutRunAll, shortcutFormatSql] = await Promise.all([
+      Promise.resolve(getter('editorKeymap')),
+      Promise.resolve(getter('shortcutRunStatement')),
+      Promise.resolve(getter('shortcutRunAll')),
+      Promise.resolve(getter('shortcutFormatSql')),
+    ])
+    if (!isPanelActive()) return
+    const next = {}
+    if (typeof editorKeymap === 'string') next.editorKeymap = editorKeymap
+    if (typeof shortcutRunStatement === 'string') next.shortcutRunStatement = shortcutRunStatement
+    if (typeof shortcutRunAll === 'string') next.shortcutRunAll = shortcutRunAll
+    if (typeof shortcutFormatSql === 'string') next.shortcutFormatSql = shortcutFormatSql
+    sqlCtrl?.applySqlKeymapSettings?.(next)
+  } catch {
+    // Non-blocking when settings API is absent
   }
 }
 
@@ -4666,6 +7169,7 @@ async function openAiSettingsModal(initialRole) {
 
 restorePanelViewStateFromLocal()
 void hydrateAiStatus()
+void hydratePanelKeymapSettings()
 bindSelectTooltipsInRoot(document)
 syncThemeFromTokens()
 setSqlColorScheme(document.documentElement.classList.contains('light'))

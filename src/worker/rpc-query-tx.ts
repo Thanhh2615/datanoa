@@ -2,10 +2,17 @@ import type { JsonValue, OrcaWorkerApi } from 'orca/worker'
 import {
   sanitizeJsonPayload,
   type DatabaseDriverType,
+  type ParsedExplainPlan,
   type QueryHistoryEntry,
   type QueryResult,
   type QueryResultSet,
+  type TlsFailure,
 } from '../protocol'
+import { parseExplainPlan } from '../shared-explain-plan.js'
+import {
+  matchMssqlShowplanDirective,
+  splitExplainTargetStatements,
+} from '../shared-sql-core.js'
 import { detectRecognizableSqlCredential } from '../drivers/common/sql-credentials'
 import {
   compactSql,
@@ -15,9 +22,11 @@ import {
   isMutatingStatement,
   splitSqlStatements,
   stripCommentsAndLiterals,
+  stripCommentsAndLiteralsDetailed,
   stripLeadingSqlComments,
 } from '../drivers/common/sql-tools'
 import type { WorkerSchemaMetadataCache } from './ai-sql-context'
+import type { CopyImportRegistry } from './copy-import-registry'
 import {
   DEFAULT_MAX_QUERY_ROWS,
   MAX_QUERY_ROWS_CEILING,
@@ -65,6 +74,7 @@ export interface QueryTxHandlersDeps {
   tracker: QueryRuntimeTracker
   schemaCache?: WorkerSchemaMetadataCache
   txOwnership?: TxOwnershipController
+  copyImportRegistry?: CopyImportRegistry
   onHistoryChanged?: () => void
 }
 
@@ -72,15 +82,143 @@ function scrubThrownError(err: unknown): unknown {
   return scrubAndEnhanceWorkerError(err)
 }
 
+const SAFE_EXPLAIN_PAREN_OPTION_RE =
+  /^(?:VERBOSE|COSTS|SETTINGS|GENERIC_PLAN|BUFFERS|SERIALIZE|WAL|TIMING|SUMMARY|MEMORY)(?:\s+(?:TRUE|FALSE|ON|OFF|0|1))?$|^FORMAT\s+(?:TEXT|XML|JSON|YAML)$/i
+
+const SAFE_ANALYZE_FALSE_OPTION_RE = /^ANALY[ZS]E\s+(?:FALSE|OFF|0)$/i
+
+function splitTopLevelParenOptions(groupContent: string): string[] {
+  const items: string[] = []
+  let depth = 0
+  let start = 0
+  for (let i = 0; i < groupContent.length; i += 1) {
+    const ch = groupContent[i]
+    if (ch === '(') depth += 1
+    else if (ch === ')') depth = Math.max(0, depth - 1)
+    else if (ch === ',' && depth === 0) {
+      items.push(groupContent.slice(start, i))
+      start = i + 1
+    }
+  }
+  items.push(groupContent.slice(start))
+  return items
+}
+
+/**
+ * Fail-closed parser for `EXPLAIN (...)` option lists:
+ * `ANALYZE`/`ANALYSE` is treated as non-executing ONLY when followed solely by `FALSE`/`OFF`/`0`.
+ * Any unknown option, quoted token, or unclosed parenthesis fails closed to `runsStatement = true`.
+ */
+export function hasFailClosedExplainAnalyzeOption(
+  sql: string,
+  driver?: DatabaseDriverType
+): boolean {
+  if (hasExplainAnalyzeOption(sql, driver)) return true
+  const stripped = stripCommentsAndLiteralsDetailed(sql, driver, {
+    preserveMysqlExecComments: true,
+    literalPlaceholder: " '' ",
+    identPlaceholder: ' x ',
+  })
+  if (stripped.hasUnclosedQuote || stripped.hasUnclosedComment) return true
+  const clean = stripped.text.replace(/^[\s(]+/, '').trim()
+  const explainMatch = /^EXPLAIN\b/i.exec(clean)
+  if (!explainMatch) return false
+  const rest = clean.slice(explainMatch[0].length).trimStart()
+  if (!rest.startsWith('(')) return false
+  const closeIdx = findMatchingParenEnd(rest, 0)
+  if (closeIdx < 0) return true
+  const groupContent = rest.slice(1, closeIdx)
+  const items = splitTopLevelParenOptions(groupContent)
+  for (const rawItem of items) {
+    const item = rawItem.trim().replace(/\s+/g, ' ')
+    if (!item) return true
+    if (/^ANALY[ZS]E\b/i.test(item)) {
+      if (!SAFE_ANALYZE_FALSE_OPTION_RE.test(item)) {
+        return true
+      }
+      continue
+    }
+    if (!SAFE_EXPLAIN_PAREN_OPTION_RE.test(item)) {
+      return true
+    }
+  }
+  return false
+}
+
+function buildParsedExplainPlan(
+  res: { columns: { name: string; type: string }[]; rows: unknown[][]; rawText?: string; explainPlan?: ParsedExplainPlan },
+  driver: DatabaseDriverType
+): ParsedExplainPlan {
+  if (res.explainPlan) return res.explainPlan
+  if (typeof res.rawText === 'string' && res.rawText.trim().length > 0) {
+    return parseExplainPlan(res.rawText, { dialect: driver })
+  }
+  const singleCell = res.rows.length === 1 && res.rows[0]?.length === 1 ? res.rows[0][0] : null
+  if (singleCell !== null && singleCell !== undefined) {
+    return parseExplainPlan(singleCell, { dialect: driver })
+  }
+  return parseExplainPlan({ columns: res.columns, rows: res.rows }, { dialect: driver })
+}
+
 async function executeSingleExplainPlan(
   tracker: QueryRuntimeTracker,
   session: IDatabaseSession,
   driver: DatabaseDriverType,
   queryId: string,
+  rawStmt: string,
   explainSql: string,
   timeoutSeconds: number,
   signal: AbortSignal
 ): Promise<QueryResult> {
+  if (typeof session.runExplain === 'function') {
+    if (signal.aborted || tracker.consumePreCancelledQuery(queryId)) {
+      throw createHostError('cancelled', 'Explain execution was cancelled')
+    }
+    const timeoutController = new AbortController()
+    const onParentAbort = () => timeoutController.abort()
+    if (signal.aborted) {
+      timeoutController.abort()
+    } else {
+      signal.addEventListener('abort', onParentAbort, { once: true })
+    }
+    const timeoutMs = Math.max(100, Math.round(timeoutSeconds * 1000))
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      timeoutController.abort()
+    }, timeoutMs)
+    const startedAt = performance.now()
+    tracker.activeQuerySessions.set(queryId, session)
+    try {
+      const driverRes = await session.runExplain(rawStmt, timeoutController.signal)
+      if (driverRes !== null) {
+        const executionTimeMs =
+          typeof driverRes.executionTimeMs === 'number'
+            ? driverRes.executionTimeMs
+            : Math.round(performance.now() - startedAt)
+        const explainPlan = buildParsedExplainPlan(driverRes, driver)
+        return {
+          columns: driverRes.columns,
+          rows: driverRes.rows,
+          rowCount: driverRes.rows.length,
+          executionTimeMs,
+          truncated: false,
+          isSelect: true,
+          explainPlan,
+        }
+      }
+    } catch (err: unknown) {
+      if (timedOut) {
+        throw createHostError('timeout', `Query timed out after ${timeoutSeconds}s`)
+      }
+      throw err
+    } finally {
+      tracker.activeQuerySessions.delete(queryId)
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onParentAbort)
+    }
+  }
+
   const res = await executeSessionQuery(
     tracker,
     session,
@@ -103,13 +241,20 @@ async function executeSingleExplainPlan(
       timeoutSeconds,
       signal
     )
-    return {
+    const mergedRes: QueryResult = {
       ...xplanRes,
       executionTimeMs: (res.executionTimeMs || 0) + (xplanRes.executionTimeMs || 0),
       isSelect: true,
     }
+    return {
+      ...mergedRes,
+      explainPlan: buildParsedExplainPlan(mergedRes, driver),
+    }
   }
-  return res
+  return {
+    ...res,
+    explainPlan: buildParsedExplainPlan(res, driver),
+  }
 }
 
 export interface ExplainPlanItem {
@@ -524,12 +669,18 @@ export function buildExplainPlanForStatement(
   }
 
   const leadingStripped = stripLeadingSqlComments(sqlBody, driver)
-  if (hasExplainAnalyzeOption(sqlBody, driver) && isExplainTargetMutating(sqlBody, driver)) {
-    throw createHostError(
-      'not_permitted',
-      'EXPLAIN ANALYZE is not permitted for mutating statements in Explain mode.'
-    )
+  const checkPostWrapExplainSafety = (wrappedExplainSql: string): void => {
+    if (
+      hasFailClosedExplainAnalyzeOption(wrappedExplainSql, driver) &&
+      isExplainTargetMutating(wrappedExplainSql, driver)
+    ) {
+      throw createHostError(
+        'not_permitted',
+        'EXPLAIN ANALYZE is not permitted for mutating statements in Explain mode.'
+      )
+    }
   }
+  checkPostWrapExplainSafety(sqlBody)
 
   if (driver === 'mssql') {
     const batches = splitMssqlBatches(sqlBody)
@@ -539,24 +690,14 @@ export function buildExplainPlanForStatement(
     }
     // Strictly allow a 3-batch already-wrapped envelope:
     // [SET SHOWPLAN_(ALL|TEXT|XML) ON, <single inner statement>, SET SHOWPLAN_(ALL|TEXT|XML) OFF]
-    const showplanOnRe = /^SET\s+(SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+ON\s*;?$/i
-    const showplanOffRe = /^SET\s+(SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+OFF\s*;?$/i
-    const firstLead = stripLeadingSqlComments(checkBatches[0] ?? '', 'mssql')
-      .replace(/;+\s*$/, '')
-      .trim()
-    const onMatch = showplanOnRe.exec(firstLead)
-    if (onMatch) {
-      const mode = onMatch[1].toUpperCase()
+    const onMode = matchMssqlShowplanDirective(checkBatches[0] ?? '', 'ON')
+    if (onMode) {
       if (checkBatches.length === 3) {
         const innerBatch = checkBatches[1]
-        const lastLead = stripLeadingSqlComments(checkBatches[2] ?? '', 'mssql')
-          .replace(/;+\s*$/, '')
-          .trim()
-        const offMatch = showplanOffRe.exec(lastLead)
+        const offMode = matchMssqlShowplanDirective(checkBatches[2] ?? '', 'OFF')
         const cleanInner = stripCommentsAndLiterals(innerBatch, 'mssql')
         if (
-          offMatch &&
-          offMatch[1].toUpperCase() === mode &&
+          offMode === onMode &&
           splitSqlStatements(innerBatch, 'mssql').length === 1 &&
           !hasStandaloneBatchGo(innerBatch) &&
           !/\bSET\s+(?:SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+(?:ON|OFF)\b/i.test(cleanInner) &&
@@ -619,6 +760,8 @@ export function buildExplainPlanForStatement(
       ? `EXPLAIN QUERY PLAN ${sqlBody}`
       : `EXPLAIN ${sqlBody}`
 
+  checkPostWrapExplainSafety(explainSql)
+
   if (readOnly && isMutatingStatement(explainSql, driver)) {
     throw createHostError('not_permitted', READ_ONLY_MUTATION_ERROR)
   }
@@ -632,12 +775,14 @@ export function registerQueryAndTxHandlers({
   tracker,
   schemaCache,
   txOwnership,
+  copyImportRegistry,
   onHistoryChanged,
 }: QueryTxHandlersDeps): void {
   const historyQueue = createSerializedQueue()
   const savedQueriesQueue = createSerializedQueue()
   const isLiveDesktopHost = Boolean(orca.host && typeof orca.host.call === 'function')
   const tx = txOwnership ?? new TxOwnershipController()
+  const activeExplainControllers = new Map<string, AbortController>()
 
   const readSessionTxState = (session: IDatabaseSession) =>
     typeof session.getTransactionState === 'function'
@@ -809,6 +954,7 @@ export function registerQueryAndTxHandlers({
     } catch (err: unknown) {
       throw scrubThrownError(err)
     }
+    copyImportRegistry?.assertNoActiveImport(input.connectionId)
     if (signal.aborted || tracker.consumePreCancelledQuery(queryId)) {
       throw createHostError('cancelled', 'Query execution was cancelled')
     }
@@ -820,6 +966,12 @@ export function registerQueryAndTxHandlers({
     )
 
     const startedAt = Date.now()
+    const historySql =
+      typeof input.templateSql === 'string' && input.templateSql.trim().length > 0
+        ? input.templateSql.trim()
+        : typeof input.historySql === 'string' && input.historySql.trim().length > 0
+          ? input.historySql.trim()
+          : trimmed
     let executionStarted = false
     try {
       let ranSerialized = false
@@ -892,13 +1044,40 @@ export function registerQueryAndTxHandlers({
         }
       }
 
+      if (historySql !== trimmed && Array.isArray(res.resultSets) && res.resultSets.length > 0) {
+        const tmplStmts =
+          res.resultSets.length > 1 ? splitSqlStatements(historySql, profile.driver).map((s) => s.text) : [historySql]
+        res = {
+          ...res,
+          resultSets: res.resultSets.map((rs, idx) => {
+            const tmpl =
+              res.resultSets && res.resultSets.length === 1
+                ? historySql
+                : tmplStmts.length === res.resultSets?.length
+                  ? tmplStmts[idx]
+                  : undefined
+            if (!tmpl) {
+              const copy = { ...rs }
+              delete copy.sql
+              delete copy.sqlPreview
+              return copy
+            }
+            return {
+              ...rs,
+              sql: tmpl,
+              sqlPreview: compactSql(tmpl),
+            }
+          }),
+        }
+      }
+
       await recordQueryHistory({
         id: queryId,
         timestamp: Date.now(),
         connectionId: profile.id,
         connectionName: profile.name,
         driver: profile.driver,
-        sql: trimmed,
+        sql: historySql,
         durationMs:
           typeof res.executionTimeMs === 'number' ? res.executionTimeMs : Date.now() - startedAt,
         rowCount: typeof res.rowCount === 'number' ? res.rowCount : 0,
@@ -923,7 +1102,7 @@ export function registerQueryAndTxHandlers({
         connectionId: profile.id,
         connectionName: profile.name,
         driver: profile.driver,
-        sql: trimmed,
+        sql: historySql,
         durationMs: executionTimeMs,
         rowCount: 0,
         isError: true,
@@ -955,6 +1134,12 @@ export function registerQueryAndTxHandlers({
               : scrubbed && typeof scrubbed === 'object' && 'message' in scrubbed
                 ? String((scrubbed as { message?: unknown }).message ?? errorMessage)
                 : errorMessage
+          const tlsFailure =
+            scrubbed && typeof scrubbed === 'object' && 'tlsFailure' in scrubbed
+              ? ((scrubbed as { tlsFailure?: TlsFailure }).tlsFailure)
+              : err && typeof err === 'object' && 'tlsFailure' in err
+                ? ((err as { tlsFailure?: TlsFailure }).tlsFailure)
+                : undefined
           return {
             isSelect: false,
             columns: [],
@@ -970,6 +1155,7 @@ export function registerQueryAndTxHandlers({
               ...(stmtMeta.statementCount !== undefined
                 ? { statementCount: stmtMeta.statementCount }
                 : {}),
+              ...(tlsFailure !== undefined ? { tlsFailure } : {}),
             },
           }
         }
@@ -1037,6 +1223,8 @@ export function registerQueryAndTxHandlers({
         throw createHostError('invalid_params', 'EXPLAIN PLAN does not support PL/SQL blocks')
       }
       explainStmts = oracleChunks
+    } else if (profile.driver === 'mssql') {
+      explainStmts = splitExplainTargetStatements(trimmed, profile.driver).map((text) => ({ text }))
     } else {
       explainStmts = splitSqlStatements(trimmed, profile.driver)
     }
@@ -1069,6 +1257,30 @@ export function registerQueryAndTxHandlers({
     }
 
     const panelId = tx.getPanelId(ctx)
+    const explainController = new AbortController()
+    const onExplainParentAbort = (): void => explainController.abort()
+    if (signal.aborted) {
+      explainController.abort()
+    } else {
+      signal.addEventListener('abort', onExplainParentAbort, { once: true })
+    }
+    activeExplainControllers.set(explainQueryId, explainController)
+    const batchDeadlineMs = Date.now() + Math.max(100, Math.round(timeoutSeconds * 1000))
+    const remainingTimeoutSeconds = (): number => {
+      const remMs = batchDeadlineMs - Date.now()
+      if (remMs <= 0) {
+        throw createHostError('timeout', `Query timed out after ${timeoutSeconds}s`)
+      }
+      return Math.max(0.1, remMs / 1000)
+    }
+
+    const templateRaw =
+      typeof input.templateSql === 'string' && input.templateSql.trim().length > 0
+        ? input.templateSql.trim()
+        : typeof input.historySql === 'string' && input.historySql.trim().length > 0
+          ? input.historySql.trim()
+          : undefined
+
     const executeExplainPlans = async (): Promise<QueryResult> => {
       if (explainPlans.length === 1) {
         return await executeSingleExplainPlan(
@@ -1076,17 +1288,20 @@ export function registerQueryAndTxHandlers({
           session,
           profile.driver,
           explainQueryId,
+          explainPlans[0].rawStmt,
           explainPlans[0].explainSql,
-          timeoutSeconds,
-          signal
+          remainingTimeoutSeconds(),
+          explainController.signal
         )
       }
 
       const totalStart = performance.now()
       const collectedSets: QueryResultSet[] = []
       let lastPlanResult: QueryResult | null = null
+      const templateStmts =
+        templateRaw !== undefined ? splitSqlStatements(templateRaw, profile.driver).map((s) => s.text) : null
       for (let i = 0; i < explainPlans.length; i++) {
-        if (signal.aborted || tracker.consumePreCancelledQuery(explainQueryId)) {
+        if (explainController.signal.aborted || tracker.consumePreCancelledQuery(explainQueryId)) {
           throw createHostError('cancelled', 'Explain execution was cancelled')
         }
         const plan = explainPlans[i]
@@ -1096,22 +1311,29 @@ export function registerQueryAndTxHandlers({
           session,
           profile.driver,
           explainQueryId,
+          plan.rawStmt,
           plan.explainSql,
-          timeoutSeconds,
-          signal
+          remainingTimeoutSeconds(),
+          explainController.signal
         )
         const stmtMs = Math.round(performance.now() - stmtStart)
         lastPlanResult = res
+        const displayStmt =
+          templateStmts && templateStmts.length === explainPlans.length
+            ? templateStmts[i]
+            : templateRaw
+              ? undefined
+              : plan.rawStmt
         collectedSets.push({
           index: i,
-          sqlPreview: compactSql(plan.rawStmt),
-          sql: plan.rawStmt,
+          ...(displayStmt !== undefined ? { sqlPreview: compactSql(displayStmt), sql: displayStmt } : {}),
           executionTimeMs: stmtMs,
           columns: res.columns,
           rows: res.rows,
           rowCount: res.rowCount,
           truncated: res.truncated,
           isSelect: true,
+          ...(res.explainPlan ? { explainPlan: res.explainPlan } : {}),
         })
       }
 
@@ -1123,6 +1345,7 @@ export function registerQueryAndTxHandlers({
         executionTimeMs: totalMs,
         truncated: Boolean(lastPlanResult?.truncated),
         isSelect: true,
+        ...(lastPlanResult?.explainPlan ? { explainPlan: lastPlanResult.explainPlan } : {}),
         resultSets: collectedSets,
       }
     }
@@ -1159,6 +1382,11 @@ export function registerQueryAndTxHandlers({
       return await executeExplainPlans()
     } catch (err: unknown) {
       throw scrubThrownError(err)
+    } finally {
+      if (activeExplainControllers.get(explainQueryId) === explainController) {
+        activeExplainControllers.delete(explainQueryId)
+      }
+      signal.removeEventListener('abort', onExplainParentAbort)
     }
   })
 
@@ -1280,11 +1508,17 @@ export function registerQueryAndTxHandlers({
       throw createHostError('invalid_params', 'queryId parameter is required')
     }
 
+    const explainController = activeExplainControllers.get(input.queryId)
+    if (explainController) {
+      explainController.abort()
+      activeExplainControllers.delete(input.queryId)
+    }
+
     const activeSession = tracker.activeQuerySessions.get(input.queryId)
     if (activeSession) {
       await activeSession.cancelQuery(input.queryId).catch(() => {})
       tracker.activeQuerySessions.delete(input.queryId)
-    } else {
+    } else if (!explainController) {
       tracker.markQueryPreCancelled(input.queryId)
       for (const s of sessionManager.getActiveSessions().values()) {
         try {
@@ -1360,6 +1594,7 @@ export function registerQueryAndTxHandlers({
     }
     const connId = input.connectionId
     const panelId = tx.requirePanelId(ctx)
+    copyImportRegistry?.assertNoActiveImport(connId)
     return await tx.withLock(connId, async () => {
       await assertMutableConnection(sessionManager, connId)
       const session = await sessionManager.getSession(connId)
@@ -1381,6 +1616,7 @@ export function registerQueryAndTxHandlers({
     }
     const connId = input.connectionId
     const panelId = input.onlyIfOwner === true ? tx.getPanelId(ctx) : tx.requirePanelId(ctx)
+    copyImportRegistry?.assertNoActiveImport(connId)
     return await tx.withLock(connId, async () => {
       await assertMutableConnection(sessionManager, connId)
       const session = await sessionManager.getSession(connId)

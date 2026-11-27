@@ -255,54 +255,85 @@ export function parseOptionalInt(raw: string | undefined): number | null {
   return Number.isFinite(num) ? num : null
 }
 
-export function copyTextToClipboard(text: string): boolean {
+function execCommandCopyFallback(text: string): boolean {
   let copied = false
   if (typeof document !== 'undefined' && document.body) {
-    const prevActive =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.setAttribute('readonly', '')
-    ta.style.position = 'fixed'
-    ta.style.top = '-9999px'
-    ta.style.left = '-9999px'
-    ta.style.width = '1px'
-    ta.style.height = '1px'
-    ta.style.opacity = '0'
-    ta.style.pointerEvents = 'none'
-    document.body.appendChild(ta)
     try {
-      ta.focus({ preventScroll: true })
-    } catch {
-      ta.focus()
-    }
-    ta.select()
-    try {
-      if (typeof ta.setSelectionRange === 'function') {
-        ta.setSelectionRange(0, text.length)
-      }
-    } catch {
-      // Ignore in minimal test DOM
-    }
-    try {
-      if (typeof document.execCommand === 'function') {
-        copied = Boolean(document.execCommand('copy'))
-      }
-    } catch {
-      // Ignore fallback failure
-    }
-    ta.remove()
-    if (prevActive && typeof prevActive.focus === 'function') {
+      const prevActive =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.setAttribute('readonly', '')
+      ta.style.position = 'fixed'
+      ta.style.top = '-9999px'
+      ta.style.left = '-9999px'
+      ta.style.width = '1px'
+      ta.style.height = '1px'
+      ta.style.opacity = '0'
+      ta.style.pointerEvents = 'none'
+      document.body.appendChild(ta)
       try {
-        prevActive.focus({ preventScroll: true })
+        ta.focus({ preventScroll: true })
       } catch {
-        prevActive.focus()
+        ta.focus()
       }
+      ta.select()
+      try {
+        if (typeof ta.setSelectionRange === 'function') {
+          ta.setSelectionRange(0, text.length)
+        }
+      } catch {
+        // Ignore in minimal test DOM
+      }
+      try {
+        if (typeof document.execCommand === 'function') {
+          copied = Boolean(document.execCommand('copy'))
+        }
+      } catch {
+        // Ignore fallback failure
+      }
+      ta.remove()
+      if (prevActive && typeof prevActive.focus === 'function') {
+        try {
+          prevActive.focus({ preventScroll: true })
+        } catch {
+          prevActive.focus()
+        }
+      }
+    } catch {
+      return false
     }
-  }
-  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-    void Promise.resolve(navigator.clipboard.writeText(text)).catch(() => {})
-    copied = true
   }
   return copied
+}
+
+export function copyTextToClipboard(text: string): boolean {
+  if (typeof navigator !== 'undefined' && typeof navigator.clipboard?.writeText === 'function') {
+    try {
+      void Promise.resolve(navigator.clipboard.writeText(text)).catch(() => {
+        execCommandCopyFallback(text)
+      })
+      return true
+    } catch {
+      return execCommandCopyFallback(text)
+    }
+  }
+  return execCommandCopyFallback(text)
+}
+
+/**
+ * Runs synchronous `execCommand('copy')` during user activation before awaiting
+ * Clipboard API (`navigator.clipboard.writeText`), returning true if either succeeds.
+ */
+export async function copyTextToClipboardAsync(text: string): Promise<boolean> {
+  const syncCopied = execCommandCopyFallback(text)
+  if (typeof navigator !== 'undefined' && typeof navigator.clipboard?.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // Preserve synchronous activation copy success if async Clipboard API rejects
+    }
+  }
+  return syncCopied
 }

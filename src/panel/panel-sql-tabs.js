@@ -3,6 +3,7 @@
 // and grouped schema-table dropdown value helpers.
 
 import { findStatementAtCaret } from './panel-core.js'
+import { isSqlClauseColumnContext } from '../shared-sql-core.js'
 
 const MAX_PANEL_CONSOLE_TABS = 20
 const MAX_PANEL_CONSOLE_SQL_LEN = 50000
@@ -630,7 +631,17 @@ export function computePanelSqlCompletions(
     prevToken === 'TABLE' ||
     prevToken === 'DESCRIBE'
 
-  if (!word && !isTableContext && !explicit) {
+  const hasSchemaColumns = Object.values(safeSchema).some(
+    (cols) => Array.isArray(cols) && cols.length > 0
+  )
+  const isClauseColContext =
+    !word &&
+    !isTableContext &&
+    !explicit &&
+    hasSchemaColumns &&
+    isSqlClauseColumnContext(before, dialect)
+
+  if (!word && !isTableContext && !isClauseColContext && !explicit) {
     return null
   }
 

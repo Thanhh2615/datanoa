@@ -1,3 +1,4 @@
+import * as crypto from 'node:crypto'
 import oracledb, {
   BLOB,
   CLOB,
@@ -11,6 +12,7 @@ import type {
   ConnectionProfile,
   QueryResult,
   QueryResultSet,
+  SchemaErGraph,
   SchemaObject,
   SchemaObjectKind,
   TableBrowseResult,
@@ -18,6 +20,14 @@ import type {
   TransactionState,
 } from '../../protocol'
 import { sanitizeJsonPayload } from '../../protocol'
+import { parseExplainPlan } from '../../shared-explain-plan.js'
+import {
+  buildSchemaErGraphFromCatalogRows,
+  type RawErColumnRow,
+  type RawErForeignKeyRow,
+  type RawErTableRow,
+  type RawErUniqueSetRow,
+} from '../common/schema-er-graph'
 import {
   DatabaseDriverError,
   areChunksAlignedWithSqlSlices,
@@ -26,6 +36,7 @@ import {
   runDriverConnectionTest,
   type ApplyChangesParams,
   type ApplyChangesResult,
+  type ExplainResult,
   type FetchPageParams,
   type IDatabaseDriver,
   type IDatabaseSession,
@@ -49,7 +60,10 @@ import {
 import {
   compactSql,
   containsDdlStatement,
+  hasExplainAnalyzeOption,
+  isExplainTargetMutating,
   isMutatingStatement,
+  quoteIdentForDialect,
   splitSqlStatements,
   stripCommentsAndLiterals,
   stripLeadingSqlComments,
@@ -107,6 +121,7 @@ export interface OracleBuiltConfig {
   currentSchema?: string
   usedDatabaseAsService: boolean
   defaultSchema: string
+  tlsServername?: string
 }
 
 interface OracleLobLike {
@@ -360,6 +375,364 @@ function isValidOracleServerCertDn(value: string): boolean {
   return parts.every((rdn) => rdn.length > 0 && /^[A-Za-z][A-Za-z0-9.-]*\s*=\s*.+$/.test(rdn))
 }
 
+function getOracleFieldValue(row: Record<string, unknown>, key: string): unknown {
+  if (key in row) return row[key]
+  const upper = key.toUpperCase()
+  if (upper in row) return row[upper]
+  const lower = key.toLowerCase()
+  if (lower in row) return row[lower]
+  return undefined
+}
+
+function getOracleFieldString(row: Record<string, unknown>, key: string): string {
+  const val = getOracleFieldValue(row, key)
+  return val === null || val === undefined ? '' : String(val).trim()
+}
+
+function formatOracleErColumnType(row: Record<string, unknown>): string {
+  const explicitType = getOracleFieldString(row, 'type')
+  if (explicitType) return explicitType
+  const baseRaw = getOracleFieldString(row, 'data_type') || 'VARCHAR2'
+  const baseUpper = baseRaw.toUpperCase()
+  const dataLength = Number(getOracleFieldValue(row, 'data_length') ?? 0)
+  const charLength = Number(getOracleFieldValue(row, 'char_length') ?? 0)
+  const charUsed = getOracleFieldString(row, 'char_used').toUpperCase()
+  const rawPrecision = getOracleFieldValue(row, 'data_precision')
+  const rawScale = getOracleFieldValue(row, 'data_scale')
+  const hasPrecision = rawPrecision !== null && rawPrecision !== undefined && rawPrecision !== ''
+  const hasScale = rawScale !== null && rawScale !== undefined && rawScale !== ''
+  const precision = hasPrecision ? Number(rawPrecision) : NaN
+  const scale = hasScale ? Number(rawScale) : NaN
+
+  if (baseUpper === 'NUMBER') {
+    if (Number.isFinite(precision) && precision > 0) {
+      if (Number.isFinite(scale) && scale !== 0) {
+        return `NUMBER(${precision},${scale})`
+      }
+      return `NUMBER(${precision})`
+    }
+    return 'NUMBER'
+  }
+  if (
+    baseUpper === 'VARCHAR2' ||
+    baseUpper === 'NVARCHAR2' ||
+    baseUpper === 'CHAR' ||
+    baseUpper === 'NCHAR'
+  ) {
+    const len = Number.isFinite(charLength) && charLength > 0 ? charLength : dataLength
+    if (Number.isFinite(len) && len > 0) {
+      const unitSuffix =
+        charUsed === 'C' && (baseUpper === 'VARCHAR2' || baseUpper === 'CHAR') ? ' CHAR' : ''
+      return `${baseRaw}(${len}${unitSuffix})`
+    }
+    return baseRaw
+  }
+  if (baseUpper === 'RAW' && Number.isFinite(dataLength) && dataLength > 0) {
+    return `RAW(${dataLength})`
+  }
+  if (baseUpper === 'FLOAT' && Number.isFinite(precision) && precision > 0 && precision !== 126) {
+    return `FLOAT(${precision})`
+  }
+  return baseRaw
+}
+
+function buildOraclePlanTableSelectSql(quotedTableName = 'PLAN_TABLE'): string {
+  return `SELECT
+  ID, PARENT_ID, DEPTH, POSITION, OPERATION, OPTIONS,
+  OBJECT_OWNER, OBJECT_NAME, OBJECT_ALIAS, OBJECT_TYPE,
+  OPTIMIZER, COST, CARDINALITY, BYTES, CPU_COST, IO_COST,
+  TEMP_SPACE, ACCESS_PREDICATES, FILTER_PREDICATES, QBLOCK_NAME
+FROM ${quotedTableName}
+WHERE STATEMENT_ID = :p1
+  AND PLAN_ID = (SELECT MAX(PLAN_ID) FROM ${quotedTableName} WHERE STATEMENT_ID = :p1)
+ORDER BY ID ASC`
+}
+
+function buildOracleMaxPlanIdSelectSql(quotedTableName = 'PLAN_TABLE'): string {
+  return `SELECT MAX(PLAN_ID) AS "plan_id" FROM ${quotedTableName} WHERE STATEMENT_ID = :p1`
+}
+
+const ORACLE_PLAN_TABLE_SELECT_SQL = buildOraclePlanTableSelectSql()
+const ORACLE_MAX_PLAN_ID_SELECT_SQL = buildOracleMaxPlanIdSelectSql()
+
+function generateOracleExplainStatementId(): string {
+  return `DN${crypto.randomBytes(14).toString('hex')}`
+}
+
+function buildOracleExplainSavepointName(): string {
+  return `datanoa_explain_${crypto.randomBytes(6).toString('hex')}`
+}
+
+function escapeOracleSqlLiteral(value: string): string {
+  return value.replace(/'/g, "''")
+}
+
+function validateOracleExplainStatementId(raw: string): string {
+  if (
+    raw.length === 0 ||
+    Buffer.byteLength(raw, 'utf8') > 30 ||
+    raw.includes('\0') ||
+    /[\r\n]/.test(raw)
+  ) {
+    throw new DatabaseDriverError(
+      'Oracle EXPLAIN PLAN STATEMENT_ID must be 1 to 30 bytes without NUL or newline characters',
+      'invalid_params',
+      'oracle'
+    )
+  }
+  return raw
+}
+
+function parseCapturedOraclePlanId(res: OracleResultLike | null | undefined): string | null {
+  const firstRow = Array.isArray(res?.rows) ? res.rows[0] : undefined
+  const raw = Array.isArray(firstRow)
+    ? firstRow[0]
+    : firstRow && typeof firstRow === 'object'
+      ? getOracleFieldValue(firstRow as Record<string, unknown>, 'plan_id') ??
+        Object.values(firstRow as Record<string, unknown>)[0]
+      : undefined
+  if (raw === null || raw === undefined) return null
+  const str = String(raw).trim()
+  return /^\d+$/.test(str) ? str : null
+}
+
+function buildOracleExplainDisplaySql(
+  quotedPlanTable: string | null,
+  statementId: string,
+  capturedPlanId: string | null
+): string {
+  const tableArg = quotedPlanTable ? `'${escapeOracleSqlLiteral(quotedPlanTable)}'` : 'NULL'
+  const stmtArg = `'${escapeOracleSqlLiteral(statementId)}'`
+  if (capturedPlanId !== null) {
+    return `SELECT PLAN_TABLE_OUTPUT FROM TABLE(DBMS_XPLAN.DISPLAY(${tableArg}, ${stmtArg}, 'TYPICAL', 'PLAN_ID = ${capturedPlanId}'))`
+  }
+  return `SELECT PLAN_TABLE_OUTPUT FROM TABLE(DBMS_XPLAN.DISPLAY(${tableArg}, ${stmtArg}))`
+}
+
+type OracleExplainHeaderToken =
+  | { kind: 'word'; value: string; upper: string; start: number; end: number }
+  | { kind: 'qident'; value: string; start: number; end: number }
+  | { kind: 'str'; value: string; start: number; end: number }
+  | { kind: 'punct'; value: string; start: number; end: number }
+
+interface ParsedOraclePlanTableSpec {
+  schema?: string
+  table: string
+}
+
+type ParsedOracleExplainHeader =
+  | { isExplainPlan: false }
+  | {
+      isExplainPlan: true
+      rawStatementId?: string
+      planTable?: ParsedOraclePlanTableSpec
+      afterForSql: string
+    }
+
+const ORACLE_UNQUOTED_IDENT_RE = /^[A-Za-z][A-Za-z0-9_$#]{0,127}$/
+
+function readNextOracleHeaderToken(sql: string, pos: number): { token: OracleExplainHeaderToken | null; nextPos: number } {
+  const len = sql.length
+  let i = pos
+
+  while (i < len) {
+    const ch = sql[i]
+    if (/\s/.test(ch)) {
+      i += 1
+      continue
+    }
+    if (ch === '-' && i + 1 < len && sql[i + 1] === '-') {
+      i += 2
+      while (i < len && sql[i] !== '\n') i += 1
+      continue
+    }
+    if (ch === '/' && i + 1 < len && sql[i + 1] === '*') {
+      const closeIdx = sql.indexOf('*/', i + 2)
+      if (closeIdx < 0) {
+        throw new DatabaseDriverError('Unclosed block comment in EXPLAIN PLAN header', 'invalid_params', 'oracle')
+      }
+      i = closeIdx + 2
+      continue
+    }
+    break
+  }
+
+  if (i >= len) {
+    return { token: null, nextPos: i }
+  }
+
+  const start = i
+  const ch = sql[i]
+
+  if (ch === '"') {
+    i += 1
+    let val = ''
+    let closed = false
+    while (i < len) {
+      if (sql[i] === '"') {
+        if (i + 1 < len && sql[i + 1] === '"') {
+          val += '"'
+          i += 2
+          continue
+        }
+        closed = true
+        i += 1
+        break
+      }
+      val += sql[i]
+      i += 1
+    }
+    if (!closed) {
+      throw new DatabaseDriverError('Unclosed quoted identifier in EXPLAIN PLAN header', 'invalid_params', 'oracle')
+    }
+    return { token: { kind: 'qident', value: val, start, end: i }, nextPos: i }
+  }
+
+  if (ch === "'") {
+    i += 1
+    let val = ''
+    let closed = false
+    while (i < len) {
+      if (sql[i] === "'") {
+        if (i + 1 < len && sql[i + 1] === "'") {
+          val += "'"
+          i += 2
+          continue
+        }
+        closed = true
+        i += 1
+        break
+      }
+      val += sql[i]
+      i += 1
+    }
+    if (!closed) {
+      throw new DatabaseDriverError('Unclosed string literal in EXPLAIN PLAN header', 'invalid_params', 'oracle')
+    }
+    return { token: { kind: 'str', value: val, start, end: i }, nextPos: i }
+  }
+
+  if (/[A-Za-z]/.test(ch)) {
+    i += 1
+    while (i < len && /[A-Za-z0-9_$#]/.test(sql[i])) i += 1
+    const raw = sql.slice(start, i)
+    return { token: { kind: 'word', value: raw, upper: raw.toUpperCase(), start, end: i }, nextPos: i }
+  }
+
+  return { token: { kind: 'punct', value: ch, start, end: i + 1 }, nextPos: i + 1 }
+}
+
+function parseOracleHeaderIdent(token: OracleExplainHeaderToken | null, label: string): string {
+  if (!token) {
+    throw new DatabaseDriverError(`Expected ${label} in EXPLAIN PLAN INTO clause`, 'invalid_params', 'oracle')
+  }
+  if (token.kind === 'word') {
+    if (!ORACLE_UNQUOTED_IDENT_RE.test(token.value)) {
+      throw new DatabaseDriverError(`Invalid ${label} in EXPLAIN PLAN INTO clause`, 'invalid_params', 'oracle')
+    }
+    return token.upper
+  }
+  if (token.kind === 'qident') {
+    if (token.value.length === 0 || token.value.length > 128 || token.value.includes('\0')) {
+      throw new DatabaseDriverError(`Invalid quoted ${label} in EXPLAIN PLAN INTO clause`, 'invalid_params', 'oracle')
+    }
+    return token.value
+  }
+  throw new DatabaseDriverError(`Invalid ${label} in EXPLAIN PLAN INTO clause`, 'invalid_params', 'oracle')
+}
+
+function parseOracleExplainPlanHeader(sql: string): ParsedOracleExplainHeader {
+  const t1 = readNextOracleHeaderToken(sql, 0)
+  if (!t1.token || t1.token.kind !== 'word' || t1.token.upper !== 'EXPLAIN') {
+    return { isExplainPlan: false }
+  }
+  const t2 = readNextOracleHeaderToken(sql, t1.nextPos)
+  if (!t2.token || t2.token.kind !== 'word' || t2.token.upper !== 'PLAN') {
+    return { isExplainPlan: false }
+  }
+
+  let pos = t2.nextPos
+  let rawStatementId: string | undefined
+  let planTable: ParsedOraclePlanTableSpec | undefined
+  let sawSet = false
+  let sawInto = false
+
+  while (true) {
+    const step = readNextOracleHeaderToken(sql, pos)
+    const tok = step.token
+    if (!tok) {
+      throw new DatabaseDriverError('EXPLAIN PLAN statement is missing FOR clause', 'invalid_params', 'oracle')
+    }
+
+    if (tok.kind === 'word' && tok.upper === 'FOR') {
+      const afterForSql = sql.slice(tok.end)
+      if (!afterForSql.trim()) {
+        throw new DatabaseDriverError('EXPLAIN PLAN statement is missing SQL after FOR', 'invalid_params', 'oracle')
+      }
+      return {
+        isExplainPlan: true,
+        ...(rawStatementId !== undefined ? { rawStatementId } : {}),
+        ...(planTable ? { planTable } : {}),
+        afterForSql,
+      }
+    }
+
+    if (tok.kind === 'word' && tok.upper === 'SET') {
+      if (sawSet) {
+        throw new DatabaseDriverError('Duplicate SET STATEMENT_ID clause in EXPLAIN PLAN', 'invalid_params', 'oracle')
+      }
+      const keyTok = readNextOracleHeaderToken(sql, step.nextPos)
+      const eqTok = readNextOracleHeaderToken(sql, keyTok.nextPos)
+      const valTok = readNextOracleHeaderToken(sql, eqTok.nextPos)
+      if (
+        keyTok.token?.kind !== 'word' ||
+        keyTok.token.upper !== 'STATEMENT_ID' ||
+        eqTok.token?.kind !== 'punct' ||
+        eqTok.token.value !== '=' ||
+        valTok.token?.kind !== 'str'
+      ) {
+        throw new DatabaseDriverError('Invalid SET STATEMENT_ID clause in EXPLAIN PLAN', 'invalid_params', 'oracle')
+      }
+      sawSet = true
+      rawStatementId = valTok.token.value
+      pos = valTok.nextPos
+      continue
+    }
+
+    if (tok.kind === 'word' && tok.upper === 'INTO') {
+      if (sawInto) {
+        throw new DatabaseDriverError('Duplicate INTO clause in EXPLAIN PLAN', 'invalid_params', 'oracle')
+      }
+      const firstStep = readNextOracleHeaderToken(sql, step.nextPos)
+      const firstIdent = parseOracleHeaderIdent(firstStep.token, 'plan table identifier')
+      const peekStep = readNextOracleHeaderToken(sql, firstStep.nextPos)
+      if (peekStep.token?.kind === 'punct' && peekStep.token.value === '.') {
+        const secondStep = readNextOracleHeaderToken(sql, peekStep.nextPos)
+        const tableIdent = parseOracleHeaderIdent(secondStep.token, 'plan table identifier')
+        planTable = { schema: firstIdent, table: tableIdent }
+        pos = secondStep.nextPos
+      } else {
+        planTable = { table: firstIdent }
+        pos = firstStep.nextPos
+      }
+      sawInto = true
+      continue
+    }
+
+    throw new DatabaseDriverError('Invalid EXPLAIN PLAN header syntax', 'invalid_params', 'oracle')
+  }
+}
+
+function resolveOracleEndpoint(
+  rawTlsServername?: string
+): string | undefined {
+  const raw = typeof rawTlsServername === 'string' ? rawTlsServername.trim() : ''
+  if (!raw) return undefined
+  const unwrapped =
+    raw.startsWith('[') && raw.endsWith(']') ? raw.slice(1, -1) : raw
+  return unwrapped || undefined
+}
+
 function extractOracleConnectHost(connectString: string, fallbackHost: string): string {
   const trimmed = connectString.trim()
   if (trimmed.startsWith('(')) {
@@ -526,6 +899,7 @@ export async function buildOracleConnectionConfig(
     }
   }
 
+  const resolvedTlsServername = resolveOracleEndpoint(extraSecrets?.tlsServername)
   if (wantsTls) {
     const verifyHost =
       profile.sslMode === 'verify-ca'
@@ -538,12 +912,7 @@ export async function buildOracleConnectionConfig(
       attrs.sslServerCertDN = urlSslServerCertDn
     }
     const hasTnsCertDn = /\(\s*SSL_SERVER_CERT_DN\s*=/i.test(connectString)
-    const rawExpectedServername =
-      typeof extraSecrets?.tlsServername === 'string' ? extraSecrets.tlsServername.trim() : ''
-    const cleanExpectedServername =
-      rawExpectedServername.startsWith('[') && rawExpectedServername.endsWith(']')
-        ? rawExpectedServername.slice(1, -1)
-        : rawExpectedServername
+    const cleanExpectedServername = resolvedTlsServername ?? ''
     const connectHost = extractOracleConnectHost(connectString, host || 'localhost')
     if (
       verifyHost &&
@@ -565,6 +934,7 @@ export async function buildOracleConnectionConfig(
     currentSchema,
     usedDatabaseAsService,
     defaultSchema,
+    ...(resolvedTlsServername ? { tlsServername: resolvedTlsServername } : {}),
   }
 }
 
@@ -579,6 +949,7 @@ export class OracleSession implements IDatabaseSession {
   private currentlyExecutingQueryId: string | null = null
 
   private isClosed = false
+  private isBroken = false
   private autoCommit = true
   private txActive = false
   private statementCount = 0
@@ -600,7 +971,7 @@ export class OracleSession implements IDatabaseSession {
   }
 
   isAlive(): boolean {
-    if (this.isClosed) return false
+    if (this.isClosed || this.isBroken) return false
     return typeof this.conn.isHealthy === 'function' ? this.conn.isHealthy() : true
   }
 
@@ -635,6 +1006,9 @@ export class OracleSession implements IDatabaseSession {
   private assertOpen(): void {
     if (this.isClosed) {
       throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'oracle')
+    }
+    if (this.isBroken) {
+      throw new DatabaseDriverError('Oracle session is in a broken state after cleanup failure', 'SESSION_BROKEN', 'oracle')
     }
   }
 
@@ -735,6 +1109,455 @@ export class OracleSession implements IDatabaseSession {
     return this.runScrubbed(async () => {
       this.assertOpen()
       return introspectOracleObjects(this.queryExecutor, this.resolveSchema(schema))
+    })
+  }
+
+  clearSchemaCache(): void {
+    this.tableDetailsCache.clear()
+  }
+
+  async introspectErGraph(schema?: string): Promise<SchemaErGraph> {
+    return this.runScrubbed(async () => {
+      this.assertOpen()
+      const targetOwner = this.resolveSchema(schema)
+
+      const tableRows = await this.queryExecutor(
+        `
+        SELECT owner AS "schema", table_name AS "name", 'table' AS "kind"
+        FROM all_tables
+        WHERE owner = :p1 AND table_name NOT LIKE 'BIN$%'
+        UNION ALL
+        SELECT owner AS "schema", view_name AS "name", 'view' AS "kind"
+        FROM all_views
+        WHERE owner = :p1 AND view_name NOT LIKE 'BIN$%'
+        ORDER BY "name" ASC
+      `,
+        [targetOwner]
+      )
+
+      const colRows = await this.queryExecutor(
+        `
+        SELECT
+          owner AS "schema",
+          table_name AS "table",
+          column_name AS "name",
+          data_type AS "data_type",
+          data_length AS "data_length",
+          char_length AS "char_length",
+          char_used AS "char_used",
+          data_precision AS "data_precision",
+          data_scale AS "data_scale",
+          nullable AS "nullable",
+          column_id AS "ordinal_position"
+        FROM all_tab_columns
+        WHERE owner = :p1 AND table_name NOT LIKE 'BIN$%'
+        ORDER BY table_name ASC, column_id ASC
+      `,
+        [targetOwner]
+      )
+
+      const consRows = await this.queryExecutor(
+        `
+        SELECT
+          ac.constraint_type AS "constraint_type",
+          ac.constraint_name AS "constraint_name",
+          ac.owner AS "from_schema",
+          ac.table_name AS "from_table",
+          acc.column_name AS "from_column",
+          acc.position AS "ordinal_position",
+          ac.r_owner AS "to_schema",
+          rc.table_name AS "to_table",
+          rcc.column_name AS "to_column",
+          ac.delete_rule AS "on_delete"
+        FROM all_constraints ac
+        JOIN all_cons_columns acc
+          ON acc.owner = ac.owner
+         AND acc.constraint_name = ac.constraint_name
+         AND acc.table_name = ac.table_name
+        LEFT JOIN all_constraints rc
+          ON ac.constraint_type = 'R'
+         AND rc.owner = ac.r_owner
+         AND rc.constraint_name = ac.r_constraint_name
+        LEFT JOIN all_cons_columns rcc
+          ON ac.constraint_type = 'R'
+         AND rcc.owner = rc.owner
+         AND rcc.constraint_name = rc.constraint_name
+         AND rcc.position = acc.position
+        WHERE ac.owner = :p1
+          AND ac.constraint_type IN ('P', 'U', 'R')
+          AND ac.table_name NOT LIKE 'BIN$%'
+        UNION ALL
+        SELECT
+          'U' AS "constraint_type",
+          ai.index_name AS "constraint_name",
+          ai.table_owner AS "from_schema",
+          ai.table_name AS "from_table",
+          aic.column_name AS "from_column",
+          aic.column_position AS "ordinal_position",
+          NULL AS "to_schema",
+          NULL AS "to_table",
+          NULL AS "to_column",
+          NULL AS "on_delete"
+        FROM all_indexes ai
+        JOIN all_ind_columns aic
+          ON aic.index_owner = ai.owner
+         AND aic.index_name = ai.index_name
+        WHERE ai.table_owner = :p1
+          AND ai.uniqueness = 'UNIQUE'
+          AND ai.index_type = 'NORMAL'
+          AND ai.table_name NOT LIKE 'BIN$%'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM all_constraints ac2
+            WHERE ac2.owner = ai.table_owner
+              AND ac2.table_name = ai.table_name
+              AND ac2.constraint_type IN ('P', 'U')
+              AND (ac2.index_owner = ai.owner OR (ac2.index_owner IS NULL AND ac2.owner = ai.owner))
+              AND ac2.index_name = ai.index_name
+          )
+        ORDER BY "constraint_type" ASC, "constraint_name" ASC, "ordinal_position" ASC
+      `,
+        [targetOwner]
+      )
+
+      const pkColsByTable = new Map<string, Set<string>>()
+      const uniqueGroups = new Map<
+        string,
+        { schema: string; table: string; indexName: string; cols: Array<{ name: string; ord: number }> }
+      >()
+      const foreignKeys: RawErForeignKeyRow[] = []
+
+      for (const r of consRows) {
+        const cType = getOracleFieldString(r, 'constraint_type').toUpperCase()
+        const fromSchema = getOracleFieldString(r, 'from_schema') || targetOwner
+        const fromTable = getOracleFieldString(r, 'from_table') || getOracleFieldString(r, 'table_name')
+        const fromColumn = getOracleFieldString(r, 'from_column') || getOracleFieldString(r, 'column_name')
+        if (!fromTable || !fromColumn) continue
+
+        if (cType === 'P') {
+          const tblKey = `${fromSchema}\u0000${fromTable}`
+          let pkSet = pkColsByTable.get(tblKey)
+          if (!pkSet) {
+            pkSet = new Set<string>()
+            pkColsByTable.set(tblKey, pkSet)
+          }
+          pkSet.add(fromColumn)
+        } else if (cType === 'U') {
+          const constraintName = getOracleFieldString(r, 'constraint_name') || `uq_${fromTable}`
+          const uKey = `${fromSchema}\u0000${fromTable}\u0000${constraintName}`
+          let grp = uniqueGroups.get(uKey)
+          if (!grp) {
+            grp = { schema: fromSchema, table: fromTable, indexName: constraintName, cols: [] }
+            uniqueGroups.set(uKey, grp)
+          }
+          const ordRaw = getOracleFieldValue(r, 'ordinal_position')
+          const ord = Number(ordRaw)
+          if (!grp.cols.some((c) => c.name === fromColumn)) {
+            grp.cols.push({ name: fromColumn, ord: Number.isFinite(ord) ? ord : grp.cols.length })
+          }
+        } else if (cType === 'R') {
+          const toTable = getOracleFieldString(r, 'to_table')
+          const toColumn = getOracleFieldString(r, 'to_column')
+          if (!toTable || !toColumn) continue
+          const toSchema = getOracleFieldString(r, 'to_schema') || fromSchema
+          const constraintName = getOracleFieldString(r, 'constraint_name')
+          const ordRaw = getOracleFieldValue(r, 'ordinal_position')
+          const ord = Number(ordRaw)
+          const onDelete = getOracleFieldString(r, 'on_delete').toUpperCase()
+          foreignKeys.push({
+            ...(constraintName ? { constraintName } : {}),
+            fromSchema,
+            fromTable,
+            fromColumn,
+            toSchema,
+            toTable,
+            toColumn,
+            ...(Number.isFinite(ord) ? { ordinalPosition: ord } : {}),
+            ...(onDelete ? { onDelete } : {}),
+          })
+        }
+      }
+
+      const tables: RawErTableRow[] = tableRows
+        .map((r): RawErTableRow | null => {
+          const name = getOracleFieldString(r, 'name') || getOracleFieldString(r, 'table_name')
+          if (!name) return null
+          const rowSchema = getOracleFieldString(r, 'schema') || getOracleFieldString(r, 'owner') || targetOwner
+          const rawKind = getOracleFieldString(r, 'kind').toLowerCase()
+          return {
+            schema: rowSchema,
+            name,
+            kind: rawKind === 'view' ? 'view' : 'table',
+          }
+        })
+        .filter((item): item is RawErTableRow => item !== null)
+
+      const columns: RawErColumnRow[] = colRows
+        .map((r): RawErColumnRow | null => {
+          const table = getOracleFieldString(r, 'table') || getOracleFieldString(r, 'table_name')
+          const name = getOracleFieldString(r, 'name') || getOracleFieldString(r, 'column_name')
+          if (!table || !name) return null
+          const rowSchema = getOracleFieldString(r, 'schema') || getOracleFieldString(r, 'owner') || targetOwner
+          const nullableRaw = getOracleFieldString(r, 'nullable').toUpperCase()
+          const pkSet = pkColsByTable.get(`${rowSchema}\u0000${table}`)
+          const isPk = pkSet ? pkSet.has(name) : false
+          const ordRaw = getOracleFieldValue(r, 'ordinal_position')
+          const ord = Number(ordRaw)
+          return {
+            schema: rowSchema,
+            table,
+            name,
+            type: formatOracleErColumnType(r),
+            nullable: nullableRaw !== 'N' && nullableRaw !== 'FALSE' && nullableRaw !== '0',
+            isPrimaryKey: isPk,
+            ...(Number.isFinite(ord) ? { ordinalPosition: ord } : {}),
+          }
+        })
+        .filter((item): item is RawErColumnRow => item !== null)
+
+      const uniqueSets: RawErUniqueSetRow[] = Array.from(uniqueGroups.values()).map((grp) => ({
+        schema: grp.schema,
+        table: grp.table,
+        indexName: grp.indexName,
+        columns: grp.cols.sort((a, b) => a.ord - b.ord).map((c) => c.name),
+      }))
+
+      return buildSchemaErGraphFromCatalogRows({
+        connectionId: this.profile.id,
+        schema: targetOwner,
+        completeness: 'full',
+        tables,
+        columns,
+        uniqueSets,
+        foreignKeys,
+      })
+    })
+  }
+
+  async runExplain(sql: string, signal?: AbortSignal): Promise<ExplainResult | null> {
+    this.assertOpen()
+    if (signal?.aborted) {
+      throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', 'oracle')
+    }
+
+    const rawTrimmed = sql.trim()
+    if (!rawTrimmed) {
+      throw new DatabaseDriverError('SQL statement cannot be empty', 'invalid_params', 'oracle')
+    }
+
+    const chunks = splitOracleStatements(rawTrimmed)
+    if (chunks.length > 1) {
+      throw new DatabaseDriverError(
+        'Oracle EXPLAIN PLAN supports only a single SQL statement at a time.',
+        'invalid_params',
+        'oracle'
+      )
+    }
+    const singleChunk = chunks[0] ?? { text: stripTrailingSemicolon(rawTrimmed), isPlSql: false }
+    if (singleChunk.isPlSql) {
+      throw new DatabaseDriverError('EXPLAIN PLAN does not support PL/SQL blocks', 'invalid_params', 'oracle')
+    }
+
+    const singleSql = stripTrailingSemicolon(singleChunk.text).trim()
+    if (!singleSql) {
+      throw new DatabaseDriverError('SQL statement cannot be empty', 'invalid_params', 'oracle')
+    }
+
+    if (hasExplainAnalyzeOption(singleSql, 'oracle') && isExplainTargetMutating(singleSql, 'oracle')) {
+      throw new DatabaseDriverError(
+        'EXPLAIN ANALYZE is not permitted for mutating statements in Explain mode.',
+        'not_permitted',
+        'oracle'
+      )
+    }
+
+    const parsedHeader = parseOracleExplainPlanHeader(singleSql)
+    const guardSql = parsedHeader.isExplainPlan ? singleSql : `EXPLAIN PLAN FOR ${singleSql}`
+    if (this.profile.readOnly && isMutatingStatement(guardSql, 'oracle')) {
+      this.assertWritable()
+    }
+
+    const statementId = generateOracleExplainStatementId()
+    let explainPlanSql: string
+    let displayStmtId = statementId
+    let hasUserStatementId = false
+    let quotedPlanTableForDisplay: string | null = null
+    let planTableSelectSql = ORACLE_PLAN_TABLE_SELECT_SQL
+    let maxPlanIdSelectSql = ORACLE_MAX_PLAN_ID_SELECT_SQL
+
+    if (parsedHeader.isExplainPlan) {
+      if (typeof parsedHeader.rawStatementId === 'string') {
+        displayStmtId = validateOracleExplainStatementId(parsedHeader.rawStatementId)
+        hasUserStatementId = true
+      }
+
+      const planSpec = parsedHeader.planTable
+      const isDefaultPlanTable = !planSpec || (!planSpec.schema && planSpec.table === 'PLAN_TABLE')
+      let intoClause = ''
+      if (!isDefaultPlanTable && planSpec) {
+        const quotedPlanTable = planSpec.schema
+          ? `${quoteIdentForDialect(planSpec.schema, 'oracle')}.${quoteIdentForDialect(planSpec.table, 'oracle')}`
+          : quoteIdentForDialect(planSpec.table, 'oracle')
+        intoClause = ` INTO ${quotedPlanTable}`
+        quotedPlanTableForDisplay = quotedPlanTable
+        planTableSelectSql = buildOraclePlanTableSelectSql(quotedPlanTable)
+        maxPlanIdSelectSql = buildOracleMaxPlanIdSelectSql(quotedPlanTable)
+      }
+
+      explainPlanSql = `EXPLAIN PLAN SET STATEMENT_ID = '${escapeOracleSqlLiteral(displayStmtId)}'${intoClause} FOR${parsedHeader.afterForSql}`
+    } else {
+      explainPlanSql = `EXPLAIN PLAN SET STATEMENT_ID = '${statementId}' FOR ${singleSql}`
+    }
+
+    return this.runExclusiveOp(async () => {
+      this.assertOpen()
+      if (signal?.aborted) {
+        throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', 'oracle')
+      }
+
+      const onAbort = (): void => {
+        void this.breakConnectionExecution().catch(() => {})
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+
+      const startTime = performance.now()
+      const isReadOnly = Boolean(this.profile.readOnly)
+      const inTx = this.txActive || !this.autoCommit
+      let rawRes: OracleResultLike | null = null
+
+      const executeExplainAndCapture = async (tryPlanTable: boolean): Promise<void> => {
+        await this.conn.execute(explainPlanSql, {}, { autoCommit: false })
+        let planTableUnavailable = false
+        if (tryPlanTable) {
+          try {
+            const planRes = await this.conn.execute(
+              planTableSelectSql,
+              { p1: displayStmtId },
+              { outFormat: getOracleOutFormatArray(), autoCommit: false }
+            )
+            if (Array.isArray(planRes.rows) && planRes.rows.length > 0) {
+              rawRes = planRes
+            }
+          } catch (err: unknown) {
+            const { errorNum } = extractOracleErrorCode(err)
+            if (errorNum === 942) {
+              planTableUnavailable = true
+            }
+            rawRes = null
+          }
+        }
+        if (!rawRes) {
+          let capturedPlanId: string | null = null
+          if (hasUserStatementId && !planTableUnavailable) {
+            try {
+              const maxRes = await this.conn.execute(
+                maxPlanIdSelectSql,
+                { p1: displayStmtId },
+                { outFormat: getOracleOutFormatArray(), autoCommit: false }
+              )
+              capturedPlanId = parseCapturedOraclePlanId(maxRes)
+            } catch {
+              capturedPlanId = null
+            }
+          }
+          const xplanDisplaySql = buildOracleExplainDisplaySql(
+            quotedPlanTableForDisplay,
+            displayStmtId,
+            capturedPlanId
+          )
+          rawRes = await this.conn.execute(
+            xplanDisplaySql,
+            {},
+            { outFormat: getOracleOutFormatArray(), autoCommit: false }
+          )
+        }
+      }
+
+      const runSavepointExplain = async (tryPlanTable: boolean): Promise<void> => {
+        const savepointName = buildOracleExplainSavepointName()
+        await this.conn.execute(`SAVEPOINT ${savepointName}`, {}, { autoCommit: false })
+        let mainErr: unknown = null
+        let hasMainErr = false
+        try {
+          await executeExplainAndCapture(tryPlanTable)
+        } catch (err: unknown) {
+          mainErr = err
+          hasMainErr = true
+        }
+        try {
+          await this.conn.execute(`ROLLBACK TO SAVEPOINT ${savepointName}`, {}, { autoCommit: false })
+        } catch (rbErr: unknown) {
+          this.isBroken = true
+          if (!hasMainErr) {
+            throw rbErr
+          }
+        }
+        if (hasMainErr) {
+          throw mainErr
+        }
+      }
+
+      const runRollbackExplain = async (tryPlanTable: boolean): Promise<void> => {
+        let mainErr: unknown = null
+        let hasMainErr = false
+        try {
+          await executeExplainAndCapture(tryPlanTable)
+        } catch (err: unknown) {
+          mainErr = err
+          hasMainErr = true
+        }
+        try {
+          await this.conn.rollback()
+        } catch (rbErr: unknown) {
+          this.isBroken = true
+          if (!hasMainErr) {
+            throw rbErr
+          }
+        }
+        if (hasMainErr) {
+          throw mainErr
+        }
+      }
+
+      try {
+        if (inTx) {
+          await runSavepointExplain(!isReadOnly)
+        } else {
+          await runRollbackExplain(!isReadOnly)
+        }
+      } catch (err: unknown) {
+        const { errorNum } = extractOracleErrorCode(err)
+        if (signal?.aborted || errorNum === 1013) {
+          throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', 'oracle', err)
+        }
+        throw err
+      } finally {
+        signal?.removeEventListener('abort', onAbort)
+      }
+
+      if (signal?.aborted) {
+        throw new DatabaseDriverError('Explain execution was cancelled', 'cancelled', 'oracle')
+      }
+
+      const executionTimeMs = Math.round(performance.now() - startTime)
+      const parsed = await extractOracleColumnsAndRows(rawRes ?? { metaData: [], rows: [] }, 1000)
+      const rawText =
+        parsed.columns.length <= 1 && parsed.rows.length > 0
+          ? parsed.rows.map((r) => (r[0] !== null && r[0] !== undefined ? String(r[0]) : '')).join('\n')
+          : undefined
+      const explainPlan = parseExplainPlan(
+        { columns: parsed.columns, rows: parsed.rows },
+        { dialect: 'oracle' }
+      )
+
+      return {
+        columns: parsed.columns,
+        rows: parsed.rows,
+        ...(rawText !== undefined ? { rawText } : {}),
+        ...(explainPlan.format ? { formatHint: explainPlan.format } : {}),
+        executionTimeMs,
+        explainPlan,
+      }
     })
   }
 

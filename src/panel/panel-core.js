@@ -42,7 +42,7 @@ import {
 
 export { analyzeDangerousSql, maskConnectionUriSecret }
 
-export const DATANOA_VERSION = '1.2.3'
+export const DATANOA_VERSION = '1.3.0'
 export const DATANOA_GITHUB_ISSUES_URL = 'https://github.com/Thanhh2615/datanoa/issues/new'
 
 export const ENGINES = [
@@ -184,16 +184,20 @@ export function sanitizeJson(val, seen = new WeakSet()) {
   if (typeof val === 'object') {
     if (seen.has(val)) return null
     seen.add(val)
-    if (Array.isArray(val)) {
-      return val.map((item) => sanitizeJson(item, seen))
-    }
-    const out = {}
-    for (const [k, v] of Object.entries(val)) {
-      if (v !== undefined && typeof v !== 'function' && typeof v !== 'symbol') {
-        out[k] = sanitizeJson(v, seen)
+    try {
+      if (Array.isArray(val)) {
+        return val.map((item) => sanitizeJson(item, seen))
       }
+      const out = {}
+      for (const [k, v] of Object.entries(val)) {
+        if (v !== undefined && typeof v !== 'function' && typeof v !== 'symbol') {
+          out[k] = sanitizeJson(v, seen)
+        }
+      }
+      return out
+    } finally {
+      seen.delete(val)
     }
-    return out
   }
   return null
 }

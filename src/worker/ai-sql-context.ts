@@ -4,6 +4,7 @@ import type {
   AiExplainIndexSuggestion,
   AiExplainLanguage,
   AiFixQueryResult,
+  ParsedExplainPlan,
   QueryHistoryEntry,
   SchemaObject,
   TableDetails,
@@ -83,11 +84,11 @@ const MAX_DETAILS_PER_CONNECTION = 120
 const MAX_OBJECTS_PER_CONNECTION = 2000
 
 export class WorkerSchemaMetadataCache {
-  private readonly store = new Map<string, ConnectionSchemaEntry>()
-  private readonly connectionRevisions = new Map<string, number>()
-  private revisionCounter = 0
+  protected readonly store = new Map<string, ConnectionSchemaEntry>()
+  protected readonly connectionRevisions = new Map<string, number>()
+  protected revisionCounter = 0
 
-  private bumpConnectionRevision(connectionId: string): void {
+  protected bumpConnectionRevision(connectionId: string): void {
     this.revisionCounter += 1
     this.connectionRevisions.delete(connectionId)
     this.connectionRevisions.set(connectionId, this.revisionCounter)
@@ -102,7 +103,7 @@ export class WorkerSchemaMetadataCache {
     return connectionId ? (this.connectionRevisions.get(connectionId) ?? 0) : 0
   }
 
-  private touchConnection(connectionId: string, entry: ConnectionSchemaEntry): void {
+  protected touchConnection(connectionId: string, entry: ConnectionSchemaEntry): void {
     this.store.delete(connectionId)
     this.store.set(connectionId, entry)
     while (this.store.size > MAX_CACHED_CONNECTIONS) {
@@ -151,10 +152,19 @@ export class WorkerSchemaMetadataCache {
     if (!connectionId || !details?.name) return
     const entry = this.store.get(connectionId) ?? { objects: [], details: new Map() }
     this.touchConnection(connectionId, entry)
+    const incomingCompleteness = details.completeness === 'lite' ? 'lite' : 'full'
+    const normalizedDetails: TableDetails =
+      details.completeness === incomingCompleteness
+        ? details
+        : { ...details, completeness: incomingCompleteness }
     const keys = detailKeysFor(details.name, details.schema)
     for (const k of keys) {
+      const prev = entry.details.get(k)
+      if (prev && prev.completeness !== 'lite' && incomingCompleteness === 'lite') {
+        continue
+      }
       entry.details.delete(k)
-      entry.details.set(k, details)
+      entry.details.set(k, normalizedDetails)
       while (entry.details.size > MAX_DETAILS_PER_CONNECTION) {
         const oldestKey = entry.details.keys().next().value
         if (oldestKey === undefined) break
@@ -169,11 +179,48 @@ export class WorkerSchemaMetadataCache {
     this.store.delete(connectionId)
   }
 
+  invalidateSchemaDetails(connectionId: string, schema?: string): void {
+    if (!connectionId) return
+    this.bumpConnectionRevision(connectionId)
+    const entry = this.store.get(connectionId)
+    if (!entry) return
+    const normSchema = typeof schema === 'string' ? schema.trim().toLowerCase() : ''
+    if (!normSchema) {
+      entry.details.clear()
+      return
+    }
+    const prefix = `${normSchema}.`
+    for (const [k, det] of Array.from(entry.details.entries())) {
+      const detSchema = (det.schema || '').trim().toLowerCase()
+      if (k.startsWith(prefix) || detSchema === normSchema) {
+        entry.details.delete(k)
+      }
+    }
+  }
+
   getSnapshot(connectionId: string): WorkerSchemaSnapshot | null {
     if (!connectionId) return null
     const entry = this.store.get(connectionId)
     if (!entry) return null
     return { objects: entry.objects, details: entry.details }
+  }
+
+  /**
+   * Returns both the schema snapshot and its monotonically increasing connection revision atomically.
+   */
+  getAiSnapshot(connectionId: string): { snapshot: WorkerSchemaSnapshot | null; revision: number } {
+    if (!connectionId) {
+      return { snapshot: null, revision: 0 }
+    }
+    const revision = this.connectionRevisions.get(connectionId) ?? 0
+    const entry = this.store.get(connectionId)
+    if (!entry) {
+      return { snapshot: null, revision }
+    }
+    return {
+      snapshot: { objects: entry.objects, details: entry.details },
+      revision,
+    }
   }
 }
 
@@ -2107,6 +2154,19 @@ function redactSecretLiteralsForPrompt(text: string): string {
   return scrubbed.replace(PLAN_SECRET_ASSIGN_RE, '$1[REDACTED]$3')
 }
 
+function tryMinifyPlanJsonText(text: string): string {
+  const trimmed = text.trim()
+  if (!trimmed || (trimmed[0] !== '{' && trimmed[0] !== '[')) {
+    return text
+  }
+  try {
+    const parsed: unknown = JSON.parse(trimmed)
+    return JSON.stringify(parsed, (_k, v: unknown) => (typeof v === 'bigint' ? v.toString() : v)) ?? text
+  } catch {
+    return text
+  }
+}
+
 function safeSerializePlanCell(cell: unknown): string {
   if (cell === null || cell === undefined) return 'NULL'
   if (typeof cell === 'bigint') return cell.toString()
@@ -2117,21 +2177,88 @@ function safeSerializePlanCell(cell: unknown): string {
     } catch {
       txt = String(cell)
     }
+  } else if (typeof cell === 'string') {
+    txt = tryMinifyPlanJsonText(cell)
   } else {
     txt = String(cell)
   }
   return redactSecretLiteralsForPrompt(txt.replace(/\r?\n/g, ' '))
 }
 
-function serializePlanTable(columns: { name: string; type: string }[], rows: unknown[][]): string {
-  if (!columns.length && !rows.length) return '(no plan rows returned)'
-  const header = columns.map((c) => sanitizeCatalogName(c?.name || 'col') || 'col').join(' | ')
+function summarizeParsedExplainPlan(plan: ParsedExplainPlan, maxChars = MAX_PLAN_CHARS): string {
+  const lines: string[] = []
+  const metaParts: string[] = [`format=${plan.format}`]
+  if (plan.planningTimeMs !== undefined && plan.planningTimeMs !== null) {
+    metaParts.push(`planningMs=${plan.planningTimeMs}`)
+  }
+  if (plan.executionTimeMs !== undefined && plan.executionTimeMs !== null) {
+    metaParts.push(`executionMs=${plan.executionTimeMs}`)
+  }
+  if (plan.totalCost !== undefined && plan.totalCost !== null) {
+    metaParts.push(`totalCost=${plan.totalCost}`)
+  }
+  lines.push(metaParts.join(' '))
+  if (Array.isArray(plan.warnings) && plan.warnings.length > 0) {
+    lines.push(`warnings=${plan.warnings.join(', ')}`)
+  }
+  const visit = (node: NonNullable<ParsedExplainPlan['root']>, depth: number): void => {
+    if (lines.join('\n').length >= maxChars) return
+    const indent = '  '.repeat(Math.min(depth, 10))
+    const parts: string[] = [node.nodeType]
+    if (node.relation) parts.push(`on ${sanitizeCatalogName(node.relation)}`)
+    if (node.indexName) parts.push(`using ${sanitizeCatalogName(node.indexName)}`)
+    if (typeof node.totalCost === 'number') parts.push(`cost=${node.totalCost}`)
+    if (typeof node.actualTotalTimeMs === 'number') parts.push(`timeMs=${node.actualTotalTimeMs}`)
+    if (typeof node.planRows === 'number') parts.push(`estRows=${node.planRows}`)
+    if (typeof node.totalActualRows === 'number') parts.push(`actRows=${node.totalActualRows}`)
+    else if (typeof node.actualRows === 'number') parts.push(`actRows=${node.actualRows}`)
+    if (node.warnings && node.warnings.length > 0) parts.push(`[${node.warnings.join('; ')}]`)
+    lines.push(`${indent}- ${parts.join(' ')}`)
+    for (const child of node.children || []) {
+      visit(child, depth + 1)
+    }
+  }
+  if (plan.root) {
+    visit(plan.root, 0)
+  } else if (plan.rawText) {
+    lines.push(redactSecretLiteralsForPrompt(tryMinifyPlanJsonText(plan.rawText)))
+  }
+  const out = lines.join('\n')
+  return out.length > maxChars ? `${out.slice(0, maxChars - 24)}\n... (plan truncated)` : out
+}
+
+const MAX_PLAN_SERIALIZE_COLUMNS = 128
+const MAX_PLAN_SERIALIZE_ROWS = 2_000
+
+function serializePlanTable(
+  columns: { name: string; type: string }[],
+  rows: unknown[][],
+  explainPlan?: ParsedExplainPlan
+): string {
+  if (!columns.length && !rows.length) {
+    if (explainPlan) return summarizeParsedExplainPlan(explainPlan, MAX_PLAN_CHARS)
+    return '(no plan rows returned)'
+  }
+  const boundedCols = columns.slice(0, MAX_PLAN_SERIALIZE_COLUMNS)
+  const rawHeader = boundedCols.map((c) => sanitizeCatalogName(c?.name || 'col') || 'col').join(' | ')
+  const header = rawHeader.length > MAX_PLAN_CHARS ? rawHeader.slice(0, MAX_PLAN_CHARS) : rawHeader
   const truncationNote = '... (plan output truncated)'
   const lines: string[] = [header]
   let chars = header.length + 1
-  for (const row of rows) {
+  let truncated = false
+  const maxRows = Math.min(rows.length, MAX_PLAN_SERIALIZE_ROWS)
+  for (let rowIdx = 0; rowIdx < maxRows; rowIdx++) {
+    const row = rows[rowIdx]
     if (!Array.isArray(row)) continue
-    const cells = row.map((cell) => safeSerializePlanCell(cell))
+    const maxCells = Math.min(row.length, MAX_PLAN_SERIALIZE_COLUMNS)
+    const cells: string[] = []
+    let rowChars = 0
+    for (let colIdx = 0; colIdx < maxCells; colIdx++) {
+      const cellStr = safeSerializePlanCell(row[colIdx])
+      cells.push(cellStr)
+      rowChars += cellStr.length + (colIdx > 0 ? 3 : 0)
+      if (chars + rowChars + 1 > MAX_PLAN_CHARS) break
+    }
     const line = cells.join(' | ')
     if (chars + line.length + 1 > MAX_PLAN_CHARS) {
       // Preserve as much of row 0 as fits (critical for single-row Postgres EXPLAIN FORMAT JSON)
@@ -2142,12 +2269,17 @@ function serializePlanTable(columns: { name: string; type: string }[], rows: unk
         }
       }
       lines.push(truncationNote)
+      truncated = true
       break
     }
     lines.push(line)
     chars += line.length + 1
   }
-  return lines.join('\n')
+  const rawSerialized = lines.join('\n')
+  if (truncated && explainPlan?.root) {
+    return summarizeParsedExplainPlan(explainPlan, MAX_PLAN_CHARS)
+  }
+  return rawSerialized
 }
 
 export interface BuildExplainAnalysisPromptInput {
@@ -2155,6 +2287,7 @@ export interface BuildExplainAnalysisPromptInput {
   sql: string
   planColumns: { name: string; type: string }[]
   planRows: unknown[][]
+  explainPlan?: ParsedExplainPlan
   snapshot: WorkerSchemaSnapshot | null
   activeSchema?: string
   language?: AiExplainLanguage
@@ -2169,7 +2302,7 @@ export function buildExplainAnalysisPrompt(input: BuildExplainAnalysisPromptInpu
 } {
   const resolvedLanguage = resolveExplainLanguage(input.language, input.uiLocale)
   const engineName = dialectLabel(input.dialect)
-  const planText = serializePlanTable(input.planColumns, input.planRows)
+  const planText = serializePlanTable(input.planColumns, input.planRows, input.explainPlan)
   const isAnalyze =
     input.dialect === 'mongodb'
       ? /executionStats|nReturned|executionTimeMillis/i.test(planText)

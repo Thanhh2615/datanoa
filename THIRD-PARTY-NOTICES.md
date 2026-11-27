@@ -1,8 +1,8 @@
 # Third-Party Notices
 
-Datanoa incorporates or bundles the following open-source software components across its ten pre-bundled vendor modules (`vendor/iconv-lite.js`, `vendor/pg.js`, `vendor/mysql2.js`, `vendor/mongodb.js`, `vendor/mssql.js`, `vendor/oracledb.js`, `vendor/codemirror.js`, `vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js`, and `vendor/ssh2.js`) and embedded font asset (`src/assets/geist-font.js`). Each component is subject to its own license terms reproduced below.
+Datanoa incorporates or bundles the following open-source software components across its eleven pre-bundled vendor modules (`vendor/iconv-lite.js`, `vendor/big-integer.js`, `vendor/pg.js`, `vendor/mysql2.js`, `vendor/mongodb.js`, `vendor/mssql.js`, `vendor/oracledb.js`, `vendor/codemirror.js`, `vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js`, and `vendor/ssh2.js`) and embedded font asset (`src/assets/geist-font.js`). Each component is subject to its own license terms reproduced below.
 
-## Summary of Bundled Components (65 Components)
+## Summary of Bundled Components (66 Components)
 
 | Package | Version | Bundle | License | Copyright Holder |
 |---|---|---|---|---|
@@ -15,7 +15,6 @@ Datanoa incorporates or bundles the following open-source software components ac
 | `sparse-bitfield` | `3.0.3` | `vendor/mongodb.js` | MIT | Mathias Buus |
 | `mssql` | `12.8.1` | `vendor/mssql.js` | MIT | Patrik Simek and contributors |
 | `tedious` | `20.4.2` | `vendor/mssql.js` | MIT | Mike D Pilsbury |
-| `@js-joda/core` | `6.3.2` | `vendor/mssql.js` | BSD-3-Clause | Philipp Thürwächter & Pattrick Hüper |
 | `tarn` | `3.1.2` | `vendor/mssql.js` | MIT | knex.js organization & contributors; Vincit Oy |
 | `js-md4` | `0.3.2` | `vendor/mssql.js` | MIT | Yi-Cyuan Chen |
 | `debug` | `4.4.3` | `vendor/mssql.js` | MIT | TJ Holowaychuk; Josh Junon |
@@ -64,8 +63,10 @@ Datanoa incorporates or bundles the following open-source software components ac
 | `@marijn/find-cluster-break` | `1.0.4` | `vendor/codemirror.js` | MIT | Marijn Haverbeke |
 | `w3c-keyname` | `2.2.8` | `vendor/codemirror.js` | MIT | Marijn Haverbeke and others |
 | `crelt` | `1.0.7` | `vendor/codemirror.js` | MIT | Marijn Haverbeke |
+| `@replit/codemirror-vim` | `6.4.0` | `vendor/codemirror.js` | MIT | Marijn Haverbeke and others |
+| `@replit/codemirror-vim-core` | `0.1.0` | `vendor/codemirror.js` | MIT | Marijn Haverbeke and others |
 | `node-sql-parser` | `5.4.0` | `vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js` | Apache-2.0 | taozhi8833998 and contributors |
-| `big-integer` | `1.6.52` | `vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js` | Unlicense | Peter Olson |
+| `big-integer` | `1.6.52` | `vendor/big-integer.js` | Unlicense | Peter Olson |
 | `ssh2` | `1.17.0` | `vendor/ssh2.js` | MIT | Brian White |
 | `asn1` | `0.2.6` | `vendor/ssh2.js` | MIT | Mark Cavage |
 | `bcrypt-pbkdf` | `1.0.2` | `vendor/ssh2.js` | BSD-3-Clause / ISC | Niels Provos; Ted Unangst; Joyent Inc |
@@ -411,44 +412,6 @@ The following bundled packages are licensed under the Apache License, Version 2.
 
 ## BSD-3-Clause License Components
 
-### `@js-joda/core@6.3.2` (`vendor/mssql.js`)
-
-```text
-BSD License
-
-For js-joda software
-
-Copyright (c) 2016, Philipp Thürwächter & Pattrick Hüper
-
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
- * Redistributions of source code must retain the above copyright notice,
-   this list of conditions and the following disclaimer.
-
- * Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
-
- * Neither the name of js-joda nor the names of its contributors
-   may be used to endorse or promote products derived from this software
-   without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
-LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
-NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-```
-
 ### `bcrypt-pbkdf@1.0.2` (`vendor/ssh2.js`)
 
 ```text
@@ -601,6 +564,8 @@ The following bundled packages are licensed under the MIT License, with each com
 - **`@marijn/find-cluster-break@1.0.4`**: `Copyright (C) 2024 by Marijn Haverbeke <marijn@haverbeke.berlin>`
 - **`w3c-keyname@2.2.8`**: `Copyright (C) 2016 by Marijn Haverbeke <marijn@haverbeke.berlin> and others`
 - **`crelt@1.0.7`**: `Copyright (C) 2020 by Marijn Haverbeke <marijn@haverbeke.berlin>`
+- **`@replit/codemirror-vim@6.4.0`**: `Copyright (C) 2018-2021 by Marijn Haverbeke <marijnh@gmail.com> and others`
+- **`@replit/codemirror-vim-core@0.1.0`**: `Copyright (C) 2018-2021 by Marijn Haverbeke <marijnh@gmail.com> and others`
 
 ### `vendor/ssh2.js`
 
@@ -724,7 +689,7 @@ DAMAGES.
 
 ## Unlicense (Public Domain) Components
 
-### `big-integer@1.6.52` (`vendor/sql-parser-pg-sqlite.js`, `vendor/sql-parser-mysql-mssql.js`) & `tweetnacl@0.14.5` (`vendor/ssh2.js`)
+### `big-integer@1.6.52` (`vendor/big-integer.js`, shared by `sql-parser-pg-sqlite` & `sql-parser-mysql-mssql`) & `tweetnacl@0.14.5` (`vendor/ssh2.js`)
 
 ```text
 This is free and unencumbered software released into the public domain.

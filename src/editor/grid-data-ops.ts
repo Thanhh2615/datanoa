@@ -138,6 +138,56 @@ export function computeInitialColumnWidthsForGrid(
   return widths
 }
 
+export interface TransposedInitialWidths {
+  fieldWidth: number
+  rowWidths: number[]
+}
+
+export function computeInitialTransposedColumnWidths(
+  model: GridModel,
+  rowIndices: readonly number[],
+  visibleColIndices: readonly number[]
+): TransposedInitialWidths {
+  let maxFieldChars = 'Field'.length + 2
+  const fieldSampleCount = Math.min(visibleColIndices.length, 40)
+  for (let i = 0; i < fieldSampleCount; i++) {
+    const colIdx = visibleColIndices[i]
+    const header = model.headers[colIdx] ?? ''
+    const isPk = model.primaryKey.includes(header)
+    const colDef = model.columns[colIdx]
+    const colType = colDef && 'type' in colDef && colDef.type ? ` : ${colDef.type}` : ''
+    const len = header.length + (isPk ? 5 : 0) + colType.length
+    if (len > maxFieldChars) {
+      maxFieldChars = len
+    }
+  }
+  const fieldWidth = Math.max(140, Math.min(260, Math.round(maxFieldChars * 7.2 + 24)))
+
+  const cappedRowCount = Math.min(rowIndices.length, 100)
+  const rowWidths: number[] = []
+  const cellSampleCount = Math.min(visibleColIndices.length, 32)
+  for (let r = 0; r < cappedRowCount; r++) {
+    const rowIdx = rowIndices[r]
+    const rowData = model.rows[rowIdx]
+    let maxRowChars = `Row ${rowIdx + 1}`.length + 4
+    for (let i = 0; i < cellSampleCount; i++) {
+      const colIdx = visibleColIndices[i]
+      const header = model.headers[colIdx] ?? ''
+      const colDef = model.columns[colIdx]
+      const colType = colDef && 'type' in colDef ? colDef.type : undefined
+      const val = rowData ? getCellValue(rowData, colIdx, header) : undefined
+      const formatted = formatCellValue(val, colType).text
+      const len = Math.min(formatted.length, 34)
+      if (len > maxRowChars) {
+        maxRowChars = len
+      }
+    }
+    rowWidths.push(Math.max(160, Math.min(280, Math.round(maxRowChars * 7.5 + 24))))
+  }
+
+  return { fieldWidth, rowWidths }
+}
+
 export function matchesClientColumnFilters(
   row: Record<string, unknown> | unknown[],
   headers: string[],

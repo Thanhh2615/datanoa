@@ -1,13 +1,25 @@
 import { randomUUID } from 'node:crypto'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import type { OrcaWorkerApi } from 'orca/worker'
+import type { JsonValue, OrcaWorkerApi } from 'orca/worker'
 import {
   ACTIVE_CONNECTION_STORAGE_KEY,
+  SAVED_CONNECTIONS_STORAGE_KEY,
+  SAVED_FOLDER_ORDER_STORAGE_KEY,
+  sanitizeJsonPayload,
   type ConnectionProfile,
+  type ConnectionProfileInput,
   type PersistedLocalDriverConfig,
+  type SshJumpHopSecret,
+  type SshJumpHostProfile,
 } from '../protocol'
 import { CUSTOM_DRIVERS_STORAGE_KEY } from '../shared-constants'
+import {
+  getConnectionFolderOrderKeys,
+  normalizeFolderOrder,
+  reconcileFolderOrder,
+  reorderConnectionsWithinFolder,
+} from '../shared-connection-order.js'
 import { maskConnectionUriSecret } from '../shared-sql-safety.js'
 import {
   isD1HttpLoopbackEndpoint,
@@ -31,10 +43,21 @@ import {
   detectDockerTargetLocality,
   detectWorkspaceDockerComposeConnections,
 } from './docker-compose-discovery'
+import {
+  SSH_HOP_ID_RE,
+  canReuseStoredChainSecret,
+  deleteHopSecrets as deleteHopSecretsVault,
+  getHopPassphraseSecretKey,
+  getHopPasswordSecretKey,
+} from '../drivers/common/ssh-hop-secrets'
 import type { WorkerSchemaMetadataCache } from './ai-sql-context'
-import type { SessionManager } from './session-manager'
+import type { ErLayoutStateStore } from './er-layout-state-store'
+import type { ExtendedSecrets, SessionManager } from './session-manager'
+import type { SshHostKeyChallengeStore } from './ssh-host-key-challenge-store'
+import type { TableDisplayStateStore } from './table-display-state-store'
 import {
   appendActionableTlsErrorHint,
+  clearPersistedSelectedSchema,
   createHostError,
   createSerializedQueue,
   getDefaultByodDriverDirs,
@@ -58,6 +81,9 @@ export interface ConnectionHandlersDeps {
   sessionManager: SessionManager
   driverManager: DriverManager
   schemaCache?: WorkerSchemaMetadataCache
+  challengeStore?: SshHostKeyChallengeStore
+  tableDisplayStateStore?: TableDisplayStateStore
+  erLayoutStateStore?: ErLayoutStateStore
 }
 
 export interface ConnectionHandlersController {
@@ -111,7 +137,7 @@ interface CanonicalDbTarget {
   rawFallback: string
 }
 
-function resolveCanonicalDbTarget(profile: ConnectionProfile): CanonicalDbTarget | null {
+function resolveCanonicalDbTarget(profile: ConnectionProfileInput): CanonicalDbTarget | null {
   const driver = typeof profile.driver === 'string' ? profile.driver.trim().toLowerCase() : ''
   if (!driver) return null
 
@@ -295,8 +321,8 @@ function resolveCanonicalDbTarget(profile: ConnectionProfile): CanonicalDbTarget
  * where a caller mutates host/port/url/driver/sshHost/sslKeyPath while referencing an existing ID.
  */
 export function canReuseStoredSecretForTarget(
-  stored: ConnectionProfile | null | undefined,
-  candidate: ConnectionProfile | null | undefined,
+  stored: ConnectionProfileInput | null | undefined,
+  candidate: ConnectionProfileInput | null | undefined,
   kind: StoredSecretKind
 ): boolean {
   if (!stored || !candidate) return false
@@ -364,7 +390,7 @@ export function canReuseStoredSecretForTarget(
   )
 }
 
-function resolveLibsqlEndpointCandidate(profile: ConnectionProfile): string {
+function resolveLibsqlEndpointCandidate(profile: ConnectionProfileInput): string {
   let raw = typeof profile.url === 'string' ? profile.url.trim() : ''
   const preferredProto = profile.ssl === false ? 'http' : 'https'
   if (!raw && typeof profile.host === 'string' && profile.host.trim().length > 0) {
@@ -387,12 +413,82 @@ function resolveLibsqlEndpointCandidate(profile: ConnectionProfile): string {
   return raw
 }
 
+function collectConnectionSecretKeys(id: string, hopIds: readonly string[]): string[] {
+  const keys = new Set<string>([
+    `pwd_${id}`,
+    `tok_${id}`,
+    `sslkey_${id}`,
+    `sshpass_${id}`,
+    `sshpwd_${id}`,
+  ])
+  for (const hopId of hopIds) {
+    if (!SSH_HOP_ID_RE.test(hopId)) continue
+    keys.add(getHopPasswordSecretKey(id, hopId))
+    keys.add(getHopPassphraseSecretKey(id, hopId))
+    keys.add(`sshhop_pwd_${id}_${hopId}`)
+    keys.add(`sshhop_pass_${id}_${hopId}`)
+  }
+  return Array.from(keys)
+}
+
+async function snapshotConnectionSecrets(
+  secretsApi: OrcaWorkerApi['secrets'],
+  keys: readonly string[]
+): Promise<Map<string, string | null>> {
+  const snapshot = new Map<string, string | null>()
+  for (const key of keys) {
+    const rawVal = await secretsApi.get(key)
+    snapshot.set(key, typeof rawVal === 'string' ? rawVal : null)
+  }
+  return snapshot
+}
+
+async function restoreConnectionSecrets(
+  secretsApi: OrcaWorkerApi['secrets'],
+  snapshot: ReadonlyMap<string, string | null>
+): Promise<void> {
+  await Promise.allSettled(
+    Array.from(snapshot.entries()).map(async ([key, prevVal]) => {
+      if (prevVal !== null) {
+        await secretsApi.set(key, prevVal)
+      } else {
+        await secretsApi.delete(key)
+      }
+    })
+  )
+}
+
+async function restoreConnectionStorage(
+  storageApi: OrcaWorkerApi['storage'],
+  prevPrimary: JsonValue | null,
+  prevLegacy: JsonValue | null
+): Promise<void> {
+  const restoreOne = async (key: string, prevVal: JsonValue | null): Promise<void> => {
+    if (prevVal === null || prevVal === undefined) {
+      if (typeof storageApi.delete === 'function') {
+        await storageApi.delete(key)
+      } else {
+        await storageApi.set(key, null as unknown as JsonValue)
+      }
+    } else {
+      await storageApi.set(key, prevVal)
+    }
+  }
+  await Promise.allSettled([
+    restoreOne(SAVED_CONNECTIONS_STORAGE_KEY, prevPrimary),
+    restoreOne('connections', prevLegacy),
+  ])
+}
+
 export function registerConnectionHandlers({
   orca,
   registerHandler,
   sessionManager,
   driverManager,
   schemaCache,
+  challengeStore,
+  tableDisplayStateStore,
+  erLayoutStateStore,
 }: ConnectionHandlersDeps): ConnectionHandlersController {
   const connectionsQueue = createSerializedQueue()
   const detectedCandidates = new Map<string, DetectedCandidateSecret>()
@@ -431,6 +527,7 @@ export function registerConnectionHandlers({
   }
 
   const isLiveDesktopHost = Boolean(orca.host && typeof orca.host.call === 'function')
+  let folderOrderBackupChecked = false
   if (isLiveDesktopHost) {
     driverManager.setBackupLoader(async () => {
       const backup = await readHostConfigBackup()
@@ -525,7 +622,7 @@ export function registerConnectionHandlers({
       }
     }
 
-    const normalized = await normalizeSqliteProfile(input.profile)
+    const normalized = sanitizeConnectionProfile(await normalizeSqliteProfile(input.profile))
     const id =
       normalized.id && !normalized.id.startsWith('ws_')
         ? normalized.id
@@ -541,7 +638,8 @@ export function registerConnectionHandlers({
 
     const rawProfile = input.profile as unknown as Record<string, unknown>
     const hasOwn = (key: string): boolean => Object.prototype.hasOwnProperty.call(rawProfile, key)
-    const sshExplicitlyDisabled = hasOwn('sshEnabled') && !input.profile.sshEnabled
+    const sshExplicitlyDisabled =
+      input.sshExplicitlyDisabled === true || (hasOwn('sshEnabled') && !input.profile.sshEnabled)
 
     return await connectionsQueue.run(async () => {
       if (d1HttpLoopback) {
@@ -583,225 +681,361 @@ export function registerConnectionHandlers({
         }
       }
 
-      const list = await sessionManager.getStoredConnections()
-      const idx = list.findIndex((c) => c.id === id)
-      const existing = idx >= 0 ? list[idx] : undefined
-      const sourceProfile = input.sourceConnectionId
-        ? list.find((c) => c.id === input.sourceConnectionId)
-        : undefined
-      const merged: ConnectionProfile = { ...normalized }
-
-      if (existing) {
-        if (!hasOwn('folder')) merged.folder = existing.folder
-        if (!hasOwn('workspaceScope')) merged.workspaceScope = existing.workspaceScope
-        if (!hasOwn('aiPolicy')) merged.aiPolicy = existing.aiPolicy
-        if (existing.driver === normalized.driver) {
-          if (!hasOwn('sslMode')) merged.sslMode = existing.sslMode
-          if (!hasOwn('sslCaPath')) merged.sslCaPath = existing.sslCaPath
-          if (!hasOwn('sslCertPath')) merged.sslCertPath = existing.sslCertPath
-          if (!hasOwn('sslKeyPath')) merged.sslKeyPath = existing.sslKeyPath
-          if (!hasOwn('hasSslKeyPassphrase')) {
-            merged.hasSslKeyPassphrase = existing.hasSslKeyPassphrase
-          }
-          if (!hasOwn('sslRejectUnauthorized')) {
-            merged.sslRejectUnauthorized = existing.sslRejectUnauthorized
-          }
-          if (!hasOwn('d1AccountId')) merged.d1AccountId = existing.d1AccountId
-          if (!hasOwn('d1DatabaseId')) merged.d1DatabaseId = existing.d1DatabaseId
-          if (!hasOwn('sshEnabled')) merged.sshEnabled = existing.sshEnabled
-          if (!sshExplicitlyDisabled) {
-            if (!hasOwn('sshHost')) merged.sshHost = existing.sshHost
-            if (!hasOwn('sshPort')) merged.sshPort = existing.sshPort
-            if (!hasOwn('sshUser')) merged.sshUser = existing.sshUser
-            if (!hasOwn('sshAuthMethod')) merged.sshAuthMethod = existing.sshAuthMethod
-            if (!hasOwn('sshPrivateKeyPath')) merged.sshPrivateKeyPath = existing.sshPrivateKeyPath
-            if (!hasOwn('hasSshPassphrase')) merged.hasSshPassphrase = existing.hasSshPassphrase
-            if (!hasOwn('hasSshPassword')) merged.hasSshPassword = existing.hasSshPassword
-          }
+      const runStorageLocked = async <T>(fn: () => Promise<T>): Promise<T> => {
+        if (typeof sessionManager.withConnectionStorageLock === 'function') {
+          return await sessionManager.withConnectionStorageLock(fn)
         }
+        return await fn()
       }
 
-      const copyPrefixes: string[] = []
-      if (input.sourceConnectionId) {
-        const allowCopyDb = canReuseStoredSecretForTarget(sourceProfile, merged, 'db')
-        const allowCopySslKey = canReuseStoredSecretForTarget(sourceProfile, merged, 'sslKey')
-        const allowCopySsh = canReuseStoredSecretForTarget(sourceProfile, merged, 'ssh')
+      const executeSaveMutation = async (): Promise<ConnectionProfile[]> => {
+        const list = await sessionManager.getStoredConnections()
+        const idx = list.findIndex((c) => c.id === id)
+        const existing = idx >= 0 ? list[idx] : undefined
+        const sourceProfile = input.sourceConnectionId
+          ? list.find((c) => c.id === input.sourceConnectionId)
+          : undefined
+        const merged: ConnectionProfile = { ...normalized }
+
+        if (existing) {
+          if (!hasOwn('folder')) merged.folder = existing.folder
+          if (!hasOwn('workspaceScope')) merged.workspaceScope = existing.workspaceScope
+          if (input.profile.aiPolicy === null) {
+            delete merged.aiPolicy
+          } else if (!hasOwn('aiPolicy') || input.profile.aiPolicy === undefined) {
+            merged.aiPolicy = existing.aiPolicy
+          }
+          if (existing.driver === normalized.driver) {
+            if (!hasOwn('sslMode')) merged.sslMode = existing.sslMode
+            if (!hasOwn('sslCaPath')) merged.sslCaPath = existing.sslCaPath
+            if (!hasOwn('sslCertPath')) merged.sslCertPath = existing.sslCertPath
+            if (!hasOwn('sslKeyPath')) merged.sslKeyPath = existing.sslKeyPath
+            if (!hasOwn('hasSslKeyPassphrase')) {
+              merged.hasSslKeyPassphrase = existing.hasSslKeyPassphrase
+            }
+            if (!hasOwn('sslRejectUnauthorized')) {
+              merged.sslRejectUnauthorized = existing.sslRejectUnauthorized
+            }
+            if (!hasOwn('tlsServername')) merged.tlsServername = existing.tlsServername
+            if (!hasOwn('d1AccountId')) merged.d1AccountId = existing.d1AccountId
+            if (!hasOwn('d1DatabaseId')) merged.d1DatabaseId = existing.d1DatabaseId
+            if (!hasOwn('sshEnabled')) merged.sshEnabled = existing.sshEnabled
+            if (!sshExplicitlyDisabled) {
+              if (!hasOwn('sshHost')) merged.sshHost = existing.sshHost
+              if (!hasOwn('sshPort')) merged.sshPort = existing.sshPort
+              if (!hasOwn('sshUser')) merged.sshUser = existing.sshUser
+              if (!hasOwn('sshAuthMethod')) merged.sshAuthMethod = existing.sshAuthMethod
+              if (!hasOwn('sshPrivateKeyPath')) merged.sshPrivateKeyPath = existing.sshPrivateKeyPath
+              if (!hasOwn('hasSshPassphrase')) merged.hasSshPassphrase = existing.hasSshPassphrase
+              if (!hasOwn('hasSshPassword')) merged.hasSshPassword = existing.hasSshPassword
+              if (!hasOwn('sshJumpHosts')) merged.sshJumpHosts = existing.sshJumpHosts
+            } else {
+              delete merged.sshJumpHosts
+            }
+          }
+        } else if (input.profile.aiPolicy === null) {
+          delete merged.aiPolicy
+        }
+
+        const incomingHopSecrets = input.sshJumpHopSecrets
+        const effectiveHopSecrets: Record<string, SshJumpHopSecret> = {}
+        const copyHopIds: string[] = []
+        const existingJumpHops = Array.isArray(existing?.sshJumpHosts) ? existing.sshJumpHosts : []
+        const existingHopIds = existingJumpHops.map((h) => h.hopId)
+
+        const copyPrefixes: string[] = []
+        if (input.sourceConnectionId) {
+          const allowCopyDb = canReuseStoredSecretForTarget(sourceProfile, merged, 'db')
+          const allowCopySslKey = canReuseStoredSecretForTarget(sourceProfile, merged, 'sslKey')
+          const allowCopySsh = canReuseStoredChainSecret(sourceProfile, merged, { kind: 'bastion' })
+          const usesTokenSave = merged.driver === 'libsql' || merged.driver === 'd1'
+
+          if (!allowCopyDb) {
+            const wantsDbCopy = usesTokenSave
+              ? input.authToken === undefined && Boolean(merged.hasAuthToken)
+              : input.password === undefined && Boolean(merged.hasPassword)
+            if (wantsDbCopy) {
+              throw createHostError(
+                'not_permitted',
+                'Stored credentials cannot be copied after changing the target host, port, URL, or driver. Re-enter credentials before saving.'
+              )
+            }
+          } else {
+            if (input.password === undefined) copyPrefixes.push('pwd')
+            if (input.authToken === undefined) copyPrefixes.push('tok')
+          }
+
+          const effectiveAllowCopySslKey = allowCopyDb && allowCopySslKey
+          const effectiveAllowCopySsh = allowCopyDb && allowCopySsh
+
+          if (!effectiveAllowCopySslKey) {
+            if (
+              input.sslKeyPassphrase === undefined &&
+              Boolean(merged.hasSslKeyPassphrase) &&
+              Boolean(merged.sslKeyPath?.trim())
+            ) {
+              throw createHostError(
+                'not_permitted',
+                'Stored TLS key passphrase cannot be copied after changing the target endpoint or TLS key path. Re-enter the passphrase before saving.'
+              )
+            }
+          } else if (input.sslKeyPassphrase === undefined) {
+            copyPrefixes.push('sslkey')
+          }
+
+          if (!effectiveAllowCopySsh) {
+            if (
+              Boolean(merged.sshEnabled) &&
+              ((input.sshPassphrase === undefined && Boolean(merged.hasSshPassphrase)) ||
+                (input.sshPassword === undefined && Boolean(merged.hasSshPassword)))
+            ) {
+              throw createHostError(
+                'not_permitted',
+                'Stored SSH credentials cannot be copied after changing the target endpoint or SSH host, port, user, or auth method. Re-enter SSH credentials before saving.'
+              )
+            }
+          } else {
+            if (input.sshPassphrase === undefined) copyPrefixes.push('sshpass')
+            if (input.sshPassword === undefined) copyPrefixes.push('sshpwd')
+          }
+
+          if (Array.isArray(merged.sshJumpHosts)) {
+            for (let i = 0; i < merged.sshJumpHosts.length; i += 1) {
+              const hop = merged.sshJumpHosts[i]
+              const supplied = incomingHopSecrets?.[hop.hopId]
+              const allowHopCopy = canReuseStoredChainSecret(sourceProfile, merged, {
+                kind: 'hop',
+                hopIndex: i,
+              })
+              const needsStoredPwd = supplied?.password === undefined && Boolean(hop.hasPassword)
+              const needsStoredPass = supplied?.passphrase === undefined && Boolean(hop.hasPassphrase)
+              if (!allowHopCopy && (needsStoredPwd || needsStoredPass)) {
+                throw createHostError(
+                  'not_permitted',
+                  'Stored SSH jump-host credentials cannot be copied after changing the target endpoint or preceding hops. Re-enter jump-host credentials before saving.'
+                )
+              }
+              if (allowHopCopy && (needsStoredPwd || needsStoredPass)) {
+                copyHopIds.push(hop.hopId)
+              }
+            }
+          }
+        }
+
+        // When updating an existing profile whose target endpoint changed without new credentials,
+        // purge stale keyring entries fail-closed so the next connect never leaks secrets to a new host.
+        const existingDbTargetChanged = Boolean(
+          existing && !canReuseStoredSecretForTarget(existing, merged, 'db')
+        )
+        const existingSshTargetChanged = Boolean(
+          existing &&
+            (existing.sshEnabled || merged.sshEnabled) &&
+            !canReuseStoredChainSecret(existing, merged, { kind: 'bastion' })
+        )
+        const existingSslKeyTargetChanged = Boolean(
+          existing &&
+            (existing.sslKeyPath || merged.sslKeyPath) &&
+            !canReuseStoredSecretForTarget(existing, merged, 'sslKey')
+        )
+
+        const staleHopIdsToPurge: string[] = []
+        const nextJumpHosts: SshJumpHostProfile[] | undefined =
+          !sshExplicitlyDisabled && Array.isArray(merged.sshJumpHosts)
+            ? merged.sshJumpHosts.map((hop, idx) => {
+                const supplied = incomingHopSecrets?.[hop.hopId]
+                const existingHop = existingJumpHops.find((h) => h.hopId === hop.hopId)
+                const hopChainReusable =
+                  !existing ||
+                  !existingHop ||
+                  canReuseStoredChainSecret(existing, merged, { kind: 'hop', hopIndex: idx })
+
+                const effPwd =
+                  supplied?.password !== undefined
+                    ? supplied.password
+                    : !hopChainReusable
+                      ? ''
+                      : undefined
+                const effPass =
+                  supplied?.passphrase !== undefined
+                    ? supplied.passphrase
+                    : !hopChainReusable
+                      ? ''
+                      : undefined
+
+                if (effPwd !== undefined || effPass !== undefined) {
+                  effectiveHopSecrets[hop.hopId] = {
+                    ...(effPwd !== undefined ? { password: effPwd } : {}),
+                    ...(effPass !== undefined ? { passphrase: effPass } : {}),
+                  }
+                }
+
+                const nextHasPassword =
+                  effPwd !== undefined
+                    ? Boolean(effPwd)
+                    : Boolean(hop.hasPassword ?? existingHop?.hasPassword)
+                const nextHasPassphrase =
+                  effPass !== undefined
+                    ? Boolean(effPass)
+                    : Boolean(hop.hasPassphrase ?? existingHop?.hasPassphrase)
+
+                return {
+                  ...hop,
+                  ...(nextHasPassword ? { hasPassword: true } : { hasPassword: undefined }),
+                  ...(nextHasPassphrase ? { hasPassphrase: true } : { hasPassphrase: undefined }),
+                }
+              })
+            : undefined
+
+        if (existing) {
+          const nextHopIdSet = new Set((nextJumpHosts ?? []).map((h) => h.hopId))
+          for (const oldHopId of existingHopIds) {
+            if (sshExplicitlyDisabled || !nextHopIdSet.has(oldHopId)) {
+              staleHopIdsToPurge.push(oldHopId)
+            }
+          }
+        }
+        if (nextJumpHosts !== undefined) {
+          merged.sshJumpHosts = nextJumpHosts
+        }
+
         const usesTokenSave = merged.driver === 'libsql' || merged.driver === 'd1'
+        const effectivePasswordInput =
+          input.password !== undefined
+            ? input.password
+            : existingDbTargetChanged || (existing && usesTokenSave && existing.driver !== merged.driver)
+              ? ''
+              : undefined
+        const effectiveAuthTokenInput =
+          input.authToken !== undefined
+            ? input.authToken
+            : existingDbTargetChanged || (existing && !usesTokenSave && existing.driver !== merged.driver)
+              ? ''
+              : undefined
+        const effectiveSslKeyPassphraseInput =
+          input.sslKeyPassphrase !== undefined
+            ? input.sslKeyPassphrase
+            : existingSslKeyTargetChanged
+              ? ''
+              : undefined
+        const effectiveSshPassphraseInput =
+          input.sshPassphrase !== undefined
+            ? input.sshPassphrase
+            : existingSshTargetChanged || sshExplicitlyDisabled
+              ? ''
+              : undefined
+        const effectiveSshPasswordInput =
+          input.sshPassword !== undefined
+            ? input.sshPassword
+            : existingSshTargetChanged || sshExplicitlyDisabled
+              ? ''
+              : undefined
 
-        if (!allowCopyDb) {
-          const wantsDbCopy = usesTokenSave
-            ? input.authToken === undefined && Boolean(merged.hasAuthToken)
-            : input.password === undefined && Boolean(merged.hasPassword)
-          if (wantsDbCopy) {
-            throw createHostError(
-              'not_permitted',
-              'Stored credentials cannot be copied after changing the target host, port, URL, or driver. Re-enter credentials before saving.'
-            )
-          }
+        const hasPassword =
+          effectivePasswordInput !== undefined
+            ? Boolean(effectivePasswordInput)
+            : Boolean(merged.hasPassword)
+        const hasAuthToken =
+          effectiveAuthTokenInput !== undefined
+            ? Boolean(effectiveAuthTokenInput)
+            : Boolean(merged.hasAuthToken)
+        const hasSslKeyPassphrase =
+          effectiveSslKeyPassphraseInput !== undefined
+            ? Boolean(effectiveSslKeyPassphraseInput)
+            : Boolean(merged.hasSslKeyPassphrase)
+        const hasSshPassphrase =
+          effectiveSshPassphraseInput !== undefined
+            ? Boolean(effectiveSshPassphraseInput)
+            : Boolean(merged.hasSshPassphrase)
+        const hasSshPassword =
+          effectiveSshPasswordInput !== undefined
+            ? Boolean(effectiveSshPasswordInput)
+            : Boolean(merged.hasSshPassword)
+
+        const profileToSave = sanitizeConnectionProfile({
+          ...merged,
+          id,
+          hasPassword,
+          hasAuthToken: hasAuthToken || undefined,
+          hasSslKeyPassphrase: hasSslKeyPassphrase || undefined,
+          hasSshPassphrase: hasSshPassphrase || undefined,
+          hasSshPassword: hasSshPassword || undefined,
+        })
+
+        const nextList = list.slice()
+        if (idx >= 0) {
+          nextList[idx] = profileToSave
         } else {
-          if (input.password === undefined) copyPrefixes.push('pwd')
-          if (input.authToken === undefined) copyPrefixes.push('tok')
+          nextList.push(profileToSave)
         }
 
-        const effectiveAllowCopySslKey = allowCopyDb && allowCopySslKey
-        const effectiveAllowCopySsh = allowCopyDb && allowCopySsh
-
-        if (!effectiveAllowCopySslKey) {
-          if (
-            input.sslKeyPassphrase === undefined &&
-            Boolean(merged.hasSslKeyPassphrase) &&
-            Boolean(merged.sslKeyPath?.trim())
-          ) {
-            throw createHostError(
-              'not_permitted',
-              'Stored TLS key passphrase cannot be copied after changing the target endpoint or TLS key path. Re-enter the passphrase before saving.'
+        const nextHopIds = (profileToSave.sshJumpHosts ?? []).map((h) => h.hopId)
+        const prevPrimaryStorage = await orca.storage.get(SAVED_CONNECTIONS_STORAGE_KEY)
+        const prevLegacyStorage = await orca.storage.get('connections')
+        const secretSnapshot = existing
+          ? await snapshotConnectionSecrets(
+              orca.secrets,
+              collectConnectionSecretKeys(id, Array.from(new Set([...existingHopIds, ...nextHopIds])))
             )
+          : new Map<string, string | null>()
+
+        try {
+          if (input.sourceConnectionId && copyPrefixes.length > 0) {
+            await sessionManager.copySecret(input.sourceConnectionId, id, copyPrefixes)
           }
-        } else if (input.sslKeyPassphrase === undefined) {
-          copyPrefixes.push('sslkey')
-        }
-
-        if (!effectiveAllowCopySsh) {
-          if (
-            Boolean(merged.sshEnabled) &&
-            ((input.sshPassphrase === undefined && Boolean(merged.hasSshPassphrase)) ||
-              (input.sshPassword === undefined && Boolean(merged.hasSshPassword)))
-          ) {
-            throw createHostError(
-              'not_permitted',
-              'Stored SSH credentials cannot be copied after changing the target endpoint or SSH host, port, user, or auth method. Re-enter SSH credentials before saving.'
-            )
+          if (input.sourceConnectionId && copyHopIds.length > 0 && typeof sessionManager.copyHopSecrets === 'function') {
+            await sessionManager.copyHopSecrets(input.sourceConnectionId, id, copyHopIds)
           }
-        } else {
-          if (input.sshPassphrase === undefined) copyPrefixes.push('sshpass')
-          if (input.sshPassword === undefined) copyPrefixes.push('sshpwd')
+          await sessionManager.saveSecret(id, {
+            password: effectivePasswordInput,
+            authToken: effectiveAuthTokenInput,
+            sslKeyPassphrase: effectiveSslKeyPassphraseInput,
+            sshPassphrase: effectiveSshPassphraseInput,
+            sshPassword: effectiveSshPasswordInput,
+          })
+          if (Object.keys(effectiveHopSecrets).length > 0 && typeof sessionManager.saveHopSecrets === 'function') {
+            await sessionManager.saveHopSecrets(id, nextHopIds, effectiveHopSecrets)
+          }
+          await runStorageLocked(async () => {
+            await sessionManager.saveStoredConnections(nextList)
+            if (staleHopIdsToPurge.length > 0) {
+              await deleteHopSecretsVault(orca.secrets, id, staleHopIdsToPurge)
+            }
+          })
+        } catch (saveErr) {
+          await runStorageLocked(async () => {
+            await restoreConnectionStorage(orca.storage, prevPrimaryStorage, prevLegacyStorage)
+          })
+          if (!existing) {
+            await sessionManager.deleteSecret(id, nextHopIds).catch(() => {})
+          } else {
+            await restoreConnectionSecrets(orca.secrets, secretSnapshot)
+          }
+          throw saveErr
         }
+        return nextList
       }
-
-      // When updating an existing profile whose target endpoint changed without new credentials,
-      // purge stale keyring entries fail-closed so the next connect never leaks secrets to a new host.
-      const existingDbTargetChanged = Boolean(
-        existing && !canReuseStoredSecretForTarget(existing, merged, 'db')
-      )
-      const existingSshTargetChanged = Boolean(
-        existing &&
-          (existing.sshEnabled || merged.sshEnabled) &&
-          !canReuseStoredSecretForTarget(existing, merged, 'ssh')
-      )
-      const existingSslKeyTargetChanged = Boolean(
-        existing &&
-          (existing.sslKeyPath || merged.sslKeyPath) &&
-          !canReuseStoredSecretForTarget(existing, merged, 'sslKey')
-      )
-
-      const usesTokenSave = merged.driver === 'libsql' || merged.driver === 'd1'
-      const effectivePasswordInput =
-        input.password !== undefined
-          ? input.password
-          : existingDbTargetChanged || (existing && usesTokenSave && existing.driver !== merged.driver)
-            ? ''
-            : undefined
-      const effectiveAuthTokenInput =
-        input.authToken !== undefined
-          ? input.authToken
-          : existingDbTargetChanged || (existing && !usesTokenSave && existing.driver !== merged.driver)
-            ? ''
-            : undefined
-      const effectiveSslKeyPassphraseInput =
-        input.sslKeyPassphrase !== undefined
-          ? input.sslKeyPassphrase
-          : existingSslKeyTargetChanged
-            ? ''
-            : undefined
-      const effectiveSshPassphraseInput =
-        input.sshPassphrase !== undefined
-          ? input.sshPassphrase
-          : existingSshTargetChanged || sshExplicitlyDisabled
-            ? ''
-            : undefined
-      const effectiveSshPasswordInput =
-        input.sshPassword !== undefined
-          ? input.sshPassword
-          : existingSshTargetChanged || sshExplicitlyDisabled
-            ? ''
-            : undefined
-
-      const hasPassword =
-        effectivePasswordInput !== undefined
-          ? Boolean(effectivePasswordInput)
-          : Boolean(merged.hasPassword)
-      const hasAuthToken =
-        effectiveAuthTokenInput !== undefined
-          ? Boolean(effectiveAuthTokenInput)
-          : Boolean(merged.hasAuthToken)
-      const hasSslKeyPassphrase =
-        effectiveSslKeyPassphraseInput !== undefined
-          ? Boolean(effectiveSslKeyPassphraseInput)
-          : Boolean(merged.hasSslKeyPassphrase)
-      const hasSshPassphrase =
-        effectiveSshPassphraseInput !== undefined
-          ? Boolean(effectiveSshPassphraseInput)
-          : Boolean(merged.hasSshPassphrase)
-      const hasSshPassword =
-        effectiveSshPasswordInput !== undefined
-          ? Boolean(effectiveSshPasswordInput)
-          : Boolean(merged.hasSshPassword)
-
-      const profileToSave = sanitizeConnectionProfile({
-        ...merged,
-        id,
-        hasPassword,
-        hasAuthToken: hasAuthToken || undefined,
-        hasSslKeyPassphrase: hasSslKeyPassphrase || undefined,
-        hasSshPassphrase: hasSshPassphrase || undefined,
-        hasSshPassword: hasSshPassword || undefined,
-      })
-
-      const prevList = list.slice()
-      if (idx >= 0) {
-        list[idx] = profileToSave
-      } else {
-        list.push(profileToSave)
-      }
-
-      if (input.sourceConnectionId && copyPrefixes.length > 0) {
-        await sessionManager.copySecret(input.sourceConnectionId, id, copyPrefixes)
-      }
-      await sessionManager.saveSecret(id, {
-        password: effectivePasswordInput,
-        authToken: effectiveAuthTokenInput,
-        sslKeyPassphrase: effectiveSslKeyPassphraseInput,
-        sshPassphrase: effectiveSshPassphraseInput,
-        sshPassword: effectiveSshPasswordInput,
-      })
-
-      try {
-        await sessionManager.saveStoredConnections(list)
-      } catch (storageErr) {
-        if (!existing) {
-          await sessionManager.deleteSecret(id).catch(() => {})
-        } else {
-          await sessionManager.saveStoredConnections(prevList).catch(() => {})
-        }
-        throw storageErr
-      }
+      const nextList =
+        typeof sessionManager.withConnectionMutation === 'function'
+          ? await sessionManager.withConnectionMutation(id, executeSaveMutation)
+          : await executeSaveMutation()
       if (isLiveDesktopHost) {
-        await writeHostConfigBackupPatch({ connections: list.map(sanitizeConnectionProfile) })
+        await writeHostConfigBackupPatch({ connections: nextList.map(sanitizeConnectionProfile) })
       }
 
       const currentActiveId = await orca.storage.get(ACTIVE_CONNECTION_STORAGE_KEY)
       const activeStillExists =
         typeof currentActiveId === 'string' &&
         currentActiveId.trim().length > 0 &&
-        list.some((c) => c.id === currentActiveId)
+        nextList.some((c) => c.id === currentActiveId)
       if (!activeStillExists) {
         await orca.storage.set(ACTIVE_CONNECTION_STORAGE_KEY, id)
       }
 
       await sessionManager.closeSession(id)
       schemaCache?.invalidateConnection(id)
+      await clearPersistedSelectedSchema(orca, id)
 
-      orca.panels.post('connections.changed', { count: list.length })
+      orca.panels.post('connections.changed', { count: nextList.length })
       return { ok: true, id }
     })
   })
@@ -812,15 +1046,50 @@ export function registerConnectionHandlers({
     }
 
     return await connectionsQueue.run(async () => {
-      const list = await sessionManager.getStoredConnections()
-      const updated = list.filter((c) => c.id !== input.id)
-      await sessionManager.saveStoredConnections(updated)
+      const runStorageLocked = async <T>(fn: () => Promise<T>): Promise<T> => {
+        if (typeof sessionManager.withConnectionStorageLock === 'function') {
+          return await sessionManager.withConnectionStorageLock(fn)
+        }
+        return await fn()
+      }
+      const executeDeleteMutation = async (): Promise<ConnectionProfile[]> => {
+        const list = await sessionManager.getStoredConnections()
+        const existingTarget = list.find((c) => c.id === input.id)
+        const hopIds = (existingTarget?.sshJumpHosts ?? []).map((h) => h.hopId)
+        const updated = list.filter((c) => c.id !== input.id)
+        const prevPrimaryStorage = await orca.storage.get(SAVED_CONNECTIONS_STORAGE_KEY)
+        const prevLegacyStorage = await orca.storage.get('connections')
+        const secretSnapshot = await snapshotConnectionSecrets(
+          orca.secrets,
+          collectConnectionSecretKeys(input.id, hopIds)
+        )
+        try {
+          // Delete secrets (including per-hop keyring entries) BEFORE removing profile metadata
+          await sessionManager.deleteSecret(input.id, hopIds)
+          await runStorageLocked(async () => {
+            await sessionManager.saveStoredConnections(updated)
+          })
+          return updated
+        } catch (delErr) {
+          await runStorageLocked(async () => {
+            await restoreConnectionStorage(orca.storage, prevPrimaryStorage, prevLegacyStorage)
+          })
+          await restoreConnectionSecrets(orca.secrets, secretSnapshot)
+          throw delErr
+        }
+      }
+      const updated =
+        typeof sessionManager.withConnectionMutation === 'function'
+          ? await sessionManager.withConnectionMutation(input.id, executeDeleteMutation)
+          : await executeDeleteMutation()
       if (isLiveDesktopHost) {
         await writeHostConfigBackupPatch({ connections: updated.map(sanitizeConnectionProfile) })
       }
-      await sessionManager.deleteSecret(input.id)
       await sessionManager.closeSession(input.id)
       schemaCache?.invalidateConnection(input.id)
+      await clearPersistedSelectedSchema(orca, input.id)
+      await tableDisplayStateStore?.deleteByConnection(input.id).catch(() => {})
+      await erLayoutStateStore?.deleteByConnection(input.id).catch(() => {})
 
       const validUpdated = updated.filter(
         (c) => c && typeof c.id === 'string' && c.id.length > 0 && !c.id.startsWith('ws_')
@@ -843,7 +1112,129 @@ export function registerConnectionHandlers({
     })
   })
 
-  registerHandler('connection.test', async (input) => {
+  registerHandler('connections.reorder', async (input) => {
+    const rawOrderedIds = input?.orderedIds
+    if (!Array.isArray(rawOrderedIds) || rawOrderedIds.length === 0) {
+      throw createHostError('invalid_params', 'orderedIds must be a non-empty array of connection IDs')
+    }
+    if (rawOrderedIds.length > 1000) {
+      throw createHostError('invalid_params', 'orderedIds exceeds maximum allowed size (1000)')
+    }
+    if (input?.folder !== undefined && typeof input.folder !== 'string') {
+      throw createHostError('invalid_params', 'folder must be a string when provided')
+    }
+
+    return await connectionsQueue.run(async () => {
+      const stored = await sessionManager.getStoredConnections()
+      const cleaned = stored.filter(
+        (c) =>
+          c &&
+          typeof c === 'object' &&
+          typeof c.id === 'string' &&
+          c.id.length > 0 &&
+          !c.id.startsWith('ws_')
+      )
+      const reordered = reorderConnectionsWithinFolder(cleaned, input.folder, rawOrderedIds)
+      if (!reordered.ok) {
+        throw createHostError(
+          'invalid_params',
+          reordered.error || 'Failed to reorder connections within folder'
+        )
+      }
+      const sanitizedNext = reordered.connections.map(sanitizeConnectionProfile)
+      if (!reordered.changed) {
+        return { ok: true, changed: false, connections: sanitizedNext }
+      }
+      await sessionManager.saveStoredConnections(sanitizedNext)
+      if (isLiveDesktopHost) {
+        await writeHostConfigBackupPatch({ connections: sanitizedNext })
+      }
+      orca.panels.post('connections.changed', { count: sanitizedNext.length })
+      return { ok: true, changed: true, connections: sanitizedNext }
+    })
+  })
+
+  registerHandler('folders.order.get', async () => {
+    await connectionsQueue.waitIdle()
+    let folderOrder = normalizeFolderOrder(await orca.storage.get(SAVED_FOLDER_ORDER_STORAGE_KEY))
+    if (folderOrder.length === 0 && isLiveDesktopHost && !folderOrderBackupChecked) {
+      folderOrder = await connectionsQueue.run(async () => {
+        const latest = normalizeFolderOrder(await orca.storage.get(SAVED_FOLDER_ORDER_STORAGE_KEY))
+        if (latest.length > 0 || folderOrderBackupChecked) {
+          folderOrderBackupChecked = true
+          return latest
+        }
+        folderOrderBackupChecked = true
+        const backup = await readHostConfigBackup()
+        const backupOrder = normalizeFolderOrder(backup?.folderOrder)
+        if (backupOrder.length > 0) {
+          await orca.storage.set(SAVED_FOLDER_ORDER_STORAGE_KEY, backupOrder)
+          return backupOrder
+        }
+        return latest
+      })
+    }
+    return { folderOrder }
+  })
+
+  registerHandler('folders.reorder', async (input) => {
+    const rawOrderedFolders = input?.orderedFolders
+    if (!Array.isArray(rawOrderedFolders) || rawOrderedFolders.length === 0) {
+      throw createHostError(
+        'invalid_params',
+        'orderedFolders must be a non-empty array of folder names'
+      )
+    }
+    if (rawOrderedFolders.length > 500) {
+      throw createHostError(
+        'invalid_params',
+        'orderedFolders exceeds maximum allowed size (500)'
+      )
+    }
+    for (const item of rawOrderedFolders) {
+      if (typeof item !== 'string' || item.trim().length === 0) {
+        throw createHostError(
+          'invalid_params',
+          'orderedFolders must contain non-empty string folder names'
+        )
+      }
+    }
+
+    return await connectionsQueue.run(async () => {
+      const stored = await sessionManager.getStoredConnections()
+      const cleaned = stored.filter(
+        (c) =>
+          c &&
+          typeof c === 'object' &&
+          typeof c.id === 'string' &&
+          c.id.length > 0 &&
+          !c.id.startsWith('ws_')
+      )
+      const currentFolderNames = getConnectionFolderOrderKeys(cleaned)
+      const existingOrder = normalizeFolderOrder(
+        await orca.storage.get(SAVED_FOLDER_ORDER_STORAGE_KEY)
+      )
+      const reconciled = reconcileFolderOrder(existingOrder, rawOrderedFolders, currentFolderNames)
+      if (!reconciled.ok) {
+        throw createHostError(
+          'invalid_params',
+          reconciled.error || 'Failed to reorder folders'
+        )
+      }
+      if (!reconciled.changed) {
+        return { ok: true, changed: false, folderOrder: reconciled.folderOrder }
+      }
+      await orca.storage.set(SAVED_FOLDER_ORDER_STORAGE_KEY, reconciled.folderOrder)
+      folderOrderBackupChecked = true
+      if (isLiveDesktopHost) {
+        await writeHostConfigBackupPatch({ folderOrder: reconciled.folderOrder })
+      }
+      orca.panels.post('connections.changed', { count: cleaned.length })
+      return { ok: true, changed: true, folderOrder: reconciled.folderOrder }
+    })
+  })
+
+  registerHandler('connection.test', async (input, ctx) => {
     if (!input?.profile?.driver) {
       throw createHostError('invalid_params', 'Driver must be specified')
     }
@@ -857,7 +1248,7 @@ export function registerConnectionHandlers({
       )
     }
 
-    const normalized = await normalizeSqliteProfile(input.profile)
+    const normalized = sanitizeConnectionProfile(await normalizeSqliteProfile(input.profile))
     if (
       normalized.driver === 'd1' &&
       typeof normalized.url === 'string' &&
@@ -928,7 +1319,10 @@ export function registerConnectionHandlers({
     }
 
     const effectiveAllowSslKey = allowDbSecret && allowSslKeySecret
-    const effectiveAllowSsh = allowDbSecret && allowSshSecret
+    const effectiveAllowSsh =
+      allowDbSecret &&
+      allowSshSecret &&
+      (!storedProfile || canReuseStoredChainSecret(storedProfile, normalized, { kind: 'bastion' }))
 
     if (
       secretLookupId &&
@@ -956,10 +1350,54 @@ export function registerConnectionHandlers({
       )
     }
 
+    const testJumpHops = Array.isArray(normalized.sshJumpHosts) ? normalized.sshJumpHosts : []
+    const incomingTestHopSecrets = input.sshJumpHopSecrets
+    const reusableHopProfiles: SshJumpHostProfile[] = []
+    if (secretLookupId && normalized.sshEnabled && testJumpHops.length > 0) {
+      for (let i = 0; i < testJumpHops.length; i += 1) {
+        const hop = testJumpHops[i]
+        const supplied = incomingTestHopSecrets?.[hop.hopId]
+        const needsStoredPwd = supplied?.password === undefined && Boolean(hop.hasPassword)
+        const needsStoredPass = supplied?.passphrase === undefined && Boolean(hop.hasPassphrase)
+        if (needsStoredPwd || needsStoredPass) {
+          const allowHop = canReuseStoredChainSecret(storedProfile, normalized, {
+            kind: 'hop',
+            hopIndex: i,
+          })
+          if (!allowHop) {
+            throw createHostError(
+              'not_permitted',
+              'Stored SSH jump-host credentials cannot be reused after changing the target endpoint or preceding hops. Re-enter jump-host credentials to test this connection.'
+            )
+          }
+          reusableHopProfiles.push(hop)
+        }
+      }
+    }
+
     const storedSecrets =
       secretLookupId && (effectiveAllowSslKey || effectiveAllowSsh)
         ? await sessionManager.getExtendedSecrets(secretLookupId)
         : {}
+    const storedHopSecrets =
+      secretLookupId &&
+      reusableHopProfiles.length > 0 &&
+      typeof sessionManager.getHopSecrets === 'function'
+        ? await sessionManager.getHopSecrets(secretLookupId, reusableHopProfiles)
+        : {}
+    const mergedHopSecrets: Record<string, SshJumpHopSecret> = {}
+    for (const hop of testJumpHops) {
+      const fromStore = storedHopSecrets[hop.hopId]
+      const fromInput = incomingTestHopSecrets?.[hop.hopId]
+      const password = fromInput?.password ?? fromStore?.password
+      const passphrase = fromInput?.passphrase ?? fromStore?.passphrase
+      if (password || passphrase) {
+        mergedHopSecrets[hop.hopId] = {
+          ...(password ? { password } : {}),
+          ...(passphrase ? { passphrase } : {}),
+        }
+      }
+    }
     const allowStoredExtended = Boolean(input.sourceConnectionId)
     const extraSecrets = {
       sslKeyPassphrase:
@@ -977,6 +1415,11 @@ export function registerConnectionHandlers({
         (effectiveAllowSsh && (allowStoredExtended || normalized.hasSshPassword)
           ? storedSecrets.sshPassword
           : undefined),
+      ...(Object.keys(mergedHopSecrets).length > 0 ? { sshJumpHopSecrets: mergedHopSecrets } : {}),
+      ...(typeof input.sshRetryToken === 'string' && input.sshRetryToken.trim()
+        ? { sshRetryToken: input.sshRetryToken.trim() }
+        : {}),
+      ...(ctx?.panel?.id ? { panelId: ctx.panel.id } : {}),
     }
     try {
       const result = await sessionManager.testConnection(normalized, secret, extraSecrets)
@@ -991,6 +1434,36 @@ export function registerConnectionHandlers({
       throw scrubAndEnhanceWorkerError(err)
     }
   })
+
+  if (challengeStore) {
+    registerHandler('ssh.hostKey.resolve', async (input) => {
+      if (!input || typeof input.challengeId !== 'string' || !input.challengeId.trim()) {
+        throw createHostError('invalid_params', 'challengeId parameter is required')
+      }
+      const res = await challengeStore.resolve({
+        challengeId: input.challengeId,
+        decision: input.decision,
+      })
+      try {
+        orca.panels?.post?.(
+          'ssh.hostKeyResolved',
+          sanitizeJsonPayload({
+            challengeId: input.challengeId.trim(),
+            decision: res.decision,
+          })
+        )
+      } catch {
+        // Ignore broadcast failure in minimal hosts
+      }
+      return {
+        ok: res.ok,
+        decision: res.decision,
+        ...(res.savedPath ? { savedPath: res.savedPath } : {}),
+        ...(res.challenge ? { challenge: sanitizeJsonPayload(res.challenge) } : {}),
+        ...(res.retryToken ? { retryToken: res.retryToken } : {}),
+      }
+    })
+  }
 
   registerHandler('connection.parseUri', async (input) => {
     const candidateId = typeof input?.candidateId === 'string' ? input.candidateId.trim() : ''

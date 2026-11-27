@@ -7,6 +7,8 @@ import {
   type QueryResult,
   type SchemaObject,
   type SchemaObjectKind,
+  type SshJumpHostProfile,
+  type StudioViewMode,
   type TableBrowseResult,
 } from '../protocol.js'
 import {
@@ -15,6 +17,7 @@ import {
   scrubConnectionNameForStorage,
   scrubSensitiveText,
 } from '../shared-sql-safety.js'
+import { normalizeFolderOrder } from '../shared-connection-order.js'
 import type { PersistedConsoleTabsState } from './console-tabs.js'
 
 export interface DocumentSessionLike {
@@ -31,6 +34,21 @@ export interface ParsedDatanoaDocument {
   connectionId?: string
   table?: string
   schema?: string
+  viewMode?: StudioViewMode
+}
+
+export function isValidStudioViewMode(value: unknown): value is StudioViewMode {
+  return (
+    value === 'split' ||
+    value === 'grid' ||
+    value === 'sql' ||
+    value === 'inspector' ||
+    value === 'er'
+  )
+}
+
+export function stripDatanoaViewModeHeader(metadataLines: readonly string[]): string[] {
+  return metadataLines.filter((line) => !/^--\s*datanoa:\s*viewMode=/i.test(line))
 }
 
 export interface TableColumnConfig {
@@ -39,10 +57,14 @@ export interface TableColumnConfig {
 }
 
 export interface StudioPersistedViewState {
-  activeViewMode?: 'split' | 'grid' | 'sql' | 'inspector'
+  updatedAt?: number
+  activeViewMode?: StudioViewMode
   activeConnectionId?: string | null
   activeTable?: string | null
   activeSchema?: string
+  selectedSchema?: string
+  selectedSchemaByConn?: Record<string, string>
+  selectedSchemaUpdatedAtByConn?: Record<string, number>
   currentPage?: number
   pageSize?: number
   activeWhereClause?: string
@@ -68,6 +90,7 @@ export const STUDIO_WARM_CACHE_STORAGE_KEY = 'datanoa.studioWarmCache'
 export interface StudioWarmCacheSnapshot {
   updatedAt: number
   connections?: ConnectionProfile[]
+  folderOrder?: string[]
   activeConnectionId?: string | null
   activeTable?: string | null
   activeSchema?: string
@@ -76,6 +99,10 @@ export interface StudioWarmCacheSnapshot {
   availableSchemas?: string[]
   defaultSchema?: string
   selectedSchema?: string
+  selectedSchemaByConn?: Record<string, string>
+  availableSchemasByConn?: Record<string, string[]>
+  defaultSchemaByConn?: Record<string, string>
+  schemaObjectsByKey?: Record<string, SchemaObject[]>
   isShowingSqlResult?: boolean
   whereClause?: string
   orderByClause?: string
@@ -93,6 +120,7 @@ export function parseDatanoaDocument(docText: string): ParsedDatanoaDocument {
   let connectionId: string | undefined
   let table: string | undefined
   let schema: string | undefined
+  let viewMode: StudioViewMode | undefined
 
   let i = 0
   while (i < lines.length) {
@@ -109,6 +137,7 @@ export function parseDatanoaDocument(docText: string): ParsedDatanoaDocument {
       if (key === 'connectionid' && val) connectionId = val
       else if (key === 'table' && val) table = val
       else if (key === 'schema' && val) schema = val
+      else if (key === 'viewmode' && isValidStudioViewMode(val)) viewMode = val
     }
     i++
   }
@@ -120,6 +149,7 @@ export function parseDatanoaDocument(docText: string): ParsedDatanoaDocument {
     connectionId,
     table,
     schema,
+    ...(viewMode ? { viewMode } : {}),
   }
 }
 
@@ -151,6 +181,65 @@ export function upsertDatanoaMetadataHeader(
   } else {
     metadataLines.push(nextLine)
   }
+}
+
+export function removeDatanoaMetadataHeader(
+  metadataLines: string[],
+  key: 'connectionId' | 'table' | 'schema'
+): boolean {
+  const prefix = `-- datanoa: ${key}=`.toLowerCase()
+  let removed = false
+  for (let i = metadataLines.length - 1; i >= 0; i--) {
+    if (metadataLines[i].trim().toLowerCase().startsWith(prefix)) {
+      metadataLines.splice(i, 1)
+      removed = true
+    }
+  }
+  return removed
+}
+
+export function sanitizeStringRecord(raw: unknown): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof k === 'string' && k.length > 0 && typeof v === 'string') {
+      const trimmed = v.trim()
+      if (trimmed.length > 0) {
+        out[k] = trimmed
+      }
+    }
+  }
+  return out
+}
+
+export function sanitizeNumberRecord(raw: unknown): Record<string, number> {
+  const out: Record<string, number> = {}
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out
+  for (const [k, v] of Object.entries(raw)) {
+    if (
+      typeof k === 'string' &&
+      k.length > 0 &&
+      typeof v === 'number' &&
+      Number.isFinite(v) &&
+      v >= 0
+    ) {
+      out[k] = v
+    }
+  }
+  return out
+}
+
+export function sanitizeStringArrayRecord(raw: unknown): Record<string, string[]> {
+  const out: Record<string, string[]> = {}
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof k === 'string' && k.length > 0 && Array.isArray(v)) {
+      out[k] = Array.from(
+        new Set(v.map((item) => (typeof item === 'string' ? item.trim() : '')).filter(Boolean))
+      )
+    }
+  }
+  return out
 }
 
 export function readLocalStudioViewState(): StudioPersistedViewState | null {
@@ -193,6 +282,12 @@ function sanitizeStudioSnapshotForLocalStorage(
   snapshot: StudioPersistedViewState
 ): StudioPersistedViewState {
   const safe: StudioPersistedViewState = { ...snapshot }
+  if (safe.selectedSchemaByConn !== undefined) {
+    safe.selectedSchemaByConn = sanitizeStringRecord(safe.selectedSchemaByConn)
+  }
+  if (safe.selectedSchemaUpdatedAtByConn !== undefined) {
+    safe.selectedSchemaUpdatedAtByConn = sanitizeNumberRecord(safe.selectedSchemaUpdatedAtByConn)
+  }
   if (typeof safe.activeWhereClause === 'string' && containsSensitiveSqlLiteral(safe.activeWhereClause)) {
     safe.activeWhereClause = ''
   }
@@ -235,7 +330,33 @@ function measureWarmCacheBytes(json: string): number {
   }
 }
 
-function sanitizeWarmConnections(conns: ConnectionProfile[] | undefined): ConnectionProfile[] | undefined {
+function sanitizeWarmJumpHosts(raw: unknown): SshJumpHostProfile[] | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const out: SshJumpHostProfile[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const rec = item as Record<string, unknown>
+    const hopId = typeof rec.hopId === 'string' ? rec.hopId.trim() : ''
+    const host = typeof rec.host === 'string' ? rec.host.trim() : ''
+    if (!hopId && !host) continue
+    const safeHop: SshJumpHostProfile = {
+      hopId,
+      host,
+      ...(typeof rec.port === 'number' && Number.isFinite(rec.port) ? { port: rec.port } : {}),
+      ...(typeof rec.user === 'string' ? { user: rec.user } : {}),
+      ...(rec.authMethod === 'agent' || rec.authMethod === 'key' || rec.authMethod === 'password'
+        ? { authMethod: rec.authMethod }
+        : {}),
+      ...(typeof rec.privateKeyPath === 'string' ? { privateKeyPath: rec.privateKeyPath } : {}),
+      ...(typeof rec.hasPassphrase === 'boolean' ? { hasPassphrase: rec.hasPassphrase } : {}),
+      ...(typeof rec.hasPassword === 'boolean' ? { hasPassword: rec.hasPassword } : {}),
+    }
+    out.push(safeHop)
+  }
+  return out
+}
+
+export function sanitizeWarmConnections(conns: ConnectionProfile[] | undefined): ConnectionProfile[] | undefined {
   if (!Array.isArray(conns)) return undefined
   return conns.slice(0, 120).map((c) => {
     const copy = { ...c } as Record<string, unknown>
@@ -244,6 +365,10 @@ function sanitizeWarmConnections(conns: ConnectionProfile[] | undefined): Connec
     delete copy.sshPassword
     delete copy.sshPassphrase
     delete copy.sslKeyPassphrase
+    delete copy.sshJumpHopSecrets
+    if (Array.isArray(copy.sshJumpHosts)) {
+      copy.sshJumpHosts = sanitizeWarmJumpHosts(copy.sshJumpHosts)
+    }
     if (typeof copy.name === 'string') {
       copy.name = scrubConnectionNameForStorage(copy.name)
     }
@@ -298,6 +423,18 @@ export function stripLiveRowsForWarmCache(
     ...snapshot,
     updatedAt: Number.isFinite(snapshot.updatedAt) ? snapshot.updatedAt : Date.now(),
     connections: sanitizeWarmConnections(snapshot.connections),
+    ...(Array.isArray(snapshot.folderOrder)
+      ? { folderOrder: normalizeFolderOrder(snapshot.folderOrder) }
+      : {}),
+    ...(snapshot.selectedSchemaByConn
+      ? { selectedSchemaByConn: sanitizeStringRecord(snapshot.selectedSchemaByConn) }
+      : {}),
+    ...(snapshot.availableSchemasByConn
+      ? { availableSchemasByConn: sanitizeStringArrayRecord(snapshot.availableSchemasByConn) }
+      : {}),
+    ...(snapshot.defaultSchemaByConn
+      ? { defaultSchemaByConn: sanitizeStringRecord(snapshot.defaultSchemaByConn) }
+      : {}),
     whereClause:
       typeof snapshot.whereClause === 'string' && containsSensitiveSqlLiteral(snapshot.whereClause)
         ? ''
@@ -316,6 +453,10 @@ export function writeLocalStudioWarmCache(snapshot: StudioWarmCacheSnapshot): vo
     if (measureWarmCacheBytes(serialized) > MAX_STUDIO_WARM_CACHE_BYTES) {
       clean.pageData = null
       clean.lastSqlResult = null
+      serialized = JSON.stringify(clean)
+    }
+    if (measureWarmCacheBytes(serialized) > MAX_STUDIO_WARM_CACHE_BYTES && clean.schemaObjectsByKey) {
+      delete clean.schemaObjectsByKey
       serialized = JSON.stringify(clean)
     }
     if (measureWarmCacheBytes(serialized) > MAX_STUDIO_WARM_CACHE_BYTES) {

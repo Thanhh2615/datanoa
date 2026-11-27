@@ -1,16 +1,21 @@
 import type { OrcaWorkerApi, PanelRequestContext } from 'orca/worker'
 import { sanitizeJsonPayload } from '../protocol'
 import { DriverManager } from '../drivers/driver-manager'
-import { SessionManager } from './session-manager'
+import { CopyImportRegistry } from './copy-import-registry'
+import { ErLayoutStateStore } from './er-layout-state-store'
+import { registerAiHandlers, type AiHandlersController } from './rpc-ai'
 import { registerConnectionHandlers, type ConnectionHandlersController } from './rpc-connections'
 import { registerDataAndSchemaHandlers } from './rpc-data-schema'
 import { registerQueryAndTxHandlers } from './rpc-query-tx'
+import { SchemaCatalog } from './schema-catalog'
+import { SessionManager } from './session-manager'
+import { SshHostKeyChallengeStore } from './ssh-host-key-challenge-store'
+import { TableDisplayStateStore } from './table-display-state-store'
 import { TxOwnershipController } from './tx-ownership'
-import { WorkerSchemaMetadataCache } from './ai-sql-context'
-import { registerAiHandlers, type AiHandlersController } from './rpc-ai'
 import {
   clearInMemoryUiSessionSnapshots,
   createQueryRuntimeTracker,
+  createStudioNavTokenConsumer,
   fitResponseWithinOrcaIpcLimit,
   flushHostConfigBackupWrites,
   openStudioDocumentInOrca,
@@ -27,34 +32,126 @@ export {
 } from './discovery'
 export { SessionManager } from './session-manager'
 
+interface WorkerSshManagerHandle {
+  dispose: () => void
+}
+
+let currentSshManager: WorkerSshManagerHandle | null = null
 let currentSessionManager: SessionManager | null = null
+let currentSchemaCatalog: SchemaCatalog | null = null
+let currentCopyImportRegistry: CopyImportRegistry | null = null
+let currentTableDisplayStateStore: TableDisplayStateStore | null = null
+let currentErLayoutStateStore: ErLayoutStateStore | null = null
 let currentAiController: AiHandlersController | null = null
 let currentTxOwnership: TxOwnershipController | null = null
 let currentConnController: ConnectionHandlersController | null = null
+let prevTeardownPromise: Promise<void> = Promise.resolve()
+let activationGeneration = 0
 const queryTracker = createQueryRuntimeTracker()
 
+function captureAndResetWorkerHandles() {
+  const prev = {
+    aiController: currentAiController,
+    connController: currentConnController,
+    txOwnership: currentTxOwnership,
+    copyImportRegistry: currentCopyImportRegistry,
+    schemaCatalog: currentSchemaCatalog,
+    tableDisplayStateStore: currentTableDisplayStateStore,
+    erLayoutStateStore: currentErLayoutStateStore,
+    sessionManager: currentSessionManager,
+    sshManager: currentSshManager,
+  }
+  currentAiController = null
+  currentConnController = null
+  currentTxOwnership = null
+  currentCopyImportRegistry = null
+  currentSchemaCatalog = null
+  currentTableDisplayStateStore = null
+  currentErLayoutStateStore = null
+  currentSessionManager = null
+  currentSshManager = null
+  prev.tableDisplayStateStore?.beginTeardown()
+  prev.erLayoutStateStore?.beginTeardown()
+  return prev
+}
+
+async function disposeCapturedHandles(
+  prev: ReturnType<typeof captureAndResetWorkerHandles>
+): Promise<void> {
+  prev.aiController?.dispose()
+  prev.connController?.clearDetectedCandidates()
+  prev.txOwnership?.clearAll()
+  await prev.copyImportRegistry?.dispose()
+  prev.schemaCatalog?.dispose()
+  await prev.tableDisplayStateStore?.flush()
+  prev.tableDisplayStateStore?.dispose()
+  await prev.erLayoutStateStore?.flush()
+  prev.erLayoutStateStore?.dispose()
+  await prev.sessionManager?.closeAll()
+  prev.sshManager?.dispose()
+  await flushHostConfigBackupWrites()
+}
+
 export default function activate(orca: OrcaWorkerApi): void {
-  if (currentAiController) {
-    currentAiController.dispose()
-    currentAiController = null
+  const myGeneration = ++activationGeneration
+  const prevHandles = captureAndResetWorkerHandles()
+  const hasPrev = Object.values(prevHandles).some(Boolean)
+  if (hasPrev) {
+    prevTeardownPromise = prevTeardownPromise
+      .then(() => disposeCapturedHandles(prevHandles))
+      .catch(() => {})
   }
-  if (currentConnController) {
-    currentConnController.clearDetectedCandidates()
-    currentConnController = null
+  const waitForPrevTeardown = prevTeardownPromise
+  const isActivationCurrent = () => activationGeneration === myGeneration
+
+  // Acyclic DAG creation:
+  // sshManager/challengeStore -> sessionManager -> schemaCatalog & copyImportRegistry;
+  // tableDisplayStateStore & erLayoutStateStore -> rpc handlers
+  const challengeStore = new SshHostKeyChallengeStore()
+  const sshManager: WorkerSshManagerHandle = {
+    dispose: () => {
+      challengeStore.dispose()
+    },
   }
-  if (currentTxOwnership) {
-    currentTxOwnership.clearAll()
-    currentTxOwnership = null
-  }
-  if (currentSessionManager) {
-    void currentSessionManager.closeAll().catch(() => {})
-    currentSessionManager = null
-  }
-  const sessionManager = new SessionManager(orca)
+  currentSshManager = sshManager
+
+  let schemaCatalogRef: SchemaCatalog | null = null
+  let copyImportRef: CopyImportRegistry | null = null
+
+  const sessionManager = new SessionManager(orca, {
+    challengeStore,
+    onSessionClosed: async (connectionId) => {
+      await copyImportRef?.abortByConnection(connectionId, 'Session closed')
+      schemaCatalogRef?.onSessionClosed(connectionId)
+    },
+  })
   currentSessionManager = sessionManager
+
   const driverManager = new DriverManager(orca.storage, (message) => orca.log(message))
   sessionManager.setDriverManager(driverManager)
-  const schemaCache = new WorkerSchemaMetadataCache()
+
+  const schemaCatalog = new SchemaCatalog({ sessionManager })
+  schemaCatalogRef = schemaCatalog
+  currentSchemaCatalog = schemaCatalog
+
+  const copyImportRegistry = new CopyImportRegistry()
+  copyImportRef = copyImportRegistry
+  currentCopyImportRegistry = copyImportRegistry
+
+  const tableDisplayStateStore = new TableDisplayStateStore({
+    orca,
+    beforeLoad: () => waitForPrevTeardown,
+    isActive: isActivationCurrent,
+  })
+  currentTableDisplayStateStore = tableDisplayStateStore
+
+  const erLayoutStateStore = new ErLayoutStateStore({
+    orca,
+    beforeLoad: () => waitForPrevTeardown,
+    isActive: isActivationCurrent,
+  })
+  currentErLayoutStateStore = erLayoutStateStore
+
   const txOwnership = new TxOwnershipController()
   currentTxOwnership = txOwnership
 
@@ -75,7 +172,12 @@ export default function activate(orca: OrcaWorkerApi): void {
     })
   }) as WorkerRegisterHandler
 
-  const aiController = registerAiHandlers({ orca, registerHandler, sessionManager, schemaCache })
+  const aiController = registerAiHandlers({
+    orca,
+    registerHandler,
+    sessionManager,
+    schemaCache: schemaCatalog,
+  })
   currentAiController = aiController
 
   currentConnController = registerConnectionHandlers({
@@ -83,21 +185,38 @@ export default function activate(orca: OrcaWorkerApi): void {
     registerHandler,
     sessionManager,
     driverManager,
-    schemaCache,
+    schemaCache: schemaCatalog,
+    challengeStore,
+    tableDisplayStateStore,
+    erLayoutStateStore,
   })
-  registerDataAndSchemaHandlers({ orca, registerHandler, sessionManager, schemaCache, txOwnership })
+  registerDataAndSchemaHandlers({
+    orca,
+    registerHandler,
+    sessionManager,
+    schemaCache: schemaCatalog,
+    txOwnership,
+    copyImportRegistry,
+    tableDisplayStateStore,
+    erLayoutStateStore,
+  })
   registerQueryAndTxHandlers({
     orca,
     registerHandler,
     sessionManager,
     tracker: queryTracker,
-    schemaCache,
+    schemaCache: schemaCatalog,
     txOwnership,
+    copyImportRegistry,
     onHistoryChanged: aiController.invalidateHistoryCache,
   })
 
+  const consumeStudioNavToken = createStudioNavTokenConsumer(orca)
   registerHandler('studio.open', async (input) => {
     return await openStudioDocumentInOrca(orca, input, sessionManager)
+  })
+  registerHandler('studio.navToken.consume', async (input) => {
+    return await consumeStudioNavToken(input?.navToken ?? '')
   })
 
   orca.commands.register('datanoa.openSqliteFile', async () => {
@@ -112,23 +231,12 @@ export default function activate(orca: OrcaWorkerApi): void {
 }
 
 export async function deactivate(): Promise<void> {
-  if (currentAiController) {
-    currentAiController.dispose()
-    currentAiController = null
-  }
-  if (currentConnController) {
-    currentConnController.clearDetectedCandidates()
-    currentConnController = null
-  }
-  if (currentTxOwnership) {
-    currentTxOwnership.clearAll()
-    currentTxOwnership = null
-  }
-  if (currentSessionManager) {
-    await currentSessionManager.closeAll()
-    currentSessionManager = null
-  }
+  activationGeneration += 1
+  const prevHandles = captureAndResetWorkerHandles()
   queryTracker.clear()
   clearInMemoryUiSessionSnapshots()
-  await flushHostConfigBackupWrites()
+  prevTeardownPromise = prevTeardownPromise
+    .then(() => disposeCapturedHandles(prevHandles))
+    .catch(() => {})
+  await prevTeardownPromise
 }

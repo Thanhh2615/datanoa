@@ -1,63 +1,27 @@
-// TLS (custom CA / client certs) + in-process ssh2 & OS SSH tunnel helpers.
+// TLS (custom CA / client certs) + in-process pure-JS ssh2 tunnel facade.
 
-import { spawn, type ChildProcess } from 'node:child_process'
-import * as crypto from 'node:crypto'
-import * as fs from 'node:fs'
 import * as net from 'node:net'
-import * as os from 'node:os'
-import * as path from 'node:path'
 import * as tls from 'node:tls'
-import type { ConnectionProfile } from '../../protocol'
+import type { ConnectionProfile, SshJumpHopSecret } from '../../protocol'
+import { readRegularFileBounded } from './bounded-file-reader'
+import {
+  verifySshHostKeyAgainstKnownHosts as verifyKnownHostsImpl,
+  type KnownHostsCheckResult,
+} from './ssh-host-keys'
+import {
+  openMultiHopSshTunnel,
+  SshHostKeyVerificationError,
+  type TrustedHostKeyPin,
+} from './ssh-multi-hop'
+
+export {
+  readRegularFileBounded,
+  SshHostKeyVerificationError,
+  type KnownHostsCheckResult,
+  type TrustedHostKeyPin,
+}
 
 const MAX_PEM_FILE_BYTES = 1024 * 1024
-const MAX_KNOWN_HOSTS_BYTES = 4 * 1024 * 1024
-
-/**
- * Safely opens and reads a regular file using a single bounded FileHandle.
- * Uses `O_NONBLOCK` on POSIX to prevent hanging on FIFOs/named pipes, verifies
- * `stat.isFile()`, and fails closed if size exceeds `maxBytes`.
- */
-export async function readRegularFileBounded(
-  filePath: string,
-  maxBytes: number,
-  label: string
-): Promise<Buffer> {
-  const openFlags =
-    fs.constants.O_RDONLY |
-    (typeof fs.constants.O_NONBLOCK === 'number' ? fs.constants.O_NONBLOCK : 0)
-  let handle: fs.promises.FileHandle | undefined
-  try {
-    handle = await fs.promises.open(filePath, openFlags)
-    const stat = await handle.stat()
-    if (!stat.isFile()) {
-      throw new Error(`${label} "${filePath}" is not a regular file`)
-    }
-    if (stat.size > maxBytes) {
-      throw new Error(
-        `${label} "${filePath}" exceeds maximum allowed size of ${maxBytes} bytes`
-      )
-    }
-    const chunks: Buffer[] = []
-    let total = 0
-    const chunkBuf = Buffer.allocUnsafe(Math.min(65_536, Math.max(1024, maxBytes + 1)))
-    for (;;) {
-      const { bytesRead } = await handle.read(chunkBuf, 0, chunkBuf.length, null)
-      if (bytesRead === 0) break
-      total += bytesRead
-      if (total > maxBytes) {
-        throw new Error(
-          `${label} "${filePath}" exceeds maximum allowed size of ${maxBytes} bytes`
-        )
-      }
-      chunks.push(Buffer.from(chunkBuf.subarray(0, bytesRead)))
-    }
-    return Buffer.concat(chunks, total)
-  } finally {
-    if (handle) {
-      await handle.close().catch(() => {})
-    }
-  }
-}
 
 function stripIpv6ZoneId(ip: string): string {
   const pct = ip.indexOf('%')
@@ -99,17 +63,14 @@ export interface DriverTlsOptions extends TlsSecretBundle {
 export interface SshTunnelHandle {
   localHost: '127.0.0.1'
   localPort: number
-  /** True while the underlying ssh child process is still running and the handle is open */
+  originalServername?: string
+  hopCount?: number
+  /** True while the underlying ssh tunnel is still running and the handle is open */
   isAlive: () => boolean
   close: () => Promise<void>
 }
 
 const SSH_DEFAULT_PORT = 22
-const SSH_STDERR_MAX_BYTES = 2048
-const SSH_POLL_INTERVAL_MS = 80
-const SSH_DEFAULT_TIMEOUT_MS = 12_000
-const SSH_PROBE_TIMEOUT_MS = 1000
-const SSH_KILL_GRACE_MS = 1200
 
 const INVALID_TOKEN_CHARS = /[\s\u0000-\u001f\u007f]/
 const INVALID_CONTROL_CHARS = /[\u0000-\u001f\u007f]/
@@ -150,8 +111,9 @@ function trimOptionalPath(value: string | undefined): string | undefined {
 }
 
 async function readPemFile(filePath: string, label: string): Promise<string> {
+  let buf: Buffer | undefined
   try {
-    const buf = await readRegularFileBounded(filePath, MAX_PEM_FILE_BYTES, label)
+    buf = await readRegularFileBounded(filePath, MAX_PEM_FILE_BYTES, label)
     return buf.toString('utf8')
   } catch (err: unknown) {
     if (
@@ -166,6 +128,32 @@ async function readPemFile(filePath: string, label: string): Promise<string> {
         : 'unreadable'
     // NEVER include key passphrases or file contents here
     throw new Error(`Cannot read ${label} from "${filePath}" (${reason})`)
+  } finally {
+    if (buf) {
+      buf.fill(0)
+    }
+  }
+}
+
+/**
+ * Resolves the network endpoint and TLS servername for a driver without altering `profile.host`.
+ */
+export function resolveDriverEndpoint(
+  profile: ConnectionProfile,
+  overrideServername?: string
+): { host: string; port?: number; tlsServername?: string } {
+  const host = typeof profile.host === 'string' ? profile.host.trim() : ''
+  const port =
+    typeof profile.port === 'number' && Number.isInteger(profile.port) && profile.port > 0
+      ? profile.port
+      : undefined
+  const rawOverride = typeof overrideServername === 'string' ? overrideServername.trim() : ''
+  const rawProfileSni = typeof profile.tlsServername === 'string' ? profile.tlsServername.trim() : ''
+  const tlsServername = rawOverride || rawProfileSni || undefined
+  return {
+    host,
+    ...(port !== undefined ? { port } : {}),
+    ...(tlsServername ? { tlsServername } : {}),
   }
 }
 
@@ -190,8 +178,9 @@ export async function resolveEffectiveTlsOptions(
   const hasCustomCerts = Boolean(caPath || certPath || keyPath)
   const hasExplicitRejectUnauthorized =
     profile.sslRejectUnauthorized !== undefined && profile.ssl !== false
+  const endpointSni = resolveDriverEndpoint(profile, originalServername).tlsServername ?? ''
 
-  if (!hasCustomCerts && !explicitMode && !hasExplicitRejectUnauthorized) return undefined
+  if (!hasCustomCerts && !explicitMode && !hasExplicitRejectUnauthorized && !endpointSni) return undefined
 
   if (profile.sslMode === 'require' && caPath && profile.sslRejectUnauthorized !== true) {
     const err = new Error(
@@ -211,7 +200,7 @@ export async function resolveEffectiveTlsOptions(
     options.passphrase = passphrase
   }
 
-  const rawServername = typeof originalServername === 'string' ? originalServername.trim() : ''
+  const rawServername = endpointSni
   const unwrappedServername =
     rawServername.startsWith('[') &&
     rawServername.endsWith(']') &&
@@ -239,7 +228,11 @@ export async function resolveEffectiveTlsOptions(
       options.checkServerIdentity = () => undefined
       break
     case 'verify-full':
+    case 'strict':
       options.rejectUnauthorized = true
+      if (profile.sslMode === 'strict' && profile.driver === 'mssql') {
+        options.ALPNProtocols = ['tds/8.0']
+      }
       // Over an SSH tunnel the host is 127.0.0.1, so verify the certificate against the
       // original remote hostname/IP explicitly (works for both DNS names and IP SANs).
       if (trimmedServername.length > 0) {
@@ -396,62 +389,6 @@ export function validateSshTunnelConfig(
   }
 }
 
-/** Builds a fully separated argv array for `spawn('ssh', args, { shell: false })` (zero shell interpolation) */
-export function buildSshSpawnArgs(
-  profile: ConnectionProfile,
-  localPort: number,
-  targetHost: string,
-  targetPort: number,
-  options?: { useAskpass?: boolean }
-): string[] {
-  const config = validateSshTunnelConfig(profile, targetHost, targetPort)
-  const authMethod = profile.sshAuthMethod ?? 'agent'
-  const useAskpass = Boolean(options?.useAskpass)
-  const keyPath =
-    authMethod === 'key'
-      ? requireSafePath(profile.sshPrivateKeyPath, 'SSH private key path')
-      : undefined
-  // RFC 3986: IPv6 literals must be bracketed inside ssh `-L` forwarding specs
-  const forwardedHost = isIpv6WithOptionalZone(config.targetHost)
-    ? `[${config.targetHost}]`
-    : config.targetHost
-
-  const authArgs: string[] = useAskpass
-    ? [
-        '-o',
-        'NumberOfPasswordPrompts=1',
-        '-o',
-        'StrictHostKeyChecking=yes',
-        '-o',
-        'KbdInteractiveAuthentication=no',
-        ...(authMethod === 'password'
-          ? ['-o', 'PreferredAuthentications=password', '-o', 'PubkeyAuthentication=no']
-          : ['-o', 'PreferredAuthentications=publickey', '-o', 'PasswordAuthentication=no']),
-      ]
-    : ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes']
-
-  return [
-    '-N',
-    '-T',
-    '-o',
-    'ExitOnForwardFailure=yes',
-    '-o',
-    'ConnectTimeout=10',
-    '-o',
-    'ServerAliveInterval=30',
-    '-o',
-    'ServerAliveCountMax=3',
-    ...authArgs,
-    '-L',
-    `127.0.0.1:${localPort}:${forwardedHost}:${config.targetPort}`,
-    '-p',
-    String(config.sshPort),
-    ...(keyPath ? ['-i', keyPath, '-o', 'IdentitiesOnly=yes'] : []),
-    '--',
-    `${config.sshUser}@${config.sshHost}`,
-  ]
-}
-
 /** Reserves a free ephemeral port on 127.0.0.1 and releases it immediately (retries on EADDRINUSE) */
 export async function allocateEphemeralPort(): Promise<number> {
   const attempt = (): Promise<number> =>
@@ -479,186 +416,9 @@ export async function allocateEphemeralPort(): Promise<number> {
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
 }
 
-function probeTcpPort(port: number): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
-    const socket = net.connect({ host: '127.0.0.1', port })
-    let settled = false
-    const finish = (open: boolean): void => {
-      if (settled) return
-      settled = true
-      socket.destroy()
-      resolve(open)
-    }
-    socket.setTimeout(SSH_PROBE_TIMEOUT_MS, () => finish(false))
-    socket.once('connect', () => finish(true))
-    socket.once('error', () => finish(false))
-  })
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise<void>((resolve) => {
-    setTimeout(resolve, ms)
-  })
-}
-
-/** Terminates the ssh child cleanly: SIGTERM, force SIGKILL after the grace period */
-async function terminateChild(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return
-  let killTimer: ReturnType<typeof setTimeout> | undefined
-  const clearKillTimer = (): void => {
-    if (killTimer !== undefined) {
-      clearTimeout(killTimer)
-      killTimer = undefined
-    }
-  }
-  const exited = new Promise<void>((resolve) => {
-    child.once('exit', () => {
-      clearKillTimer()
-      resolve()
-    })
-    child.once('error', () => {
-      clearKillTimer()
-      resolve()
-    })
-  })
-  try {
-    child.kill('SIGTERM')
-  } catch {
-    return
-  }
-  const forced = new Promise<void>((resolve) => {
-    killTimer = setTimeout(() => {
-      killTimer = undefined
-      try {
-        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
-      } catch {
-        // Already gone
-      }
-      // Give the OS kernel a brief window to reap after SIGKILL
-      const reapTimer = setTimeout(() => resolve(), 300)
-      child.once('exit', () => {
-        clearTimeout(reapTimer)
-        resolve()
-      })
-    }, SSH_KILL_GRACE_MS)
-  })
-  await Promise.race([exited, forced])
-  // Never leave a dangling kill timer keeping the Node event loop alive
-  clearKillTimer()
-}
-
-function sanitizeStderr(stderr: string, secretToScrub?: string): string {
-  const masked =
-    secretToScrub && secretToScrub.length > 0 ? stderr.split(secretToScrub).join('[REDACTED]') : stderr
-  return masked.trim().replace(/\s+/g, ' ').slice(0, SSH_STDERR_MAX_BYTES)
-}
-
-interface EphemeralAskpass {
-  scriptPath: string
-  cleanup: () => Promise<void>
-}
-
-const ASKPASS_HELPER_JS = [
-  'function extractPrompt() {',
-  '  const argvPrompt = process.argv.slice(2).join(" ").trim();',
-  '  if (argvPrompt) return argvPrompt;',
-  '  const raw = String(process.env.DATANOA_CMD_RAW || "");',
-  '  if (!raw) return "";',
-  '  const m = /askpass\\.cmd"?\\s+([\\s\\S]+)$/i.exec(raw);',
-  '  if (!m) return "";',
-  '  let rest = m[1].trim();',
-  '  if (/\\/c\\s+""/i.test(raw) && rest.endsWith(\'"\')) rest = rest.slice(0, -1).trim();',
-  '  if (rest.length >= 2 && rest.startsWith(\'"\') && rest.endsWith(\'"\')) rest = rest.slice(1, -1);',
-  '  return rest.trim();',
-  '}',
-  'const prompt = extractPrompt();',
-  'if (!prompt) { process.exit(1); }',
-  'if (/(?:continue connecting|fingerprint|\\(yes\\/no|are you sure|host key)/i.test(prompt)) { process.exit(1); }',
-  'const mode = String(process.env.DATANOA_SSH_AUTH_MODE || "").trim().toLowerCase();',
-  'if (mode === "password") {',
-  '  const body = prompt.replace(/^[^\\s:]+@[^\\s:]+\'s\\s+/i, "");',
-  '  if (/\\b(?:passphrase|verification|passcode|otp|token|pin|one-time)\\b/i.test(body) || !/\\bpassword\\s*:?\\s*$/i.test(prompt)) { process.exit(1); }',
-  '} else if (mode === "passphrase") {',
-  '  if (!/\\bpassphrase\\b/i.test(prompt)) { process.exit(1); }',
-  '} else {',
-  '  process.exit(1);',
-  '}',
-  'const secret = process.env.DATANOA_SSH_SECRET || "";',
-  'if (!secret) { process.exit(1); }',
-  'process.stdout.write(secret);',
-  '',
-].join('\n')
-
-async function createEphemeralAskpassHelper(): Promise<EphemeralAskpass> {
-  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'datanoa-ssh-'))
-  const isWin = process.platform === 'win32'
-  let cleaned = false
-  const cleanup = async (): Promise<void> => {
-    if (cleaned) return
-    cleaned = true
-    await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {})
-  }
-
-  let scriptPath: string
-  try {
-    if (!isWin) {
-      await fs.promises.chmod(dir, 0o700).catch(() => {})
-    }
-    const jsPath = path.join(dir, 'askpass.cjs')
-    await fs.promises.writeFile(jsPath, ASKPASS_HELPER_JS, { encoding: 'utf8', mode: 0o600 })
-    if (isWin) {
-      scriptPath = path.join(dir, 'askpass.cmd')
-      // Pass raw command line via delayed expansion so cmd.exe never re-parses quotes or metacharacters
-      const cmdContent =
-        '@echo off\r\nsetlocal EnableDelayedExpansion\r\nset "DATANOA_CMD_RAW=!CMDCMDLINE!"\r\n"%DATANOA_NODE_EXE%" "%~dp0askpass.cjs"\r\n'
-      await fs.promises.writeFile(scriptPath, cmdContent, { encoding: 'utf8', mode: 0o700 })
-    } else {
-      scriptPath = path.join(dir, 'askpass.sh')
-      const scriptContent = '#!/bin/sh\nexec "$DATANOA_NODE_EXE" "$(dirname "$0")/askpass.cjs" "$@"\n'
-      await fs.promises.writeFile(scriptPath, scriptContent, { encoding: 'utf8', mode: 0o700 })
-      await fs.promises.chmod(scriptPath, 0o700).catch(() => {})
-    }
-  } catch (err) {
-    await cleanup()
-    throw err
-  }
-
-  return { scriptPath, cleanup }
-}
-
-function matchKnownHostsPattern(pattern: string, targetHost: string, targetPort: number): boolean {
-  const candidates =
-    targetPort === 22
-      ? [targetHost.toLowerCase(), `[${targetHost.toLowerCase()}]:22`]
-      : [`[${targetHost.toLowerCase()}]:${targetPort}`]
-  if (pattern.startsWith('|1|')) {
-    const parts = pattern.split('|')
-    if (parts.length !== 4 || !parts[2] || !parts[3]) return false
-    let salt: Buffer
-    let expectedHash: Buffer
-    try {
-      salt = Buffer.from(parts[2], 'base64')
-      expectedHash = Buffer.from(parts[3], 'base64')
-    } catch {
-      return false
-    }
-    for (const candidate of candidates) {
-      const digest = crypto.createHmac('sha1', salt).update(candidate, 'utf8').digest()
-      if (digest.length === expectedHash.length && crypto.timingSafeEqual(digest, expectedHash)) {
-        return true
-      }
-    }
-    return false
-  }
-  const normalizedPattern = pattern.toLowerCase()
-  return candidates.includes(normalizedPattern)
-}
-
-export type KnownHostsCheckResult = 'matched' | 'mismatch' | 'revoked' | 'unknown'
-
 /**
  * Verifies an SSH server host key against OpenSSH `known_hosts` text (plain, `[host]:port`,
- * comma-separated host patterns, and `|1|<salt>|<hmac-sha1>` hashed entries).
+ * wildcards `*`/`?`, `!` negation, `@revoked`, and `|1|<salt>|<hmac-sha1>` hashed entries).
  */
 export function verifySshHostKeyAgainstKnownHosts(
   host: string,
@@ -666,354 +426,13 @@ export function verifySshHostKeyAgainstKnownHosts(
   serverHostKey: Buffer,
   knownHostsText: string
 ): KnownHostsCheckResult {
-  const normalizedHost = host.trim().toLowerCase()
-  let sawMatchingHost = false
-  let matchedKey = false
-
-  for (const rawLine of knownHostsText.split(/\r?\n/)) {
-    const line = rawLine.trim()
-    if (!line || line.startsWith('#')) continue
-    const parts = line.split(/\s+/)
-    let idx = 0
-    let marker: '' | '@revoked' | '@cert-authority' = ''
-    if (parts[0] === '@revoked' || parts[0] === '@cert-authority') {
-      marker = parts[0]
-      idx = 1
-    }
-    if (parts.length < idx + 3) continue
-    if (marker === '@cert-authority') continue
-
-    const hostField = parts[idx]
-    const keyBase64 = parts[idx + 2]
-    const patterns = hostField.split(',').filter(Boolean)
-    let matchedHost = false
-    let negated = false
-    for (const pat of patterns) {
-      if (pat.startsWith('!')) {
-        if (matchKnownHostsPattern(pat.slice(1), normalizedHost, port)) {
-          negated = true
-        }
-      } else if (matchKnownHostsPattern(pat, normalizedHost, port)) {
-        matchedHost = true
-      }
-    }
-    if (!matchedHost || negated) continue
-
-    let entryKey: Buffer
-    try {
-      entryKey = Buffer.from(keyBase64, 'base64')
-    } catch {
-      continue
-    }
-    if (entryKey.length === 0) continue
-
-    const keyEquals =
-      entryKey.length === serverHostKey.length && crypto.timingSafeEqual(entryKey, serverHostKey)
-    if (marker === '@revoked') {
-      if (keyEquals) return 'revoked'
-      continue
-    }
-    sawMatchingHost = true
-    if (keyEquals) {
-      matchedKey = true
-    }
-  }
-
-  if (matchedKey) return 'matched'
-  if (sawMatchingHost) return 'mismatch'
-  return 'unknown'
-}
-
-async function loadKnownHostsTexts(overridePaths?: readonly string[]): Promise<string[]> {
-  const candidates =
-    overridePaths && overridePaths.length > 0
-      ? [...overridePaths]
-      : [
-          path.join(os.homedir(), '.ssh', 'known_hosts'),
-          ...(process.platform === 'win32'
-            ? [path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'ssh', 'ssh_known_hosts')]
-            : ['/etc/ssh/ssh_known_hosts']),
-        ]
-  const out: string[] = []
-  for (const filePath of candidates) {
-    try {
-      const buf = await readRegularFileBounded(filePath, MAX_KNOWN_HOSTS_BYTES, 'known_hosts')
-      out.push(buf.toString('utf8'))
-    } catch {
-      // Missing or unreadable known_hosts file
-    }
-  }
-  return out
-}
-
-type Ssh2VendorModule = typeof import('../../../vendor/ssh2.js')
-let ssh2VendorPromise: Promise<Ssh2VendorModule> | null = null
-
-async function loadSsh2Vendor(): Promise<Ssh2VendorModule> {
-  if (!ssh2VendorPromise) {
-    ssh2VendorPromise = import('../../../vendor/ssh2.js').catch((err: unknown) => {
-      ssh2VendorPromise = null
-      throw err
-    })
-  }
-  return ssh2VendorPromise
-}
-
-async function openInProcessSsh2Tunnel(
-  profile: ConnectionProfile,
-  targetHost: string,
-  targetPort: number,
-  options?: {
-    timeoutMs?: number
-    secrets?: SshSecretBundle
-    knownHostsPaths?: readonly string[]
-  }
-): Promise<SshTunnelHandle> {
-  const timeoutMs = options?.timeoutMs ?? SSH_DEFAULT_TIMEOUT_MS
-  const config = validateSshTunnelConfig(profile, targetHost, targetPort)
-  const authMethod = profile.sshAuthMethod ?? 'agent'
-
-  let sshPassword: string | undefined
-  let privateKey: Buffer | undefined
-  let passphrase: string | undefined
-  let agent: string | undefined
-
-  if (authMethod === 'password') {
-    const pwd = options?.secrets?.sshPassword
-    if (typeof pwd !== 'string' || pwd.length === 0) {
-      throw new Error('SSH password is required when SSH authentication method is "password".')
-    }
-    sshPassword = pwd
-  } else if (authMethod === 'key') {
-    const keyPath = requireSafePath(profile.sshPrivateKeyPath, 'SSH private key path')
-    privateKey = await readRegularFileBounded(keyPath, MAX_PEM_FILE_BYTES, 'SSH private key')
-    if (typeof options?.secrets?.sshPassphrase === 'string' && options.secrets.sshPassphrase.length > 0) {
-      passphrase = options.secrets.sshPassphrase
-    }
-  } else {
-    agent =
-      process.env.SSH_AUTH_SOCK ||
-      (process.platform === 'win32' ? '\\\\.\\pipe\\openssh-ssh-agent' : undefined)
-  }
-
-  const knownHostsTexts = await loadKnownHostsTexts(options?.knownHostsPaths)
-  const { Client } = await loadSsh2Vendor()
-  const client = new Client()
-  let hostVerifyError = ''
-  let clientReady = false
-  let clientClosed = false
-  let closed = false
-  const activeSockets = new Set<net.Socket>()
-
-  await new Promise<void>((resolve, reject) => {
-    let settled = false
-    const finishErr = (err: Error): void => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      try {
-        client.destroy()
-      } catch {
-        // Ignore
-      }
-      reject(err)
-    }
-    const timer = setTimeout(() => {
-      finishErr(
-        new Error(
-          `SSH tunnel to ${config.targetHost}:${config.targetPort} via ${config.sshHost}:${config.sshPort} timed out after ${timeoutMs}ms.`
-        )
-      )
-    }, timeoutMs)
-
-    client.once('ready', () => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      clientReady = true
-      resolve()
-    })
-    client.once('error', (err) => {
-      const detail = hostVerifyError || sanitizeStderr(err.message, sshPassword ?? passphrase)
-      const authHint =
-        authMethod === 'password'
-          ? ' Verify the SSH password, username, and that the bastion host key is in known_hosts.'
-          : authMethod === 'key'
-            ? ' Verify the private key path, passphrase (if encrypted), and known_hosts entry.'
-            : ''
-      finishErr(
-        new Error(
-          `SSH tunnel to ${config.targetHost}:${config.targetPort} via ${config.sshHost}:${config.sshPort} failed: ${detail}.${authHint}`
-        )
-      )
-    })
-    client.once('close', () => {
-      clientClosed = true
-      if (!settled) {
-        finishErr(
-          new Error(
-            hostVerifyError ||
-              `SSH tunnel to ${config.targetHost}:${config.targetPort} closed before handshake completed.`
-          )
-        )
-      }
-    })
-    if (sshPassword) {
-      let kbdAttempted = false
-      client.on('keyboard-interactive', (_name, _instructions, _lang, prompts, finish) => {
-        if (kbdAttempted || prompts.length === 0) {
-          finish([])
-          return
-        }
-        kbdAttempted = true
-        const responses = prompts.map((p) => {
-          const text = String(p.prompt || '')
-          if (/(?:continue connecting|fingerprint|host key|passphrase|otp|token|verification)/i.test(text)) {
-            return ''
-          }
-          return sshPassword ?? ''
-        })
-        finish(responses)
-      })
-    }
-
-    client.connect({
-      host: config.sshHost,
-      port: config.sshPort,
-      username: config.sshUser,
-      ...(sshPassword ? { password: sshPassword, tryKeyboard: true } : {}),
-      ...(privateKey ? { privateKey } : {}),
-      ...(passphrase ? { passphrase } : {}),
-      ...(agent ? { agent } : {}),
-      readyTimeout: timeoutMs,
-      keepaliveInterval: 30_000,
-      keepaliveCountMax: 3,
-      hostVerifier: (rawKey: Buffer | string): boolean => {
-        const keyBuf = Buffer.isBuffer(rawKey) ? rawKey : Buffer.from(rawKey, 'binary')
-        let verdict: KnownHostsCheckResult = 'unknown'
-        for (const text of knownHostsTexts) {
-          const res = verifySshHostKeyAgainstKnownHosts(config.sshHost, config.sshPort, keyBuf, text)
-          if (res === 'revoked') {
-            verdict = 'revoked'
-            break
-          }
-          if (res === 'matched') {
-            verdict = 'matched'
-            break
-          }
-          if (res === 'mismatch') {
-            verdict = 'mismatch'
-          }
-        }
-        if (verdict === 'matched') return true
-        if (verdict === 'revoked') {
-          hostVerifyError = `Host key for ${config.sshHost}:${config.sshPort} is revoked in known_hosts`
-        } else if (verdict === 'mismatch') {
-          hostVerifyError = `Host key verification failed: remote host identification for ${config.sshHost}:${config.sshPort} has changed`
-        } else {
-          hostVerifyError = `Host key verification failed: ${config.sshHost}:${config.sshPort} is not present in known_hosts`
-        }
-        return false
-      },
-    })
-  })
-
-  const server = net.createServer((localSock) => {
-    activeSockets.add(localSock)
-    localSock.once('close', () => activeSockets.delete(localSock))
-    localSock.on('error', () => {
-      localSock.destroy()
-    })
-    if (closed || clientClosed) {
-      localSock.destroy()
-      return
-    }
-    const srcIp = localSock.remoteAddress || '127.0.0.1'
-    const srcPort = localSock.remotePort || 0
-    client.forwardOut(srcIp, srcPort, config.targetHost, config.targetPort, (err, channel) => {
-      if (err || !channel || localSock.destroyed) {
-        localSock.destroy(err ?? undefined)
-        return
-      }
-      localSock.pipe(channel)
-      channel.pipe(localSock)
-      channel.on('error', () => {
-        localSock.destroy()
-      })
-      channel.once('close', () => {
-        localSock.destroy()
-      })
-      localSock.once('close', () => {
-        try {
-          channel.close()
-        } catch {
-          // Ignore
-        }
-      })
-    })
-  })
-
-  client.on('error', () => {
-    clientClosed = true
-  })
-  client.on('close', () => {
-    clientClosed = true
-    for (const sock of activeSockets) {
-      sock.destroy()
-    }
-    activeSockets.clear()
-    server.close()
-  })
-
-  const localPort = await new Promise<number>((resolve, reject) => {
-    server.once('error', (err) => {
-      client.destroy()
-      reject(err)
-    })
-    server.listen({ host: '127.0.0.1', port: 0 }, () => {
-      const addr = server.address()
-      const port = typeof addr === 'object' && addr ? addr.port : 0
-      if (port > 0) resolve(port)
-      else {
-        server.close()
-        client.destroy()
-        reject(new Error('Failed to bind local SSH forwarding port on 127.0.0.1'))
-      }
-    })
-  })
-
-  let closePromise: Promise<void> | null = null
-  const close = (): Promise<void> => {
-    closed = true
-    if (!closePromise) {
-      closePromise = new Promise<void>((resolve) => {
-        for (const sock of activeSockets) {
-          sock.destroy()
-        }
-        activeSockets.clear()
-        server.close(() => {
-          try {
-            client.end()
-            client.destroy()
-          } catch {
-            // Ignore
-          }
-          resolve()
-        })
-      })
-    }
-    return closePromise
-  }
-
-  const isAlive = (): boolean => !closed && clientReady && !clientClosed && server.listening
-  return { localHost: '127.0.0.1', localPort, isAlive, close }
+  return verifyKnownHostsImpl(host, port, serverHostKey, knownHostsText)
 }
 
 /**
- * Opens an SSH local port forward to `targetHost:targetPort` through the configured bastion.
- * Uses pure-JS in-process `ssh2` by default (zero child env secrets, zero temp askpass files,
- * zero ephemeral port TOCTOU, zero TCP RST probe spam). Falls back to OS `ssh` argv spawning
- * ONLY when an explicit `options.sshBinary` override is supplied (e.g. test harnesses).
+ * Opens an SSH local port forward to `targetHost:targetPort` through the configured bastion
+ * (and optional intermediate jump hosts) strictly in-process via pure-JS `ssh2`
+ * (zero OS `ssh` child processes, zero env secrets, zero temp askpass files).
  */
 export async function openSshTunnel(
   profile: ConnectionProfile,
@@ -1021,141 +440,23 @@ export async function openSshTunnel(
   targetPort: number,
   options?: {
     timeoutMs?: number
-    sshBinary?: string
     secrets?: SshSecretBundle
+    hopSecrets?: Readonly<Record<string, SshJumpHopSecret>>
     knownHostsPaths?: readonly string[]
+    trustedHostKeys?: TrustedHostKeyPin[]
+    consumeTrustedHostKeyPin?: (host: string, port: number, exactFingerprint: string) => boolean
+    connectionId?: string
+    panelId?: string
   }
 ): Promise<SshTunnelHandle> {
-  const customBinary = options?.sshBinary?.trim()
-  if (!customBinary) {
-    return openInProcessSsh2Tunnel(profile, targetHost, targetPort, options)
-  }
-
-  const timeoutMs = options?.timeoutMs ?? SSH_DEFAULT_TIMEOUT_MS
-  const sshBinary = customBinary
-  const authMethod = profile.sshAuthMethod ?? 'agent'
-
-  let askpassSecret: string | undefined
-  if (authMethod === 'password') {
-    const pwd = options?.secrets?.sshPassword
-    if (typeof pwd !== 'string' || pwd.length === 0) {
-      throw new Error('SSH password is required when SSH authentication method is "password".')
-    }
-    askpassSecret = pwd
-  } else if (authMethod === 'key') {
-    const passphrase = options?.secrets?.sshPassphrase
-    if (typeof passphrase === 'string' && passphrase.length > 0) {
-      askpassSecret = passphrase
-    }
-  }
-
-  const useAskpass = typeof askpassSecret === 'string' && askpassSecret.length > 0
-  const localPort = await allocateEphemeralPort()
-  const args = buildSshSpawnArgs(profile, localPort, targetHost, targetPort, { useAskpass })
-
-  const askpassHelper = useAskpass ? await createEphemeralAskpassHelper() : null
-
-  let child: ChildProcess | undefined
-  try {
-    // A `.js`/`.mjs`/`.cjs` sshBinary runs through the current Node binary (tests/CI mock bastion)
-    const isNodeScript = /\.(?:mjs|cjs|js)$/i.test(sshBinary)
-    const spawnCommand = isNodeScript ? process.execPath : sshBinary
-    const spawnArgs = isNodeScript ? [sshBinary, ...args] : args
-
-    const spawnEnv: NodeJS.ProcessEnv =
-      askpassHelper && askpassSecret
-        ? {
-            ...process.env,
-            SSH_ASKPASS: askpassHelper.scriptPath,
-            SSH_ASKPASS_REQUIRE: 'force',
-            DISPLAY: process.env.DISPLAY || 'datanoa:0',
-            DATANOA_SSH_SECRET: askpassSecret,
-            DATANOA_SSH_AUTH_MODE: authMethod === 'password' ? 'password' : 'passphrase',
-            DATANOA_NODE_EXE: process.execPath,
-            ELECTRON_RUN_AS_NODE: '1',
-          }
-        : { ...process.env }
-
-    child = spawn(spawnCommand, spawnArgs, {
-      shell: false,
-      // The ssh child never writes meaningful stdout; ignoring it prevents pipe backpressure
-      stdio: ['ignore', 'ignore', 'pipe'],
-      env: spawnEnv,
-      windowsHide: true,
-    })
-
-    let stderr = ''
-    child.stderr?.setEncoding('utf8')
-    child.stderr?.on('data', (chunk: string) => {
-      if (stderr.length < SSH_STDERR_MAX_BYTES) {
-        stderr = (stderr + chunk).slice(0, SSH_STDERR_MAX_BYTES)
-      }
-    })
-    // Never leave an unhandled stream error behind
-    child.stderr?.on('error', () => {})
-
-    let exitDetail = ''
-    let hasExited = false
-    child.once('error', (err: Error) => {
-      hasExited = true
-      exitDetail = `failed to start "${sshBinary}": ${err.message}`
-    })
-    child.once('exit', (code, signal) => {
-      hasExited = true
-      if (!exitDetail) {
-        exitDetail = `exited with code ${code ?? 'null'}${signal ? ` (signal ${signal})` : ''}`
-      }
-    })
-
-    const failure = (reason: string): Error => {
-      const detail = sanitizeStderr(stderr, askpassSecret)
-      const authHint =
-        authMethod === 'password'
-          ? ' Verify the SSH password, username, and that the bastion host key is in known_hosts.'
-          : authMethod === 'key'
-            ? ' Verify the private key path, passphrase (if encrypted), and known_hosts entry.'
-            : ''
-      return new Error(
-        `SSH tunnel to ${targetHost}:${targetPort} via ${sshBinary} ${reason}.${detail ? ` ssh: ${detail}` : ''}${authHint}`
-      )
-    }
-
-    const deadline = Date.now() + timeoutMs
-    for (;;) {
-      // Check exit BEFORE probing: a dying ssh must never be masked by a stale bind (TOCTOU)
-      if (hasExited) {
-        throw failure(exitDetail)
-      }
-      if (await probeTcpPort(localPort)) break
-      if (hasExited) {
-        throw failure(exitDetail)
-      }
-      if (Date.now() >= deadline) {
-        throw failure(`did not open local forwarding port ${localPort} within ${timeoutMs}ms`)
-      }
-      await delay(SSH_POLL_INTERVAL_MS)
-    }
-
-    const activeChild = child
-    let closePromise: Promise<void> | null = null
-    let closed = false
-    const close = (): Promise<void> => {
-      closed = true
-      if (!closePromise) closePromise = terminateChild(activeChild)
-      return closePromise
-    }
-    const isAlive = (): boolean =>
-      !closed && !hasExited && activeChild.exitCode === null && activeChild.signalCode === null
-
-    return { localHost: '127.0.0.1', localPort, isAlive, close }
-  } catch (err) {
-    if (child) {
-      await terminateChild(child)
-    }
-    throw err instanceof Error ? err : new Error(String(err))
-  } finally {
-    if (askpassHelper) {
-      await askpassHelper.cleanup()
-    }
-  }
+  return await openMultiHopSshTunnel(profile, targetHost, targetPort, {
+    timeoutMs: options?.timeoutMs,
+    secrets: options?.secrets,
+    hopSecrets: options?.hopSecrets,
+    knownHostsPaths: options?.knownHostsPaths,
+    trustedHostKeys: options?.trustedHostKeys,
+    consumeTrustedHostKeyPin: options?.consumeTrustedHostKeyPin,
+    connectionId: options?.connectionId,
+    panelId: options?.panelId,
+  })
 }

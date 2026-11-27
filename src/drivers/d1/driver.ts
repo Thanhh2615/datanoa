@@ -14,6 +14,7 @@ import type {
   PreviewChangesResult,
   QueryResult,
   QueryResultSet,
+  SchemaErGraph,
   SchemaObject,
   SchemaObjectKind,
   TableBrowseResult,
@@ -22,6 +23,13 @@ import type {
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
+import {
+  assembleSqliteErColumnsAndForeignKeys,
+  assembleSqliteUniqueSets,
+  buildSchemaErGraphFromCatalogRows,
+  type RawErTableRow,
+  type RawErUniqueSetRow,
+} from '../common/schema-er-graph'
 import {
   DatabaseDriverError,
   attachFailedStatementMeta,
@@ -362,6 +370,10 @@ export class D1Session implements IDatabaseSession {
     return !this.isClosed
   }
 
+  clearSchemaCache(): void {
+    this.tableDetailsCache.clear()
+  }
+
   private buildHeaders(): Record<string, string> {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (this.authToken && this.authToken.trim().length > 0) {
@@ -541,6 +553,392 @@ export class D1Session implements IDatabaseSession {
     const details = await introspectSqliteTableDetails(this.queryExecutor, table, targetSchema)
     this.tableDetailsCache.set(targetSchema, 'main', table, details)
     return details
+  }
+
+  async introspectErGraph(schema?: string): Promise<SchemaErGraph> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'd1')
+    }
+    const targetSchema = (schema || 'main').trim() || 'main'
+    const masterRows = await this.queryExecutor(`
+      SELECT name, type AS kind, sql
+      FROM sqlite_master
+      WHERE type IN ('table', 'view')
+        AND name NOT LIKE 'sqlite!_%' ESCAPE '!'
+        AND UPPER(COALESCE(sql, '')) NOT LIKE 'CREATE VIRTUAL TABLE%'
+      ORDER BY name ASC;
+    `)
+
+    const tableSqlByName = new Map<string, string>()
+    const tables: RawErTableRow[] = []
+    for (const r of masterRows) {
+      if (typeof r.name !== 'string' || r.name.length === 0) continue
+      tables.push({
+        schema: targetSchema,
+        name: String(r.name),
+        kind: r.kind === 'view' ? 'view' : 'table',
+      })
+      if (typeof r.sql === 'string') {
+        tableSqlByName.set(String(r.name), r.sql)
+      }
+    }
+
+    if (tables.length === 0) {
+      return buildSchemaErGraphFromCatalogRows({
+        connectionId: this.profile.id,
+        schema: targetSchema,
+        completeness: 'full',
+        tables: [],
+        columns: [],
+        foreignKeys: [],
+      })
+    }
+
+    let rawColRows: Record<string, unknown>[] = []
+    let rawFkRows: Record<string, unknown>[] = []
+    let rawUniqRows: Record<string, unknown>[] = []
+
+    const collectD1UniqueFallback = async (): Promise<void> => {
+      const idxListItems: Array<{ tableName: string; sql: string }> = []
+      for (const tbl of tables) {
+        if (tbl.kind === 'view') continue
+        const quoted = `"${tbl.name.replace(/"/g, '""')}"`
+        idxListItems.push({ tableName: tbl.name, sql: `PRAGMA index_list(${quoted});` })
+      }
+      if (idxListItems.length === 0) return
+
+      const candidateIndexes: Array<{ tableName: string; indexName: string; isPartial: number; sql: string }> = []
+      let listViaBatch = false
+      try {
+        const D1_BATCH_CHUNK = 40
+        for (let offset = 0; offset < idxListItems.length; offset += D1_BATCH_CHUNK) {
+          const slice = idxListItems.slice(offset, offset + D1_BATCH_CHUNK)
+          const payloads = await this.executeBatch(slice.map((item) => ({ sql: item.sql, params: [] })))
+          for (let i = 0; i < slice.length; i++) {
+            const rows = payloads[i]?.results || []
+            for (const il of rows) {
+              if (Number(il.unique ?? 0) !== 1 || Number(il.partial ?? 0) !== 0) continue
+              const idxName = typeof il.name === 'string' ? il.name : ''
+              if (!idxName) continue
+              const escapedIdx = `"${idxName.replace(/"/g, '""')}"`
+              candidateIndexes.push({
+                tableName: slice[i].tableName,
+                indexName: idxName,
+                isPartial: Number(il.partial ?? 0),
+                sql: `PRAGMA index_info(${escapedIdx});`,
+              })
+            }
+          }
+        }
+        listViaBatch = true
+      } catch {
+        listViaBatch = false
+      }
+
+      if (listViaBatch) {
+        if (candidateIndexes.length === 0) return
+        try {
+          const D1_BATCH_CHUNK = 40
+          for (let offset = 0; offset < candidateIndexes.length; offset += D1_BATCH_CHUNK) {
+            const slice = candidateIndexes.slice(offset, offset + D1_BATCH_CHUNK)
+            const payloads = await this.executeBatch(slice.map((item) => ({ sql: item.sql, params: [] })))
+            for (let i = 0; i < slice.length; i++) {
+              const meta = slice[i]
+              const infoRows = payloads[i]?.results || []
+              for (const ii of infoRows) {
+                rawUniqRows.push({
+                  table_name: meta.tableName,
+                  index_name: meta.indexName,
+                  is_partial: meta.isPartial,
+                  seqno: ii.seqno,
+                  cid: ii.cid,
+                  col_name: ii.name,
+                })
+              }
+            }
+          }
+          return
+        } catch {
+          rawUniqRows = []
+        }
+      }
+
+      for (const tbl of tables) {
+        if (tbl.kind === 'view') continue
+        try {
+          const quoted = `"${tbl.name.replace(/"/g, '""')}"`
+          const idxList = await this.queryExecutor(`PRAGMA index_list(${quoted});`)
+          for (const il of idxList) {
+            if (Number(il.unique ?? 0) !== 1 || Number(il.partial ?? 0) !== 0) continue
+            const idxName = typeof il.name === 'string' ? il.name : ''
+            if (!idxName) continue
+            const escapedIdx = `"${idxName.replace(/"/g, '""')}"`
+            const infoRows = await this.queryExecutor(`PRAGMA index_info(${escapedIdx});`)
+            for (const ii of infoRows) {
+              rawUniqRows.push({
+                table_name: tbl.name,
+                index_name: idxName,
+                is_partial: il.partial ?? 0,
+                seqno: ii.seqno,
+                cid: ii.cid,
+                col_name: ii.name,
+              })
+            }
+          }
+        } catch {
+          // Best-effort unique index fallback per table
+        }
+      }
+    }
+
+    try {
+      rawColRows = await this.queryExecutor(`
+        SELECT m.name AS table_name,
+               p.name AS col_name,
+               p.type AS col_type,
+               p."notnull" AS col_notnull,
+               p.pk AS col_pk,
+               p.hidden AS col_hidden
+        FROM sqlite_master m
+        JOIN pragma_table_xinfo(m.name) p
+        WHERE m.type IN ('table', 'view')
+          AND m.name NOT LIKE 'sqlite!_%' ESCAPE '!'
+          AND UPPER(COALESCE(m.sql, '')) NOT LIKE 'CREATE VIRTUAL TABLE%'
+        ORDER BY m.name ASC, p.cid ASC;
+      `)
+      rawFkRows = await this.queryExecutor(`
+        SELECT m.name AS table_name,
+               f.id AS fk_id,
+               f.seq AS seq,
+               f."table" AS to_table,
+               f."from" AS from_col,
+               f."to" AS to_col,
+               f.on_delete AS on_delete,
+               f.on_update AS on_update
+        FROM sqlite_master m
+        JOIN pragma_foreign_key_list(m.name) f
+        WHERE m.type = 'table'
+          AND m.name NOT LIKE 'sqlite!_%' ESCAPE '!'
+          AND UPPER(COALESCE(m.sql, '')) NOT LIKE 'CREATE VIRTUAL TABLE%'
+        ORDER BY m.name ASC, f.id ASC, f.seq ASC;
+      `)
+      try {
+        rawUniqRows = await this.queryExecutor(`
+          SELECT m.name AS table_name,
+                 il.name AS index_name,
+                 il.partial AS is_partial,
+                 ii.seqno AS seqno,
+                 ii.cid AS cid,
+                 ii.name AS col_name
+          FROM sqlite_master m
+          JOIN pragma_index_list(m.name) il
+          JOIN pragma_index_info(il.name) ii
+          WHERE m.type = 'table'
+            AND m.name NOT LIKE 'sqlite!_%' ESCAPE '!'
+            AND UPPER(COALESCE(m.sql, '')) NOT LIKE 'CREATE VIRTUAL TABLE%'
+            AND il."unique" = 1
+          ORDER BY m.name ASC, il.name ASC, ii.seqno ASC;
+        `)
+      } catch {
+        await collectD1UniqueFallback()
+      }
+    } catch {
+      const batchItems: Array<{ tableName: string; kind: 'col' | 'fk' | 'idx'; sql: string }> = []
+      for (const tbl of tables) {
+        const quoted = `"${tbl.name.replace(/"/g, '""')}"`
+        batchItems.push({
+          tableName: tbl.name,
+          kind: 'col',
+          sql: `PRAGMA table_xinfo(${quoted});`,
+        })
+        if (tbl.kind !== 'view') {
+          batchItems.push({
+            tableName: tbl.name,
+            kind: 'fk',
+            sql: `PRAGMA foreign_key_list(${quoted});`,
+          })
+          batchItems.push({
+            tableName: tbl.name,
+            kind: 'idx',
+            sql: `PRAGMA index_list(${quoted});`,
+          })
+        }
+      }
+
+      const candidateIndexes: Array<{ tableName: string; indexName: string; isPartial: number; sql: string }> = []
+      let batchSucceeded = false
+      try {
+        const D1_BATCH_CHUNK = 40
+        for (let offset = 0; offset < batchItems.length; offset += D1_BATCH_CHUNK) {
+          const slice = batchItems.slice(offset, offset + D1_BATCH_CHUNK)
+          const payloads = await this.executeBatch(
+            slice.map((item) => ({ sql: item.sql, params: [] }))
+          )
+          for (let i = 0; i < slice.length; i++) {
+            const meta = slice[i]
+            const rows = payloads[i]?.results || []
+            if (meta.kind === 'col') {
+              for (const r of rows) {
+                rawColRows.push({
+                  table_name: meta.tableName,
+                  col_name: r.name,
+                  col_type: r.type,
+                  col_notnull: r.notnull,
+                  col_pk: r.pk,
+                  col_hidden: r.hidden,
+                })
+              }
+            } else if (meta.kind === 'fk') {
+              for (const r of rows) {
+                rawFkRows.push({
+                  table_name: meta.tableName,
+                  fk_id: r.id,
+                  seq: r.seq,
+                  to_table: r.table,
+                  from_col: r.from,
+                  to_col: r.to,
+                  on_delete: r.on_delete,
+                  on_update: r.on_update,
+                })
+              }
+            } else {
+              for (const il of rows) {
+                if (Number(il.unique ?? 0) !== 1 || Number(il.partial ?? 0) !== 0) continue
+                const idxName = typeof il.name === 'string' ? il.name : ''
+                if (!idxName) continue
+                const escapedIdx = `"${idxName.replace(/"/g, '""')}"`
+                candidateIndexes.push({
+                  tableName: meta.tableName,
+                  indexName: idxName,
+                  isPartial: Number(il.partial ?? 0),
+                  sql: `PRAGMA index_info(${escapedIdx});`,
+                })
+              }
+            }
+          }
+        }
+        for (let offset = 0; offset < candidateIndexes.length; offset += D1_BATCH_CHUNK) {
+          const slice = candidateIndexes.slice(offset, offset + D1_BATCH_CHUNK)
+          const payloads = await this.executeBatch(slice.map((item) => ({ sql: item.sql, params: [] })))
+          for (let i = 0; i < slice.length; i++) {
+            const meta = slice[i]
+            const infoRows = payloads[i]?.results || []
+            for (const ii of infoRows) {
+              rawUniqRows.push({
+                table_name: meta.tableName,
+                index_name: meta.indexName,
+                is_partial: meta.isPartial,
+                seqno: ii.seqno,
+                cid: ii.cid,
+                col_name: ii.name,
+              })
+            }
+          }
+        }
+        batchSucceeded = true
+      } catch {
+        batchSucceeded = false
+      }
+
+      if (!batchSucceeded) {
+        rawColRows = []
+        rawFkRows = []
+        rawUniqRows = []
+        for (const tbl of tables) {
+          const quoted = `"${tbl.name.replace(/"/g, '""')}"`
+          try {
+            const rows = await this.queryExecutor(`PRAGMA table_xinfo(${quoted});`)
+            for (const r of rows) {
+              rawColRows.push({
+                table_name: tbl.name,
+                col_name: r.name,
+                col_type: r.type,
+                col_notnull: r.notnull,
+                col_pk: r.pk,
+                col_hidden: r.hidden,
+              })
+            }
+          } catch {
+            try {
+              const fallbackRows = await this.queryExecutor(`PRAGMA table_info(${quoted});`)
+              for (const r of fallbackRows) {
+                rawColRows.push({
+                  table_name: tbl.name,
+                  col_name: r.name,
+                  col_type: r.type,
+                  col_notnull: r.notnull,
+                  col_pk: r.pk,
+                  col_hidden: 0,
+                })
+              }
+            } catch {
+              // Skip broken views or restricted D1 pragmas cleanly
+            }
+          }
+
+          if (tbl.kind !== 'view') {
+            try {
+              const fkRows = await this.queryExecutor(`PRAGMA foreign_key_list(${quoted});`)
+              for (const r of fkRows) {
+                rawFkRows.push({
+                  table_name: tbl.name,
+                  fk_id: r.id,
+                  seq: r.seq,
+                  to_table: r.table,
+                  from_col: r.from,
+                  to_col: r.to,
+                  on_delete: r.on_delete,
+                  on_update: r.on_update,
+                })
+              }
+            } catch {
+              // Skip per-table foreign_key_list failure cleanly
+            }
+            try {
+              const idxList = await this.queryExecutor(`PRAGMA index_list(${quoted});`)
+              for (const il of idxList) {
+                if (Number(il.unique ?? 0) !== 1 || Number(il.partial ?? 0) !== 0) continue
+                const idxName = typeof il.name === 'string' ? il.name : ''
+                if (!idxName) continue
+                const escapedIdx = `"${idxName.replace(/"/g, '""')}"`
+                const infoRows = await this.queryExecutor(`PRAGMA index_info(${escapedIdx});`)
+                for (const ii of infoRows) {
+                  rawUniqRows.push({
+                    table_name: tbl.name,
+                    index_name: idxName,
+                    is_partial: il.partial ?? 0,
+                    seqno: ii.seqno,
+                    cid: ii.cid,
+                    col_name: ii.name,
+                  })
+                }
+              }
+            } catch {
+              // Best-effort unique index fallback per table
+            }
+          }
+        }
+      }
+    }
+
+    const uniqueSets: RawErUniqueSetRow[] = assembleSqliteUniqueSets(targetSchema, rawUniqRows)
+    const { columns, foreignKeys } = assembleSqliteErColumnsAndForeignKeys({
+      schema: targetSchema,
+      tables,
+      tableSqlByName,
+      rawColRows,
+      rawFkRows,
+    })
+
+    return buildSchemaErGraphFromCatalogRows({
+      connectionId: this.profile.id,
+      schema: targetSchema,
+      completeness: 'full',
+      tables,
+      columns,
+      uniqueSets,
+      foreignKeys,
+    })
   }
 
   async fetchPage(params: FetchPageParams): Promise<TableBrowseResult> {

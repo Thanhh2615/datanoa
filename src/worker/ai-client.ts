@@ -460,7 +460,7 @@ const PLACEHOLDER_RE =
 
 const SECRET_RULES: readonly { kind: string; pattern: RegExp }[] = [
   { kind: 'private key', pattern: /-----(?:BEGIN|END) (?:[A-Z]+ )*PRIVATE KEY(?: BLOCK)?-----/ },
-  { kind: 'key body', pattern: /(?:^[ \t]*["']?[A-Za-z0-9+/]{60,80}={0,2}["']?[ \t]*,?[ \t]*\r?\n){3}/m },
+  { kind: 'key body', pattern: /(?:^[ \t]*["']?[A-Za-z0-9+/]{60,80}={0,2}["']?[ \t]*,?[ \t]*\r?\n){2}^[ \t]*["']?[A-Za-z0-9+/]{60,80}={0,2}["']?[ \t]*,?[ \t]*(?:\r?\n|$)/m },
   { kind: 'key body', pattern: /(?:[A-Za-z0-9+/]{60,80}={0,2}\\n){3}/ },
   { kind: 'AWS access key', pattern: /\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA)[0-9A-Z]{16}\b/ },
   { kind: 'AWS secret key', pattern: /aws_secret_access_key\s*[=:]\s*["']?[A-Za-z0-9/+=]{40}\b/i },
@@ -670,11 +670,14 @@ function scanTextForSecret(text: string, dialect?: AiDialect): string | null {
   }
   const sqlCred = detectRecognizableSqlCredential(text, dialect)
   if (sqlCred) return sqlCred
-  // Scan SQL credential statement slices so prompt prefixes ("Broken SQL query:\nCREATE USER ...") cannot mask DDL credentials
+  // Scan bounded SQL credential statement slices so prompt prefixes ("Broken SQL query:\nCREATE USER ...") cannot mask DDL credentials
+  const SQL_CRED_SLICE_MAX_CHARS = 2048
   for (const match of text.matchAll(SQL_CRED_CLAUSE_START_RE)) {
     const startIdx = match.index ?? 0
     if (startIdx === 0) continue
-    const slice = text.slice(startIdx)
+    const rawWindow = text.slice(startIdx, Math.min(text.length, startIdx + SQL_CRED_SLICE_MAX_CHARS))
+    const semiIdx = findFirstUnquotedSemicolon(rawWindow, null, dialect)
+    const slice = semiIdx >= 0 ? rawWindow.slice(0, semiIdx + 1) : rawWindow
     const nestedCred = detectRecognizableSqlCredential(slice, dialect)
     if (nestedCred) return nestedCred
     const unclosedNested = UNCLOSED_SQL_CRED_TAIL_RE.exec(slice)
@@ -691,6 +694,9 @@ export function hasSensitiveContent(
   extra = '',
   dialect?: AiDialect
 ): string | null {
+  if (after === '' && extra === '') {
+    return scanTextForSecret(before, dialect)
+  }
   return (
     scanTextForSecret(`${extra}\n${before}\n${after}`, dialect) ??
     scanTextForSecret(`${before}${after}`, dialect)
@@ -971,7 +977,7 @@ function unwrapSingleBacktickInline(text: string, prefix: string, dialect?: AiDi
   return text
 }
 
-function extractUnfencedSuggestion(raw: string, prefix = '', dialect?: AiDialect): string {
+export function extractUnfencedSuggestion(raw: string, prefix = '', dialect?: AiDialect): string {
   const withoutThink = raw
     .replace(/<think>[\s\S]*?<\/think>/gi, '')
     .replace(/<think>[\s\S]*$/gi, '')
@@ -2336,16 +2342,29 @@ function scanTopLevelSqlTokens(
   return { keywords, semicolons, firstTerminatorAt }
 }
 
+const ISO_DATE_STRING_LITERAL_RE =
+  /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/
+
+function isIsoDateStringLiteral(lit: ScannedSqlLiteral): boolean {
+  if (lit.kind !== 'string') return false
+  return ISO_DATE_STRING_LITERAL_RE.test(lit.value.trim())
+}
+
 function isFabricatedPlaceholderLiteral(lit: ScannedSqlLiteral, modelIntroducedWhere: boolean): boolean {
   const v = lit.value.trim().toLowerCase()
   if (!v) return false
   if (lit.kind === 'number' || /^-?\d+(?:\.\d+)?$/.test(v)) {
     const digits = v.replace(/[-.]/g, '')
-    if (digits.length >= 4) return true
-    if (/^(?:123|234|345|456|567|678|789|321|000|111|222|999)$/.test(digits)) return true
+    if (digits.length >= 7) return true
+    if (/^(\d)\1{2,}$/.test(digits) || /^(\d{2})\1{2,}$/.test(digits)) return true
+    if (
+      digits.length >= 3 &&
+      ('01234567890'.includes(digits) || '9876543210'.includes(digits))
+    ) {
+      return true
+    }
     return modelIntroducedWhere && lit.kind === 'string' && /^\d+$/.test(v)
   }
-  if (/^\d{4}-\d{2}-\d{2}/.test(v)) return true
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-/.test(v)) return true
   if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) return true
   const stripped = v.replace(/^[%_]+|[%_]+$/g, '')
@@ -2455,7 +2474,7 @@ export function trimFabricatedFilterLiterals(
       const hasFabricatedLiteral = ungrounded.some(
         (lit) =>
           isFabricatedPlaceholderLiteral(lit, true) ||
-          (hasPrecedingClause && lit.kind === 'string')
+          (hasPrecedingClause && lit.kind === 'string' && !isIsoDateStringLiteral(lit))
       )
       if (hasFabricatedLiteral) {
         const cutIdx = i === 0 ? whereKw.start : seg.cutAt
@@ -2841,6 +2860,7 @@ export type FetchPostLike = (
   json(): Promise<unknown>
   text(): Promise<string>
   body?: ReadableStream<Uint8Array> | null
+  bodyUsed?: boolean
   headers?: { get(name: string): string | null }
 }>
 
@@ -2856,9 +2876,21 @@ export type FetchGetLike = (
   ok: boolean
   status: number
   json(): Promise<unknown>
+  text?: () => Promise<string>
   body?: ReadableStream<Uint8Array> | null
+  bodyUsed?: boolean
   headers?: { get(name: string): string | null }
 }>
+
+type AiHttpResponseLike = {
+  ok: boolean
+  status: number
+  json(): Promise<unknown>
+  text?: () => Promise<string>
+  body?: ReadableStream<Uint8Array> | null
+  bodyUsed?: boolean
+  headers?: { get(name: string): string | null }
+}
 
 export class ReasoningExhaustedError extends Error {
   constructor() {
@@ -2910,26 +2942,41 @@ interface StreamDelta {
   error: string | null
 }
 
+export const AI_MAX_ERROR_MESSAGE_CHARS = 512
+
+export function truncateAiErrorMessage(
+  message: string,
+  maxChars = AI_MAX_ERROR_MESSAGE_CHARS
+): string {
+  if (typeof message !== 'string') return ''
+  const trimmed = message.trim()
+  if (trimmed.length <= maxChars) return trimmed
+  if (maxChars <= 1) return trimmed.slice(0, Math.max(0, maxChars))
+  return `${trimmed.slice(0, maxChars - 1)}…`
+}
+
 function extractStreamErrorMessage(obj: unknown): string | null {
   if (!isRecord(obj)) return null
   if (obj.type === 'error') {
     if (isRecord(obj.error) && typeof obj.error.message === 'string' && obj.error.message.trim()) {
-      return obj.error.message.trim()
+      return truncateAiErrorMessage(obj.error.message)
     }
-    if (typeof obj.message === 'string' && obj.message.trim()) return obj.message.trim()
-    return 'Provider reported a streaming error.'
+    if (typeof obj.message === 'string' && obj.message.trim()) {
+      return truncateAiErrorMessage(obj.message)
+    }
+    return 'Provider reported an error.'
   }
   if (isRecord(obj.error)) {
     if (typeof obj.error.message === 'string' && obj.error.message.trim()) {
-      return obj.error.message.trim()
+      return truncateAiErrorMessage(obj.error.message)
     }
     if (typeof obj.error.type === 'string' && obj.error.type.trim()) {
-      return obj.error.type.trim()
+      return truncateAiErrorMessage(obj.error.type)
     }
-    return 'Provider reported a streaming error.'
+    return 'Provider reported an error.'
   }
   if (typeof obj.error === 'string' && obj.error.trim()) {
-    return obj.error.trim()
+    return truncateAiErrorMessage(obj.error)
   }
   return null
 }
@@ -3504,49 +3551,117 @@ function parseChatStreamText(format: AiProviderFormat, raw: string): ChatReadRes
   return { text, sawReasoning, finishReason }
 }
 
-async function readChatResult(
+function parseStatementEditStreamText(
   format: AiProviderFormat,
-  response: Awaited<ReturnType<FetchPostLike>>,
-  maxBytes = AI_MAX_EXPLAIN_BODY_BYTES
-): Promise<ChatReadResult> {
+  raw: string
+): { text: string; finishReason: string | null; sawReasoning: boolean } {
+  let text = ''
+  let finishReason: string | null = null
+  let sawReasoning = false
+  for (const line of raw.split(/\r?\n/)) {
+    const parsed = parseStreamLine(format, line)
+    if (parsed.error) throw new Error(parsed.error)
+    if (parsed.finishReason) finishReason = parsed.finishReason
+    if (parsed.sawReasoning) sawReasoning = true
+    if (parsed.delta) {
+      text += parsed.delta
+      if (shouldStopEditStreamText(text)) break
+    }
+    if (parsed.done) break
+  }
+  return { text, finishReason, sawReasoning }
+}
+
+function throwIfProviderPayloadError(json: unknown): void {
+  const errMsg = extractStreamErrorMessage(json)
+  if (errMsg) {
+    throw new Error(errMsg)
+  }
+}
+
+function assertNotHtmlProviderResponse(contentType: string, raw: string): void {
+  const trimmed = raw.trimStart()
+  if (
+    contentType.includes('text/html') ||
+    /^<!doctype\s+html\b/i.test(trimmed) ||
+    /^<html[\s>]/i.test(trimmed)
+  ) {
+    throw new Error('Provider returned an HTML error page instead of AI output.')
+  }
+}
+
+async function readAiHttpResponse<T>(
+  response: AiHttpResponseLike,
+  maxBytes: number,
+  handlers: {
+    onEarlyStop?: () => void
+    onStreamBody: (body: ReadableStream<Uint8Array>) => Promise<T>
+    onJson: (json: unknown) => T
+    onStreamText: (raw: string) => T
+  }
+): Promise<T> {
   const rawLength = response.headers?.get('content-length')
   if (rawLength !== null && rawLength !== undefined && rawLength.trim() !== '') {
     const declared = Number(rawLength)
     if (Number.isFinite(declared) && declared > maxBytes) {
       await response.body?.cancel().catch(() => undefined)
+      handlers.onEarlyStop?.()
       throw new AiResponseTooLargeError(maxBytes)
     }
   }
   const contentType = (response.headers?.get('content-type') ?? '').toLowerCase()
-  const isStreamType = /text\/event-stream|x-ndjson/.test(contentType)
-  if (isStreamType && response.body) {
-    return await readChatStreamBody(format, response.body, maxBytes)
+  if (/text\/event-stream|x-ndjson/.test(contentType) && response.body) {
+    return await handlers.onStreamBody(response.body)
   }
-  if (!response.body) {
-    const json = await readJsonBounded(response, maxBytes)
-    return {
-      text: extractChatText(format, json),
-      sawReasoning: false,
-      finishReason: extractFinishReasonFromJson(format, json),
-      json,
+  let raw: string | null = null
+  if (response.body) {
+    raw = await readBodyAll(response.body, maxBytes)
+  } else if (typeof response.text === 'function') {
+    const textBody = await response.text()
+    if (Buffer.byteLength(textBody, 'utf8') > maxBytes) {
+      handlers.onEarlyStop?.()
+      throw new AiResponseTooLargeError(maxBytes)
+    }
+    if (textBody.length > 0 || response.bodyUsed === true) {
+      raw = textBody
     }
   }
-  const raw = await readBodyAll(response.body, maxBytes)
+  if (raw === null) {
+    assertNotHtmlProviderResponse(contentType, '')
+    const json = await response.json()
+    throwIfProviderPayloadError(json)
+    return handlers.onJson(json)
+  }
+  assertNotHtmlProviderResponse(contentType, raw)
   const trimmed = raw.trimStart()
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
     try {
       const json: unknown = JSON.parse(raw)
-      return {
-        text: extractChatText(format, json),
-        sawReasoning: false,
-        finishReason: extractFinishReasonFromJson(format, json),
-        json,
-      }
-    } catch {
+      throwIfProviderPayloadError(json)
+      return handlers.onJson(json)
+    } catch (err) {
+      if (!(err instanceof SyntaxError)) throw err
       // Fall through to SSE/NDJSON line parsing when a proxy omits stream content-type
     }
   }
-  return parseChatStreamText(format, raw)
+  return handlers.onStreamText(raw)
+}
+
+async function readChatResult(
+  format: AiProviderFormat,
+  response: Awaited<ReturnType<FetchPostLike>>,
+  maxBytes = AI_MAX_EXPLAIN_BODY_BYTES
+): Promise<ChatReadResult> {
+  return await readAiHttpResponse<ChatReadResult>(response, maxBytes, {
+    onStreamBody: (body) => readChatStreamBody(format, body, maxBytes),
+    onJson: (json) => ({
+      text: extractChatText(format, json),
+      sawReasoning: false,
+      finishReason: extractFinishReasonFromJson(format, json),
+      json,
+    }),
+    onStreamText: (raw) => parseChatStreamText(format, raw),
+  })
 }
 
 function waitAbortable(ms: number, signal: AbortSignal): Promise<void> {
@@ -3566,27 +3681,12 @@ function waitAbortable(ms: number, signal: AbortSignal): Promise<void> {
   })
 }
 
-async function readJsonBounded(
-  response: {
-    json(): Promise<unknown>
-    body?: ReadableStream<Uint8Array> | null
-    headers?: { get(name: string): string | null }
-  },
-  maxBytes: number
-): Promise<unknown> {
-  const rawLength = response.headers?.get('content-length')
-  if (rawLength !== null && rawLength !== undefined && rawLength.trim() !== '') {
-    const declared = Number(rawLength)
-    if (Number.isFinite(declared) && declared > maxBytes) {
-      await response.body?.cancel().catch(() => undefined)
-      throw new AiResponseTooLargeError(maxBytes)
-    }
+function assertValidAiBaseUrl(baseUrl: string, hasApiKey: boolean): string {
+  const checked = validateAiBaseUrl(baseUrl, { hasApiKey })
+  if (!checked.ok) {
+    throw new Error(checked.error)
   }
-  if (response.body) {
-    const raw = await readBodyAll(response.body, maxBytes)
-    return JSON.parse(raw)
-  }
-  return await response.json()
+  return checked.url
 }
 
 async function readCompletionResult(
@@ -3599,53 +3699,36 @@ async function readCompletionResult(
   onDelta?: (accumulatedText: string) => void,
   boundaryCtx?: StreamBoundaryContext
 ): Promise<SqlFetchResult> {
-  const rawLength = response.headers?.get('content-length')
-  if (rawLength !== null && rawLength !== undefined && rawLength.trim() !== '') {
-    const declared = Number(rawLength)
-    if (Number.isFinite(declared) && declared > AI_MAX_COMPLETION_BODY_BYTES) {
-      await response.body?.cancel().catch(() => undefined)
-      onEarlyStop?.()
-      throw new AiResponseTooLargeError(AI_MAX_COMPLETION_BODY_BYTES)
-    }
-  }
-  const contentType = (response.headers?.get('content-type') ?? '').toLowerCase()
-  const isStreamType = /text\/event-stream|x-ndjson/.test(contentType)
-  if (isStreamType && response.body) {
-    const streamed = await readStreamBody(
-      format,
-      response.body,
-      multiline,
-      onEarlyStop,
-      AI_MAX_COMPLETION_BODY_BYTES,
-      suffix,
-      signal,
-      onDelta,
-      boundaryCtx
-    )
-    return {
-      text: streamed.text,
-      sawReasoning: streamed.sawReasoning,
-      finishReason: streamed.finishReason,
-    }
-  }
-  if (!response.body) {
-    return { json: await readJsonBounded(response, AI_MAX_COMPLETION_BODY_BYTES) }
-  }
-  const raw = await readBodyAll(response.body, AI_MAX_COMPLETION_BODY_BYTES)
-  const trimmed = raw.trimStart()
-  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    try {
-      return { json: JSON.parse(raw) }
-    } catch {
-      // fall through to stream parsing
-    }
-  }
-  const parsed = parseStreamText(format, raw, multiline, suffix, boundaryCtx)
-  return {
-    text: parsed.text,
-    sawReasoning: parsed.sawReasoning,
-    finishReason: parsed.finishReason,
-  }
+  return await readAiHttpResponse<SqlFetchResult>(response, AI_MAX_COMPLETION_BODY_BYTES, {
+    onEarlyStop,
+    onStreamBody: async (body) => {
+      const streamed = await readStreamBody(
+        format,
+        body,
+        multiline,
+        onEarlyStop,
+        AI_MAX_COMPLETION_BODY_BYTES,
+        suffix,
+        signal,
+        onDelta,
+        boundaryCtx
+      )
+      return {
+        text: streamed.text,
+        sawReasoning: streamed.sawReasoning,
+        finishReason: streamed.finishReason,
+      }
+    },
+    onJson: (json) => ({ json }),
+    onStreamText: (raw) => {
+      const parsed = parseStreamText(format, raw, multiline, suffix, boundaryCtx)
+      return {
+        text: parsed.text,
+        sawReasoning: parsed.sawReasoning,
+        finishReason: parsed.finishReason,
+      }
+    },
+  })
 }
 
 function resultText(format: AiProviderFormat, result: SqlFetchResult): string {
@@ -3683,6 +3766,104 @@ function buildHealedCompletionRequest(
   }
 }
 
+export interface SqlPostProcessOptions {
+  prefix: string
+  suffix: string
+  dialect?: AiDialect
+  multiline?: boolean
+  knownIdentifiers?: Iterable<string>
+  groundedSources?: readonly string[]
+  initialQuote?: '\'' | '"' | '`' | null
+}
+
+function postProcessRawSqlCompletion(
+  raw: string,
+  opts: SqlPostProcessOptions
+): string | null {
+  if (looksInjected(raw)) return null
+  const multiline = opts.multiline !== false
+  const hadTrailingMarker = TRAILING_SPECIAL_MARKER_RE.test(raw)
+  const unfenced = extractUnfencedSuggestion(raw, opts.prefix, opts.dialect)
+  const cleaned =
+    opts.dialect !== 'redis'
+      ? (() => {
+          const semiAt = findFirstUnquotedSemicolon(
+            unfenced,
+            opts.initialQuote ?? null,
+            opts.dialect
+          )
+          return semiAt >= 0 ? unfenced.slice(0, semiAt + 1) : unfenced
+        })()
+      : unfenced
+  const deduped = dropDuplicatedFromSuffix(
+    removeRepetitiveBlocks(removeRepetitiveLines(cleaned)),
+    opts.suffix
+  )
+  const singleLine = trimMultiLineInSingleLineMode(deduped, opts.suffix, multiline)
+  const echoed = trimPrefixEcho(
+    singleLine,
+    opts.prefix,
+    opts.dialect,
+    opts.knownIdentifiers
+  )
+  const withoutCaret = stripTrailingCaretPipe(
+    echoed,
+    opts.prefix,
+    opts.dialect,
+    hadTrailingMarker
+  )
+  const bracketed = matchCompletionBrackets(
+    withoutCaret,
+    opts.prefix,
+    opts.dialect,
+    opts.suffix
+  )
+  const notRewritten = skipRewrittenSuffix(bracketed, opts.suffix)
+  const overlapped = trimSingleLineSuffixOverlap(
+    trimSuffixOverlap(notRewritten, opts.suffix),
+    opts.suffix,
+    opts.prefix,
+    opts.dialect
+  )
+  return trimFabricatedFilterLiterals(
+    overlapped,
+    opts.prefix,
+    opts.suffix,
+    opts.groundedSources ?? [],
+    opts.dialect
+  )
+}
+
+/**
+ * Post-processes a plain continuation string emitted instead of `<REWRITE>` tags
+ * in Tier-2 edit mode using the same sanitization and literal-grounding guards.
+ */
+export function sanitizePlainContinuationFallback(
+  raw: string,
+  opts: Omit<SqlPostProcessOptions, 'initialQuote'> & {
+    rawPrefix?: string
+  }
+): string {
+  const initialQuote =
+    opts.dialect === 'redis'
+      ? null
+      : scanSqlBoundaryState(opts.prefix, opts.dialect).inQuote
+  const grounded = postProcessRawSqlCompletion(raw, {
+    ...opts,
+    initialQuote,
+  })
+  if (grounded === null) return ''
+  const final = normalizeCompletionBoundary(
+    grounded,
+    opts.rawPrefix ?? opts.prefix,
+    opts.dialect,
+    opts.knownIdentifiers,
+    opts.suffix
+  )
+  if (!final || isProseExplanation(final)) return ''
+  return final
+}
+
 export async function completeSqlWithMeta(
   provider: AiProviderConfig,
   req: AiCompletionRequest,
@@ -3701,6 +3882,7 @@ export async function completeSqlWithMeta(
   ) {
     return empty
   }
+  assertValidAiBaseUrl(provider.baseUrl, Boolean(provider.apiKey))
 
   const typo = resolveTrailingTypoToken(req.prefix, req.dialect, req.knownIdentifiers)
   const effectiveReq = typo ? buildHealedCompletionRequest(req, typo) : req
@@ -3848,60 +4030,19 @@ export async function completeSqlWithMeta(
   }
 
   const raw = resultText(provider.format, result)
-  if (looksInjected(raw)) return empty
-  const hadTrailingMarker = TRAILING_SPECIAL_MARKER_RE.test(raw)
-  const unfenced = extractUnfencedSuggestion(raw, effectiveReq.prefix, effectiveReq.dialect)
-  const cleaned =
-    effectiveReq.dialect !== 'redis'
-      ? (() => {
-          const semiAt = findFirstUnquotedSemicolon(
-            unfenced,
-            boundaryCtx.initialQuote ?? null,
-            effectiveReq.dialect
-          )
-          return semiAt >= 0 ? unfenced.slice(0, semiAt + 1) : unfenced
-        })()
-      : unfenced
-  const deduped = dropDuplicatedFromSuffix(
-    removeRepetitiveBlocks(removeRepetitiveLines(cleaned)),
-    req.suffix
-  )
-  const singleLine = trimMultiLineInSingleLineMode(deduped, effectiveReq.suffix, multiline)
-  const echoed = trimPrefixEcho(
-    singleLine,
-    effectiveReq.prefix,
-    effectiveReq.dialect,
-    effectiveReq.knownIdentifiers
-  )
-  const withoutCaret = stripTrailingCaretPipe(
-    echoed,
-    effectiveReq.prefix,
-    effectiveReq.dialect,
-    hadTrailingMarker
-  )
-  const bracketed = matchCompletionBrackets(
-    withoutCaret,
-    effectiveReq.prefix,
-    effectiveReq.dialect,
-    effectiveReq.suffix
-  )
-  const notRewritten = skipRewrittenSuffix(bracketed, effectiveReq.suffix)
-  const overlapped = trimSingleLineSuffixOverlap(
-    trimSuffixOverlap(notRewritten, effectiveReq.suffix),
-    effectiveReq.suffix,
-    effectiveReq.prefix,
-    effectiveReq.dialect
-  )
   const groundedSources: string[] = []
   if (effectiveReq.fimHistorySql) groundedSources.push(effectiveReq.fimHistorySql)
   if (effectiveReq.fimPriorSql) groundedSources.push(effectiveReq.fimPriorSql)
-  const grounded = trimFabricatedFilterLiterals(
-    overlapped,
-    effectiveReq.prefix,
-    effectiveReq.suffix,
+  const grounded = postProcessRawSqlCompletion(raw, {
+    prefix: effectiveReq.prefix,
+    suffix: req.suffix,
+    dialect: effectiveReq.dialect,
+    multiline,
+    knownIdentifiers: effectiveReq.knownIdentifiers,
     groundedSources,
-    effectiveReq.dialect
-  )
+    initialQuote: boundaryCtx.initialQuote ?? null,
+  })
+  if (grounded === null) return empty
   if (typo) {
     if (grounded && isProseExplanation(grounded)) return empty
     let fullSuggestion: string
@@ -3977,25 +4118,6 @@ export interface StatementEditCompletionResult {
   finishReason: string | null
 }
 
-interface ParsedEditStreamMeta {
-  delta: string
-  done: boolean
-  finishReason: string | null
-  sawReasoning: boolean
-  error: string | null
-}
-
-function parseStatementEditStreamLine(format: AiProviderFormat, rawLine: string): ParsedEditStreamMeta {
-  const parsed = parseStreamLine(format, rawLine)
-  return {
-    delta: parsed.delta,
-    done: parsed.done,
-    finishReason: parsed.finishReason,
-    sawReasoning: parsed.sawReasoning,
-    error: parsed.error,
-  }
-}
-
 function extractFinishReasonFromJson(format: AiProviderFormat, json: unknown): string | null {
   if (!isRecord(json)) return null
   if (format === 'ollama') return typeof json.done_reason === 'string' ? json.done_reason : null
@@ -4047,7 +4169,7 @@ async function readStatementEditStreamBody(
       while (newline !== -1) {
         const line = buffer.slice(0, newline)
         buffer = buffer.slice(newline + 1)
-        const parsed = parseStatementEditStreamLine(format, line)
+        const parsed = parseStreamLine(format, line)
         if (parsed.error) {
           await reader.cancel().catch(() => undefined)
           onEarlyStop?.()
@@ -4073,7 +4195,7 @@ async function readStatementEditStreamBody(
     }
     buffer += decoder.decode()
     if (buffer.trim()) {
-      const tail = parseStatementEditStreamLine(format, buffer)
+      const tail = parseStreamLine(format, buffer)
       if (tail.error) throw new Error(tail.error)
       if (tail.finishReason) finishReason = tail.finishReason
       if (tail.sawReasoning) sawReasoning = true
@@ -4101,6 +4223,7 @@ export async function completeSqlStatementEdit(
   if (hasSensitiveContent(req.statement, '', `${req.user}\n${req.statement}`, req.dialect)) {
     return empty
   }
+  assertValidAiBaseUrl(provider.baseUrl, Boolean(provider.apiKey))
 
   const estimatedStmtTokens = Math.ceil(req.statement.length / 3.2)
   const nepMaxTokens = Math.min(
@@ -4166,67 +4289,36 @@ export async function completeSqlStatementEdit(
       if (!response.ok) {
         throw new ProviderHttpError(response.status)
       }
-      const rawLength = response.headers?.get('content-length')
-      if (rawLength !== null && rawLength !== undefined && rawLength.trim() !== '') {
-        const declared = Number(rawLength)
-        if (Number.isFinite(declared) && declared > AI_MAX_COMPLETION_BODY_BYTES) {
-          await response.body?.cancel().catch(() => undefined)
-          streamAbortController.abort()
-          throw new AiResponseTooLargeError(AI_MAX_COMPLETION_BODY_BYTES)
-        }
-      }
-      const contentType = (response.headers?.get('content-type') ?? '').toLowerCase()
-      if (/text\/event-stream|x-ndjson/.test(contentType) && response.body) {
-        const streamed = await readStatementEditStreamBody(
-          provider.format,
-          response.body,
-          () => streamAbortController.abort(),
-          AI_MAX_COMPLETION_BODY_BYTES
-        )
-        return {
-          raw: streamed.text,
-          finishReason: streamed.finishReason,
-          sawReasoning: streamed.sawReasoning,
-        }
-      }
-      if (!response.body) {
-        const json = await readJsonBounded(response, AI_MAX_COMPLETION_BODY_BYTES)
-        return {
+      return await readAiHttpResponse(response, AI_MAX_COMPLETION_BODY_BYTES, {
+        onEarlyStop: () => streamAbortController.abort(),
+        onStreamBody: async (body) => {
+          const streamed = await readStatementEditStreamBody(
+            provider.format,
+            body,
+            () => streamAbortController.abort(),
+            AI_MAX_COMPLETION_BODY_BYTES
+          )
+          return {
+            raw: streamed.text,
+            finishReason: streamed.finishReason,
+            sawReasoning: streamed.sawReasoning,
+          }
+        },
+        onJson: (json) => ({
           raw: extractChatText(provider.format, json),
           finishReason: extractFinishReasonFromJson(provider.format, json),
           sawReasoning: false,
           json,
-        }
-      }
-      const bodyText = await readBodyAll(response.body, AI_MAX_COMPLETION_BODY_BYTES)
-      const trimmed = bodyText.trimStart()
-      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-        try {
-          const json: unknown = JSON.parse(bodyText)
+        }),
+        onStreamText: (raw) => {
+          const parsed = parseStatementEditStreamText(provider.format, raw)
           return {
-            raw: extractChatText(provider.format, json),
-            finishReason: extractFinishReasonFromJson(provider.format, json),
-            sawReasoning: false,
-            json,
+            raw: parsed.text,
+            finishReason: parsed.finishReason,
+            sawReasoning: parsed.sawReasoning,
           }
-        } catch {
-          // fall through to SSE text parsing
-        }
-      }
-      let parsedText = ''
-      let parsedFinish: string | null = null
-      let parsedReasoning = false
-      for (const line of bodyText.split(/\r?\n/)) {
-        const parsed = parseStatementEditStreamLine(provider.format, line)
-        if (parsed.finishReason) parsedFinish = parsed.finishReason
-        if (parsed.sawReasoning) parsedReasoning = true
-        if (parsed.delta) {
-          parsedText += parsed.delta
-          if (shouldStopEditStreamText(parsedText)) break
-        }
-        if (parsed.done) break
-      }
-      return { raw: parsedText, finishReason: parsedFinish, sawReasoning: parsedReasoning }
+        },
+      })
     } finally {
       signal.removeEventListener('abort', onCallerAbort)
     }
@@ -4312,6 +4404,7 @@ export async function completeChat(
   if (secretKind) {
     throw new SensitiveContentBlockedError(secretKind)
   }
+  assertValidAiBaseUrl(provider.baseUrl, Boolean(provider.apiKey))
 
   let useEffort = provider.format === 'openai'
   let useStream = true
@@ -4380,6 +4473,12 @@ export function buildModelsRequest(target: Pick<AiProviderConfig, 'format' | 'ba
   return { url: `${root}/models`, init: { method: 'GET', headers } }
 }
 
+const DISALLOWED_MODEL_ID_KEYS: ReadonlySet<string> = new Set([
+  '__proto__',
+  'constructor',
+  'prototype',
+])
+
 export function extractModelIds(json: unknown): string[] {
   const data = isRecord(json)
     ? Array.isArray(json.data)
@@ -4396,7 +4495,13 @@ export function extractModelIds(json: unknown): string[] {
       if (typeof entry.name === 'string') return entry.name
       return null
     })
-    .filter((id): id is string => typeof id === 'string' && id.length > 0 && !NOT_FOR_CODE_RE.test(id))
+    .filter(
+      (id): id is string =>
+        typeof id === 'string' &&
+        id.length > 0 &&
+        !DISALLOWED_MODEL_ID_KEYS.has(id.trim()) &&
+        !NOT_FOR_CODE_RE.test(id)
+    )
   return [...new Set(ids)].sort((a, b) => a.localeCompare(b))
 }
 
@@ -4405,10 +4510,28 @@ export async function listModels(
   signal: AbortSignal,
   fetchImpl: FetchGetLike = fetch as unknown as FetchGetLike
 ): Promise<string[]> {
+  assertValidAiBaseUrl(target.baseUrl, Boolean(target.apiKey))
   const { url, init } = buildModelsRequest(target)
   const response = await fetchImpl(url, { ...init, redirect: 'error', signal })
   if (!response.ok) throw new ProviderHttpError(response.status)
-  return extractModelIds(await readJsonBounded(response, AI_MAX_MODELS_BODY_BYTES))
+  return await readAiHttpResponse<string[]>(response, AI_MAX_MODELS_BODY_BYTES, {
+    onStreamBody: async (body) => {
+      const raw = await readBodyAll(body, AI_MAX_MODELS_BODY_BYTES)
+      const contentType = (response.headers?.get('content-type') ?? '').toLowerCase()
+      assertNotHtmlProviderResponse(contentType, raw)
+      const json: unknown = JSON.parse(raw)
+      throwIfProviderPayloadError(json)
+      return extractModelIds(json)
+    },
+    onJson: (json) => extractModelIds(json),
+    onStreamText: (raw) => {
+      const trimmed = raw.trim()
+      if (!trimmed) return []
+      const json: unknown = JSON.parse(trimmed)
+      throwIfProviderPayloadError(json)
+      return extractModelIds(json)
+    },
+  })
 }
 
 export function filterModels(all: readonly string[], typed: string): string[] {
@@ -4755,11 +4878,41 @@ function isRedirectFailureError(error: unknown): boolean {
   return typeof cause === 'string' && /\bredirect/i.test(cause)
 }
 
+export function redactAiSecretsInText(input: string, knownSecrets: readonly string[] = []): string {
+  if (typeof input !== 'string' || !input) return ''
+  let out = scrubSensitiveText(input, { stripAllFragments: true })
+  for (const secret of knownSecrets) {
+    if (typeof secret === 'string' && secret.length >= 4) {
+      out = out.split(secret).join('[REDACTED]')
+      if (secret.length >= 8) {
+        try {
+          const encoded = encodeURIComponent(secret)
+          if (encoded && encoded !== secret) {
+            out = out.split(encoded).join('[REDACTED]')
+            const encodedLowerHex = encoded.replace(/%[0-9A-F]{2}/g, (hex) => hex.toLowerCase())
+            if (encodedLowerHex !== encoded) {
+              out = out.split(encodedLowerHex).join('[REDACTED]')
+            }
+          }
+        } catch {
+          // Ignore malformed surrogate sequences when encoding secrets
+        }
+      }
+    }
+  }
+  for (const rule of SECRET_RULES) {
+    const flags = rule.pattern.flags.includes('g') ? rule.pattern.flags : `${rule.pattern.flags}g`
+    out = out.replace(new RegExp(rule.pattern.source, flags), '[REDACTED]')
+  }
+  return out
+}
+
 export function explainFailure(
   error: unknown,
   host: string,
   timeoutMs: number,
-  format?: AiProviderFormat
+  format?: AiProviderFormat,
+  knownSecrets: readonly string[] = []
 ): string {
   const seconds = (timeoutMs / 1000).toFixed(1).replace(/\.0$/, '')
   if (
@@ -4793,7 +4946,7 @@ export function explainFailure(
       ? `Could not reach ${host || 'localhost'}. Is the local server running?`
       : `Could not reach ${host || 'provider'}. Check the base URL and network connection.`
   }
-  return scrubSensitiveText(errorMessage(error), { stripAllFragments: true })
+  return truncateAiErrorMessage(redactAiSecretsInText(errorMessage(error), knownSecrets))
 }
 
 export type AiModelStats = {

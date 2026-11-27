@@ -2066,6 +2066,7 @@ export function stripLeadingSqlComments(sql, dialect) {
 export function stripCommentsAndLiteralsDetailed(sql, dialect, options = {}) {
   const rules = getDialectLexerRules(dialect)
   const preserveMysqlExecComments = options.preserveMysqlExecComments ?? true
+  const preserveLiterals = Boolean(options.preserveLiterals)
   const literalPlaceholder = options.literalPlaceholder ?? ' '
   const identPlaceholder = options.identPlaceholder ?? literalPlaceholder
   const allowBsSingle =
@@ -2082,6 +2083,7 @@ export function stripCommentsAndLiteralsDetailed(sql, dialect, options = {}) {
   let execCommentDepth = 0
   let hasUnclosedQuote = false
   let hasUnclosedComment = false
+  let endsInLineComment = false
   const len = sql.length
 
   while (i < len) {
@@ -2089,16 +2091,25 @@ export function stripCommentsAndLiteralsDetailed(sql, dialect, options = {}) {
     if (rules.lineCommentDash && ch === '-' && i + 1 < len && sql[i + 1] === '-') {
       out += ' '
       i = scanLineCommentEnd(sql, i)
+      if (i >= len && (len === 0 || sql[len - 1] !== '\n')) {
+        endsInLineComment = true
+      }
       continue
     }
     if (rules.lineCommentSlash && ch === '/' && i + 1 < len && sql[i + 1] === '/') {
       out += ' '
       i = scanLineCommentEnd(sql, i)
+      if (i >= len && (len === 0 || sql[len - 1] !== '\n')) {
+        endsInLineComment = true
+      }
       continue
     }
     if (rules.lineCommentHash && ch === '#') {
       out += ' '
       i = scanLineCommentEnd(sql, i - 1)
+      if (i >= len && (len === 0 || sql[len - 1] !== '\n')) {
+        endsInLineComment = true
+      }
       continue
     }
     if (execCommentDepth > 0 && ch === '*' && i + 1 < len && sql[i + 1] === '/') {
@@ -2124,30 +2135,34 @@ export function stripCommentsAndLiteralsDetailed(sql, dialect, options = {}) {
       continue
     }
     if (isPostgresEscapeStringStart(sql, i, dialect)) {
-      out += literalPlaceholder
       const seg = scanQuotedSegmentEnd(sql, i + 1, "'", true)
+      out += preserveLiterals ? sql.slice(i, seg.end) : literalPlaceholder
       if (!seg.closed) hasUnclosedQuote = true
       i = seg.end
       continue
     }
     const oracleQuote = scanOracleQuoteEnd(sql, i, dialect)
     if (oracleQuote) {
-      out += literalPlaceholder
+      out += preserveLiterals ? sql.slice(i, oracleQuote.end) : literalPlaceholder
       if (!oracleQuote.closed) hasUnclosedQuote = true
       i = oracleQuote.end
       continue
     }
     if (ch === "'" || ch === '"' || (ch === '`' && rules.backtickIdentifiers)) {
-      out += ch === "'" ? literalPlaceholder : identPlaceholder
       const allowBackslash = ch === "'" ? allowBsSingle : ch === '"' ? allowBsDouble : false
       const seg = scanQuotedSegmentEnd(sql, i, ch, allowBackslash)
+      out += preserveLiterals
+        ? sql.slice(i, seg.end)
+        : ch === "'"
+          ? literalPlaceholder
+          : identPlaceholder
       if (!seg.closed) hasUnclosedQuote = true
       i = seg.end
       continue
     }
     if (ch === '[' && rules.bracketIdentifiers !== 'none') {
-      out += identPlaceholder
       const seg = scanBracketIdentEnd(sql, i, rules.bracketIdentifiers === 'doubling')
+      out += preserveLiterals ? sql.slice(i, seg.end) : identPlaceholder
       if (!seg.closed) hasUnclosedQuote = true
       i = seg.end
       continue
@@ -2155,10 +2170,11 @@ export function stripCommentsAndLiteralsDetailed(sql, dialect, options = {}) {
     if (rules.dollarQuoting && ch === '$') {
       const tag = matchDollarQuoteTag(sql, i)
       if (tag !== null) {
-        out += literalPlaceholder
         const closeIdx = sql.indexOf(tag, i + tag.length)
         if (closeIdx < 0) hasUnclosedQuote = true
-        i = closeIdx >= 0 ? closeIdx + tag.length : len
+        const nextIdx = closeIdx >= 0 ? closeIdx + tag.length : len
+        out += preserveLiterals ? sql.slice(i, nextIdx) : literalPlaceholder
+        i = nextIdx
         continue
       }
     }
@@ -2170,11 +2186,21 @@ export function stripCommentsAndLiteralsDetailed(sql, dialect, options = {}) {
     hasUnclosedComment = true
   }
 
-  return { text: out, hasUnclosedQuote, hasUnclosedComment }
+  return { text: out, hasUnclosedQuote, hasUnclosedComment, endsInLineComment }
 }
 
 export function stripCommentsAndLiterals(sql, dialect, preserveMysqlExecComments = true) {
   return stripCommentsAndLiteralsDetailed(sql, dialect, { preserveMysqlExecComments }).text
+}
+
+/**
+ * Strips SQL comments while preserving string literals, quoted identifiers, and code tokens.
+ */
+export function stripSqlCommentsOnly(sql, dialect) {
+  return stripCommentsAndLiteralsDetailed(sql, dialect, {
+    preserveLiterals: true,
+    preserveMysqlExecComments: false,
+  }).text
 }
 
 const SQL_DDL_VERBS = new Set([
@@ -4204,6 +4230,38 @@ export function splitMssqlBatches(script) {
   return batches
 }
 
+const MSSQL_SHOWPLAN_ON_RE = /^SET\s+(SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+ON\s*;?$/i
+const MSSQL_SHOWPLAN_OFF_RE = /^SET\s+(SHOWPLAN_ALL|SHOWPLAN_TEXT|SHOWPLAN_XML)\s+OFF\s*;?$/i
+
+export function matchMssqlShowplanDirective(sql, phase = 'ON') {
+  const lead = stripLeadingSqlComments(String(sql || ''), 'mssql')
+    .replace(/;+\s*$/, '')
+    .trim()
+  const re = phase === 'OFF' ? MSSQL_SHOWPLAN_OFF_RE : MSSQL_SHOWPLAN_ON_RE
+  const match = re.exec(lead)
+  return match ? match[1].toUpperCase() : null
+}
+
+export function isMssqlShowplanBatchHead(sql) {
+  return matchMssqlShowplanDirective(sql, 'ON') !== null
+}
+
+export function splitExplainTargetStatements(sql, dialect) {
+  const trimmed = String(sql || '').trim()
+  if (!trimmed) return []
+  if (dialect === 'redis') return [trimmed]
+  if (dialect === 'mssql') {
+    const batches = splitMssqlBatches(trimmed)
+    const isShowplanEnvelope = batches.length === 3 && isMssqlShowplanBatchHead(batches[0] ?? '')
+    if (isShowplanEnvelope || batches.length > 1) {
+      return [trimmed]
+    }
+  }
+  return splitSqlStatements(trimmed, dialect)
+    .map((s) => s.text.trim())
+    .filter(Boolean)
+}
+
 /**
  * Splits an Oracle SQL / SQL*Plus script on standalone `/` separator lines while honoring
  * `--` line comments, `/* *\/` block comments, `'...'`, `"..."`, and `q'[...]'` / `nq'[...]'` quotes.
@@ -4393,6 +4451,7 @@ const AI_CONTINUATION_TAIL_WORDS = new Set([
   'DO',
   'DECLARE',
   'LOOP',
+  'FOR',
 ])
 
 function skipWsAndSqlComments(text, start, dialect) {
@@ -4446,20 +4505,29 @@ const AI_TOP_LEVEL_DROP_OBJECTS = new Set([
   'MATERIALIZED',
 ])
 
-function peekNextSqlWord(text, start, dialect) {
+function peekNextSqlWordWithOffset(text, start, dialect) {
   const pos = skipWsAndSqlComments(text, start, dialect)
-  if (pos >= text.length || !isIdentStartChar(text.charCodeAt(pos))) return ''
+  if (pos >= text.length || !isIdentStartChar(text.charCodeAt(pos))) {
+    return { word: '', end: pos }
+  }
   let end = pos + 1
   while (end < text.length && isIdentContChar(text.charCodeAt(end))) end++
-  return text.slice(pos, end).toUpperCase()
+  return { word: text.slice(pos, end).toUpperCase(), end }
+}
+
+function peekNextSqlWord(text, start, dialect) {
+  return peekNextSqlWordWithOffset(text, start, dialect).word
 }
 
 function peekSecondSqlWord(text, start, dialect) {
-  const pos1 = skipWsAndSqlComments(text, start, dialect)
-  if (pos1 >= text.length || !isIdentStartChar(text.charCodeAt(pos1))) return ''
-  let end1 = pos1 + 1
-  while (end1 < text.length && isIdentContChar(text.charCodeAt(end1))) end1++
-  return peekNextSqlWord(text, end1, dialect)
+  const first = peekNextSqlWordWithOffset(text, start, dialect)
+  if (!first.word) return ''
+  return peekNextSqlWord(text, first.end, dialect)
+}
+
+function isNextNonWsCharOpenParen(text, start, dialect) {
+  const pos = skipWsAndSqlComments(text, start, dialect)
+  return pos < text.length && text[pos] === '('
 }
 
 function hasCloserInSuffix(suffix, kind, dialect) {
@@ -4783,7 +4851,7 @@ function splitAiSqlSegments(script, dialect, baseStart = 0) {
 
     const ch = script[i]
 
-    // Soft-split on blank line followed by top-level SQL starter (only when statement is top-level complete)
+    // Soft-split on newline followed by top-level SQL starter (blank line or single newline statement boundary)
     if (ch === '\r' || ch === '\n') {
       if (
         hasExecutableToken &&
@@ -4801,43 +4869,56 @@ function splitAiSqlSegments(script, dialect, baseStart = 0) {
             : k < len && script[k] === '\n'
               ? 1
               : 0
-        if (nl2 > 0) {
-          const afterBlank = k + nl2
-          const nextWord = peekNextSqlWord(script, afterBlank, dialect)
-          const blockedByTail =
-            withAwaitingMainDml ||
-            awaitingTargetAfterExplain ||
-            AI_CONTINUATION_TAIL_WORDS.has(lastSignificantUpperWord) ||
-            lastSignificantPunct === '(' ||
-            lastSignificantPunct === ',' ||
-            lastSignificantPunct === '=' ||
-            ((firstTopWord === 'INSERT' || firstTopWord === 'REPLACE' || firstTopWord === 'UPSERT') &&
-              !insertSawBody &&
-              (nextWord === 'SELECT' || nextWord === 'WITH')) ||
-            (firstTopWord === 'ALTER' &&
-              (nextWord === 'ALTER' ||
-                (nextWord === 'DROP' &&
-                  !AI_TOP_LEVEL_DROP_OBJECTS.has(peekSecondSqlWord(script, afterBlank, dialect)))))
-          if (AI_TOP_LEVEL_STARTER_WORDS.has(nextWord) && !blockedByTail) {
-            flushSegment(i, 0, -1)
-            segStart = afterBlank
-            i = afterBlank
-            continue
-          }
+        const afterBreak = nl2 > 0 ? k + nl2 : i + nl1
+        const nextWordInfo = peekNextSqlWordWithOffset(script, afterBreak, dialect)
+        const nextWord = nextWordInfo.word
+        const isSingleLineWithHint =
+          nl2 === 0 &&
+          nextWord === 'WITH' &&
+          isNextNonWsCharOpenParen(script, nextWordInfo.end, dialect)
+        const isSingleLineCtasWithoutAs =
+          nl2 === 0 &&
+          firstTopWord === 'CREATE' &&
+          (nextWord === 'SELECT' || nextWord === 'WITH') &&
+          lastSignificantPunct !== ')'
+        const blockedByTail =
+          withAwaitingMainDml ||
+          awaitingTargetAfterExplain ||
+          isSingleLineWithHint ||
+          isSingleLineCtasWithoutAs ||
+          AI_CONTINUATION_TAIL_WORDS.has(lastSignificantUpperWord) ||
+          lastSignificantPunct === '(' ||
+          lastSignificantPunct === ',' ||
+          lastSignificantPunct === '=' ||
+          ((firstTopWord === 'INSERT' || firstTopWord === 'REPLACE' || firstTopWord === 'UPSERT') &&
+            !insertSawBody &&
+            (nextWord === 'SELECT' || nextWord === 'WITH')) ||
+          (firstTopWord === 'ALTER' &&
+            (nextWord === 'ALTER' ||
+              (nextWord === 'DROP' &&
+                !AI_TOP_LEVEL_DROP_OBJECTS.has(peekSecondSqlWord(script, afterBreak, dialect)))))
+        if (AI_TOP_LEVEL_STARTER_WORDS.has(nextWord) && !blockedByTail) {
+          flushSegment(i, 0, -1)
+          segStart = afterBreak
+          i = afterBreak
+          continue
         }
       }
     }
 
     if (rules.lineCommentDash && ch === '-' && i + 1 < len && script[i + 1] === '-') {
       i = scanLineCommentEnd(script, i)
+      if (i > 0 && script[i - 1] === '\n') i--
       continue
     }
     if (rules.lineCommentSlash && ch === '/' && i + 1 < len && script[i + 1] === '/') {
       i = scanLineCommentEnd(script, i)
+      if (i > 0 && script[i - 1] === '\n') i--
       continue
     }
     if (rules.lineCommentHash && ch === '#') {
       i = scanLineCommentEnd(script, i - 1)
+      if (i > 0 && script[i - 1] === '\n') i--
       continue
     }
     if (execCommentDepth > 0 && ch === '*' && i + 1 < len && script[i + 1] === '/') {
@@ -4945,7 +5026,7 @@ function splitAiSqlSegments(script, dialect, baseStart = 0) {
           }
           if (
             (firstTopWord === 'INSERT' || firstTopWord === 'REPLACE' || firstTopWord === 'UPSERT') &&
-            (wordUpper === 'VALUES' || wordUpper === 'SELECT' || wordUpper === 'WITH' || wordUpper === 'DEFAULT')
+            (wordUpper === 'VALUES' || wordUpper === 'SELECT' || wordUpper === 'DEFAULT')
           ) {
             insertSawBody = true
           }
@@ -5258,4 +5339,138 @@ export function isolateActiveSqlStatement(prefix, suffix, dialect) {
     isFreshStatementAfterSemicolon: false,
     precedingErroredSlice: null,
   })
+}
+
+const CLAUSE_COLUMN_SINGLE_WORDS = new Set([
+  'SELECT',
+  'WHERE',
+  'AND',
+  'OR',
+  'ON',
+  'SET',
+  'HAVING',
+  'RETURNING',
+])
+
+const COMMA_COLUMN_CLAUSE_WORDS = new Set([
+  'SELECT',
+  'DISTINCT',
+  'SET',
+  'GROUP',
+  'ORDER',
+  'PARTITION',
+  'BY',
+  'HAVING',
+  'WHERE',
+  'ON',
+  'AND',
+  'OR',
+  'RETURNING',
+])
+
+const COMMA_CLAUSE_TRACKED_WORDS = new Set([
+  ...COMMA_COLUMN_CLAUSE_WORDS,
+  'FROM',
+  'JOIN',
+  'USING',
+  'INTO',
+  'UPDATE',
+  'VALUES',
+  'LIMIT',
+  'OFFSET',
+])
+
+/**
+ * Returns true when the cursor sits immediately after a SQL clause token + whitespace
+ * or after a comma inside a column-bearing SQL clause (never inside strings/comments).
+ */
+export function isSqlClauseColumnContext(before, dialect) {
+  if (typeof before !== 'string' || before.length === 0) return false
+  const stripped = stripCommentsAndLiteralsDetailed(before, dialect, {
+    literalPlaceholder: ' _lit_ ',
+    identPlaceholder: ' _id_ ',
+  })
+  if (stripped.hasUnclosedQuote || stripped.hasUnclosedComment || stripped.endsInLineComment) return false
+
+  const lastSemi = stripped.text.lastIndexOf(';')
+  const stmtClean = lastSemi >= 0 ? stripped.text.slice(lastSemi + 1) : stripped.text
+  const trimmed = stmtClean.trimEnd()
+  if (!trimmed) return false
+
+  if (trimmed.endsWith(',')) {
+    const beforeComma = trimmed.slice(0, -1)
+    let parenDepth = 0
+    /** @type {Map<number, string>} */
+    const trackedClauseAtDepth = new Map()
+    /** @type {Set<number>} */
+    const blockedDepths = new Set()
+    let lastWordUpper = ''
+    for (let i = 0; i < beforeComma.length; i++) {
+      const ch = beforeComma[i]
+      if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch === '_') {
+        let end = i + 1
+        while (end < beforeComma.length) {
+          const c = beforeComma[end]
+          if (
+            (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c === '_'
+          ) {
+            end++
+          } else {
+            break
+          }
+        }
+        const upper = beforeComma.slice(i, end).toUpperCase()
+        lastWordUpper = upper
+        if (COMMA_CLAUSE_TRACKED_WORDS.has(upper)) {
+          trackedClauseAtDepth.set(parenDepth, upper)
+        }
+        i = end - 1
+        continue
+      }
+      if (ch === '(') {
+        parenDepth++
+        if (lastWordUpper === 'VALUES' || lastWordUpper === 'IN') {
+          blockedDepths.add(parenDepth)
+        }
+        lastWordUpper = ''
+        continue
+      }
+      if (ch === ')' && parenDepth > 0) {
+        trackedClauseAtDepth.delete(parenDepth)
+        blockedDepths.delete(parenDepth)
+        parenDepth--
+        lastWordUpper = ''
+        continue
+      }
+      if (ch !== ' ' && ch !== '\t' && ch !== '\n' && ch !== '\r') {
+        lastWordUpper = ''
+      }
+    }
+    for (let d = parenDepth; d >= 0; d--) {
+      if (trackedClauseAtDepth.has(d)) {
+        return COMMA_COLUMN_CLAUSE_WORDS.has(trackedClauseAtDepth.get(d))
+      }
+      if (blockedDepths.has(d)) return false
+    }
+    return false
+  }
+
+  if (!/\s$/.test(before)) return false
+  const m = /(?:^|[\s(])(?:([A-Za-z_][A-Za-z0-9_]*)\s+)?([A-Za-z_][A-Za-z0-9_]*)$/.exec(trimmed)
+  if (!m) return false
+  const prevWord = m[1] ? m[1].toUpperCase() : ''
+  const lastWord = m[2].toUpperCase()
+
+  if (CLAUSE_COLUMN_SINGLE_WORDS.has(lastWord)) return true
+  if (lastWord === 'DISTINCT' && prevWord === 'SELECT') return true
+  if (lastWord === 'BY' && (prevWord === 'ORDER' || prevWord === 'GROUP' || prevWord === 'PARTITION')) {
+    return true
+  }
+  return (
+    lastWord === 'NOT' &&
+    (prevWord === 'WHERE' || prevWord === 'AND' || prevWord === 'OR' || prevWord === 'ON' || prevWord === 'HAVING')
+  )
 }

@@ -1,6 +1,7 @@
 // src/panel/panel-connection-form.js
 // Side Panel Connection Form, Engine Selector, URI Parser & Workspace Auto-Discovery
 
+import { isReservedFolderName, normalizeConnectionFolderKey } from '../shared-connection-order.js'
 import { findCredentialAuthorityAtIndex, isCloudDatabaseHost } from '../shared-sql-safety.js'
 import {
   ENGINES,
@@ -191,9 +192,11 @@ export function createPanelConnectionFormController(ctx) {
     updateViewportLayout,
     savePanelViewState,
     copyText,
+    clearUriPasteTimer,
   } = ctx
 
   let detectSeq = 0
+  const detectBtnSeq = new WeakMap()
   let parseUriSeq = 0
   let refreshByodSeq = 0
   let dockerApplySeq = 0
@@ -203,6 +206,174 @@ export function createPanelConnectionFormController(ctx) {
   let activeAutoDisplayUri = null
   let lastParsedDisplayUri = ''
   let lastParsedCandidateId = ''
+  let spotlightTimer = null
+  let byodGroupEl = null
+  let byodToggleBtn = null
+  let byodToggleCountEl = null
+  let byodTilesGridEl = null
+  let byodEnginesCount = 0
+  let byodGroupExpanded = false
+  let orgSafetyExpanded = false
+
+  function prefersReducedMotionUi() {
+    try {
+      return Boolean(
+        typeof window !== 'undefined' &&
+          typeof window.matchMedia === 'function' &&
+          window.matchMedia('(prefers-reduced-motion: reduce)').matches
+      )
+    } catch {
+      return false
+    }
+  }
+
+  function focusElementWithoutScroll(el) {
+    if (!el || typeof el.focus !== 'function') return
+    try {
+      el.focus({ preventScroll: true })
+    } catch {
+      el.focus()
+    }
+  }
+
+  function setByodGroupExpanded(expanded) {
+    byodGroupExpanded = Boolean(expanded)
+    if (byodGroupEl) byodGroupEl.classList.toggle('is-expanded', byodGroupExpanded)
+    if (byodToggleBtn) {
+      byodToggleBtn.setAttribute('aria-expanded', byodGroupExpanded ? 'true' : 'false')
+    }
+    if (byodTilesGridEl) byodTilesGridEl.hidden = !byodGroupExpanded
+  }
+
+  function syncByodToggleBadge(driverId) {
+    if (!byodToggleCountEl) return
+    if (BYOD_IDS.has(driverId)) {
+      byodToggleCountEl.textContent = ENGINE_BY_ID[driverId]?.label || driverId
+    } else {
+      byodToggleCountEl.textContent = String(byodEnginesCount)
+    }
+  }
+
+  function setOrgSafetyExpanded(expanded) {
+    orgSafetyExpanded = Boolean(expanded)
+    const grp = $('connOrgSafetyGroup')
+    const toggle = $('connOrgSafetyToggle')
+    const bodyEl = $('connOrgSafetyBody')
+    if (grp) grp.classList.toggle('is-expanded', orgSafetyExpanded)
+    if (toggle) toggle.setAttribute('aria-expanded', orgSafetyExpanded ? 'true' : 'false')
+    if (bodyEl) bodyEl.hidden = !orgSafetyExpanded
+  }
+
+  function hasNonDefaultOrgSafety() {
+    const folder = ($('formFolder')?.value || '').trim()
+    const scope = ($('formWorkspaceScope')?.value || '').trim()
+    const policy = ($('formAiPolicy')?.value || '').trim()
+    const ro = Boolean($('formReadOnly')?.checked)
+    const tag = state.formColorTag && state.formColorTag !== 'none'
+    return Boolean(folder || scope || policy || ro || tag)
+  }
+
+  function syncOrgSafetySummary() {
+    const summaryEl = $('connOrgSafetySummary')
+    if (!summaryEl) return
+    const parts = []
+    if (state.formColorTag && state.formColorTag !== 'none') {
+      const lbl =
+        state.formColorTag === 'prod'
+          ? 'Prod'
+          : state.formColorTag === 'staging'
+            ? 'Staging'
+            : 'Dev'
+      parts.push(lbl)
+    }
+    if ($('formReadOnly')?.checked) parts.push('Read-Only')
+    const folder = ($('formFolder')?.value || '').trim()
+    if (folder) parts.push(folder.length > 18 ? `${folder.slice(0, 17)}…` : folder)
+    if (($('formWorkspaceScope')?.value || '').trim()) parts.push('Pinned')
+    const policy = ($('formAiPolicy')?.value || '').trim()
+    if (policy) parts.push(`AI: ${policy}`)
+    summaryEl.textContent = parts.join(' · ')
+    summaryEl.hidden = parts.length === 0
+  }
+
+  function syncOrgSafetyState() {
+    setOrgSafetyExpanded(hasNonDefaultOrgSafety())
+    syncOrgSafetySummary()
+  }
+
+  function clearFormImportSpotlight(clearSourcePill = true) {
+    if (spotlightTimer !== null) {
+      clearTimeout(spotlightTimer)
+      spotlightTimer = null
+    }
+    const card = $('connDetailsCard')
+    if (card) card.classList.remove('is-form-spotlight')
+    if (clearSourcePill) {
+      const pill = $('connDetailsSourcePill')
+      if (pill) {
+        pill.textContent = ''
+        pill.hidden = true
+      }
+    }
+  }
+
+  function focusConnectionFormAfterImport(opts = {}) {
+    const { sourceLabel = '', preferredField = null, collapseDiscovery = false } = opts
+    if (collapseDiscovery) {
+      state.discoveredSearch = ''
+      if ($('discoveredSearchInput')) $('discoveredSearchInput').value = ''
+      state.discoveryCollapsed = { env: true, docker: true, sqlite: true }
+      renderDiscoveredItems()
+    }
+    clearFormImportSpotlight(false)
+    const pill = $('connDetailsSourcePill')
+    if (pill && sourceLabel) {
+      pill.textContent = `Filled from ${sourceLabel}`
+      pill.hidden = false
+    }
+
+    const driver = state.formDriver
+    let targetEl = preferredField || null
+    if (!targetEl) {
+      if ((driver === 'sqlite' || driver === 'duckdb') && !$('formFilePath')?.value.trim()) {
+        targetEl = $('formFilePath')
+      } else if (driver === 'libsql' && !$('formLibsqlUrl')?.value.trim()) {
+        targetEl = $('formLibsqlUrl')
+      } else if (
+        driver !== 'sqlite' &&
+        driver !== 'duckdb' &&
+        driver !== 'libsql' &&
+        !$('formHost')?.value.trim()
+      ) {
+        targetEl = $('formHost')
+      } else {
+        targetEl = $('formName')
+      }
+    }
+
+    const card = $('connDetailsCard')
+    const scrollBehavior = prefersReducedMotionUi() ? 'auto' : 'smooth'
+    const scrollTarget = preferredField || card || targetEl
+    if (scrollTarget && typeof scrollTarget.scrollIntoView === 'function') {
+      scrollTarget.scrollIntoView({
+        behavior: scrollBehavior,
+        block: preferredField ? 'center' : 'nearest',
+      })
+    }
+    if (targetEl && typeof targetEl.focus === 'function') {
+      focusElementWithoutScroll(targetEl)
+      if (targetEl === $('formName') && targetEl.value && typeof targetEl.select === 'function') {
+        targetEl.select()
+      }
+    }
+    if (card) {
+      card.classList.add('is-form-spotlight')
+      spotlightTimer = setTimeout(() => {
+        spotlightTimer = null
+        card.classList.remove('is-form-spotlight')
+      }, 1400)
+    }
+  }
 
   function clearActiveAutoUri() {
     activeAutoCandidateId = null
@@ -214,11 +385,23 @@ export function createPanelConnectionFormController(ctx) {
     const sslOn = Boolean($('formSsl')?.checked)
     const verifyRow = $('sslVerifyRow')
     const verifyEl = $('formSslVerify')
+    const sniRow = $('tlsServernameRow')
+    const caRow = $('sslCaPathRow')
     if (verifyRow) {
       verifyRow.hidden = !sslOn
     }
+    if (sniRow) {
+      sniRow.hidden = !sslOn && !($('formTlsServername')?.value || '').trim()
+    }
+    if (caRow) {
+      caRow.hidden = !sslOn && !($('formSslCaPath')?.value || '').trim()
+    }
     if (verifyEl) {
-      if (state.formSslMode === 'verify-ca' || state.formSslMode === 'verify-full') {
+      if (
+        state.formSslMode === 'verify-ca' ||
+        state.formSslMode === 'verify-full' ||
+        state.formSslMode === 'strict'
+      ) {
         verifyEl.checked = true
         verifyEl.disabled = true
       } else if (sslOn) {
@@ -231,6 +414,39 @@ export function createPanelConnectionFormController(ctx) {
         verifyEl.disabled = true
         verifyEl.checked = true
       }
+    }
+  }
+
+  function syncSshStatusUi(profile) {
+    const row = $('sshStatusRow')
+    const txt = $('sshStatusText')
+    const btn = $('disableSshBtn')
+    if (!row || !txt || !btn) return
+    const target =
+      profile ||
+      (state.editingId && Array.isArray(state.connections)
+        ? state.connections.find((c) => c && c.id === state.editingId)
+        : state.sourceSecretConnId && Array.isArray(state.connections)
+          ? state.connections.find((c) => c && c.id === state.sourceSecretConnId)
+          : null)
+    const hasSsh = Boolean(
+      target && (target.sshEnabled || (Array.isArray(target.sshJumpHosts) && target.sshJumpHosts.length > 0))
+    )
+    if (!hasSsh) {
+      row.hidden = true
+      return
+    }
+    row.hidden = false
+    if (state.sshExplicitlyDisabled === true) {
+      txt.textContent = 'SSH disabled (save to remove tunnel & hop secrets)'
+      btn.textContent = 'Undo Disable'
+    } else {
+      const hopCount = Array.isArray(target?.sshJumpHosts) ? target.sshJumpHosts.length : 0
+      txt.textContent =
+        hopCount > 0
+          ? `SSH Tunnel configured (${hopCount} jump hop${hopCount === 1 ? '' : 's'})`
+          : 'SSH Tunnel configured'
+      btn.textContent = 'Disable SSH'
     }
   }
   const BYOD_IDS = new Set([
@@ -422,6 +638,7 @@ export function createPanelConnectionFormController(ctx) {
         }
         state.pendingWorkspaceScope = null
         syncSelectTooltip(wsSel)
+        syncOrgSafetySummary()
         enhanceCollapsibleSelectDropdown(wsSel, {
           tooltipPrefix: 'Workspace Scope (Pin Connection)',
           searchPlaceholder: 'Search workspaces by name, branch, or project folder...',
@@ -438,7 +655,7 @@ export function createPanelConnectionFormController(ctx) {
     if (!wrap) return
     wrap.textContent = ''
     const existing = Array.isArray(state.connections)
-      ? state.connections.map((c) => (c?.folder || '').trim()).filter(Boolean)
+      ? state.connections.map((c) => normalizeConnectionFolderKey(c?.folder)).filter(Boolean)
       : []
     const folders = Array.from(new Set(existing)).sort((a, b) => a.localeCompare(b))
     if (folders.length === 0) {
@@ -461,6 +678,7 @@ export function createPanelConnectionFormController(ctx) {
       btn.addEventListener('click', () => {
         if ($('formFolder')) {
           $('formFolder').value = fName
+          syncOrgSafetySummary()
           savePanelViewState?.()
         }
       })
@@ -509,6 +727,7 @@ export function createPanelConnectionFormController(ctx) {
       p.classList.toggle('active', p.dataset.env === state.formColorTag)
     })
     syncAiPolicyHint()
+    syncOrgSafetySummary()
     savePanelViewState?.()
   }
 
@@ -522,6 +741,12 @@ export function createPanelConnectionFormController(ctx) {
     document.querySelectorAll('.engine-tile').forEach((tile) => {
       tile.classList.toggle('active', tile.dataset.driver === valid)
     })
+    if (BYOD_IDS.has(valid)) {
+      setByodGroupExpanded(true)
+    } else if (prevDriver && BYOD_IDS.has(prevDriver)) {
+      setByodGroupExpanded(false)
+    }
+    syncByodToggleBadge(valid)
 
     const isSqlite = valid === 'sqlite'
     const isDuckdb = valid === 'duckdb'
@@ -587,9 +812,6 @@ export function createPanelConnectionFormController(ctx) {
       state.formSslTouched = false
     }
     syncSslVerifyUi()
-    if ($('quickBrowseDbFileBtn')) {
-      $('quickBrowseDbFileBtn').hidden = !isFileDb
-    }
     renderDiscoveredItems()
     syncPanelByodBox()
     clearFormNotice()
@@ -604,15 +826,11 @@ export function createPanelConnectionFormController(ctx) {
     const builtinEngines = ENGINES.filter((eng) => !eng.studioOnly && !BYOD_IDS.has(eng.id))
     const byodEngines = ENGINES.filter((eng) => !eng.studioOnly && BYOD_IDS.has(eng.id))
 
-    const appendEngineGroup = (groupKey, labelText, engines) => {
+    const appendEngineGroup = (groupKey, labelText, engines, collapsible = false) => {
       if (engines.length === 0) return
       const groupEl = document.createElement('div')
       groupEl.className = 'engine-group'
       groupEl.dataset.engineGroup = groupKey
-
-      const labelEl = document.createElement('div')
-      labelEl.className = 'engine-group-label'
-      labelEl.textContent = labelText
 
       const tilesGrid = document.createElement('div')
       tilesGrid.className = 'engine-group-grid'
@@ -635,12 +853,55 @@ export function createPanelConnectionFormController(ctx) {
         tilesGrid.appendChild(btn)
       }
 
-      groupEl.append(labelEl, tilesGrid)
+      if (collapsible) {
+        const toggleBtn = document.createElement('button')
+        toggleBtn.type = 'button'
+        toggleBtn.id = 'panelByodGroupToggle'
+        toggleBtn.className = 'engine-group-toggle'
+        toggleBtn.setAttribute('aria-controls', 'panelByodTilesGrid')
+        tilesGrid.id = 'panelByodTilesGrid'
+        const chev = document.createElement('span')
+        chev.className = 'engine-group-toggle-chevron'
+        chev.setAttribute('aria-hidden', 'true')
+        chev.textContent = '\u25b8'
+        const txt = document.createElement('span')
+        txt.className = 'engine-group-label'
+        txt.textContent = labelText
+        const cnt = document.createElement('span')
+        cnt.className = 'engine-group-toggle-count'
+        cnt.textContent = `${engines.length}`
+        toggleBtn.append(chev, txt, cnt)
+        toggleBtn.addEventListener('click', () => {
+          setByodGroupExpanded(!byodGroupExpanded)
+        })
+        byodGroupEl = groupEl
+        byodToggleBtn = toggleBtn
+        byodToggleCountEl = cnt
+        byodEnginesCount = engines.length
+        byodTilesGridEl = tilesGrid
+        groupEl.append(toggleBtn, tilesGrid)
+        setByodGroupExpanded(BYOD_IDS.has(state.formDriver))
+        syncByodToggleBadge(state.formDriver)
+      } else {
+        const labelEl = document.createElement('div')
+        labelEl.className = 'engine-group-label'
+        labelEl.textContent = labelText
+        groupEl.append(labelEl, tilesGrid)
+      }
       grid.appendChild(groupEl)
     }
 
-    appendEngineGroup('builtin', 'Built-in Database Engines', builtinEngines)
-    appendEngineGroup('byod', 'Local Custom Drivers (BYOD)', byodEngines)
+    appendEngineGroup('builtin', 'Built-in Database Engines', builtinEngines, false)
+    appendEngineGroup('byod', 'Local Custom Drivers (BYOD)', byodEngines, true)
+
+    const orgToggle = $('connOrgSafetyToggle')
+    if (orgToggle) {
+      orgToggle.addEventListener('click', () => {
+        setOrgSafetyExpanded(!orgSafetyExpanded)
+      })
+    }
+    setOrgSafetyExpanded(hasNonDefaultOrgSafety())
+    syncOrgSafetySummary()
 
     const redisSel = $('formRedisDb')
     redisSel.textContent = ''
@@ -682,6 +943,10 @@ export function createPanelConnectionFormController(ctx) {
               state.lastAutoFilledSqliteName = smartName
             }
             clearFormNotice()
+            focusConnectionFormAfterImport({
+              sourceLabel: 'local file',
+              collapseDiscovery: true,
+            })
             savePanelViewState?.()
           }
         })
@@ -939,6 +1204,8 @@ export function createPanelConnectionFormController(ctx) {
       'formRedisDb',
       'formSsl',
       'formSslVerify',
+      'formTlsServername',
+      'formSslCaPath',
       'formReadOnly',
       'formAiPolicy',
     ]
@@ -963,9 +1230,14 @@ export function createPanelConnectionFormController(ctx) {
         }
         if (id === 'formAiPolicy') {
           syncAiPolicyHint()
+          syncOrgSafetySummary()
         }
         if (id === 'formWorkspaceScope') {
           state.pendingWorkspaceScope = null
+          syncOrgSafetySummary()
+        }
+        if (id === 'formFolder' || id === 'formReadOnly') {
+          syncOrgSafetySummary()
         }
         if (id === 'formSsl') {
           state.formSslTouched = true
@@ -987,7 +1259,8 @@ export function createPanelConnectionFormController(ctx) {
               state.formSslMode === undefined ||
               state.formSslMode === 'auto' ||
               state.formSslMode === 'verify-ca' ||
-              state.formSslMode === 'verify-full'
+              state.formSslMode === 'verify-full' ||
+              state.formSslMode === 'strict'
             ) {
               state.formSslMode = 'require'
             }
@@ -996,7 +1269,54 @@ export function createPanelConnectionFormController(ctx) {
           }
           syncSslVerifyUi()
         }
+        if (id === 'formTlsServername') {
+          state.formTlsServernameTouched = true
+        }
+        if (id === 'formSslCaPath') {
+          state.formSslCaPathTouched = true
+        }
         if (isSelect) syncSelectTooltip(el)
+        savePanelViewState?.()
+      })
+    }
+
+    if ($('browseSslCaBtn')) {
+      $('browseSslCaBtn').addEventListener('click', () => {
+        if (state.formBusy || !state.formOpen) return
+        void openPanelFilePickerModal({
+          title: 'Select CA Certificate',
+          mode: 'file',
+          initialDir: $('formSslCaPath')?.value.trim() || undefined,
+          extensions: ['.pem', '.crt', '.cer', '.ca-bundle'],
+        })
+          .then((res) => {
+            if (!state.formOpen) return
+            if (res?.ok && res.path) {
+              if ($('formSslCaPath')) $('formSslCaPath').value = res.path
+              state.formSslCaPathTouched = true
+              if ($('formSsl')) $('formSsl').checked = true
+              if (
+                state.formSslMode === 'disable' ||
+                state.formSslMode === 'require' ||
+                !state.formSslMode
+              ) {
+                state.formSslMode = 'verify-ca'
+                state.formSslRejectUnauthorized = true
+                state.formSslTouched = true
+              }
+              syncSslVerifyUi()
+              savePanelViewState?.()
+            }
+          })
+          .catch(() => {})
+      })
+    }
+
+    if ($('disableSshBtn')) {
+      $('disableSshBtn').addEventListener('click', () => {
+        if (state.formBusy || !state.formOpen) return
+        state.sshExplicitlyDisabled = !state.sshExplicitlyDisabled
+        syncSshStatusUi()
         savePanelViewState?.()
       })
     }
@@ -1007,6 +1327,8 @@ export function createPanelConnectionFormController(ctx) {
 
   function resetConnectionForm() {
     dockerApplySeq++
+    parseUriSeq++
+    clearUriPasteTimer?.()
     clearActiveAutoUri()
     lastParsedDisplayUri = ''
     lastParsedCandidateId = ''
@@ -1021,6 +1343,9 @@ export function createPanelConnectionFormController(ctx) {
     state.formSslMode = undefined
     state.formSslRejectUnauthorized = undefined
     state.formSslTouched = false
+    state.formTlsServernameTouched = false
+    state.formSslCaPathTouched = false
+    state.sshExplicitlyDisabled = false
     state.parsedOracleUrl = ''
     state.lastAutoFilledSqliteName = ''
     state.discoveredSearch = ''
@@ -1042,7 +1367,10 @@ export function createPanelConnectionFormController(ctx) {
     $('formPassword').value = ''
     $('formPassword').placeholder = 'Optional'
     $('formSsl').checked = false
+    if ($('formTlsServername')) $('formTlsServername').value = ''
+    if ($('formSslCaPath')) $('formSslCaPath').value = ''
     syncSslVerifyUi()
+    syncSshStatusUi(null)
     $('formReadOnly').checked = false
     if ($('formAiPolicy')) {
       $('formAiPolicy').value = ''
@@ -1059,6 +1387,10 @@ export function createPanelConnectionFormController(ctx) {
     renderPanelFolderChips()
     void refreshPanelByodAndWorkspaces()
     setFormColorTag('none')
+    setByodGroupExpanded(false)
+    setOrgSafetyExpanded(false)
+    syncOrgSafetySummary()
+    clearFormImportSpotlight(true)
     clearFormNotice()
   }
 
@@ -1161,10 +1493,20 @@ export function createPanelConnectionFormController(ctx) {
             ? Boolean(profile.ssl)
             : isCloudAutoSsl || hasExplicitTlsMode
       $('formSsl').checked = effectiveSsl
+      if ($('formTlsServername')) {
+        $('formTlsServername').value = typeof profile.tlsServername === 'string' ? profile.tlsServername : ''
+      }
+      if ($('formSslCaPath')) {
+        $('formSslCaPath').value = typeof profile.sslCaPath === 'string' ? profile.sslCaPath : ''
+      }
       state.formSslMode = profile.sslMode
       state.formSslRejectUnauthorized = profile.sslRejectUnauthorized
       state.formSslTouched = false
+      state.formTlsServernameTouched = false
+      state.formSslCaPathTouched = false
+      state.sshExplicitlyDisabled = false
       syncSslVerifyUi()
+      syncSshStatusUi(profile)
       if (driver === 'redis') {
         $('formRedisDb').value = String(profile.redisDb ?? 0)
       } else {
@@ -1183,9 +1525,16 @@ export function createPanelConnectionFormController(ctx) {
       }
     }
 
+    setOrgSafetyExpanded(hasNonDefaultOrgSafety() || opts?.focusSection === 'ai')
+    syncOrgSafetySummary()
+    clearFormImportSpotlight(true)
     setFormOpen(true)
     if (opts?.focusSection === 'tls') {
       const targetEl = $('formSslVerify') && !$('sslVerifyRow')?.hidden ? $('formSslVerify') : $('formSsl')
+      targetEl?.scrollIntoView?.({ block: 'center' })
+      targetEl?.focus?.()
+    } else if (opts?.focusSection === 'ai') {
+      const targetEl = $('formAiPolicy')
       targetEl?.scrollIntoView?.({ block: 'center' })
       targetEl?.focus?.()
     }
@@ -1200,8 +1549,8 @@ export function createPanelConnectionFormController(ctx) {
     const aiPolicy =
       rawAiPolicy === 'allow' || rawAiPolicy === 'ask' || rawAiPolicy === 'never'
         ? rawAiPolicy
-        : undefined
-    const folder = ($('formFolder') ? $('formFolder').value : '').trim().slice(0, 64)
+        : null
+    const folder = normalizeConnectionFolderKey($('formFolder') ? $('formFolder').value : '')
     const workspaceScope = ($('formWorkspaceScope') ? $('formWorkspaceScope').value : '').trim().slice(0, 260)
 
     if (driver === 'sqlite' || driver === 'duckdb') {
@@ -1217,7 +1566,7 @@ export function createPanelConnectionFormController(ctx) {
           filePath,
           readOnly,
           colorTag,
-          ...(aiPolicy ? { aiPolicy } : {}),
+          aiPolicy,
           folder,
           workspaceScope,
         },
@@ -1242,7 +1591,7 @@ export function createPanelConnectionFormController(ctx) {
           ssl: /^(?:https|libsql|wss):\/\//i.test(url) || !/^http:\/\//i.test(url),
           readOnly,
           colorTag,
-          ...(aiPolicy ? { aiPolicy } : {}),
+          aiPolicy,
           hasAuthToken: Boolean(authToken) || keepStoredToken,
           folder,
           workspaceScope,
@@ -1279,7 +1628,7 @@ export function createPanelConnectionFormController(ctx) {
       ssl,
       readOnly,
       colorTag,
-      ...(aiPolicy ? { aiPolicy } : {}),
+      aiPolicy,
       hasPassword: Boolean(password) || keepStoredPassword,
       folder,
       workspaceScope,
@@ -1361,7 +1710,8 @@ export function createPanelConnectionFormController(ctx) {
       state.formSslMode === 'disable' ||
       state.formSslMode === 'require' ||
       state.formSslMode === 'verify-ca' ||
-      state.formSslMode === 'verify-full'
+      state.formSslMode === 'verify-full' ||
+      state.formSslMode === 'strict'
     ) {
       profile.sslMode = state.formSslMode
     }
@@ -1383,18 +1733,21 @@ export function createPanelConnectionFormController(ctx) {
       profile.sslRejectUnauthorized = true
     }
 
+    const tlsServername = ($('formTlsServername')?.value || '').trim()
+    if (tlsServername) {
+      profile.tlsServername = tlsServername
+    }
+    const sslCaPath = ($('formSslCaPath')?.value || '').trim()
+    if (sslCaPath) {
+      profile.sslCaPath = sslCaPath
+    }
+
     const preserveSourceId =
       state.editingId === id ? id : state.sourceSecretConnId || null
     if (preserveSourceId && Array.isArray(state.connections)) {
       const existing = state.connections.find((c) => c && c.id === preserveSourceId)
       if (existing && existing.driver === driver) {
-        const extendedKeys = [
-          'sslMode',
-          'sslCaPath',
-          'sslCertPath',
-          'sslKeyPath',
-          'hasSslKeyPassphrase',
-          'sslRejectUnauthorized',
+        const sshKeys = new Set([
           'sshEnabled',
           'sshHost',
           'sshPort',
@@ -1403,6 +1756,25 @@ export function createPanelConnectionFormController(ctx) {
           'sshPrivateKeyPath',
           'hasSshPassphrase',
           'hasSshPassword',
+          'sshJumpHosts',
+        ])
+        const extendedKeys = [
+          'sslMode',
+          'sslCaPath',
+          'sslCertPath',
+          'sslKeyPath',
+          'hasSslKeyPassphrase',
+          'sslRejectUnauthorized',
+          'tlsServername',
+          'sshEnabled',
+          'sshHost',
+          'sshPort',
+          'sshUser',
+          'sshAuthMethod',
+          'sshPrivateKeyPath',
+          'hasSshPassphrase',
+          'hasSshPassword',
+          'sshJumpHosts',
           'd1AccountId',
           'd1DatabaseId',
         ]
@@ -1410,16 +1782,33 @@ export function createPanelConnectionFormController(ctx) {
           if (state.formSslTouched && (key === 'sslMode' || key === 'sslRejectUnauthorized')) {
             continue
           }
+          if (key === 'tlsServername' && ($('formTlsServername') || state.formTlsServernameTouched)) {
+            continue
+          }
+          if (key === 'sslCaPath' && ($('formSslCaPath') || state.formSslCaPathTouched)) {
+            continue
+          }
+          if (state.sshExplicitlyDisabled === true && sshKeys.has(key)) {
+            continue
+          }
           if (existing[key] !== undefined && profile[key] === undefined) {
-            profile[key] = existing[key]
+            profile[key] =
+              key === 'sshJumpHosts' && Array.isArray(existing[key])
+                ? existing[key].map((hop) => (hop && typeof hop === 'object' ? { ...hop } : hop))
+                : existing[key]
           }
         }
       }
+    }
+    if (state.sshExplicitlyDisabled === true) {
+      profile.sshEnabled = false
+      profile.sshJumpHosts = []
     }
 
     return {
       profile,
       ...(password ? { password } : {}),
+      ...(state.sshExplicitlyDisabled === true ? { sshExplicitlyDisabled: true } : {}),
       ...(state.sourceSecretConnId ? { sourceConnectionId: state.sourceSecretConnId } : {}),
     }
   }
@@ -1452,6 +1841,9 @@ export function createPanelConnectionFormController(ctx) {
     ) {
       clearActiveAutoUri()
     }
+    if (state.lastParsedUri && lastParsedDisplayUri && displayUri === lastParsedDisplayUri) {
+      return { uri: state.lastParsedUri, displayUri }
+    }
     return { uri: displayUri, displayUri }
   }
 
@@ -1470,9 +1862,6 @@ export function createPanelConnectionFormController(ctx) {
         showFormNotice(res?.error || 'Could not parse connection URI.', 'danger')
         return false
       }
-      state.lastParsedUri = target.uri || ''
-      lastParsedCandidateId = target.candidateId || ''
-      lastParsedDisplayUri = target.displayUri || (target.uri ? maskConnectionUriSecret(target.uri) : '')
       const p = res.profile
       if (!p.driver || !ENGINE_BY_ID[p.driver] || ENGINE_BY_ID[p.driver].studioOnly) {
         showFormNotice(
@@ -1510,7 +1899,7 @@ export function createPanelConnectionFormController(ctx) {
       const nextPassword =
         res.password !== undefined
           ? res.password
-          : dropStoredSecret
+          : dropStoredSecret || res.placeholderPassword
             ? ''
             : $('formPassword').value
       const nextAuthToken =
@@ -1537,7 +1926,10 @@ export function createPanelConnectionFormController(ctx) {
       setFormDriver(driver, true)
       state.parsedOracleUrl = driver === 'oracle' && p.url ? scrubPanelNetworkFormUrl(p.url) : ''
       if (p.name) $('formName').value = p.name
-      if (p.readOnly !== undefined) $('formReadOnly').checked = Boolean(p.readOnly)
+      if (p.readOnly !== undefined) {
+        $('formReadOnly').checked = Boolean(p.readOnly)
+        syncOrgSafetySummary()
+      }
       if (driver === 'sqlite' || driver === 'duckdb') {
         $('formFilePath').value = p.filePath || ''
       } else if (driver === 'libsql') {
@@ -1597,6 +1989,22 @@ export function createPanelConnectionFormController(ctx) {
         }
         $('formPassword').value = nextPassword
       }
+      const maskedDisplayUri = target.uri
+        ? maskConnectionUriSecret(target.uri)
+        : target.displayUri
+      const uriEl = $('uriInput')
+      if (
+        uriEl &&
+        !target.candidateId &&
+        target.uri &&
+        maskedDisplayUri &&
+        uriEl.value.trim() === target.uri
+      ) {
+        uriEl.value = maskedDisplayUri
+      }
+      state.lastParsedUri = target.uri || ''
+      lastParsedCandidateId = target.candidateId || ''
+      lastParsedDisplayUri = maskedDisplayUri
       state.lastParsedPlaceholderUri = Boolean(res.placeholderPassword)
       const missingPlaceholderPassword =
         state.lastParsedPlaceholderUri && !$('formPassword').value
@@ -1607,13 +2015,19 @@ export function createPanelConnectionFormController(ctx) {
           `Parsed ${ENGINE_BY_ID[driver].label} URI — placeholder password was removed. Enter your actual Database Password below before testing.`,
           'danger'
         )
-        $('formPassword').focus()
       } else {
         $('formPassword').placeholder =
           state.formHadPassword && (state.editingId || state.sourceSecretConnId)
             ? 'Stored password preserved (type to replace)'
             : 'Optional'
         showFormNotice(`Parsed ${ENGINE_BY_ID[driver].label} URI`, 'success')
+      }
+      if (!options.skipFocus || missingPlaceholderPassword) {
+        focusConnectionFormAfterImport({
+          sourceLabel: options.sourceLabel || 'URI',
+          preferredField: missingPlaceholderPassword ? $('formPassword') : null,
+          collapseDiscovery: options.collapseDiscovery !== false,
+        })
       }
       savePanelViewState?.()
       return true
@@ -1633,7 +2047,8 @@ export function createPanelConnectionFormController(ctx) {
 
   async function detectWorkspace(folderPath, isManual = false) {
     const seq = ++detectSeq
-    const detectBtn = $('detectWorkspaceBtn')
+    const detectBtn = (folderPath ? $('quickScanFolderBtn') : null) || $('detectWorkspaceBtn')
+    if (detectBtn) detectBtnSeq.set(detectBtn, seq)
     setButtonLoading(detectBtn, true, 'Scanning...')
     try {
       const [wsRes, folderRes] = await Promise.all([
@@ -1707,7 +2122,7 @@ export function createPanelConnectionFormController(ctx) {
         showFormNotice('Workspace discovery failed.', 'danger')
       }
     } finally {
-      if (seq === detectSeq) {
+      if (detectBtn && detectBtnSeq.get(detectBtn) === seq) {
         setButtonLoading(detectBtn, false)
         if (state.formBusy && detectBtn instanceof HTMLButtonElement) {
           detectBtn.disabled = true
@@ -1791,13 +2206,17 @@ export function createPanelConnectionFormController(ctx) {
 
     if (item.hint) {
       showFormNotice(item.hint, 'warn')
-      if (item.passwordFromFile) $('formPassword')?.focus()
     } else {
       showFormNotice(
         `Imported ${ENGINE_BY_ID[item.driver].label} service "${item.name}" from Docker Compose.`,
         'success'
       )
     }
+    focusConnectionFormAfterImport({
+      sourceLabel: 'Docker',
+      preferredField: item.passwordFromFile ? $('formPassword') : null,
+      collapseDiscovery: true,
+    })
     savePanelViewState?.()
 
     if (item.candidateId) {
@@ -1965,7 +2384,7 @@ export function createPanelConnectionFormController(ctx) {
               ...(item.candidateId ? { candidateId: item.candidateId } : { uri: item.uri }),
               displayUri: maskedUri,
             },
-            { clearMissingSecret: true }
+            { clearMissingSecret: true, sourceLabel: '.env', collapseDiscovery: true }
           )
         })
         envList.appendChild(chip)
@@ -2131,8 +2550,12 @@ export function createPanelConnectionFormController(ctx) {
             $('formName').value = file.name
             state.lastAutoFilledSqliteName = file.name
           }
-          renderDiscoveredItems()
           clearFormNotice()
+          focusConnectionFormAfterImport({
+            sourceLabel: 'SQLite file',
+            collapseDiscovery: true,
+          })
+          savePanelViewState?.()
         })
         fileList.appendChild(chip)
       }
@@ -2142,7 +2565,16 @@ export function createPanelConnectionFormController(ctx) {
   }
 
   function setFormControlsBusy(busy) {
-    const ids = ['testFormBtn', 'saveFormBtn', 'clearFormBtn', 'uriInput', 'parseUriBtn', 'detectWorkspaceBtn']
+    const ids = [
+      'testFormBtn',
+      'saveFormBtn',
+      'clearFormBtn',
+      'uriInput',
+      'parseUriBtn',
+      'quickBrowseDbFileBtn',
+      'quickScanFolderBtn',
+      'detectWorkspaceBtn',
+    ]
     for (const id of ids) {
       const el = $(id)
       if (el) el.disabled = Boolean(busy)
@@ -2172,7 +2604,7 @@ export function createPanelConnectionFormController(ctx) {
     ) {
       return true
     }
-    return await handleParseUri(target)
+    return await handleParseUri(target, { skipFocus: true, collapseDiscovery: false })
   }
 
   function ensureRequiredPasswordBeforeSubmit(targetId) {
@@ -2214,12 +2646,29 @@ export function createPanelConnectionFormController(ctx) {
     return true
   }
 
+  function ensureValidFolderBeforeSubmit() {
+    const folderInp = $('formFolder')
+    if (folderInp && isReservedFolderName(folderInp.value)) {
+      setOrgSafetyExpanded(true)
+      showFormNotice(
+        'Folder name "__ungrouped__" is reserved. Choose a different folder name or leave it blank.',
+        'danger'
+      )
+      folderInp.focus?.()
+      return false
+    }
+    return true
+  }
+
   return {
     initStaticSelectors,
     setFormColorTag,
     setFormDriver,
     syncSslVerifyUi,
+    syncOrgSafetyState,
+    clearFormImportSpotlight,
     clearActiveAutoUri,
+    getParseUriSeq: () => parseUriSeq,
     resetConnectionForm,
     clearFormFields,
     populateFormFromProfile,
@@ -2231,6 +2680,7 @@ export function createPanelConnectionFormController(ctx) {
     refreshPanelByodAndWorkspaces,
     setFormControlsBusy,
     ensureUriParsedBeforeAction,
+    ensureValidFolderBeforeSubmit,
     ensureRequiredPasswordBeforeSubmit,
   }
 }

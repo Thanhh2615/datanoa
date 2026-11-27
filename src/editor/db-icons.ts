@@ -12,7 +12,13 @@ import {
   WORKSPACE_ICON_SHAPES,
 } from '../shared-db-icons.js'
 import { createCollapsibleSelectController } from '../shared-collapsible-select.js'
-import { copyTextToClipboard } from './grid-formatters.js'
+import {
+  UNGROUPED_FOLDER_ORDER_KEY,
+  normalizeConnectionFolderKey,
+  normalizeFolderOrder,
+  sortFoldersByOrder,
+} from '../shared-connection-order.js'
+import { copyTextToClipboardAsync } from './grid-formatters.js'
 
 export { DB_LOGO_COLORS }
 
@@ -90,41 +96,51 @@ export function createSvgElement(tag: string, attrs: Record<string, string>): SV
   return el
 }
 
+const SAFE_BYOD_SLOT_CLASS_RE = /^[A-Za-z0-9_-]{1,64}$/
+
 export function createDbLogoSvg(driver: DatabaseDriverType): SVGElement {
-  const byodKey = String(driver)
-  if (Object.prototype.hasOwnProperty.call(BYOD_LOGO_PATHS, byodKey)) {
-    return createByodDriverLogoSvg(byodKey)
+  const rawDriver = typeof driver === 'string' ? driver : ''
+  if (Object.prototype.hasOwnProperty.call(BYOD_LOGO_PATHS, rawDriver)) {
+    return createByodDriverLogoSvg(rawDriver)
   }
-  const fallbackColor = DB_LOGO_COLORS[driver] || '#e6e6e6'
+  const safeDriver: DatabaseDriverType = Object.prototype.hasOwnProperty.call(
+    DB_LOGO_COLORS,
+    rawDriver
+  )
+    ? (rawDriver as DatabaseDriverType)
+    : 'sqlite'
+  const fallbackColor = DB_LOGO_COLORS[safeDriver] || '#e6e6e6'
   const svg = createSvgElement('svg', {
-    class: `db-svg db-${driver}`,
+    class: `db-svg db-${safeDriver}`,
     width: '14',
     height: '14',
     viewBox: '0 0 24 24',
     fill: 'currentColor',
-    style: `color: var(--db-${driver}, ${fallbackColor})`,
+    style: `color: var(--db-${safeDriver}, ${fallbackColor})`,
     'aria-hidden': 'true',
   })
 
-  if (driver === 'clickhouse') {
+  if (safeDriver === 'clickhouse') {
     for (const rect of CLICKHOUSE_LOGO_RECTS) {
       svg.appendChild(createSvgElement('rect', rect))
     }
     return svg
   }
 
-  const d = DB_LOGO_PATHS[driver] ?? DB_LOGO_PATHS.sqlite
+  const d = DB_LOGO_PATHS[safeDriver] ?? DB_LOGO_PATHS.sqlite
   svg.appendChild(createSvgElement('path', { d }))
   return svg
 }
 
 export function createByodDriverLogoSvg(slotId: string): SVGElement {
-  const resolvedId = Object.prototype.hasOwnProperty.call(BYOD_LOGO_PATHS, slotId)
-    ? slotId
+  const rawSlot = typeof slotId === 'string' ? slotId : ''
+  const resolvedId = Object.prototype.hasOwnProperty.call(BYOD_LOGO_PATHS, rawSlot)
+    ? rawSlot
     : 'custom'
+  const safeSlotClass = SAFE_BYOD_SLOT_CLASS_RE.test(rawSlot) ? rawSlot : resolvedId
   const entry = BYOD_LOGO_PATHS[resolvedId]
   const svg = createSvgElement('svg', {
-    class: `db-svg db-${resolvedId} db-byod-${slotId}`,
+    class: `db-svg db-${resolvedId} db-byod-${safeSlotClass}`,
     width: '14',
     height: '14',
     viewBox: '0 0 24 24',
@@ -214,6 +230,26 @@ export async function downloadTextFile(
   filename: string,
   mimeType: string
 ): Promise<DownloadTextResult> {
+  return await downloadFilePayload(content, filename, mimeType, { preserveNativeFailure: false })
+}
+
+export async function downloadBinaryFile(
+  data: ArrayBuffer,
+  filename: string,
+  mimeType: string,
+  options?: { preserveNativeFailure?: boolean }
+): Promise<DownloadTextResult> {
+  return await downloadFilePayload(data, filename, mimeType, {
+    preserveNativeFailure: options?.preserveNativeFailure ?? true,
+  })
+}
+
+async function downloadFilePayload(
+  data: string | ArrayBuffer,
+  filename: string,
+  mimeType: string,
+  options?: { preserveNativeFailure?: boolean }
+): Promise<DownloadTextResult> {
   if (typeof window !== 'undefined') {
     const saveAs = (window as unknown as { orca?: OrcaSaveAsBridge }).orca?.files?.saveAs
     if (typeof saveAs === 'function') {
@@ -221,10 +257,15 @@ export async function downloadTextFile(
         const res = await saveAs({
           suggestedName: filename,
           mimeType,
-          data: content,
+          data,
         })
-        return res?.status === 'cancelled' ? 'cancelled' : 'saved'
+        if (res?.status === 'cancelled') return 'cancelled'
+        if (res?.status === 'saved' || res === undefined) return 'saved'
+        if (options?.preserveNativeFailure) return 'failed'
       } catch {
+        if (options?.preserveNativeFailure) {
+          return 'failed'
+        }
         // Fall back to Blob download if native save dialog fails or is unsupported
       }
     }
@@ -235,14 +276,20 @@ export async function downloadTextFile(
   if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') {
     return 'failed'
   }
-  const blob = new Blob([content], { type: mimeType })
+  const blob = new Blob([data], { type: mimeType })
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
   link.download = filename
   link.style.display = 'none'
   document.body.appendChild(link)
-  link.click()
+  try {
+    link.click()
+  } catch {
+    link.remove()
+    URL.revokeObjectURL?.(url)
+    return 'failed'
+  }
   link.remove()
   setTimeout(() => {
     URL.revokeObjectURL?.(url)
@@ -368,9 +415,12 @@ export function extractQueriedTableName(sqlText: string): string | null {
   return candidate
 }
 
-export function copyTextFallback(text: string, triggerBtn?: HTMLButtonElement | null): void {
-  copyTextToClipboard(text)
-  if (triggerBtn) {
+export async function copyTextFallback(
+  text: string,
+  triggerBtn?: HTMLButtonElement | null
+): Promise<boolean> {
+  const copied = await copyTextToClipboardAsync(text)
+  if (copied && triggerBtn) {
     const extBtn = triggerBtn as HTMLButtonElement & {
       _copyResetTimer?: ReturnType<typeof setTimeout>
     }
@@ -385,6 +435,7 @@ export function copyTextFallback(text: string, triggerBtn?: HTMLButtonElement | 
       triggerBtn.textContent = orig
     }, 1200)
   }
+  return copied
 }
 
 export function bindStudioSelectTooltipsInRoot(root: ParentNode | Document): { dispose(): void } {
@@ -502,7 +553,8 @@ export function groupConnectionsForSelector<
   T extends { folder?: string; workspaceScope?: string },
 >(
   connections: readonly T[],
-  currentWorkspaceScope = ''
+  currentWorkspaceScope = '',
+  folderOrder?: readonly string[]
 ): { grouped: boolean; groups: ConnectionSelectorGroup<T>[] } {
   const scope = currentWorkspaceScope.trim()
   const currentWorkspace: T[] = []
@@ -512,7 +564,7 @@ export function groupConnectionsForSelector<
   let hasGrouping = false
 
   for (const conn of connections) {
-    const folder = (conn.folder || '').trim()
+    const folder = normalizeConnectionFolderKey(conn.folder)
     const connScope = (conn.workspaceScope || '').trim()
     if (folder || connScope) hasGrouping = true
     if (folder) {
@@ -536,17 +588,33 @@ export function groupConnectionsForSelector<
   if (currentWorkspace.length > 0) {
     groups.push({ label: 'Current Workspace', items: currentWorkspace })
   }
-  for (const folder of Array.from(byFolder.keys()).sort((a, b) => a.localeCompare(b))) {
-    const list = byFolder.get(folder)
+  const folderOrderKeys = Array.from(byFolder.keys())
+  if (general.length > 0) {
+    folderOrderKeys.push(UNGROUPED_FOLDER_ORDER_KEY)
+  }
+  const sortedFolderKeys = sortFoldersByOrder(folderOrderKeys, folderOrder)
+  const hasExplicitUngroupedRank = normalizeFolderOrder(folderOrder).includes(
+    UNGROUPED_FOLDER_ORDER_KEY
+  )
+  let pushedOtherWorkspace = false
+  for (const key of sortedFolderKeys) {
+    if (key === UNGROUPED_FOLDER_ORDER_KEY) {
+      if (!hasExplicitUngroupedRank && otherWorkspace.length > 0 && !pushedOtherWorkspace) {
+        groups.push({ label: 'Other Workspaces', items: otherWorkspace })
+        pushedOtherWorkspace = true
+      }
+      if (general.length > 0) {
+        groups.push({ label: 'General (Ungrouped)', items: general })
+      }
+      continue
+    }
+    const list = byFolder.get(key)
     if (list && list.length > 0) {
-      groups.push({ label: folder, items: list })
+      groups.push({ label: key, items: list })
     }
   }
-  if (otherWorkspace.length > 0) {
+  if (otherWorkspace.length > 0 && !pushedOtherWorkspace) {
     groups.push({ label: 'Other Workspaces', items: otherWorkspace })
-  }
-  if (general.length > 0) {
-    groups.push({ label: 'General (Ungrouped)', items: general })
   }
   return { grouped: true, groups }
 }
@@ -575,6 +643,7 @@ const studioSelectController = createCollapsibleSelectController({
     trigger: 'datanoa-custom-select-trigger',
     leadIcon: 'datanoa-custom-select-lead-icon',
     label: 'datanoa-custom-select-label',
+    triggerBadges: 'datanoa-custom-select-trigger-badges',
     chev: 'datanoa-custom-select-chev',
     popover: 'datanoa-custom-select-popover',
     head: 'datanoa-custom-select-head',
@@ -586,7 +655,11 @@ const studioSelectController = createCollapsibleSelectController({
     itemText: 'datanoa-custom-select-item-text',
     itemLabel: 'datanoa-custom-select-item-label',
     itemSub: 'datanoa-custom-select-item-sub',
+    itemBadges: 'datanoa-custom-select-item-badges',
     itemCheck: 'datanoa-custom-select-item-check',
+    badge: 'datanoa-cs-badge',
+    dragHandle: 'datanoa-custom-select-drag-handle',
+    dragSpacer: 'datanoa-custom-select-drag-spacer',
     folderHead: 'datanoa-custom-select-folder-head',
     folderIcon: 'datanoa-custom-select-folder-icon',
     folderName: 'datanoa-custom-select-folder-name',
@@ -594,9 +667,9 @@ const studioSelectController = createCollapsibleSelectController({
     empty: 'datanoa-custom-select-empty',
   },
   layout: {
-    minWidth: 280,
+    minWidth: 380,
     margin: 8,
-    maxHeight: 340,
+    maxHeight: 480,
     vwFallback: 1024,
     vhFallback: 768,
     gap: 10,
@@ -664,9 +737,18 @@ export function closeActiveStudioCollapsibleDropdown(): void {
 export interface StudioCollapsibleSelectOptions {
   tooltipPrefix?: string
   searchPlaceholder?: string
+  searchAriaLabel?: string
   collapsedFolders?: Set<string>
   defaultCollapseNonActiveFolders?: boolean
+  onFolderToggle?: (collapsedFolders: Set<string>) => void
   leadingIconType?: 'none' | 'workspace' | 'db'
+  popoverMinWidth?: number
+  popoverMaxHeight?: number
+  showTriggerBadges?: boolean
+  reorderConnections?: boolean
+  reorderFolders?: boolean
+  onReorderConnections?: (folderKey: string, orderedIds: string[]) => void | Promise<unknown>
+  onReorderFolders?: (orderedFolders: string[]) => void | Promise<unknown>
   onOpen?: () => void
 }
 

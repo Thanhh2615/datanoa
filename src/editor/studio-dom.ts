@@ -1,6 +1,7 @@
 // src/editor/studio-dom.ts
 // Typed DOM shell builder for DatanoaStudioEditor (extracts ~1,000 lines of layout construction from index.ts)
 
+import type { StudioViewMode } from '../protocol.js'
 import { DATANOA_LOGO_DATA_URI } from '../assets/logo.js'
 import { createDbLogoSvg, createSvgElement } from './db-icons.js'
 import { renderAiStatusButtonContent } from '../shared-ai-ui.js'
@@ -30,7 +31,7 @@ export interface StudioDomRefs {
   aiBtn: HTMLButtonElement
   refreshBtn: HTMLButtonElement
   sqlToolbarEl: HTMLDivElement
-  tabButtons: Record<'split' | 'grid' | 'sql' | 'inspector', HTMLButtonElement>
+  tabButtons: Record<StudioViewMode, HTMLButtonElement>
   searchInputEl: HTMLInputElement
   newTableBtn: HTMLButtonElement
   schemaSelectEl: HTMLSelectElement
@@ -38,6 +39,8 @@ export interface StudioDomRefs {
   sidebarListEl: HTMLDivElement
   mainViewEl: HTMLDivElement
   tableTopbarEl: HTMLDivElement
+  topbarSchemaWrapEl: HTMLDivElement
+  topbarSchemaSelectEl: HTMLSelectElement
   topbarFilterInputEl: HTMLInputElement
   topbarCountEl: HTMLSpanElement
   topbarPrevBtn: HTMLButtonElement
@@ -102,7 +105,9 @@ export interface StudioDomRefs {
   explainAiEl: HTMLDivElement
   resultSetsBarEl: HTMLDivElement
   inspectorAreaEl: HTMLDivElement
+  erAreaEl: HTMLDivElement
   statusStateEl: HTMLSpanElement
+  vimModePillEl: HTMLSpanElement
   statusSelectionEl: HTMLButtonElement
   statusMetricsEl: HTMLSpanElement
   shortcutsBtn: HTMLButtonElement
@@ -290,17 +295,25 @@ export function createStudioDomTree(
   inspectorTabBtn.className = 'datanoa-tab-btn'
   inspectorTabBtn.textContent = 'Schema Inspector'
 
-  const tabButtons: Record<'split' | 'grid' | 'sql' | 'inspector', HTMLButtonElement> = {
+  const erTabBtn = document.createElement('button')
+  erTabBtn.type = 'button'
+  erTabBtn.className = 'datanoa-tab-btn'
+  erTabBtn.textContent = 'ER Diagram'
+  erTabBtn.title = 'Interactive Entity-Relationship Diagram'
+
+  const tabButtons: Record<StudioViewMode, HTMLButtonElement> = {
     split: splitTabBtn,
     grid: gridTabBtn,
     sql: sqlTabBtn,
     inspector: inspectorTabBtn,
+    er: erTabBtn,
   }
 
   tabsContainer.appendChild(splitTabBtn)
   tabsContainer.appendChild(gridTabBtn)
   tabsContainer.appendChild(sqlTabBtn)
   tabsContainer.appendChild(inspectorTabBtn)
+  tabsContainer.appendChild(erTabBtn)
 
   toolbar.appendChild(sidebarToggleBtn)
   toolbar.appendChild(brandPill)
@@ -381,6 +394,36 @@ export function createStudioDomTree(
   const tableTopbarEl = document.createElement('div')
   tableTopbarEl.className = 'datanoa-table-topbar'
 
+  const topbarSchemaWrapEl = document.createElement('div')
+  topbarSchemaWrapEl.className = 'datanoa-topbar-schema-wrap'
+  topbarSchemaWrapEl.style.display = 'none'
+
+  const topbarSchemaIcon = createSvgElement('svg', {
+    class: 'datanoa-topbar-schema-icon',
+    width: '12',
+    height: '12',
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    'stroke-width': '1.9',
+    'stroke-linecap': 'round',
+    'stroke-linejoin': 'round',
+    'aria-hidden': 'true',
+  })
+  topbarSchemaIcon.append(
+    createSvgElement('polygon', { points: '12 2 2 7 12 12 22 7 12 2' }),
+    createSvgElement('polyline', { points: '2 17 12 22 22 17' }),
+    createSvgElement('polyline', { points: '2 12 12 17 22 12' })
+  )
+
+  const topbarSchemaSelectEl = document.createElement('select')
+  topbarSchemaSelectEl.className = 'datanoa-schema-select datanoa-topbar-schema-select'
+  topbarSchemaSelectEl.title = 'Switch active database schema'
+  topbarSchemaSelectEl.setAttribute('aria-label', 'Active schema (horizontal bar)')
+
+  topbarSchemaWrapEl.appendChild(topbarSchemaIcon)
+  topbarSchemaWrapEl.appendChild(topbarSchemaSelectEl)
+
   const topbarFilterWrap = document.createElement('div')
   topbarFilterWrap.className = 'datanoa-topbar-filter-wrap'
 
@@ -426,6 +469,7 @@ export function createStudioDomTree(
   topbarNewTableBtn.title = 'Create a new table visually'
   topbarNewTableBtn.disabled = true
 
+  tableTopbarEl.appendChild(topbarSchemaWrapEl)
   tableTopbarEl.appendChild(topbarFilterWrap)
   tableTopbarEl.appendChild(topbarPrevBtn)
   tableTopbarEl.appendChild(topbarTrackEl)
@@ -442,7 +486,12 @@ export function createStudioDomTree(
 
   const splitResizerEl = document.createElement('div')
   splitResizerEl.className = 'datanoa-split-resizer'
-  splitResizerEl.title = 'Drag to resize SQL Console & Data Grid'
+  splitResizerEl.setAttribute('role', 'separator')
+  splitResizerEl.setAttribute('aria-orientation', 'horizontal')
+  splitResizerEl.setAttribute('aria-label', 'Resize SQL Console and Data Grid')
+  splitResizerEl.setAttribute('aria-valuemin', '80')
+  splitResizerEl.tabIndex = 0
+  splitResizerEl.title = 'Drag to resize SQL Console & Data Grid · Double-click to reset'
 
   const historyDrawerEl = document.createElement('div')
   historyDrawerEl.className = 'datanoa-history-drawer'
@@ -835,6 +884,10 @@ export function createStudioDomTree(
   inspectorAreaEl.className = 'datanoa-inspector-view'
   inspectorAreaEl.style.display = 'none'
 
+  const erAreaEl = document.createElement('div')
+  erAreaEl.className = 'datanoa-er-view'
+  erAreaEl.style.display = 'none'
+
   mainViewEl.appendChild(tableTopbarEl)
   mainViewEl.appendChild(sqlToolbarEl)
   mainViewEl.appendChild(consoleTabsBarEl)
@@ -854,6 +907,7 @@ export function createStudioDomTree(
   mainViewEl.appendChild(explainAiEl)
   mainViewEl.appendChild(valueInspectorEl)
   mainViewEl.appendChild(inspectorAreaEl)
+  mainViewEl.appendChild(erAreaEl)
 
   workspaceBody.appendChild(sidebarEl)
   workspaceBody.appendChild(mainViewEl)
@@ -865,6 +919,11 @@ export function createStudioDomTree(
   const statusStateEl = document.createElement('span')
   statusStateEl.className = 'datanoa-status-state'
   statusStateEl.textContent = 'Ready'
+
+  const vimModePillEl = document.createElement('span')
+  vimModePillEl.className = 'datanoa-vim-mode-pill'
+  vimModePillEl.style.display = 'none'
+  vimModePillEl.textContent = 'NORMAL'
 
   const statusSelectionEl = document.createElement('button')
   statusSelectionEl.type = 'button'
@@ -903,6 +962,7 @@ export function createStudioDomTree(
   statusActionsEl.appendChild(feedbackBtn)
 
   statusBar.appendChild(statusStateEl)
+  statusBar.appendChild(vimModePillEl)
   statusBar.appendChild(statusSelectionEl)
   statusBar.appendChild(statusMetricsEl)
   statusBar.appendChild(statusActionsEl)
@@ -944,6 +1004,8 @@ export function createStudioDomTree(
     sidebarListEl,
     mainViewEl,
     tableTopbarEl,
+    topbarSchemaWrapEl,
+    topbarSchemaSelectEl,
     topbarFilterInputEl,
     topbarCountEl,
     topbarPrevBtn,
@@ -1008,7 +1070,9 @@ export function createStudioDomTree(
     explainAiEl,
     resultSetsBarEl,
     inspectorAreaEl,
+    erAreaEl,
     statusStateEl,
+    vimModePillEl,
     statusSelectionEl,
     statusMetricsEl,
     shortcutsBtn,

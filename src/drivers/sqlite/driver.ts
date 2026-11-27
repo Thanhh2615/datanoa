@@ -11,6 +11,7 @@ import type {
   PreviewChangesResult,
   QueryResult,
   QueryResultSet,
+  SchemaErGraph,
   SchemaObject,
   SchemaObjectKind,
   TableBrowseResult,
@@ -19,6 +20,13 @@ import type {
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
+import {
+  assembleSqliteErColumnsAndForeignKeys,
+  assembleSqliteUniqueSets,
+  buildSchemaErGraphFromCatalogRows,
+  type RawErTableRow,
+  type RawErUniqueSetRow,
+} from '../common/schema-er-graph'
 import {
   DatabaseDriverError,
   attachFailedStatementMeta,
@@ -114,6 +122,10 @@ export class SqliteSession implements IDatabaseSession {
 
   isAlive(): boolean {
     return !this.isClosed && !this.closingPromise && (this.worker !== null || this.cancelPromise !== null)
+  }
+
+  clearSchemaCache(): void {
+    this.tableDetailsCache.clear()
   }
 
   private resolveWorkerPath(): URL {
@@ -346,6 +358,162 @@ export class SqliteSession implements IDatabaseSession {
     const details = await introspectSqliteTableDetails(this.queryExecutor, table, targetSchema)
     this.tableDetailsCache.set(targetSchema, 'main', table, details)
     return details
+  }
+
+  async introspectErGraph(schema?: string): Promise<SchemaErGraph> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'sqlite')
+    }
+    const targetSchema = (schema || 'main').trim() || 'main'
+    const prefix =
+      targetSchema.toLowerCase() === 'main' ? '' : `${quoteIdentForDialect(targetSchema, 'sqlite')}.`
+    const masterRows = await this.queryExecutor(`
+      SELECT name, type AS kind, sql
+      FROM ${prefix}sqlite_master
+      WHERE type IN ('table', 'view')
+        AND name NOT LIKE 'sqlite!_%' ESCAPE '!'
+        AND UPPER(COALESCE(sql, '')) NOT LIKE 'CREATE VIRTUAL TABLE%'
+      ORDER BY name ASC;
+    `)
+
+    const tableSqlByName = new Map<string, string>()
+    const tables: RawErTableRow[] = []
+    for (const r of masterRows) {
+      if (typeof r.name !== 'string' || r.name.length === 0) continue
+      tables.push({
+        schema: targetSchema,
+        name: String(r.name),
+        kind: r.kind === 'view' ? 'view' : 'table',
+      })
+      if (typeof r.sql === 'string') {
+        tableSqlByName.set(String(r.name), r.sql)
+      }
+    }
+
+    if (tables.length === 0) {
+      return buildSchemaErGraphFromCatalogRows({
+        connectionId: this.profile.id,
+        schema: targetSchema,
+        completeness: 'full',
+        tables: [],
+        columns: [],
+        foreignKeys: [],
+      })
+    }
+
+    let rawColRows: Record<string, unknown>[]
+    let rawFkRows: Record<string, unknown>[]
+    let rawUniqRows: Record<string, unknown>[] = []
+    const pragmaSchemaArg =
+      targetSchema.toLowerCase() === 'main' ? '' : `, '${targetSchema.replace(/'/g, "''")}'`
+
+    try {
+      rawColRows = await this.queryExecutor(`
+        SELECT m.name AS table_name,
+               p.name AS col_name,
+               p.type AS col_type,
+               p."notnull" AS col_notnull,
+               p.pk AS col_pk,
+               p.hidden AS col_hidden
+        FROM ${prefix}sqlite_master m
+        JOIN pragma_table_xinfo(m.name${pragmaSchemaArg}) p
+        WHERE m.type IN ('table', 'view')
+          AND m.name NOT LIKE 'sqlite!_%' ESCAPE '!'
+          AND UPPER(COALESCE(m.sql, '')) NOT LIKE 'CREATE VIRTUAL TABLE%'
+        ORDER BY m.name ASC, p.cid ASC;
+      `)
+      rawFkRows = await this.queryExecutor(`
+        SELECT m.name AS table_name,
+               f.id AS fk_id,
+               f.seq AS seq,
+               f."table" AS to_table,
+               f."from" AS from_col,
+               f."to" AS to_col,
+               f.on_delete AS on_delete,
+               f.on_update AS on_update
+        FROM ${prefix}sqlite_master m
+        JOIN pragma_foreign_key_list(m.name${pragmaSchemaArg}) f
+        WHERE m.type = 'table'
+          AND m.name NOT LIKE 'sqlite!_%' ESCAPE '!'
+          AND UPPER(COALESCE(m.sql, '')) NOT LIKE 'CREATE VIRTUAL TABLE%'
+        ORDER BY m.name ASC, f.id ASC, f.seq ASC;
+      `)
+      try {
+        rawUniqRows = await this.queryExecutor(`
+          SELECT m.name AS table_name,
+                 il.name AS index_name,
+                 il.partial AS is_partial,
+                 ii.seqno AS seqno,
+                 ii.cid AS cid,
+                 ii.name AS col_name
+          FROM ${prefix}sqlite_master m
+          JOIN pragma_index_list(m.name${pragmaSchemaArg}) il
+          JOIN pragma_index_info(il.name${pragmaSchemaArg}) ii
+          WHERE m.type = 'table'
+            AND m.name NOT LIKE 'sqlite!_%' ESCAPE '!'
+            AND UPPER(COALESCE(m.sql, '')) NOT LIKE 'CREATE VIRTUAL TABLE%'
+            AND il."unique" = 1
+          ORDER BY m.name ASC, il.name ASC, ii.seqno ASC;
+        `)
+      } catch {
+        rawUniqRows = []
+      }
+    } catch {
+      const batch = await this.sendToWorker<{
+        colRows: Record<string, unknown>[]
+        fkRows: Record<string, unknown>[]
+      }>('erIntrospectBatch', {
+        schema: targetSchema,
+        tables: tables.map((t) => ({ name: t.name, kind: t.kind === 'view' ? 'view' : 'table' })),
+      })
+      rawColRows = Array.isArray(batch?.colRows) ? batch.colRows : []
+      rawFkRows = Array.isArray(batch?.fkRows) ? batch.fkRows : []
+      for (const tbl of tables) {
+        if (tbl.kind === 'view') continue
+        try {
+          const escapedTable = `"${tbl.name.replace(/"/g, '""')}"`
+          const idxList = await this.queryExecutor(`PRAGMA ${prefix}index_list(${escapedTable});`)
+          for (const il of idxList) {
+            if (Number(il.unique ?? 0) !== 1 || Number(il.partial ?? 0) !== 0) continue
+            const idxName = typeof il.name === 'string' ? il.name : ''
+            if (!idxName) continue
+            const escapedIdx = `"${idxName.replace(/"/g, '""')}"`
+            const infoRows = await this.queryExecutor(`PRAGMA ${prefix}index_info(${escapedIdx});`)
+            for (const ii of infoRows) {
+              rawUniqRows.push({
+                table_name: tbl.name,
+                index_name: idxName,
+                is_partial: il.partial ?? 0,
+                seqno: ii.seqno,
+                cid: ii.cid,
+                col_name: ii.name,
+              })
+            }
+          }
+        } catch {
+          // Best-effort unique index fallback per table
+        }
+      }
+    }
+
+    const uniqueSets: RawErUniqueSetRow[] = assembleSqliteUniqueSets(targetSchema, rawUniqRows)
+    const { columns, foreignKeys } = assembleSqliteErColumnsAndForeignKeys({
+      schema: targetSchema,
+      tables,
+      tableSqlByName,
+      rawColRows,
+      rawFkRows,
+    })
+
+    return buildSchemaErGraphFromCatalogRows({
+      connectionId: this.profile.id,
+      schema: targetSchema,
+      completeness: 'full',
+      tables,
+      columns,
+      uniqueSets,
+      foreignKeys,
+    })
   }
 
   private isMemoryDb(): boolean {

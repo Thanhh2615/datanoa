@@ -8,9 +8,11 @@ import type {
   DatabaseDriverType,
   SchemaObject,
   SchemaObjectKind,
+  StudioViewMode,
   TableDetails,
 } from '../protocol.js'
 import { copyTextFallback, createSvgElement } from './db-icons.js'
+import { isGridVisibleMode } from './result-set-controller.js'
 
 export function getObjectKindShortLabel(kind: SchemaObjectKind): string {
   switch (kind) {
@@ -163,11 +165,11 @@ export interface SidebarContextMenuCallbacks {
   item: SchemaObject
   driver: DatabaseDriverType
   isReadOnly: boolean
-  activeViewMode: 'split' | 'grid' | 'sql' | 'inspector'
+  activeViewMode: StudioViewMode
   closeMenus: () => void
   onSelectReadOnlyObject: (item: SchemaObject) => void
   onSelectSidebarObject: (item: SchemaObject) => void
-  onSwitchMode: (mode: 'split' | 'grid' | 'sql' | 'inspector') => void
+  onSwitchMode: (mode: StudioViewMode) => void
   onUpdateStatus: (msg: string) => void
   onCopyObjectDdl: (item: SchemaObject) => void
   onOpenObjectDdlInConsole: (item: SchemaObject) => void
@@ -264,7 +266,7 @@ export function createSidebarContextMenu(opts: SidebarContextMenuCallbacks): HTM
   if (item.kind === 'materialized_view') {
     addItem('Open Data', () => {
       onSelectSidebarObject(item)
-      if (activeViewMode === 'inspector') {
+      if (!isGridVisibleMode(activeViewMode)) {
         onSwitchMode('split')
       }
     })
@@ -283,7 +285,7 @@ export function createSidebarContextMenu(opts: SidebarContextMenuCallbacks): HTM
 
   addItem('Open Data', () => {
     onSelectSidebarObject(item)
-    if (activeViewMode === 'inspector') {
+    if (!isGridVisibleMode(activeViewMode)) {
       onSwitchMode('split')
     }
   })
@@ -752,6 +754,9 @@ export interface RenderSidebarObjectsOptions {
   sidebarListEl: HTMLElement | null
   schemaObjects: SchemaObject[]
   schemaError?: string | null
+  schemaStale?: boolean
+  schemaStaleReason?: string
+  schemaCachedAt?: number
   filterQuery: string
   activeConnectionId: string | null
   activeConnection: ConnectionProfile | undefined
@@ -800,6 +805,8 @@ export function renderStudioSidebarList(
   const {
     sidebarListEl,
     schemaError,
+    schemaStale,
+    schemaStaleReason,
     filterQuery,
     activeConnectionId,
     activeConnection,
@@ -885,6 +892,31 @@ export function renderStudioSidebarList(
     if (nonEmptyGroups.length === 0) {
       return
     }
+  }
+
+  if (schemaStale) {
+    const staleBanner = document.createElement('div')
+    staleBanner.className = 'datanoa-sidebar-stale-banner'
+    staleBanner.style.display = 'flex'
+    staleBanner.style.alignItems = 'center'
+    staleBanner.style.justifyContent = 'space-between'
+    staleBanner.style.gap = '6px'
+    staleBanner.style.padding = '6px 10px'
+    const badge = document.createElement('span')
+    badge.className = 'datanoa-stale-badge'
+    badge.textContent = 'Cached · Stale'
+    if (schemaStaleReason) badge.title = schemaStaleReason
+    staleBanner.appendChild(badge)
+    if (onRetrySchema) {
+      const retryBtn = document.createElement('button')
+      retryBtn.type = 'button'
+      retryBtn.className = 'datanoa-btn datanoa-btn-sm'
+      retryBtn.dataset.sidebarRetryCatalog = 'true'
+      retryBtn.textContent = 'Retry'
+      retryBtn.addEventListener('click', onRetrySchema)
+      staleBanner.appendChild(retryBtn)
+    }
+    sidebarListEl.appendChild(staleBanner)
   }
 
   if (nonEmptyGroups.length === 0) {

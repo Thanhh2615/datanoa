@@ -9,8 +9,13 @@ import {
   acceptCompletion,
   closeCompletion,
   completionStatus,
+  getCM,
   keymap,
 } from '../vendor/codemirror.js'
+import {
+  isModalKeymapActive as isSharedModalKeymapActive,
+  isModalNonInsertMode as isSharedModalNonInsertMode,
+} from './shared-cm-keymap.js'
 import {
   getDialectLexerRules,
   isPostgresEscapeStringStart,
@@ -21,6 +26,7 @@ import {
   scanLineCommentEnd,
   scanOracleQuoteEnd,
   scanQuotedSegmentEnd,
+  stripSqlCommentsOnly,
 } from './shared-sql-core.js'
 import { analyzeSqlDiagnostics } from './shared-sql-diagnostics.js'
 import { containsSensitiveSqlText } from './shared-sql-safety.js'
@@ -357,7 +363,48 @@ function defaultUnschedule(id) {
 
 export const setGhostEffect = StateEffect.define()
 export const clearGhostEffect = StateEffect.define()
+export const notifyAiAvailabilityEffect = StateEffect.define()
 const ghostAcceptedEffect = StateEffect.define()
+
+export function notifyAiAvailabilityChanged(view) {
+  if (view && typeof view.dispatch === 'function') {
+    view.dispatch({ effects: notifyAiAvailabilityEffect.of(undefined) })
+  }
+}
+
+export function isActiveSqlStatementSensitive(prefix, suffix, dialect, mode = 'auto') {
+  const safePrefix = typeof prefix === 'string' ? prefix : ''
+  const safeSuffix = typeof suffix === 'string' ? suffix : ''
+  const combined = `${safePrefix}${safeSuffix}`
+  if (!combined) return false
+  if (dialect !== 'redis' && dialect !== 'mongodb') {
+    const codeOnly = stripSqlCommentsOnly(combined, dialect)
+    if (codeOnly.trim().length > 0) {
+      return containsSensitiveSqlText(codeOnly)
+    }
+  } else if (dialect === 'redis') {
+    const nonCommentLines = combined
+      .split(/\r?\n/)
+      .filter((line) => {
+        const trimmed = line.trimStart()
+        return trimmed.length > 0 && !trimmed.startsWith('#') && !trimmed.startsWith('--')
+      })
+      .join('\n')
+    if (nonCommentLines.trim().length > 0) {
+      return containsSensitiveSqlText(nonCommentLines)
+    }
+  }
+  const isolated = isolateActiveSqlStatement(safePrefix, safeSuffix, dialect)
+  if (isolated.isFreshStatementAfterSemicolon) {
+    if (mode === 'edit' && isolated.precedingErroredSlice?.text) {
+      if (containsSensitiveSqlText(isolated.precedingErroredSlice.text)) {
+        return true
+      }
+    }
+    return containsSensitiveSqlText(`${isolated.stmtPrefix}${isolated.stmtSuffix}`)
+  }
+  return containsSensitiveSqlText(combined)
+}
 
 function normalizeReplaceChars(value, offset) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
@@ -749,8 +796,29 @@ class LiveModelTracker {
 export function createCmInlineAiExtension(options) {
   const isEnabled = options?.isEnabled ?? (() => false)
   const getDialect = typeof options?.getDialect === 'function' ? options.getDialect : () => undefined
+  const getConnectionId =
+    typeof options?.getConnectionId === 'function'
+      ? options.getConnectionId
+      : () => options?.connectionId
   const requestCompletion = options?.requestCompletion
   const onMetric = options?.onMetric
+  const onRequestError =
+    typeof options?.onRequestError === 'function' ? options.onRequestError : undefined
+  const isModalMode = (view) => {
+    if (typeof options?.isModalMode === 'function') {
+      return Boolean(options.isModalMode(view))
+    }
+    return isSharedModalNonInsertMode(view)
+  }
+  const isModalKeymap = (view) => {
+    if (typeof options?.isModalKeymap === 'function') {
+      return Boolean(options.isModalKeymap(view))
+    }
+    if (typeof options?.isModalMode === 'function' && options.isModalMode(view)) {
+      return true
+    }
+    return Boolean(getCM(view)?.state?.vim) || isSharedModalKeymapActive(view)
+  }
 
   const ghostDecorations = EditorViewDecorationsFromField()
 
@@ -775,6 +843,7 @@ export function createCmInlineAiExtension(options) {
         this.inflight = null
         this.docVersion = 0
         this.lastOffered = null
+        this.pendingAvailabilityTrigger = null
         this.estimatedLatencyMs = 0
         this.destroyed = false
       }
@@ -822,8 +891,11 @@ export function createCmInlineAiExtension(options) {
         }
         if (!handledAccept) {
           for (const eff of allEffects) {
-            if (eff.is(clearGhostEffect) && this.lastOffered) {
-              this.dropOffered('stale')
+            if (eff.is(clearGhostEffect)) {
+              this.cancelPending()
+              if (this.lastOffered) {
+                this.dropOffered('stale')
+              }
             }
           }
         }
@@ -831,7 +903,7 @@ export function createCmInlineAiExtension(options) {
       }
 
       tryContinueOfferedGhost(vu, sel) {
-        if (!this.lastOffered) {
+        if (!this.lastOffered || isModalMode(vu.view)) {
           return false
         }
         const isPureInsert =
@@ -883,7 +955,10 @@ export function createCmInlineAiExtension(options) {
         return true
       }
 
-      scheduleDocChangeTrigger(vu, offset) {
+      scheduleDocChangeTrigger(vu, offset, minDelayOverride = null) {
+        if (isModalMode(vu.view)) {
+          return
+        }
         const expectedVersion = this.docVersion
         const { prefix, suffix, dialect } = sliceCursorWindow(vu.state, offset)
         if (shouldSkipInlineTrigger(prefix, suffix, dialect)) {
@@ -891,11 +966,15 @@ export function createCmInlineAiExtension(options) {
         }
         const newlineAt = suffix.indexOf('\n')
         const suffixLine = newlineAt === -1 ? suffix : suffix.slice(0, newlineAt)
-        const delay = this.pacer.delayMs({
+        const pacedDelay = this.pacer.delayMs({
           triggerChar: prefix.slice(-1),
           isLineEnd: /^\W*$/.test(suffixLine),
           estimatedLatencyMs: this.estimatedLatencyMs,
         })
+        const delay =
+          typeof minDelayOverride === 'number' && Number.isFinite(minDelayOverride)
+            ? Math.max(0, Math.min(pacedDelay, minDelayOverride))
+            : pacedDelay
         this.timer = setTimeout(() => {
           this.timer = null
           void this.trigger(expectedVersion, offset, false)
@@ -907,8 +986,31 @@ export function createCmInlineAiExtension(options) {
           this.docVersion += 1
           this.tracker.mapChanges(vu.changes)
         }
+        const hasAvailabilityNotify = vu.transactions.some((tr) =>
+          tr.effects.some((eff) => eff.is(notifyAiAvailabilityEffect))
+        )
         const handledAccept = this.handleTransactionEffects(vu)
-        if (!isEnabled() || vu.state.readOnly) {
+        if (!isEnabled() || vu.state.readOnly || isModalMode(vu.view)) {
+          if (vu.docChanged && !vu.state.readOnly && !isModalMode(vu.view) && !isEnabled()) {
+            const sel = vu.state.selection.main
+            const hasInteractiveEdit = vu.transactions.some(
+              (tr) =>
+                tr.docChanged &&
+                !tr.isUserEvent('input.complete') &&
+                (tr.isUserEvent('input') || tr.isUserEvent('delete') || vu.view.hasFocus)
+            )
+            if (hasInteractiveEdit && sel.empty && vu.state.doc.length > 0) {
+              this.pacer.noteKey()
+              this.pendingAvailabilityTrigger = {
+                version: this.docVersion,
+                offset: sel.head,
+              }
+            } else {
+              this.pendingAvailabilityTrigger = null
+            }
+          } else if (vu.docChanged || vu.selectionSet || vu.state.readOnly || isModalMode(vu.view)) {
+            this.pendingAvailabilityTrigger = null
+          }
           this.cancelPending()
           if (this.lastOffered) {
             this.dropOffered('stale')
@@ -922,8 +1024,36 @@ export function createCmInlineAiExtension(options) {
           }
           return
         }
+        if (
+          hasAvailabilityNotify &&
+          !vu.docChanged &&
+          !vu.selectionSet &&
+          this.pendingAvailabilityTrigger
+        ) {
+          const pending = this.pendingAvailabilityTrigger
+          this.pendingAvailabilityTrigger = null
+          const sel = vu.state.selection.main
+          if (
+            pending.version === this.docVersion &&
+            sel.empty &&
+            sel.head === pending.offset &&
+            vu.view.hasFocus &&
+            typeof requestCompletion === 'function' &&
+            vu.state.doc.length > 0 &&
+            !this.timer &&
+            !this.inflight &&
+            !vu.state.field(ghostStateField, false)
+          ) {
+            const elapsed = Math.max(0, Date.now() - this.pacer._lastKeyAt)
+            const normalDelay = this.pacer.pause()
+            const remaining = Math.max(0, normalDelay - elapsed)
+            this.scheduleDocChangeTrigger(vu, sel.head, remaining)
+          }
+          return
+        }
         if (!vu.docChanged) {
           if (!vu.selectionSet) return
+          this.pendingAvailabilityTrigger = null
           this.cancelPending()
           if (this.lastOffered && !vu.state.field(ghostStateField, false)) {
             this.dropOffered('stale')
@@ -931,6 +1061,7 @@ export function createCmInlineAiExtension(options) {
           this.scheduleSelectionTrigger(vu)
           return
         }
+        this.pendingAvailabilityTrigger = null
         if (handledAccept) {
           this.cancelPending()
           return
@@ -957,7 +1088,12 @@ export function createCmInlineAiExtension(options) {
       }
 
       scheduleSelectionTrigger(vu) {
-        if (typeof requestCompletion !== 'function' || vu.state.readOnly || vu.state.doc.length === 0) {
+        if (
+          typeof requestCompletion !== 'function' ||
+          vu.state.readOnly ||
+          vu.state.doc.length === 0 ||
+          isModalMode(vu.view)
+        ) {
           return
         }
         const sel = vu.state.selection.main
@@ -998,7 +1134,13 @@ export function createCmInlineAiExtension(options) {
       }
 
       triggerImmediate(mode = 'auto') {
-        if (this.destroyed || this.view.state.readOnly || !isEnabled() || typeof requestCompletion !== 'function') {
+        if (
+          this.destroyed ||
+          this.view.state.readOnly ||
+          !isEnabled() ||
+          typeof requestCompletion !== 'function' ||
+          isModalMode(this.view)
+        ) {
           return
         }
         const state = this.view.state
@@ -1029,7 +1171,13 @@ export function createCmInlineAiExtension(options) {
       }
 
       async trigger(expectedVersion, offset, manual = false, mode = 'auto') {
-        if (this.destroyed || this.view.state.readOnly || !isEnabled() || typeof requestCompletion !== 'function') {
+        if (
+          this.destroyed ||
+          this.view.state.readOnly ||
+          !isEnabled() ||
+          typeof requestCompletion !== 'function' ||
+          isModalMode(this.view)
+        ) {
           return
         }
         const state = this.view.state
@@ -1037,6 +1185,7 @@ export function createCmInlineAiExtension(options) {
         if (!state.selection.main.empty || state.selection.main.head !== offset) return
 
         const { prefix, suffix, dialect } = sliceCursorWindow(state, offset)
+        const connectionId = getConnectionId()
         if (mode === 'edit') {
           const isolated = isolateActiveSqlStatement(prefix, suffix, dialect)
           const quoteState = scanQuoteCommentState(isolated.stmtPrefix, dialect)
@@ -1048,16 +1197,13 @@ export function createCmInlineAiExtension(options) {
           this.cancelPending()
           return
         }
-        // Scan an expanded margin around the IPC slice (or entire doc up to 200 KiB) so boundary-straddling secrets cannot slip past
+        // Scan active SQL statement around the bounded IPC window so unrelated prior statements/comments do not block
         const docLen = state.doc.length
-        const sensitiveScanText =
-          docLen <= 200_000
-            ? state.doc.toString()
-            : state.doc.sliceString(
-                Math.max(0, offset - AI_MAX_IPC_PREFIX_CHARS - 512),
-                Math.min(docLen, offset + AI_MAX_IPC_SUFFIX_CHARS + 512)
-              )
-        if (containsSensitiveSqlText(sensitiveScanText)) {
+        const scanStart = Math.max(0, offset - AI_MAX_IPC_PREFIX_CHARS - 512)
+        const scanEnd = Math.min(docLen, offset + AI_MAX_IPC_SUFFIX_CHARS + 512)
+        const scanPrefix = state.doc.sliceString(scanStart, offset)
+        const scanSuffix = state.doc.sliceString(offset, scanEnd)
+        if (isActiveSqlStatementSensitive(scanPrefix, scanSuffix, dialect, mode)) {
           this.cancelPending()
           return
         }
@@ -1081,7 +1227,8 @@ export function createCmInlineAiExtension(options) {
             ac.signal.aborted ||
             !isEnabled() ||
             this.view.state.readOnly ||
-            getDialect() !== dialect
+            getDialect() !== dialect ||
+            getConnectionId() !== connectionId
           ) {
             return
           }
@@ -1118,8 +1265,24 @@ export function createCmInlineAiExtension(options) {
           if (res.id > 0) {
             onMetric?.(res.id, 'shown')
           }
-        } catch {
+        } catch (err) {
           if (this.inflight === flight) this.inflight = null
+          // Surface explicit manual requests (Tab completion or Alt+\ edit); keep background auto-completions quiet.
+          if ((manual === true || mode === 'edit') && !this.destroyed && !ac.signal.aborted) {
+            try {
+              const errorMode = mode === 'edit' ? 'edit' : 'complete'
+              onRequestError?.(err, {
+                mode: errorMode,
+                manual: Boolean(manual),
+                prefix,
+                suffix,
+                dialect,
+                connectionId,
+              })
+            } catch {
+              // Keep editor command resilient if onRequestError throws
+            }
+          }
         }
       }
 
@@ -1151,6 +1314,10 @@ export function createCmInlineAiExtension(options) {
       escapeTabArmed = false
       return false
     }
+    if (isModalKeymap(view)) {
+      escapeTabArmed = false
+      return false
+    }
     // WCAG 2.1.2 keyboard focus escape: pressing Escape in idle editor lets next Tab leave the editor
     escapeTabArmed = true
     return false
@@ -1170,7 +1337,7 @@ export function createCmInlineAiExtension(options) {
       escapeTabArmed = false
       return false
     }
-    if (view.state.readOnly) {
+    if (view.state.readOnly || isModalMode(view)) {
       return false
     }
     if (acceptGhostFull(view)) {
@@ -1230,11 +1397,32 @@ export function createCmInlineAiExtension(options) {
     return true
   }
 
+  const modalEscapeGuard = Prec.highest(
+    EditorView.domEventHandlers({
+      keydown(event, view) {
+        if (
+          event.key === 'Escape' &&
+          !event.ctrlKey &&
+          !event.altKey &&
+          !event.metaKey &&
+          clearGhostCommand(view)
+        ) {
+          escapeTabArmed = false
+          event.preventDefault()
+          event.stopPropagation()
+          return true
+        }
+        return false
+      },
+    })
+  )
+
   return [
     ghostStateField,
     ghostDecorations,
     plugin,
     resetEscapeTabListener,
+    modalEscapeGuard,
     Prec.highest(
       keymap.of([
         { key: 'Tab', run: handleTabKey },

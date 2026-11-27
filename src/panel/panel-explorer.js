@@ -17,6 +17,18 @@ import {
   createEnvBadge,
   getFolderSvgMarkup,
 } from './panel-utils.js'
+import {
+  UNGROUPED_FOLDER_ORDER_KEY,
+  normalizeConnectionFolderKey,
+  getConnectionReorderBounds,
+  computeReorderedFolderIds,
+  computeMovedFolderIds,
+  getConnectionFolderOrderKeys,
+  sortFoldersByOrder,
+  getFolderReorderBounds,
+  computeReorderedFolders,
+  computeMovedFolders,
+} from '../shared-connection-order.js'
 
 export function getExplorerObjectGroupLabel(driver) {
   if (driver === 'redis') return 'Keyspaces'
@@ -172,11 +184,103 @@ export function createPanelExplorerController(ctx) {
     populateFormFromProfile,
     openDeleteConfirmModal,
     savePanelViewState,
+    reorderConnectionsInFolder,
+    reorderFolders,
   } = ctx
 
   let countRowsSeq = 0
   let sqlGenSeq = 0
   const announcedSchemaErrors = new Map()
+  let activeDrag = null
+  let dropIndicator = null
+  let pendingFocusTarget = null
+
+  function clearDropIndicator() {
+    if (!dropIndicator) return
+    dropIndicator.rowEl?.classList?.remove('is-drop-before', 'is-drop-after')
+    dropIndicator = null
+  }
+
+  function clearActiveDrag() {
+    clearDropIndicator()
+    if (activeDrag?.rowEl) {
+      activeDrag.rowEl.classList.remove('is-dragging')
+    }
+    activeDrag = null
+  }
+
+  function setDropIndicator(rowEl, placement) {
+    if (dropIndicator && dropIndicator.rowEl === rowEl && dropIndicator.placement === placement) {
+      return
+    }
+    clearDropIndicator()
+    rowEl.classList.add(placement === 'before' ? 'is-drop-before' : 'is-drop-after')
+    dropIndicator = { rowEl, placement }
+  }
+
+  function resolveDropPlacement(connItem, clientY) {
+    const rect =
+      typeof connItem.getBoundingClientRect === 'function' ? connItem.getBoundingClientRect() : null
+    const midpoint = rect ? rect.top + rect.height / 2 : 0
+    return clientY < midpoint ? 'before' : 'after'
+  }
+
+  function getFolderCollapseKey(folderOrderKey) {
+    return folderOrderKey === UNGROUPED_FOLDER_ORDER_KEY
+      ? `builtin:${UNGROUPED_FOLDER_ORDER_KEY}`
+      : `folder:${folderOrderKey}`
+  }
+
+  function isFolderSectionCollapsed(folderOrderKey) {
+    const collapsed = state.collapsedFolders
+    if (!collapsed) return false
+    const sectionKey = getFolderCollapseKey(folderOrderKey)
+    if (collapsed.has(sectionKey)) return true
+    if (folderOrderKey !== UNGROUPED_FOLDER_ORDER_KEY && folderOrderKey !== 'General (Ungrouped)') {
+      return collapsed.has(folderOrderKey)
+    }
+    return false
+  }
+
+  function toggleFolderSectionCollapsed(folderOrderKey) {
+    if (!state.collapsedFolders) state.collapsedFolders = new Set()
+    const sectionKey = getFolderCollapseKey(folderOrderKey)
+    if (isFolderSectionCollapsed(folderOrderKey)) {
+      state.collapsedFolders.delete(sectionKey)
+      if (folderOrderKey !== UNGROUPED_FOLDER_ORDER_KEY && folderOrderKey !== 'General (Ungrouped)') {
+        state.collapsedFolders.delete(folderOrderKey)
+      }
+    } else {
+      state.collapsedFolders.add(sectionKey)
+    }
+  }
+
+  function getFolderOrderKeys() {
+    return getConnectionFolderOrderKeys(state.connections)
+  }
+
+  function moveConnectionDirection(connectionId, direction, focusTarget = 'row') {
+    if (state.filter.trim().length > 0) return
+    if (typeof reorderConnectionsInFolder !== 'function') return
+    const plan = computeMovedFolderIds(state.connections, connectionId, direction)
+    if (!plan.ok || !plan.changed) return
+    if (focusTarget === 'row' || focusTarget === 'menu') {
+      pendingFocusTarget = { kind: 'connection', connectionId, onMenuBtn: focusTarget === 'menu' }
+    }
+    void reorderConnectionsInFolder(plan.folder, plan.orderedIds)
+  }
+
+  function moveFolderDirection(folderOrderKey, direction, focusTarget = 'row') {
+    if (state.filter.trim().length > 0) return
+    if (typeof reorderFolders !== 'function') return
+    const folderKeys = getFolderOrderKeys()
+    const plan = computeMovedFolders(folderKeys, folderOrderKey, direction, state.folderOrder)
+    if (!plan.ok || !plan.changed) return
+    if (focusTarget === 'row' || focusTarget === 'menu') {
+      pendingFocusTarget = { kind: 'folder', folderOrderKey, onMenuBtn: focusTarget === 'menu' }
+    }
+    void reorderFolders(plan.orderedFolders)
+  }
 
   function reportConnectionError(connectionId, connObj, msg) {
     if (typeof showConnectionBanner === 'function') {
@@ -218,6 +322,82 @@ export function createPanelExplorerController(ctx) {
     const empty = $('explorerEmpty')
     const filterWrap = $('schemaFilterWrap')
     const container = $('schemaTreeContainer')
+    clearActiveDrag()
+
+    const activeEl = typeof document !== 'undefined' ? document.activeElement : null
+    let restoreFocus = pendingFocusTarget
+    if (
+      !restoreFocus &&
+      activeEl &&
+      typeof container.contains === 'function' &&
+      container.contains(activeEl)
+    ) {
+      const focusedConnItem =
+        typeof activeEl.closest === 'function' ? activeEl.closest('.tree-conn-item') : null
+      const focusedRow =
+        focusedConnItem && typeof focusedConnItem.closest === 'function'
+          ? focusedConnItem.closest('.tree-row[data-connection-id]')
+          : null
+      if (focusedRow?.dataset?.connectionId) {
+        restoreFocus = {
+          kind: 'connection',
+          connectionId: focusedRow.dataset.connectionId,
+          onMenuBtn: Boolean(
+            typeof activeEl.closest === 'function' && activeEl.closest('.tree-actions')
+          ),
+        }
+      } else {
+        const focusedFolderItem =
+          typeof activeEl.closest === 'function' ? activeEl.closest('.tree-folder-item') : null
+        const focusedFolderGroup =
+          focusedFolderItem && typeof focusedFolderItem.closest === 'function'
+            ? focusedFolderItem.closest('.tree-folder-group[data-folder-order-key]') ||
+              focusedFolderItem.closest('.tree-folder-group[data-folder-name]')
+            : null
+        const focusedFolderKey =
+          focusedFolderGroup?.dataset?.folderOrderKey || focusedFolderGroup?.dataset?.folderName
+        if (focusedFolderKey) {
+          restoreFocus = {
+            kind: 'folder',
+            folderOrderKey: focusedFolderKey,
+            onMenuBtn: Boolean(
+              typeof activeEl.closest === 'function' && activeEl.closest('.tree-actions')
+            ),
+          }
+        }
+      }
+    }
+    pendingFocusTarget = null
+
+    const restoreFocusedTarget = () => {
+      if (!restoreFocus) return
+      if (restoreFocus.kind === 'connection') {
+        const rows = container.querySelectorAll('.tree-row[data-connection-id]')
+        for (const row of rows) {
+          if (row?.dataset?.connectionId !== restoreFocus.connectionId) continue
+          const targetEl = restoreFocus.onMenuBtn
+            ? row.querySelector('.tree-conn-item .tree-actions .mini-btn') ||
+              row.querySelector('.tree-conn-item')
+            : row.querySelector('.tree-conn-item')
+          targetEl?.focus?.()
+          break
+        }
+        return
+      }
+      if (restoreFocus.kind === 'folder') {
+        const groups = container.querySelectorAll('.tree-folder-group[data-folder-order-key]')
+        for (const group of groups) {
+          if (group?.dataset?.folderOrderKey !== restoreFocus.folderOrderKey) continue
+          const folderHeadEl = group.querySelector('.tree-folder-item')
+          const targetEl = restoreFocus.onMenuBtn
+            ? folderHeadEl?.querySelector('.tree-actions .mini-btn') || folderHeadEl
+            : folderHeadEl
+          targetEl?.focus?.()
+          break
+        }
+      }
+    }
+
     container.textContent = ''
     if (!state.collapsedFolders) {
       state.collapsedFolders = new Set()
@@ -248,6 +428,20 @@ export function createPanelExplorerController(ctx) {
     filterWrap.hidden = false
 
     const q = state.filter.trim().toLowerCase()
+    const folderCounts = new Map()
+    for (const c of state.connections) {
+      const fk = normalizeConnectionFolderKey(c?.folder)
+      folderCounts.set(fk, (folderCounts.get(fk) || 0) + 1)
+    }
+    let hasAnyReorderableRow = false
+    if (!q) {
+      for (const count of folderCounts.values()) {
+        if (count > 1) {
+          hasAnyReorderableRow = true
+          break
+        }
+      }
+    }
 
     const createConnectionErrorBlock = (conn, schemaErr) => {
       const errBox = document.createElement('div')
@@ -332,15 +526,34 @@ export function createPanelExplorerController(ctx) {
       const isConnOpen = state.expandedConns.has(conn.id) || (Boolean(q) && matchingObjs.length > 0)
       const schemaErr =
         typeof state.schemaErrors?.[conn.id] === 'string' ? state.schemaErrors[conn.id] : ''
+      const folderKey = normalizeConnectionFolderKey(conn.folder)
+      const canReorderRow = !q && (folderCounts.get(folderKey) || 0) > 1
       const connRow = document.createElement('div')
       connRow.className = 'tree-row'
       connRow.dataset.connectionId = conn.id
+      connRow.dataset.folderKey = folderKey
 
       const connItem = document.createElement('div')
-      connItem.className = `tree-item tree-conn-item${state.activeConnectionId === conn.id ? ' active' : ''}${schemaErr ? ' has-error' : ''}`
+      connItem.className = `tree-item tree-conn-item${state.activeConnectionId === conn.id ? ' active' : ''}${schemaErr ? ' has-error' : ''}${canReorderRow ? ' is-reorderable' : ''}`
       connItem.setAttribute('role', 'button')
       connItem.tabIndex = 0
       connItem.title = `${conn.name} (${conn.driver})${conn.folder ? ` — Folder: ${conn.folder}` : ''}${schemaErr ? ` — Error: ${schemaErr}` : ''}`
+      if (canReorderRow) {
+        connItem.draggable = true
+        connItem.setAttribute('draggable', 'true')
+        const grip = document.createElement('span')
+        grip.className = 'tree-drag-handle'
+        grip.setAttribute('aria-hidden', 'true')
+        grip.title = 'Drag to reorder within folder'
+        grip.innerHTML =
+          '<svg width="10" height="12" viewBox="0 0 10 12" fill="currentColor" aria-hidden="true"><circle cx="3" cy="2" r="1"></circle><circle cx="7" cy="2" r="1"></circle><circle cx="3" cy="6" r="1"></circle><circle cx="7" cy="6" r="1"></circle><circle cx="3" cy="10" r="1"></circle><circle cx="7" cy="10" r="1"></circle></svg>'
+        connItem.appendChild(grip)
+      } else if (hasAnyReorderableRow) {
+        const spacer = document.createElement('span')
+        spacer.className = 'tree-drag-spacer'
+        spacer.setAttribute('aria-hidden', 'true')
+        connItem.appendChild(spacer)
+      }
 
       const chev = document.createElement('span')
       chev.className = `tree-chevron${isConnOpen ? ' open' : ''}`
@@ -390,6 +603,8 @@ export function createPanelExplorerController(ctx) {
       const menuBtn = document.createElement('button')
       menuBtn.type = 'button'
       menuBtn.className = 'mini-btn'
+      menuBtn.draggable = false
+      menuBtn.setAttribute('draggable', 'false')
       menuBtn.title = 'Connection Actions'
       menuBtn.setAttribute('aria-label', 'Connection Actions')
       menuBtn.textContent = '⋮'
@@ -422,6 +637,19 @@ export function createPanelExplorerController(ctx) {
 
       connItem.addEventListener('click', toggleConn)
       connItem.addEventListener('keydown', (e) => {
+        if (
+          e.altKey &&
+          !e.ctrlKey &&
+          !e.metaKey &&
+          !e.shiftKey &&
+          (e.key === 'ArrowUp' || e.key === 'ArrowDown')
+        ) {
+          if (state.filter.trim().length > 0) return
+          e.preventDefault()
+          e.stopPropagation()
+          moveConnectionDirection(conn.id, e.key === 'ArrowUp' ? 'up' : 'down', 'row')
+          return
+        }
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault()
           toggleConn()
@@ -431,6 +659,109 @@ export function createPanelExplorerController(ctx) {
         e.preventDefault()
         openContextMenu(e.clientX, e.clientY, { type: 'connection', conn })
       })
+
+      if (canReorderRow) {
+        let pointerDownInActions = false
+        const markPointerDown = (e) => {
+          const tgt = e.target
+          pointerDownInActions = Boolean(
+            tgt && typeof tgt.closest === 'function' && tgt.closest('.tree-actions')
+          )
+        }
+        const clearPointerDown = () => {
+          pointerDownInActions = false
+        }
+        connItem.addEventListener('pointerdown', markPointerDown)
+        connItem.addEventListener('mousedown', markPointerDown)
+        connItem.addEventListener('pointerup', clearPointerDown)
+        connItem.addEventListener('mouseup', clearPointerDown)
+
+        connItem.addEventListener('dragstart', (e) => {
+          if (state.filter.trim().length > 0 || pointerDownInActions) {
+            pointerDownInActions = false
+            e.preventDefault()
+            return
+          }
+          const tgt = e.target
+          if (tgt && typeof tgt.closest === 'function' && tgt.closest('.tree-actions')) {
+            e.preventDefault()
+            return
+          }
+          closeContextMenu()
+          clearActiveDrag()
+          activeDrag = { kind: 'connection', connectionId: conn.id, folderKey, rowEl: connRow }
+          connRow.classList.add('is-dragging')
+          if (e.dataTransfer) {
+            e.dataTransfer.effectAllowed = 'move'
+            try {
+              e.dataTransfer.setData('application/x-datanoa-connection-id', conn.id)
+              e.dataTransfer.setData('text/plain', conn.id)
+            } catch {
+              // Ignore synthetic/read-only DataTransfer restrictions
+            }
+          }
+        })
+        connItem.addEventListener('dragend', () => {
+          pointerDownInActions = false
+          clearActiveDrag()
+        })
+      }
+
+      connRow.addEventListener('dragover', (e) => {
+        if (!activeDrag || activeDrag.kind !== 'connection' || state.filter.trim().length > 0) return
+        if (activeDrag.folderKey !== folderKey) {
+          if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
+          clearDropIndicator()
+          return
+        }
+        if (activeDrag.connectionId === conn.id) {
+          if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
+          clearDropIndicator()
+          return
+        }
+        const placement = resolveDropPlacement(connItem, e.clientY)
+        const plan = computeReorderedFolderIds(
+          state.connections,
+          activeDrag.connectionId,
+          conn.id,
+          placement
+        )
+        if (!plan.ok || !plan.changed) {
+          if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
+          clearDropIndicator()
+          return
+        }
+        e.preventDefault()
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+        setDropIndicator(connRow, placement)
+      })
+
+      connRow.addEventListener('dragleave', (e) => {
+        if (e.relatedTarget && typeof connRow.contains === 'function' && connRow.contains(e.relatedTarget)) {
+          return
+        }
+        if (dropIndicator?.rowEl === connRow) {
+          clearDropIndicator()
+        }
+      })
+
+      connRow.addEventListener('drop', (e) => {
+        if (!activeDrag || activeDrag.kind !== 'connection' || state.filter.trim().length > 0) return
+        if (activeDrag.folderKey !== folderKey) {
+          clearDropIndicator()
+          return
+        }
+        e.preventDefault()
+        e.stopPropagation()
+        const sourceId = activeDrag.connectionId
+        const placement = resolveDropPlacement(connItem, e.clientY)
+        clearActiveDrag()
+        const plan = computeReorderedFolderIds(state.connections, sourceId, conn.id, placement)
+        if (plan.ok && plan.changed && typeof reorderConnectionsInFolder === 'function') {
+          void reorderConnectionsInFolder(plan.folder, plan.orderedIds)
+        }
+      })
+
       connRow.appendChild(connItem)
 
       if (isConnOpen) {
@@ -460,6 +791,48 @@ export function createPanelExplorerController(ctx) {
         } else {
           if (schemaErr) {
             childrenBox.appendChild(createConnectionErrorBlock(conn, schemaErr))
+          }
+
+          const staleInfo = state.schemaStaleByConn?.[conn.id]
+          if (staleInfo?.stale) {
+            const staleBanner = document.createElement('div')
+            staleBanner.className = 'datanoa-sidebar-stale-banner'
+            const badge = document.createElement('span')
+            badge.className = 'datanoa-stale-badge'
+            badge.textContent = 'Cached · Stale'
+            if (staleInfo.staleReason) badge.title = staleInfo.staleReason
+            const retryBtn = document.createElement('button')
+            retryBtn.type = 'button'
+            retryBtn.className = 'mini-btn datanoa-stale-retry-btn'
+            retryBtn.textContent = 'Retry'
+            retryBtn.title = 'Force refresh schema catalog from database'
+            retryBtn.addEventListener('click', (e) => {
+              e.stopPropagation()
+              void loadSchema(conn.id, { force: true, forceRefresh: true })
+            })
+            staleBanner.append(badge, retryBtn)
+            childrenBox.appendChild(staleBanner)
+          }
+
+          if (conn.driver !== 'redis') {
+            const erRow = document.createElement('div')
+            erRow.className = 'datanoa-er-studio-row'
+            const erBtn = document.createElement('button')
+            erBtn.type = 'button'
+            erBtn.className = 'mini-btn datanoa-er-studio-btn'
+            erBtn.textContent = 'Open ER Diagram in Studio ↗'
+            erBtn.title = 'Open interactive ER Diagram view in Full Studio'
+            erBtn.addEventListener('click', (e) => {
+              e.stopPropagation()
+              const connSchema = state.selectedSchemaByConn?.[conn.id]
+              void openFullStudio({
+                connectionId: conn.id,
+                ...(connSchema ? { schema: connSchema } : {}),
+                viewMode: 'er',
+              })
+            })
+            erRow.appendChild(erBtn)
+            childrenBox.appendChild(erRow)
           }
 
           const listToShow = q && !connMatches ? matchingObjs : q ? matchingObjs : objects
@@ -659,11 +1032,20 @@ export function createPanelExplorerController(ctx) {
           if (tables.length === 0 && views.length === 0 && (!schemaErr || objects.length > 0)) {
             const none = document.createElement('div')
             none.className = 'col-leaf'
+            const selectedSchema =
+              typeof state.selectedSchemaByConn?.[conn.id] === 'string'
+                ? state.selectedSchemaByConn[conn.id].trim()
+                : ''
+            const hasMultiSchemasAvail =
+              Array.isArray(state.availableSchemasByConn?.[conn.id]) &&
+              state.availableSchemasByConn[conn.id].length > 1
             none.textContent =
               objects.length === 0
-                ? conn.driver === 'mongodb'
-                  ? 'No collections found'
-                  : 'No tables found'
+                ? !schemaErr && selectedSchema && hasMultiSchemasAvail
+                  ? `No tables or views in "${selectedSchema}"`
+                  : conn.driver === 'mongodb'
+                    ? 'No collections found'
+                    : 'No tables found'
                 : 'No matching objects'
             childrenBox.appendChild(none)
           }
@@ -675,19 +1057,20 @@ export function createPanelExplorerController(ctx) {
       return connRow
     }
 
-    const hasAnyFolder = state.connections.some((c) => Boolean((c.folder || '').trim()))
+    const hasAnyFolder = state.connections.some((c) => Boolean(normalizeConnectionFolderKey(c.folder)))
     if (!hasAnyFolder) {
       for (const conn of state.connections) {
         const node = buildConnectionRow(conn)
         if (node) container.appendChild(node)
       }
+      restoreFocusedTarget()
       return
     }
 
     const byFolder = new Map()
     const ungrouped = []
     for (const conn of state.connections) {
-      const f = (conn.folder || '').trim()
+      const f = normalizeConnectionFolderKey(conn.folder)
       if (f) {
         if (!byFolder.has(f)) byFolder.set(f, [])
         byFolder.get(f).push(conn)
@@ -696,7 +1079,15 @@ export function createPanelExplorerController(ctx) {
       }
     }
 
-    const renderFolderSection = (folderLabel, connList) => {
+    const sectionKeys = [
+      ...byFolder.keys(),
+      ...(ungrouped.length > 0 ? [UNGROUPED_FOLDER_ORDER_KEY] : []),
+    ]
+    const sortedSectionKeys = sortFoldersByOrder(sectionKeys, state.folderOrder)
+    const hasMultipleFolders = sortedSectionKeys.length > 1
+    const hasReorderableFolders = !q && hasMultipleFolders
+
+    const renderFolderSection = (folderOrderKey, folderLabel, connList) => {
       const nodes = []
       for (const conn of connList) {
         const node = buildConnectionRow(conn)
@@ -704,15 +1095,35 @@ export function createPanelExplorerController(ctx) {
       }
       if (nodes.length === 0) return
 
-      const isCollapsed = !q && state.collapsedFolders.has(folderLabel)
+      const collapseKey = getFolderCollapseKey(folderOrderKey)
+      const isCollapsed = !q && isFolderSectionCollapsed(folderOrderKey)
+      const canReorderFolder = hasReorderableFolders
       const folderGroup = document.createElement('div')
       folderGroup.className = 'tree-folder-group'
+      folderGroup.dataset.folderName = folderLabel
+      folderGroup.dataset.folderOrderKey = folderOrderKey
+      folderGroup.dataset.sectionKey = collapseKey
+      if (canReorderFolder) {
+        folderGroup.dataset.reorderableFolder = '1'
+      }
 
       const folderHead = document.createElement('div')
-      folderHead.className = 'tree-item tree-folder-item'
+      folderHead.className = `tree-item tree-folder-item${canReorderFolder ? ' is-reorderable' : ''}`
       folderHead.setAttribute('role', 'button')
       folderHead.tabIndex = 0
       folderHead.title = `Folder "${folderLabel}" (${nodes.length} connection(s)) — Click to ${isCollapsed ? 'expand' : 'collapse'}`
+
+      if (canReorderFolder) {
+        folderHead.draggable = true
+        folderHead.setAttribute('draggable', 'true')
+        const grip = document.createElement('span')
+        grip.className = 'tree-drag-handle'
+        grip.setAttribute('aria-hidden', 'true')
+        grip.title = 'Drag to reorder folder'
+        grip.innerHTML =
+          '<svg width="10" height="12" viewBox="0 0 10 12" fill="currentColor" aria-hidden="true"><circle cx="3" cy="2" r="1"></circle><circle cx="7" cy="2" r="1"></circle><circle cx="3" cy="6" r="1"></circle><circle cx="7" cy="6" r="1"></circle><circle cx="3" cy="10" r="1"></circle><circle cx="7" cy="10" r="1"></circle></svg>'
+        folderHead.appendChild(grip)
+      }
 
       const fChev = document.createElement('span')
       fChev.className = `tree-chevron${isCollapsed ? '' : ' open'}`
@@ -733,23 +1144,192 @@ export function createPanelExplorerController(ctx) {
 
       folderHead.append(fChev, fIcon, fName, fCount)
 
+      if (hasMultipleFolders) {
+        const fActions = document.createElement('div')
+        fActions.className = 'tree-actions'
+        const fMenuBtn = document.createElement('button')
+        fMenuBtn.type = 'button'
+        fMenuBtn.className = 'mini-btn'
+        fMenuBtn.draggable = false
+        fMenuBtn.setAttribute('draggable', 'false')
+        fMenuBtn.title = 'Folder Actions'
+        fMenuBtn.setAttribute('aria-label', 'Folder Actions')
+        fMenuBtn.textContent = '⋮'
+        fMenuBtn.addEventListener('click', (e) => {
+          e.stopPropagation()
+          const r = fMenuBtn.getBoundingClientRect()
+          openContextMenu(r.left, r.bottom + 4, {
+            type: 'folder',
+            folderName: folderLabel,
+            folderOrderKey,
+          })
+        })
+        fActions.appendChild(fMenuBtn)
+        folderHead.appendChild(fActions)
+      }
+
       const toggleFolder = () => {
-        if (state.collapsedFolders.has(folderLabel)) {
-          state.collapsedFolders.delete(folderLabel)
-        } else {
-          state.collapsedFolders.add(folderLabel)
-        }
+        toggleFolderSectionCollapsed(folderOrderKey)
         savePanelViewState?.()
         renderExplorer()
       }
 
       folderHead.addEventListener('click', toggleFolder)
       folderHead.addEventListener('keydown', (e) => {
+        if (
+          hasMultipleFolders &&
+          e.altKey &&
+          !e.ctrlKey &&
+          !e.metaKey &&
+          !e.shiftKey &&
+          (e.key === 'ArrowUp' || e.key === 'ArrowDown')
+        ) {
+          if (state.filter.trim().length > 0) return
+          e.preventDefault()
+          e.stopPropagation()
+          moveFolderDirection(folderOrderKey, e.key === 'ArrowUp' ? 'up' : 'down', 'row')
+          return
+        }
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault()
           toggleFolder()
         }
       })
+
+      folderHead.addEventListener('contextmenu', (e) => {
+        e.preventDefault()
+        openContextMenu(e.clientX, e.clientY, {
+          type: 'folder',
+          folderName: folderLabel,
+          folderOrderKey,
+        })
+      })
+
+      if (canReorderFolder) {
+        let pointerDownInActions = false
+        const markPointerDown = (e) => {
+          const tgt = e.target
+          pointerDownInActions = Boolean(
+            tgt && typeof tgt.closest === 'function' && tgt.closest('.tree-actions')
+          )
+        }
+        const clearPointerDown = () => {
+          pointerDownInActions = false
+        }
+        folderHead.addEventListener('pointerdown', markPointerDown)
+        folderHead.addEventListener('mousedown', markPointerDown)
+        folderHead.addEventListener('pointerup', clearPointerDown)
+        folderHead.addEventListener('mouseup', clearPointerDown)
+
+        folderHead.addEventListener('dragstart', (e) => {
+          if (state.filter.trim().length > 0 || pointerDownInActions) {
+            pointerDownInActions = false
+            e.preventDefault()
+            return
+          }
+          const tgt = e.target
+          if (tgt && typeof tgt.closest === 'function' && tgt.closest('.tree-actions')) {
+            e.preventDefault()
+            return
+          }
+          closeContextMenu()
+          clearActiveDrag()
+          activeDrag = {
+            kind: 'folder',
+            folderOrderKey,
+            folderLabel,
+            rowEl: folderGroup,
+          }
+          folderGroup.classList.add('is-dragging')
+          if (e.dataTransfer) {
+            e.dataTransfer.effectAllowed = 'move'
+            try {
+              e.dataTransfer.setData('application/x-datanoa-folder-name', folderOrderKey)
+              e.dataTransfer.setData('text/plain', folderOrderKey)
+            } catch {
+              // Ignore synthetic/read-only DataTransfer restrictions
+            }
+          }
+        })
+        folderHead.addEventListener('dragend', () => {
+          pointerDownInActions = false
+          clearActiveDrag()
+        })
+      }
+
+      folderGroup.addEventListener('dragover', (e) => {
+        if (!activeDrag || state.filter.trim().length > 0) return
+        if (activeDrag.kind !== 'folder') {
+          const tgt = e.target
+          const insideConnRow =
+            tgt &&
+            typeof tgt.closest === 'function' &&
+            Boolean(tgt.closest('.tree-row[data-connection-id]'))
+          if (!insideConnRow) {
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
+            clearDropIndicator()
+          }
+          return
+        }
+        if (!canReorderFolder || activeDrag.folderOrderKey === folderOrderKey) {
+          if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
+          clearDropIndicator()
+          return
+        }
+        const placement = resolveDropPlacement(folderHead, e.clientY)
+        const plan = computeReorderedFolders(
+          sortedSectionKeys,
+          activeDrag.folderOrderKey,
+          folderOrderKey,
+          placement,
+          state.folderOrder
+        )
+        if (!plan.ok || !plan.changed) {
+          if (e.dataTransfer) e.dataTransfer.dropEffect = 'none'
+          clearDropIndicator()
+          return
+        }
+        e.preventDefault()
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+        setDropIndicator(folderGroup, placement)
+      })
+
+      folderGroup.addEventListener('dragleave', (e) => {
+        if (
+          e.relatedTarget &&
+          typeof folderGroup.contains === 'function' &&
+          folderGroup.contains(e.relatedTarget)
+        ) {
+          return
+        }
+        if (dropIndicator?.rowEl === folderGroup) {
+          clearDropIndicator()
+        }
+      })
+
+      folderGroup.addEventListener('drop', (e) => {
+        if (!activeDrag || activeDrag.kind !== 'folder' || state.filter.trim().length > 0) return
+        if (!canReorderFolder || activeDrag.folderOrderKey === folderOrderKey) {
+          clearDropIndicator()
+          return
+        }
+        e.preventDefault()
+        e.stopPropagation()
+        const sourceFolderKey = activeDrag.folderOrderKey
+        const placement = resolveDropPlacement(folderHead, e.clientY)
+        clearActiveDrag()
+        const plan = computeReorderedFolders(
+          sortedSectionKeys,
+          sourceFolderKey,
+          folderOrderKey,
+          placement,
+          state.folderOrder
+        )
+        if (plan.ok && plan.changed && typeof reorderFolders === 'function') {
+          void reorderFolders(plan.orderedFolders)
+        }
+      })
+
       folderGroup.appendChild(folderHead)
 
       if (!isCollapsed) {
@@ -764,13 +1344,14 @@ export function createPanelExplorerController(ctx) {
       container.appendChild(folderGroup)
     }
 
-    const sortedFolders = Array.from(byFolder.keys()).sort((a, b) => a.localeCompare(b))
-    for (const folder of sortedFolders) {
-      renderFolderSection(folder, byFolder.get(folder))
+    for (const sectionKey of sortedSectionKeys) {
+      if (sectionKey === UNGROUPED_FOLDER_ORDER_KEY) {
+        renderFolderSection(UNGROUPED_FOLDER_ORDER_KEY, 'General (Ungrouped)', ungrouped)
+      } else {
+        renderFolderSection(sectionKey, sectionKey, byFolder.get(sectionKey))
+      }
     }
-    if (ungrouped.length > 0) {
-      renderFolderSection('General (Ungrouped)', ungrouped)
-    }
+    restoreFocusedTarget()
   }
 
   function expandAllExplorer() {
@@ -787,11 +1368,13 @@ export function createPanelExplorerController(ctx) {
 
   function collapseAllExplorer() {
     if (!state.collapsedFolders) state.collapsedFolders = new Set()
-    const hasAnyFolder = state.connections.some((c) => Boolean((c.folder || '').trim()))
+    const hasAnyFolder = state.connections.some((c) => Boolean(normalizeConnectionFolderKey(c.folder)))
     if (hasAnyFolder) {
       for (const conn of state.connections) {
-        const f = (conn.folder || '').trim()
-        state.collapsedFolders.add(f || 'General (Ungrouped)')
+        const f = normalizeConnectionFolderKey(conn.folder)
+        state.collapsedFolders.add(
+          getFolderCollapseKey(f || UNGROUPED_FOLDER_ORDER_KEY)
+        )
       }
     }
     state.expandedConns.clear()
@@ -816,17 +1399,29 @@ export function createPanelExplorerController(ctx) {
       s.className = 'ctx-sep'
       menu.appendChild(s)
     }
-    const addItem = (label, onClick, danger = false, disabled = false) => {
+    const addItem = (label, onClick, danger = false, disabled = false, opts = null) => {
       const btn = document.createElement('button')
       btn.type = 'button'
       btn.className = `ctx-item${danger ? ' danger' : ''}`
       btn.setAttribute('role', 'menuitem')
       btn.disabled = Boolean(disabled)
+      if (opts?.action) btn.dataset.action = opts.action
+      if (opts?.title) btn.title = opts.title
       if (disabled) {
         btn.style.opacity = '0.45'
         btn.style.cursor = 'not-allowed'
       }
-      btn.textContent = label
+      if (opts?.shortcut) {
+        const lbl = document.createElement('span')
+        lbl.className = 'ctx-item-label'
+        lbl.textContent = label
+        const kbd = document.createElement('kbd')
+        kbd.className = 'ctx-kbd'
+        kbd.textContent = opts.shortcut
+        btn.append(lbl, kbd)
+      } else {
+        btn.textContent = label
+      }
       btn.addEventListener('click', (e) => {
         e.stopPropagation()
         if (disabled) return
@@ -999,6 +1594,53 @@ export function createPanelExplorerController(ctx) {
       return
     }
 
+    if (target.type === 'folder') {
+      const folderName = String(target.folderName || '').trim()
+      const folderOrderKey = String(
+        target.folderOrderKey ||
+          (folderName === 'General (Ungrouped)' ? UNGROUPED_FOLDER_ORDER_KEY : folderName)
+      ).trim()
+      if (!folderName || !folderOrderKey) return
+      addHeader(folderName)
+      const isCollapsed = isFolderSectionCollapsed(folderOrderKey)
+      addItem(isCollapsed ? 'Expand Folder' : 'Collapse Folder', () => {
+        toggleFolderSectionCollapsed(folderOrderKey)
+        savePanelViewState?.()
+        renderExplorer()
+      })
+      const folderKeys = getFolderOrderKeys()
+      const folderBounds = getFolderReorderBounds(folderKeys, folderOrderKey, state.folderOrder)
+      if (folderBounds.found && folderBounds.total > 1) {
+        addSep()
+        const filterActive = state.filter.trim().length > 0
+        const filterTip = 'Clear filter to reorder folders'
+        addItem(
+          'Move Folder Up',
+          () => moveFolderDirection(folderOrderKey, 'up', 'menu'),
+          false,
+          filterActive || !folderBounds.canMoveUp,
+          {
+            action: 'move-folder-up',
+            shortcut: 'Alt+↑',
+            title: filterActive ? filterTip : 'Move folder up (Alt+↑)',
+          }
+        )
+        addItem(
+          'Move Folder Down',
+          () => moveFolderDirection(folderOrderKey, 'down', 'menu'),
+          false,
+          filterActive || !folderBounds.canMoveDown,
+          {
+            action: 'move-folder-down',
+            shortcut: 'Alt+↓',
+            title: filterActive ? filterTip : 'Move folder down (Alt+↓)',
+          }
+        )
+      }
+      positionMenu()
+      return
+    }
+
     const { conn, obj } = target
     const isMongo = conn?.driver === 'mongodb'
     const isRedis = conn?.driver === 'redis'
@@ -1010,6 +1652,21 @@ export function createPanelExplorerController(ctx) {
           await selectTableAndOpen(conn.id, obj.name, obj.schema, false)
           switchTab('structure')
         })
+      }
+      if (obj.kind === 'table' && !isRedis) {
+        addItem(
+          'Import Data...',
+          () =>
+            openFullStudio({
+              connectionId: conn.id,
+              table: obj.name,
+              schema: obj.schema,
+              viewMode: 'grid',
+              action: 'import',
+            }),
+          false,
+          Boolean(conn.readOnly)
+        )
       }
       addItem('Open in Full Studio ↗', () =>
         openFullStudio({ connectionId: conn.id, table: obj.name, schema: obj.schema })
@@ -1107,6 +1764,17 @@ export function createPanelExplorerController(ctx) {
     } else {
       addHeader(conn.name)
       addItem('Open in Full Studio ↗', () => openFullStudio({ connectionId: conn.id }))
+      if (!isRedis) {
+        addItem('Open ER Diagram in Studio ↗', () =>
+          openFullStudio({
+            connectionId: conn.id,
+            ...(state.selectedSchemaByConn?.[conn.id]
+              ? { schema: state.selectedSchemaByConn[conn.id] }
+              : {}),
+            viewMode: 'er',
+          })
+        )
+      }
       if (!isRedis && !conn.readOnly) {
         addItem(isMongo ? '+ New Collection...' : '+ New Table...', () => {
           if (state.activeConnectionId !== conn.id) activateConnection(conn.id)
@@ -1124,6 +1792,34 @@ export function createPanelExplorerController(ctx) {
         switchTab('sql')
       })
       addSep()
+      const reorderBounds = getConnectionReorderBounds(state.connections, conn.id)
+      if (reorderBounds.found && reorderBounds.total > 1) {
+        const filterActive = state.filter.trim().length > 0
+        const filterTip = 'Clear filter to reorder connections'
+        addItem(
+          'Move Up',
+          () => moveConnectionDirection(conn.id, 'up', 'menu'),
+          false,
+          filterActive || !reorderBounds.canMoveUp,
+          {
+            action: 'move-conn-up',
+            shortcut: 'Alt+↑',
+            title: filterActive ? filterTip : 'Move connection up within folder (Alt+↑)',
+          }
+        )
+        addItem(
+          'Move Down',
+          () => moveConnectionDirection(conn.id, 'down', 'menu'),
+          false,
+          filterActive || !reorderBounds.canMoveDown,
+          {
+            action: 'move-conn-down',
+            shortcut: 'Alt+↓',
+            title: filterActive ? filterTip : 'Move connection down within folder (Alt+↓)',
+          }
+        )
+        addSep()
+      }
     }
 
     addItem('Edit Connection', () => populateFormFromProfile(conn, 'edit'))

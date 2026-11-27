@@ -1,4 +1,10 @@
 import { getDialectLexerRules, scanBlockCommentEnd, scanBracketIdentEnd, scanQuotedSegmentEnd } from './shared-sql-core.js'
+import {
+  DEFAULT_EXPLAIN_SVG_PALETTE,
+  buildExplainNodePopoverData,
+  clampExplainViewport,
+  renderExplainPlanSvg,
+} from './shared-explain-svg.js'
 
 export const AI_EXPLAIN_LANGUAGE_OPTIONS = [
   { value: 'auto', label: 'Auto (IDE locale)' },
@@ -463,6 +469,7 @@ export function renderAiStatusButtonContent(buttonEl, snapshot) {
   const badge = formatAiStatusBadge(snapshot)
   if (!buttonEl) return badge
   clearNode(buttonEl)
+  buttonEl.appendChild(createAiRobotIcon())
 
   if (badge.autocompleteState === 'off' && badge.explainState === 'off') {
     const item = el('span', 'datanoa-ai-role-item')
@@ -1043,8 +1050,8 @@ export function getAiPanelMaxHeight(container, edge = 'bottom') {
   return Math.max(AI_PANEL_MIN_HEIGHT, Math.min(windowMax, available))
 }
 
-function clampAiPanelHeight(px, container, edge) {
-  const maxH = getAiPanelMaxHeight(container, edge)
+function clampAiPanelHeight(px, container, edge, cachedMaxH = null) {
+  const maxH = cachedMaxH !== null ? cachedMaxH : getAiPanelMaxHeight(container, edge)
   return Math.max(AI_PANEL_MIN_HEIGHT, Math.min(maxH, Math.round(px)))
 }
 
@@ -1055,8 +1062,8 @@ function clearContainerHeightStyle(container) {
   }
 }
 
-function applyContainerUserHeight(container, px, edge, persistDataset = true) {
-  const clamped = clampAiPanelHeight(px, container, edge)
+function applyContainerUserHeight(container, px, edge, persistDataset = true, cachedMaxH = null) {
+  const clamped = clampAiPanelHeight(px, container, edge, cachedMaxH)
   if (container.style) {
     container.style.height = `${clamped}px`
     container.style.maxHeight = 'none'
@@ -1110,11 +1117,16 @@ function createAiPanelResizer(container, edge, onResize) {
   grip.setAttribute('aria-hidden', 'true')
   resizer.appendChild(grip)
 
-  const setHeight = (nextPx) => {
-    const clamped = applyContainerUserHeight(container, nextPx, normalizedEdge)
-    resizer.setAttribute('aria-valuemax', String(getAiPanelMaxHeight(container, normalizedEdge)))
+  const setHeight = (nextPx, { cachedMaxH = null, notifyResize = true } = {}) => {
+    const resolvedMaxH =
+      cachedMaxH !== null ? cachedMaxH : getAiPanelMaxHeight(container, normalizedEdge)
+    const clamped = applyContainerUserHeight(container, nextPx, normalizedEdge, true, resolvedMaxH)
+    resizer.setAttribute('aria-valuemax', String(resolvedMaxH))
     resizer.setAttribute('aria-valuenow', String(clamped))
-    onResize?.()
+    if (notifyResize) {
+      onResize?.()
+    }
+    return clamped
   }
 
   const resetHeight = () => {
@@ -1132,38 +1144,95 @@ function createAiPanelResizer(container, edge, onResize) {
     ev.preventDefault?.()
     cleanupAiPanelResize(container)
     const startY = Number(ev.clientY) || 0
+    const parentEl = container.parentElement
+    const cachedMaxH = getAiPanelMaxHeight(container, normalizedEdge)
     const startHeight = getCurrentContainerHeight(container)
+    let pendingHeight = clampAiPanelHeight(startHeight, container, normalizedEdge, cachedMaxH)
+    let lastAppliedHeight = pendingHeight
+    let hasMoved = false
+    let didResize = false
+    let rafId = null
+    let rafPending = false
+
+    resizer.setAttribute('aria-valuemax', String(cachedMaxH))
     resizer.classList?.add?.('is-resizing')
+    parentEl?.classList?.add?.('datanoa-split-resizing', 'is-split-resizing')
     if (document.body?.style) {
       document.body.style.cursor = 'row-resize'
       document.body.style.userSelect = 'none'
     }
+
+    const flushPendingHeight = (notifyResize) => {
+      rafPending = false
+      rafId = null
+      if (!container.parentNode || container.isConnected === false) return
+      if (pendingHeight === lastAppliedHeight) return
+      lastAppliedHeight = pendingHeight
+      didResize = true
+      setHeight(pendingHeight, { cachedMaxH, notifyResize })
+    }
+
     const onMove = (moveEv) => {
-      if (!container.parentNode || container.isConnected === false) {
-        stopDrag()
+      if (!container.parentNode || container.isConnected === false || container.hidden) {
+        stopDrag(false)
+        return
+      }
+      if (moveEv.isTrusted && moveEv.buttons === 0) {
+        stopDrag(true)
         return
       }
       const curY = Number(moveEv.clientY) || 0
       const delta = normalizedEdge === 'top' ? startY - curY : curY - startY
-      setHeight(startHeight + delta)
+      const nextH = clampAiPanelHeight(startHeight + delta, container, normalizedEdge, cachedMaxH)
+      if (nextH === pendingHeight) return
+      hasMoved = true
+      pendingHeight = nextH
+      if (typeof requestAnimationFrame === 'function') {
+        if (!rafPending) {
+          rafPending = true
+          const id = requestAnimationFrame(() =>
+            flushPendingHeight(typeof ResizeObserver !== 'function')
+          )
+          rafId = rafPending ? id : null
+        }
+      } else {
+        flushPendingHeight(true)
+      }
     }
-    const stopDrag = () => {
+
+    const stopDrag = (shouldFlush = true) => {
+      rafPending = false
+      if (rafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(rafId)
+        rafId = null
+      }
+      if (shouldFlush && hasMoved && pendingHeight !== lastAppliedHeight) {
+        flushPendingHeight(false)
+      }
       window.removeEventListener('mousemove', onMove)
-      window.removeEventListener('mouseup', stopDrag)
-      window.removeEventListener('blur', stopDrag)
+      window.removeEventListener('mouseup', onEnd)
+      window.removeEventListener('blur', onEnd)
       resizer.classList?.remove?.('is-resizing')
+      parentEl?.classList?.remove?.('datanoa-split-resizing', 'is-split-resizing')
       if (document.body?.style) {
         document.body.style.cursor = ''
         document.body.style.userSelect = ''
       }
-      if (activeAiPanelResizeCleanups.get(container) === stopDrag) {
+      if (activeAiPanelResizeCleanups.get(container) === cancelDrag) {
         activeAiPanelResizeCleanups.delete(container)
       }
+      if (shouldFlush && didResize) {
+        onResize?.()
+      }
     }
-    activeAiPanelResizeCleanups.set(container, stopDrag)
+
+    const onEnd = () => stopDrag(true)
+    const cancelDrag = () => stopDrag(false)
+
+    activeAiPanelResizeCleanups.set(container, cancelDrag)
     window.addEventListener('mousemove', onMove)
-    window.addEventListener('mouseup', stopDrag)
-    window.addEventListener('blur', stopDrag)
+    window.addEventListener('mouseup', onEnd)
+    window.addEventListener('blur', onEnd)
   })
 
   resizer.addEventListener('dblclick', () => {
@@ -1195,7 +1264,516 @@ function createAiPanelResizer(container, edge, onResize) {
 }
 
 const explainPanelCallbacksMap = new WeakMap()
+const explainPanelViewStateMap = new WeakMap()
+const explainViewportCleanupMap = new WeakMap()
 const fixPanelCallbacksMap = new WeakMap()
+const fixPanelViewStateMap = new WeakMap()
+
+const EXPLAIN_VISUAL_STYLE_ID = 'datanoa-shared-explain-visual-styles'
+
+function ensureExplainVisualStyles() {
+  if (typeof document === 'undefined' || !document.head) return
+  if (typeof document.getElementById === 'function' && document.getElementById(EXPLAIN_VISUAL_STYLE_ID)) {
+    return
+  }
+  const style = document.createElement('style')
+  style.id = EXPLAIN_VISUAL_STYLE_ID
+  style.textContent = `
+.datanoa-ai-prod-pill[data-color-tag='prod'] {
+  color: var(--danger, var(--orca-destructive, #f87171));
+  border-color: color-mix(in srgb, var(--danger, var(--orca-destructive, #f87171)) 48%, var(--border, rgba(148, 163, 184, 0.25)));
+  background: color-mix(in srgb, var(--danger, var(--orca-destructive, #f87171)) 12%, transparent);
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+.datanoa-ai-policy-pill[data-policy='never'] {
+  color: var(--danger, var(--orca-destructive, #f87171));
+  border-color: color-mix(in srgb, var(--danger, var(--orca-destructive, #f87171)) 42%, var(--border, rgba(148, 163, 184, 0.25)));
+  background: color-mix(in srgb, var(--danger, var(--orca-destructive, #f87171)) 10%, transparent);
+}
+.datanoa-ai-policy-pill[data-policy='ask'] {
+  color: var(--warn, #fbbf24);
+  border-color: color-mix(in srgb, var(--warn, #fbbf24) 42%, var(--border, rgba(148, 163, 184, 0.25)));
+  background: color-mix(in srgb, var(--warn, #fbbf24) 10%, transparent);
+}
+.datanoa-ai-confirm-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border, var(--orca-border, rgba(148, 163, 184, 0.2)));
+  background: color-mix(in srgb, var(--warn, #fbbf24) 9%, var(--surface, var(--card, #14181f)));
+  font-size: 12px;
+  color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+}
+.datanoa-ai-confirm-text {
+  flex: 1 1 240px;
+  min-width: 0;
+  line-height: 1.4;
+}
+.datanoa-explain-view-switcher {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border-radius: var(--radius-control, 6px);
+  border: 1px solid var(--border, var(--orca-border, rgba(148, 163, 184, 0.2)));
+  background: var(--card, color-mix(in srgb, var(--text, var(--t1, #e6e6e6)) 4%, var(--bg, #000000)));
+  gap: 2px;
+}
+.datanoa-explain-view-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted, var(--t2, #94a3b8));
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 140ms cubic-bezier(0.22, 1, 0.36, 1), color 140ms cubic-bezier(0.22, 1, 0.36, 1), border-color 140ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.datanoa-explain-view-tab:hover:not([aria-selected='true']) {
+  color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  background: var(--hover, color-mix(in srgb, var(--text, var(--t1, #e6e6e6)) 6%, transparent));
+}
+.datanoa-explain-view-tab[aria-selected='true'] {
+  background: var(--raised, color-mix(in srgb, var(--text, var(--t1, #e6e6e6)) 10%, var(--bg, #000000)));
+  border-color: var(--border-hi, var(--border, rgba(148, 163, 184, 0.25)));
+  color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  font-weight: 500;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+.datanoa-explain-view-tab:focus-visible {
+  outline: 1.5px solid var(--accent-ring, var(--orca-ring, #38bdf8));
+  outline-offset: -1px;
+}
+.datanoa-explain-tab-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  background: var(--muted, var(--t2, #94a3b8));
+}
+.datanoa-explain-tab-dot[data-tone='ok'] {
+  background: var(--ok, #4cc38a);
+}
+.datanoa-explain-tab-dot[data-tone='info'] {
+  background: var(--info, #38bdf8);
+  animation: datanoa-ai-robot-pulse 1100ms cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+.datanoa-explain-tab-dot[data-tone='danger'] {
+  background: var(--danger, var(--orca-destructive, #e5484d));
+}
+.datanoa-explain-collapse-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 8px;
+  color: var(--muted, var(--t2, #94a3b8));
+}
+.datanoa-explain-collapse-btn:hover {
+  color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+}
+.datanoa-explain-collapse-chevron {
+  display: block;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  transition: transform 160ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.datanoa-explain-collapse-btn[aria-expanded='false'] .datanoa-explain-collapse-chevron {
+  transform: rotate(-90deg);
+}
+.datanoa-explain-visual-wrap,
+.datanoa-explain-raw-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  position: relative;
+  flex-shrink: 0;
+  padding-bottom: 4px;
+}
+.datanoa-explain-frame {
+  border: 1px solid var(--border, var(--orca-border, rgba(148, 163, 184, 0.2)));
+  border-radius: var(--radius, 8px);
+  background: var(--bg, var(--orca-background, #0d1117));
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+.datanoa-explain-popover-slot {
+  flex-shrink: 0;
+}
+.datanoa-explain-summary-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-height: 32px;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--border, var(--orca-border, rgba(148, 163, 184, 0.16)));
+  background: var(--surface, var(--card, color-mix(in srgb, var(--text, var(--t1, #e6e6e6)) 4%, var(--bg, #000000))));
+  font-size: 11px;
+}
+.datanoa-explain-summary-pills {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-family: var(--mono-font, var(--mono, ui-monospace, monospace));
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted, var(--t2, #94a3b8));
+}
+.datanoa-explain-meta-item {
+  white-space: nowrap;
+}
+.datanoa-explain-meta-sep {
+  opacity: 0.45;
+  user-select: none;
+}
+.datanoa-explain-meta-warn {
+  color: var(--warn, #fbbf24);
+  font-weight: 500;
+}
+.datanoa-explain-summary-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.datanoa-explain-zoom-group {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border, var(--orca-border, rgba(148, 163, 184, 0.2)));
+  border-radius: var(--radius-control, 6px);
+  overflow: hidden;
+  background: var(--bg, var(--orca-background, #0d1117));
+}
+.datanoa-explain-zoom-group .datanoa-ai-btn {
+  border: 0;
+  border-radius: 0;
+  height: 22px;
+  min-width: 24px;
+  padding: 0 6px;
+  font-family: var(--mono-font, var(--mono, ui-monospace, monospace));
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.datanoa-explain-zoom-group .datanoa-ai-btn + .datanoa-ai-btn {
+  border-left: 1px solid var(--border, var(--orca-border, rgba(148, 163, 184, 0.16)));
+}
+.datanoa-explain-svg-viewport {
+  position: relative;
+  min-height: 140px;
+  max-height: 320px;
+  overflow: hidden;
+  background-color: var(--bg, var(--orca-background, #0d1117));
+  background-image: radial-gradient(color-mix(in srgb, var(--text, var(--t1, #e6e6e6)) 9%, transparent) 1px, transparent 1px);
+  background-size: 16px 16px;
+  cursor: grab;
+  user-select: none;
+}
+.datanoa-explain-svg-viewport.is-panning {
+  cursor: grabbing;
+}
+.datanoa-explain-svg-viewport svg .datanoa-explain-svg-bg {
+  fill: transparent;
+}
+.datanoa-explain-svg-stage {
+  transform-origin: 0 0;
+  display: inline-block;
+}
+.datanoa-explain-svg-stage .datanoa-explain-node {
+  cursor: pointer;
+}
+.datanoa-explain-svg-stage .datanoa-explain-node .datanoa-explain-node-card {
+  transition: stroke 140ms cubic-bezier(0.22, 1, 0.36, 1), fill 140ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.datanoa-explain-svg-stage .datanoa-explain-node:hover .datanoa-explain-node-card {
+  stroke: var(--border-strong, var(--border-hi, rgba(148, 163, 184, 0.48)));
+}
+.datanoa-explain-svg-stage .datanoa-explain-node:focus-visible {
+  outline: none;
+}
+.datanoa-explain-svg-stage .datanoa-explain-node:focus-visible .datanoa-explain-node-card,
+.datanoa-explain-svg-stage .datanoa-explain-node[data-selected='true'] rect:first-of-type {
+  stroke: var(--accent-ring, var(--orca-ring, #38bdf8));
+  stroke-width: 1.75;
+}
+.datanoa-explain-frame .datanoa-explain-raw-pre {
+  border: 0;
+  border-radius: 0;
+  padding: 12px;
+  max-height: 300px;
+  overflow: auto;
+}
+.datanoa-explain-ai-empty {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  border: 1px solid var(--border, var(--orca-border, rgba(148, 163, 184, 0.2)));
+  border-radius: var(--radius, 8px);
+  background: var(--card, color-mix(in srgb, var(--text, var(--t1, #e6e6e6)) 4%, var(--bg, #000000)));
+}
+.datanoa-explain-node-popover {
+  position: relative;
+  border: 1px solid var(--border-strong, var(--border, rgba(148, 163, 184, 0.3)));
+  border-radius: var(--radius, 8px);
+  background: var(--popover, var(--orca-popover, var(--surface, #14181f)));
+  color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  padding: 12px;
+  box-shadow: var(--menu-shadow, 0 8px 24px rgba(0, 0, 0, 0.4));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+}
+.datanoa-explain-popover-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.datanoa-explain-popover-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+}
+.datanoa-explain-popover-metric {
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border, var(--orca-border, rgba(148, 163, 184, 0.2)));
+  background: var(--card, color-mix(in srgb, var(--text, var(--t1, #e6e6e6)) 5%, var(--bg, #000000)));
+}
+.datanoa-explain-popover-metric-label {
+  display: block;
+  font-size: 10px;
+  color: var(--muted, var(--t2, #94a3b8));
+}
+.datanoa-explain-popover-metric-val {
+  font-family: var(--mono-font, var(--mono, ui-monospace, monospace));
+  font-size: 12px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.datanoa-explain-popover-details {
+  display: grid;
+  grid-template-columns: minmax(110px, auto) 1fr;
+  gap: 4px 12px;
+  font-size: 12px;
+}
+.datanoa-explain-popover-detail-key {
+  color: var(--muted, var(--t2, #94a3b8));
+}
+.datanoa-explain-popover-detail-val {
+  font-family: var(--mono-font, var(--mono, ui-monospace, monospace));
+  overflow-wrap: anywhere;
+}
+@media (prefers-reduced-motion: reduce) {
+  .datanoa-explain-tab-dot[data-tone='info'] {
+    animation: none;
+  }
+}
+`
+  document.head.appendChild(style)
+}
+
+export function resolveEffectiveExplainAiPolicy(state) {
+  const raw = state?.aiPolicy
+  if (raw === 'never' || raw === 'ask' || raw === 'allow') {
+    return raw
+  }
+  const tag = typeof state?.colorTag === 'string' ? state.colorTag.trim().toLowerCase() : ''
+  if (tag === 'prod' || tag === 'production') {
+    return 'ask'
+  }
+  return 'allow'
+}
+
+function appendAiPolicyPill(titleGroup, effectivePolicy) {
+  if (effectivePolicy === 'never') {
+    const policyPill = el('span', 'datanoa-ai-pill datanoa-ai-policy-pill', 'AI Blocked · Never')
+    policyPill.setAttribute('data-policy', 'never')
+    policyPill.title = 'AI assistance is disabled for this connection (policy: never)'
+    titleGroup.appendChild(policyPill)
+  } else if (effectivePolicy === 'ask') {
+    const policyPill = el('span', 'datanoa-ai-pill datanoa-ai-policy-pill', 'Policy · Ask')
+    policyPill.setAttribute('data-policy', 'ask')
+    policyPill.title = 'Explicit confirmation required before sending SQL/plan to AI'
+    titleGroup.appendChild(policyPill)
+  }
+}
+
+function getOrCreateFixViewState(container, state, effectivePolicy) {
+  let vs = fixPanelViewStateMap.get(container)
+  if (!vs) {
+    vs = {
+      lastStateRef: null,
+      pendingAskConfirm: false,
+    }
+    fixPanelViewStateMap.set(container, vs)
+  }
+  if (state !== vs.lastStateRef) {
+    vs.lastStateRef = state
+    if (
+      state?.pendingConfirm === true &&
+      effectivePolicy === 'ask' &&
+      (state.phase === 'idle' || state.phase === 'error')
+    ) {
+      vs.pendingAskConfirm = true
+    } else if (
+      !state ||
+      state.phase === 'hidden' ||
+      state.phase === 'loading' ||
+      state.phase === 'ready' ||
+      effectivePolicy !== 'ask'
+    ) {
+      vs.pendingAskConfirm = false
+    }
+  }
+  return vs
+}
+
+function createChevronDownIcon() {
+  const svg = createSvgNode('svg', {
+    class: 'datanoa-explain-collapse-chevron',
+    width: '14',
+    height: '14',
+    viewBox: '0 0 16 16',
+    fill: 'none',
+    'aria-hidden': 'true',
+    focusable: 'false',
+  })
+  svg.appendChild(
+    createSvgNode('path', {
+      d: 'M4 6L8 10L12 6',
+      stroke: 'currentColor',
+      'stroke-width': '1.5',
+      'stroke-linecap': 'round',
+      'stroke-linejoin': 'round',
+    })
+  )
+  return svg
+}
+
+function getOrCreateExplainViewState(container, state) {
+  let vs = explainPanelViewStateMap.get(container)
+  const plan = state?.explainPlan ?? null
+  const phase = state?.phase || 'idle'
+  if (!vs || vs.planRef !== plan) {
+    const defaultView = !plan
+      ? 'ai'
+      : phase === 'loading' || phase === 'ready' || phase === 'error'
+        ? 'ai'
+        : plan.root
+          ? 'visual'
+          : 'raw'
+    vs = {
+      planRef: plan,
+      activeView: defaultView,
+      lastPhase: phase,
+      selectedNodeId: null,
+      viewport: { x: 0, y: 0, scale: 1 },
+      viewportInitialized: false,
+      pendingAskConfirm: false,
+    }
+    explainPanelViewStateMap.set(container, vs)
+  }
+  if (!plan) {
+    vs.activeView = 'ai'
+  } else if (
+    state?.explainViewMode === 'visual' ||
+    state?.explainViewMode === 'raw' ||
+    state?.explainViewMode === 'ai'
+  ) {
+    vs.activeView = state.explainViewMode
+  } else if (
+    vs.lastPhase === 'idle' &&
+    (phase === 'loading' || phase === 'ready' || phase === 'error')
+  ) {
+    vs.activeView = 'ai'
+  }
+  vs.lastPhase = phase
+  return vs
+}
+
+function resolveExplainSvgPaletteFromDom(container) {
+  if (typeof window === 'undefined' || typeof window.getComputedStyle !== 'function' || !container) {
+    return DEFAULT_EXPLAIN_SVG_PALETTE
+  }
+  try {
+    const cs = window.getComputedStyle(container)
+    const pick = (names, fallback) => {
+      for (const n of names) {
+        const val = cs.getPropertyValue(n)?.trim()
+        if (val) return val
+      }
+      return fallback
+    }
+    return {
+      bg: pick(['--bg', '--orca-background'], DEFAULT_EXPLAIN_SVG_PALETTE.bg),
+      cardBg: pick(['--card', '--surface', '--orca-popover'], DEFAULT_EXPLAIN_SVG_PALETTE.cardBg),
+      cardBorder: pick(['--border', '--orca-border'], DEFAULT_EXPLAIN_SVG_PALETTE.cardBorder),
+      textPrimary: pick(['--text', '--t1', '--fg', '--orca-foreground'], DEFAULT_EXPLAIN_SVG_PALETTE.textPrimary),
+      textMuted: pick(['--muted', '--t2', '--orca-muted-foreground'], DEFAULT_EXPLAIN_SVG_PALETTE.textMuted),
+      edgeStroke: pick(['--border-strong', '--border', '--orca-border'], DEFAULT_EXPLAIN_SVG_PALETTE.edgeStroke),
+      critical: pick(['--danger', '--orca-destructive'], DEFAULT_EXPLAIN_SVG_PALETTE.critical),
+      high: pick(['--warn'], DEFAULT_EXPLAIN_SVG_PALETTE.high),
+      moderate: pick(['--info'], DEFAULT_EXPLAIN_SVG_PALETTE.moderate),
+      low: pick(['--ok'], DEFAULT_EXPLAIN_SVG_PALETTE.low),
+      neutral: pick(['--muted', '--t2'], DEFAULT_EXPLAIN_SVG_PALETTE.neutral),
+    }
+  } catch {
+    return DEFAULT_EXPLAIN_SVG_PALETTE
+  }
+}
+
+function parseSvgMarkupSafe(svgMarkup) {
+  if (!svgMarkup || typeof document === 'undefined') return null
+  if (typeof DOMParser === 'function') {
+    try {
+      const parsed = new DOMParser().parseFromString(svgMarkup, 'image/svg+xml')
+      const rootSvg =
+        parsed?.documentElement?.tagName?.toLowerCase() === 'svg'
+          ? parsed.documentElement
+          : parsed?.body?.querySelector?.('svg')
+      if (rootSvg) {
+        return typeof document.importNode === 'function' ? document.importNode(rootSvg, true) : rootSvg
+      }
+    } catch {
+      // Fall through to safe fragment fallback
+    }
+  }
+  const host = document.createElement('div')
+  host.innerHTML = svgMarkup
+  return host.querySelector ? host.querySelector('svg') : host.firstElementChild
+}
+
+function cleanupExplainViewportListeners(container) {
+  const fn = explainViewportCleanupMap.get(container)
+  if (typeof fn === 'function') {
+    try {
+      fn()
+    } catch {
+      // Ignore viewport listener cleanup errors
+    }
+    explainViewportCleanupMap.delete(container)
+  }
+}
 
 function appendPanelPrivacyPills(titleGroup, state) {
   if (!state) return
@@ -1218,151 +1796,632 @@ function appendPanelPrivacyPills(titleGroup, state) {
     prodPill.title = 'Production connection — review AI requests carefully'
     titleGroup.appendChild(prodPill)
   }
+  const activeSchema = typeof state.activeSchema === 'string' ? state.activeSchema.trim() : ''
+  if (activeSchema) {
+    const schemaPill = el('span', 'datanoa-ai-pill datanoa-ai-schema-pill', `schema: ${activeSchema}`)
+    schemaPill.title = `Active schema: ${activeSchema}`
+    titleGroup.appendChild(schemaPill)
+  }
 }
 
-export function renderSharedExplainAiPanel(container, state, callbacks) {
-  if (!container) return
-  explainPanelCallbacksMap.set(container, callbacks)
-  if (
-    state?.phase === 'loading' &&
-    !container.hidden &&
-    container.dataset?.phase === 'loading' &&
-    typeof container.querySelector === 'function' &&
-    container.querySelector('.datanoa-ai-loading-box')
-  ) {
-    return
+function formatPopoverMetric(val, suffix = '') {
+  if (val === null || val === undefined || !Number.isFinite(Number(val))) return '—'
+  const num = Number(val)
+  const rounded = Math.abs(num) >= 100 ? Math.round(num) : Math.round(num * 100) / 100
+  return `${rounded}${suffix}`
+}
+
+function renderExplainNodePopover(node, onClose) {
+  const data = buildExplainNodePopoverData(node)
+  const popover = el('div', 'datanoa-explain-node-popover')
+  popover.setAttribute('role', 'region')
+  popover.setAttribute('aria-label', `Plan node details: ${data.title}`)
+  popover.setAttribute('data-node-id', data.id)
+
+  const head = el('div', 'datanoa-explain-popover-head')
+  const headLeft = el('div', 'datanoa-ai-explain-title-group')
+  headLeft.appendChild(el('strong', 'datanoa-ai-item-title', data.title))
+  if (data.subtitle) {
+    headLeft.appendChild(el('span', 'datanoa-ai-pill', data.subtitle))
   }
-  cleanupAiPanelResize(container)
-  if (!state || state.phase === 'hidden') {
-    container.hidden = true
-    if (container.dataset) {
-      delete container.dataset.phase
-      delete container.dataset.collapsed
+  const sevBadge = el('span', `datanoa-ai-sev sev-${data.severity}`, data.severity)
+  headLeft.appendChild(sevBadge)
+
+  const closeBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', '×')
+  closeBtn.type = 'button'
+  closeBtn.setAttribute('aria-label', 'Close node details')
+  closeBtn.addEventListener('click', onClose)
+  head.appendChild(headLeft)
+  head.appendChild(closeBtn)
+  popover.appendChild(head)
+
+  if (data.warnings.length > 0) {
+    const warnStrip = el('div', 'datanoa-ai-inline-warn', data.warnings.join(' · '))
+    warnStrip.setAttribute('role', 'note')
+    popover.appendChild(warnStrip)
+  }
+
+  const metricsGrid = el('div', 'datanoa-explain-popover-metrics')
+  const metricItems = [
+    ['Exclusive Cost', formatPopoverMetric(data.metrics.exclusiveCost)],
+    ['Total Cost', formatPopoverMetric(data.metrics.totalCost)],
+    [
+      'Cost Share',
+      data.metrics.costFraction !== null ? `${Math.round(data.metrics.costFraction * 100)}%` : '—',
+    ],
+    ['Exclusive Time', formatPopoverMetric(data.metrics.exclusiveTimeMs, 'ms')],
+    ['Total Time', formatPopoverMetric(data.metrics.actualTotalTimeMs, 'ms')],
+    [
+      'Time Share',
+      data.metrics.timeFraction !== null ? `${Math.round(data.metrics.timeFraction * 100)}%` : '—',
+    ],
+    ['Est. Rows', formatPopoverMetric(data.metrics.planRows)],
+    ['Actual Rows', formatPopoverMetric(data.metrics.totalActualRows)],
+    ['Loops', formatPopoverMetric(data.metrics.actualLoops)],
+    ['Workers', formatPopoverMetric(data.metrics.processCount)],
+  ]
+  for (const [label, val] of metricItems) {
+    const box = el('div', 'datanoa-explain-popover-metric')
+    box.appendChild(el('span', 'datanoa-explain-popover-metric-label', label))
+    box.appendChild(el('span', 'datanoa-explain-popover-metric-val', val))
+    metricsGrid.appendChild(box)
+  }
+  popover.appendChild(metricsGrid)
+
+  if (data.details.length > 0) {
+    const detGrid = el('div', 'datanoa-explain-popover-details')
+    for (const entry of data.details) {
+      detGrid.appendChild(el('div', 'datanoa-explain-popover-detail-key', entry.key))
+      detGrid.appendChild(el('div', 'datanoa-explain-popover-detail-val', entry.value))
     }
-    clearContainerHeightStyle(container)
-    clearNode(container)
+    popover.appendChild(detGrid)
+  }
+
+  return popover
+}
+
+function execCommandCopyFallback(value) {
+  if (typeof document === 'undefined' || !document.body) return false
+  const prevActive =
+    document.activeElement && typeof document.activeElement.focus === 'function'
+      ? document.activeElement
+      : null
+  const ta = document.createElement('textarea')
+  ta.value = value
+  ta.setAttribute?.('readonly', '')
+  if (ta.style) {
+    ta.style.position = 'fixed'
+    ta.style.top = '-9999px'
+    ta.style.left = '-9999px'
+    ta.style.width = '1px'
+    ta.style.height = '1px'
+    ta.style.opacity = '0'
+    ta.style.pointerEvents = 'none'
+  }
+  let copied = false
+  try {
+    document.body.appendChild(ta)
+    try {
+      ta.focus?.({ preventScroll: true })
+    } catch {
+      try {
+        ta.focus?.()
+      } catch {
+        // Ignore minimal DOM focus errors
+      }
+    }
+    try {
+      ta.select?.()
+    } catch {
+      // Ignore minimal DOM select errors
+    }
+    try {
+      ta.setSelectionRange?.(0, value.length)
+    } catch {
+      // Ignore minimal DOM selection errors
+    }
+    try {
+      if (typeof document.execCommand === 'function') {
+        copied = Boolean(document.execCommand('copy'))
+      }
+    } catch {
+      copied = false
+    }
+  } finally {
+    try {
+      if (typeof ta.remove === 'function') {
+        ta.remove()
+      } else if (ta.parentNode) {
+        ta.parentNode.removeChild(ta)
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+    if (prevActive && prevActive.isConnected !== false) {
+      try {
+        prevActive.focus({ preventScroll: true })
+      } catch {
+        try {
+          prevActive.focus()
+        } catch {
+          // Ignore focus restore errors
+        }
+      }
+    }
+  }
+  return copied
+}
+
+async function copyTextWithButtonFeedback(btn, text, label, callbacks) {
+  const value = String(text ?? '')
+  const seq = btn ? (btn._copyFeedbackSeq = (btn._copyFeedbackSeq || 0) + 1) : 0
+  // Preserve synchronous user gesture in restricted/isolated frames while also
+  // attempting async Clipboard API writeText within the click turn.
+  const syncExecCopied = execCommandCopyFallback(value)
+  let clipOk = false
+  if (typeof navigator !== 'undefined' && typeof navigator.clipboard?.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(value)
+      clipOk = true
+    } catch {
+      clipOk = false
+    }
+  }
+  const ok = clipOk || syncExecCopied
+  if (btn && btn._copyFeedbackSeq !== seq) {
+    return ok
+  }
+  const statusMsg = ok ? `Copied ${label || 'text'}` : 'Clipboard write failed'
+  if (typeof callbacks?.onStatus === 'function') {
+    callbacks.onStatus(statusMsg)
+  }
+  if (!btn) return ok
+  if (btn._copyResetTimer !== undefined) {
+    clearTimeout(btn._copyResetTimer)
+    btn._copyResetTimer = undefined
+  }
+  const orig = btn.dataset?.origLabel || btn._copyOrigLabel || btn.textContent || 'Copy'
+  btn._copyOrigLabel = orig
+  if (btn.dataset) {
+    btn.dataset.origLabel = orig
+    btn.dataset.copyState = ok ? 'copied' : 'failed'
+  }
+  btn.textContent = ok ? 'Copied' : 'Clipboard write failed'
+  btn.title = statusMsg
+  btn.setAttribute?.('aria-label', statusMsg)
+  if (typeof setTimeout === 'function') {
+    const t = setTimeout(() => {
+      if (btn._copyFeedbackSeq !== seq) return
+      btn._copyResetTimer = undefined
+      if (btn.isConnected !== false) {
+        btn.textContent = orig
+      }
+      if (btn.dataset) {
+        delete btn.dataset.copyState
+      }
+    }, 1500)
+    if (typeof t === 'object' && t !== null && typeof t.unref === 'function') {
+      t.unref()
+    }
+    btn._copyResetTimer = t
+  }
+  return ok
+}
+
+function triggerExplainCopy(container, btn, fallbackCallbacks, text, label) {
+  const cb = (container && explainPanelCallbacksMap.get(container)) || fallbackCallbacks
+  if (typeof cb?.onCopyText === 'function') {
+    cb.onCopyText(text, label)
     return
   }
+  void copyTextWithButtonFeedback(btn, text, label, cb)
+}
 
-  container.hidden = false
-  container.className = 'datanoa-ai-explain-panel'
-  if (container.dataset) {
-    container.dataset.phase = String(state.phase || '')
-    container.dataset.collapsed = state.collapsed ? 'true' : 'false'
+function appendExplainMetaSegments(containerEl, segments) {
+  let emitted = 0
+  for (const seg of segments) {
+    if (!seg || !seg.text) continue
+    if (emitted > 0) {
+      const sep = el('span', 'datanoa-explain-meta-sep', '·')
+      sep.setAttribute('aria-hidden', 'true')
+      containerEl.appendChild(sep)
+    }
+    const cls = seg.warn
+      ? 'datanoa-explain-meta-item datanoa-explain-meta-warn'
+      : 'datanoa-explain-meta-item'
+    containerEl.appendChild(el('span', cls, seg.text))
+    emitted += 1
   }
-  clearNode(container)
+}
 
-  const resizeEdge = callbacks?.resizeEdge === 'bottom' ? 'bottom' : 'top'
-  const isResizable = (state.phase === 'ready' || state.phase === 'error') && !state.collapsed
-  if (isResizable) {
-    restoreSavedContainerHeight(container, resizeEdge)
-  } else {
-    clearContainerHeightStyle(container)
-  }
+function buildExplainVisualOrRawSection(container, state, callbacks, viewState) {
+  const plan = state.explainPlan
+  if (!plan) return null
 
-  if (isResizable && resizeEdge === 'top') {
-    container.appendChild(createAiPanelResizer(container, resizeEdge, callbacks?.onResize))
-  }
-
-  const header = el('div', 'datanoa-ai-explain-bar')
-  const titleGroup = el('div', 'datanoa-ai-explain-title-group')
-  titleGroup.appendChild(el('span', 'datanoa-ai-explain-title', 'Execution Plan Analysis'))
-
-  if (state.phase === 'ready' && state.result && typeof state.result.durationMs === 'number') {
-    const metaPill = el(
-      'span',
-      'datanoa-ai-pill',
-      formatExplainMetaBadge(state.result.durationMs, state.result.language)
+  if (viewState.activeView === 'raw') {
+    const rawWrap = el('div', 'datanoa-explain-raw-wrap')
+    const hasPlanRawText = typeof plan.rawText === 'string' && plan.rawText.length > 0
+    const hasPassedRawText =
+      typeof state.rawPlanText === 'string' && state.rawPlanText.length > 0
+    const isNormalizedFallback = !hasPlanRawText && !hasPassedRawText
+    const rawText = hasPlanRawText
+      ? plan.rawText
+      : hasPassedRawText
+        ? state.rawPlanText
+        : JSON.stringify(plan, null, 2)
+    const frame = el('div', 'datanoa-explain-frame')
+    const rawBar = el('div', 'datanoa-explain-summary-bar')
+    const pills = el('div', 'datanoa-explain-summary-pills')
+    appendExplainMetaSegments(pills, [
+      { text: plan.format || 'raw-text' },
+      { text: `${plan.nodeCount ?? 0} nodes` },
+      ...(isNormalizedFallback ? [{ text: 'Normalized JSON', warn: true }] : []),
+    ])
+    const acts = el('div', 'datanoa-explain-summary-actions')
+    const copyBtnLabel = isNormalizedFallback ? 'Copy Normalized Plan' : 'Copy Raw Plan'
+    const copyToastLabel = isNormalizedFallback
+      ? 'Summarized / Normalized Plan'
+      : 'Raw EXPLAIN plan'
+    const copyRawBtn = el(
+      'button',
+      'btn btn-ghost btn-sm datanoa-ai-btn datanoa-explain-copy-raw-btn',
+      copyBtnLabel
     )
-    titleGroup.appendChild(metaPill)
-  }
-  appendPanelPrivacyPills(titleGroup, state)
-  header.appendChild(titleGroup)
+    copyRawBtn.type = 'button'
+    copyRawBtn.addEventListener('click', () => {
+      triggerExplainCopy(container, copyRawBtn, callbacks, rawText, copyToastLabel)
+    })
+    acts.appendChild(copyRawBtn)
+    rawBar.appendChild(pills)
+    rawBar.appendChild(acts)
+    frame.appendChild(rawBar)
 
-  const controls = el('div', 'datanoa-ai-explain-controls')
-
-  if (state.phase === 'loading') {
-    const cancelBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Cancel')
-    cancelBtn.type = 'button'
-    cancelBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onCancel?.())
-    controls.appendChild(cancelBtn)
-  } else if (!state.aiEnabled || !state.aiReady) {
-    const setupBtn = el('button', 'btn btn-primary btn-sm datanoa-ai-btn', 'Configure Explain & Fix AI')
-    setupBtn.type = 'button'
-    setupBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onConfigureAi?.())
-    controls.appendChild(setupBtn)
-  } else {
-    const label = state.phase === 'ready' || state.phase === 'error' ? 'Re-analyze' : 'Analyze with AI'
-    const cls = state.phase === 'idle' ? 'btn btn-primary btn-sm datanoa-ai-btn' : 'btn btn-ghost btn-sm datanoa-ai-btn'
-    const analyzeBtn = el('button', cls, label)
-    analyzeBtn.type = 'button'
-    analyzeBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onAnalyze?.())
-    controls.appendChild(analyzeBtn)
-
-    if (state.phase === 'ready') {
-      const collapseBtn = el(
-        'button',
-        'btn btn-ghost btn-sm datanoa-ai-btn',
-        state.collapsed ? 'Expand' : 'Collapse'
+    if (isNormalizedFallback) {
+      const notice = el(
+        'div',
+        'datanoa-ai-inline-warn',
+        'Summarized / Normalized Plan (raw output truncated for size)'
       )
-      collapseBtn.type = 'button'
-      collapseBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onToggleCollapsed?.())
-      controls.appendChild(collapseBtn)
+      notice.setAttribute('role', 'note')
+      rawWrap.appendChild(notice)
+    }
+
+    const pre = el('pre', 'datanoa-ai-code datanoa-explain-raw-pre', rawText)
+    frame.appendChild(pre)
+    rawWrap.appendChild(frame)
+    return rawWrap
+  }
+
+  const wrap = el('div', 'datanoa-explain-visual-wrap')
+  const palette = resolveExplainSvgPaletteFromDom(container)
+  const svgRes = renderExplainPlanSvg(plan, { palette })
+
+  const frame = el('div', 'datanoa-explain-frame')
+  const summaryBar = el('div', 'datanoa-explain-summary-bar')
+  const pills = el('div', 'datanoa-explain-summary-pills')
+  const metaSegments = [
+    { text: svgRes.summary.format },
+    { text: `${svgRes.summary.nodeCount} node${svgRes.summary.nodeCount === 1 ? '' : 's'}` },
+  ]
+  if (svgRes.summary.planningTimeMs !== null) {
+    metaSegments.push({ text: `Plan ${formatExplainDuration(svgRes.summary.planningTimeMs)}` })
+  }
+  if (svgRes.summary.executionTimeMs !== null) {
+    metaSegments.push({ text: `Exec ${formatExplainDuration(svgRes.summary.executionTimeMs)}` })
+  }
+  if (svgRes.summary.totalCost !== null) {
+    metaSegments.push({ text: `Cost ${formatPopoverMetric(svgRes.summary.totalCost)}` })
+  }
+  if (svgRes.summary.warningCount > 0) {
+    metaSegments.push({
+      text: `${svgRes.summary.warningCount} warning${svgRes.summary.warningCount === 1 ? '' : 's'}`,
+      warn: true,
+    })
+  }
+  appendExplainMetaSegments(pills, metaSegments)
+
+  const actions = el('div', 'datanoa-explain-summary-actions')
+  const zoomGroup = el('div', 'datanoa-explain-zoom-group')
+  const zoomOutBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', '−')
+  zoomOutBtn.type = 'button'
+  zoomOutBtn.setAttribute('aria-label', 'Zoom out EXPLAIN tree')
+  const zoomResetBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', '100%')
+  zoomResetBtn.type = 'button'
+  zoomResetBtn.setAttribute('aria-label', 'Reset EXPLAIN tree zoom to 100%')
+  const zoomInBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', '+')
+  zoomInBtn.type = 'button'
+  zoomInBtn.setAttribute('aria-label', 'Zoom in EXPLAIN tree')
+  const zoomFitBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn datanoa-explain-fit-btn', 'Fit')
+  zoomFitBtn.type = 'button'
+  zoomFitBtn.setAttribute('aria-label', 'Fit EXPLAIN tree to view')
+  zoomGroup.appendChild(zoomOutBtn)
+  zoomGroup.appendChild(zoomResetBtn)
+  zoomGroup.appendChild(zoomInBtn)
+  zoomGroup.appendChild(zoomFitBtn)
+
+  const copySvgBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn datanoa-explain-copy-svg-btn', 'Copy SVG')
+  copySvgBtn.type = 'button'
+  copySvgBtn.addEventListener('click', () => {
+    triggerExplainCopy(container, copySvgBtn, callbacks, svgRes.svg, 'SVG')
+  })
+  actions.appendChild(zoomGroup)
+  actions.appendChild(copySvgBtn)
+  summaryBar.appendChild(pills)
+  summaryBar.appendChild(actions)
+  frame.appendChild(summaryBar)
+
+  if (!plan.root || svgRes.nodes.length === 0) {
+    wrap.appendChild(frame)
+    wrap.appendChild(
+      el(
+        'p',
+        'datanoa-ai-hint',
+        'No structured tree nodes could be extracted for this plan. Switch to Raw Plan to inspect the raw output.'
+      )
+    )
+    return wrap
+  }
+
+  const viewportEl = el('div', 'datanoa-explain-svg-viewport')
+  const idealHeight = Math.min(320, Math.max(140, Math.ceil(svgRes.height) + 12))
+  if (viewportEl.style) {
+    viewportEl.style.height = `${idealHeight}px`
+  }
+  const stageEl = el('div', 'datanoa-explain-svg-stage')
+  const svgNode = parseSvgMarkupSafe(svgRes.svg)
+  if (svgNode) {
+    stageEl.appendChild(svgNode)
+  }
+  viewportEl.appendChild(stageEl)
+
+  const computeCenteredViewport = (rectWidth, rectHeight, scaleOverride) => {
+    const viewW = rectWidth > 0 ? rectWidth : svgRes.width
+    const viewH = rectHeight > 0 ? rectHeight : idealHeight
+    const fitScale =
+      scaleOverride !== undefined
+        ? scaleOverride
+        : Math.min(
+            1,
+            Math.max(
+              0.35,
+              Math.min(
+                Math.max(80, viewW - 16) / Math.max(1, svgRes.width),
+                Math.max(80, viewH - 8) / Math.max(1, svgRes.height)
+              )
+            )
+          )
+    const x = Math.max(0, (viewW - svgRes.width * fitScale) / 2)
+    const y = Math.max(0, (viewH - svgRes.height * fitScale) / 2)
+    return { x, y, scale: fitScale }
+  }
+
+  const syncStageTransform = () => {
+    const rect = viewportEl.getBoundingClientRect?.()
+    viewState.viewport = clampExplainViewport(
+      viewState.viewport,
+      svgRes.width,
+      svgRes.height,
+      rect && rect.width > 0 && rect.height > 0 ? { width: rect.width, height: rect.height } : undefined
+    )
+    if (stageEl.style) {
+      stageEl.style.transform = `translate(${viewState.viewport.x}px, ${viewState.viewport.y}px) scale(${viewState.viewport.scale})`
+    }
+    zoomResetBtn.textContent = `${Math.round(viewState.viewport.scale * 100)}%`
+  }
+
+  const syncSelectedSvgNodeAttr = () => {
+    if (typeof stageEl.querySelectorAll !== 'function') return
+    for (const g of stageEl.querySelectorAll('.datanoa-explain-node')) {
+      const id = g.getAttribute?.('data-node-id') || g.dataset?.nodeId || ''
+      if (id && id === viewState.selectedNodeId) {
+        g.setAttribute?.('data-selected', 'true')
+        g.setAttribute?.('aria-pressed', 'true')
+      } else {
+        g.removeAttribute?.('data-selected')
+        g.setAttribute?.('aria-pressed', 'false')
+      }
     }
   }
 
-  header.appendChild(controls)
-  container.appendChild(header)
+  const initialRect = viewportEl.getBoundingClientRect?.()
+  if (!viewState.viewportInitialized && initialRect && initialRect.width > 0) {
+    viewState.viewport = computeCenteredViewport(initialRect.width, initialRect.height || idealHeight)
+    viewState.viewportInitialized = true
+  }
 
-  if (state.phase === 'idle') {
-    if (!state.aiEnabled || !state.aiReady) {
-      const scrollWrap = el('div', 'datanoa-ai-panel-scroll')
-      const note = !state.aiEnabled
-        ? 'Explain & Fix AI is turned off. Enable Explain & Fix in AI SQL Assistant settings to analyze execution plans.'
-        : 'Explain & Fix AI setup is incomplete. Configure provider credentials in AI SQL Assistant settings to analyze this EXPLAIN plan.'
-      scrollWrap.appendChild(el('p', 'datanoa-ai-hint', note))
-      container.appendChild(scrollWrap)
+  syncStageTransform()
+  syncSelectedSvgNodeAttr()
+
+  zoomOutBtn.addEventListener('click', () => {
+    viewState.viewportInitialized = true
+    viewState.viewport = { ...viewState.viewport, scale: viewState.viewport.scale / 1.2 }
+    syncStageTransform()
+  })
+  zoomInBtn.addEventListener('click', () => {
+    viewState.viewportInitialized = true
+    viewState.viewport = { ...viewState.viewport, scale: viewState.viewport.scale * 1.2 }
+    syncStageTransform()
+  })
+  zoomResetBtn.addEventListener('click', () => {
+    viewState.viewportInitialized = true
+    const rect = viewportEl.getBoundingClientRect?.()
+    viewState.viewport =
+      rect && rect.width > 0
+        ? computeCenteredViewport(rect.width, rect.height || idealHeight, 1)
+        : { x: 0, y: 0, scale: 1 }
+    syncStageTransform()
+  })
+  zoomFitBtn.addEventListener('click', () => {
+    viewState.viewportInitialized = true
+    const rect = viewportEl.getBoundingClientRect?.()
+    viewState.viewport =
+      rect && rect.width > 0
+        ? computeCenteredViewport(rect.width, rect.height || idealHeight)
+        : { x: 0, y: 0, scale: 1 }
+    syncStageTransform()
+  })
+
+  viewportEl.addEventListener('wheel', (ev) => {
+    if (!ev.ctrlKey && !ev.metaKey) return
+    ev.preventDefault?.()
+    viewState.viewportInitialized = true
+    const factor = ev.deltaY < 0 ? 1.12 : 1 / 1.12
+    viewState.viewport = { ...viewState.viewport, scale: viewState.viewport.scale * factor }
+    syncStageTransform()
+  }, { passive: false })
+
+  let isPanning = false
+  let panMoved = false
+  let panStartX = 0
+  let panStartY = 0
+  let originX = 0
+  let originY = 0
+
+  const onWindowMove = (moveEv) => {
+    if (!isPanning) return
+    const dx = (Number(moveEv.clientX) || 0) - panStartX
+    const dy = (Number(moveEv.clientY) || 0) - panStartY
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+      panMoved = true
     }
-    return
+    viewState.viewportInitialized = true
+    viewState.viewport = { ...viewState.viewport, x: originX + dx, y: originY + dy }
+    syncStageTransform()
   }
 
-  if (state.phase === 'loading') {
-    const scrollWrap = el('div', 'datanoa-ai-panel-scroll')
-    scrollWrap.appendChild(createAiLoadingNode('Analyzing execution plan and index opportunities...'))
-    container.appendChild(scrollWrap)
-    return
+  const onWindowUp = () => {
+    if (!isPanning) return
+    isPanning = false
+    viewportEl.classList?.remove?.('is-panning')
   }
 
-  if (state.phase === 'error') {
-    const scrollWrap = el('div', 'datanoa-ai-panel-scroll')
-    const errWrap = el('div', 'datanoa-ai-error-box')
-    errWrap.setAttribute('role', 'alert')
-    errWrap.appendChild(el('div', 'datanoa-ai-error-text', state.error || 'Could not analyze execution plan'))
-    const errActions = el('div', 'datanoa-ai-row-actions')
-    const retryBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Retry')
-    retryBtn.type = 'button'
-    retryBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onAnalyze?.())
-    const cfgBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'AI Settings')
-    cfgBtn.type = 'button'
-    cfgBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onConfigureAi?.())
-    errActions.appendChild(retryBtn)
-    errActions.appendChild(cfgBtn)
-    errWrap.appendChild(errActions)
-    scrollWrap.appendChild(errWrap)
-    container.appendChild(scrollWrap)
-    if (isResizable && resizeEdge === 'bottom') {
-      container.appendChild(createAiPanelResizer(container, resizeEdge, callbacks?.onResize))
+  viewportEl.addEventListener('mousedown', (ev) => {
+    if (ev.button !== undefined && ev.button !== 0) return
+    if (ev.target?.closest?.('.datanoa-explain-node')) return
+    isPanning = true
+    panMoved = false
+    panStartX = Number(ev.clientX) || 0
+    panStartY = Number(ev.clientY) || 0
+    originX = viewState.viewport.x
+    originY = viewState.viewport.y
+    viewportEl.classList?.add?.('is-panning')
+  })
+
+  let rafId = null
+  if (
+    !viewState.viewportInitialized &&
+    typeof requestAnimationFrame === 'function'
+  ) {
+    rafId = requestAnimationFrame(() => {
+      rafId = null
+      if (viewState.viewportInitialized || viewportEl.isConnected === false) return
+      const rect = viewportEl.getBoundingClientRect?.()
+      if (!rect || rect.width <= 0) return
+      viewState.viewport = computeCenteredViewport(rect.width, rect.height || idealHeight)
+      viewState.viewportInitialized = true
+      syncStageTransform()
+    })
+  }
+
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('mousemove', onWindowMove)
+    window.addEventListener('mouseup', onWindowUp)
+    explainViewportCleanupMap.set(container, () => {
+      window.removeEventListener('mousemove', onWindowMove)
+      window.removeEventListener('mouseup', onWindowUp)
+      if (rafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(rafId)
+        rafId = null
+      }
+    })
+  } else if (rafId !== null && typeof cancelAnimationFrame === 'function') {
+    explainViewportCleanupMap.set(container, () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId)
+        rafId = null
+      }
+    })
+  }
+
+  const popoverSlot = el('div', 'datanoa-explain-popover-slot')
+  const renderPopoverSlot = () => {
+    clearNode(popoverSlot)
+    if (!viewState.selectedNodeId) return
+    const match = svgRes.nodes.find((item) => item.id === viewState.selectedNodeId)
+    if (!match) return
+    popoverSlot.appendChild(
+      renderExplainNodePopover(match.node, () => {
+        viewState.selectedNodeId = null
+        syncSelectedSvgNodeAttr()
+        renderPopoverSlot()
+      })
+    )
+  }
+
+  const toggleSvgNodeSelection = (nodeGroup) => {
+    if (!nodeGroup) return
+    const nodeId = nodeGroup.getAttribute?.('data-node-id') || nodeGroup.dataset?.nodeId || ''
+    if (!nodeId) return
+    viewState.selectedNodeId = viewState.selectedNodeId === nodeId ? null : nodeId
+    syncSelectedSvgNodeAttr()
+    renderPopoverSlot()
+  }
+
+  viewportEl.addEventListener('click', (ev) => {
+    if (panMoved) return
+    const nodeGroup = ev.target?.closest?.('.datanoa-explain-node')
+    toggleSvgNodeSelection(nodeGroup)
+  })
+
+  viewportEl.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter' && ev.key !== ' ') return
+    const nodeGroup = ev.target?.closest?.('.datanoa-explain-node')
+    if (!nodeGroup) return
+    ev.preventDefault?.()
+    toggleSvgNodeSelection(nodeGroup)
+  })
+
+  frame.appendChild(viewportEl)
+  wrap.appendChild(frame)
+  renderPopoverSlot()
+  wrap.appendChild(popoverSlot)
+
+  if (Array.isArray(plan.missingIndexes) && plan.missingIndexes.length > 0) {
+    const idxSec = el('div', 'datanoa-ai-section datanoa-explain-missing-indexes')
+    idxSec.appendChild(el('div', 'datanoa-ai-section-label', 'Missing Index Hints (from EXPLAIN plan)'))
+    const list = el('div', 'datanoa-ai-list')
+    for (const mi of plan.missingIndexes) {
+      if (!mi?.ddl) continue
+      const card = el('div', 'datanoa-ai-item')
+      const top = el('div', 'datanoa-ai-item-top')
+      const reasonText =
+        typeof mi.impact === 'number'
+          ? `${mi.table} · Impact ${mi.impact}%`
+          : mi.table || 'Suggested index'
+      top.appendChild(el('span', 'datanoa-ai-item-detail', reasonText))
+      const copyDdlBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Copy DDL')
+      copyDdlBtn.type = 'button'
+      copyDdlBtn.addEventListener('click', () => {
+        triggerExplainCopy(container, copyDdlBtn, callbacks, mi.ddl, 'DDL')
+      })
+      top.appendChild(copyDdlBtn)
+      card.appendChild(top)
+      card.appendChild(createHighlightedSqlPre(mi.ddl, state.dialect || plan.dialect))
+      list.appendChild(card)
     }
-    return
+    if (list.childNodes.length > 0) {
+      idxSec.appendChild(list)
+      wrap.appendChild(idxSec)
+    }
   }
 
-  if (state.collapsed || !state.result) {
-    return
-  }
+  return wrap
+}
 
-  const scrollWrap = el('div', 'datanoa-ai-panel-scroll')
+function buildExplainAiReadyBody(container, state, callbacks) {
   const body = el('div', 'datanoa-ai-explain-body')
   const res = state.result
+  if (!res) return body
 
   const rawCaveats = Array.isArray(res.caveats) ? res.caveats : []
   const unstructuredCaveat = rawCaveats.find((c) => /unstructured/i.test(String(c)))
@@ -1427,7 +2486,9 @@ export function renderSharedExplainAiPanel(container, state, callbacks) {
         top.appendChild(el('span', 'datanoa-ai-item-detail', idx.reason || 'Suggested index'))
         const copyDdlBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Copy DDL')
         copyDdlBtn.type = 'button'
-        copyDdlBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onCopyText?.(idx.ddl, 'DDL'))
+        copyDdlBtn.addEventListener('click', () => {
+          triggerExplainCopy(container, copyDdlBtn, callbacks, idx.ddl, 'DDL')
+        })
         top.appendChild(copyDdlBtn)
         card.appendChild(top)
         card.appendChild(createHighlightedSqlPre(idx.ddl, state.dialect))
@@ -1453,9 +2514,9 @@ export function renderSharedExplainAiPanel(container, state, callbacks) {
 
     const copyBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Copy SQL')
     copyBtn.type = 'button'
-    copyBtn.addEventListener('click', () =>
-      explainPanelCallbacksMap.get(container)?.onCopyText?.(res.optimizedSql, 'Optimized SQL')
-    )
+    copyBtn.addEventListener('click', () => {
+      triggerExplainCopy(container, copyBtn, callbacks, res.optimizedSql, 'Optimized SQL')
+    })
 
     const newTabBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'New Tab')
     newTabBtn.type = 'button'
@@ -1484,7 +2545,385 @@ export function renderSharedExplainAiPanel(container, state, callbacks) {
     body.appendChild(sec)
   }
 
-  scrollWrap.appendChild(body)
+  return body
+}
+
+export function renderSharedExplainAiPanel(container, state, callbacks) {
+  if (!container) return
+  explainPanelCallbacksMap.set(container, callbacks)
+
+  if (!state || state.phase === 'hidden') {
+    cleanupAiPanelResize(container)
+    cleanupExplainViewportListeners(container)
+    container.hidden = true
+    if (container.dataset) {
+      delete container.dataset.phase
+      delete container.dataset.collapsed
+      delete container.dataset.aiPolicy
+      delete container.dataset.explainView
+    }
+    clearContainerHeightStyle(container)
+    clearNode(container)
+    return
+  }
+
+  const collapsedFlag = Boolean(state.collapsed)
+  const hasExplainPlan = Boolean(state.explainPlan)
+  const viewState = getOrCreateExplainViewState(container, state)
+
+  if (
+    state.phase === 'loading' &&
+    !collapsedFlag &&
+    viewState.activeView === 'ai' &&
+    !container.hidden &&
+    container.dataset?.phase === 'loading' &&
+    container.dataset?.collapsed === 'false' &&
+    container.dataset?.explainView === 'ai' &&
+    typeof container.querySelector === 'function' &&
+    container.querySelector('.datanoa-ai-loading-box')
+  ) {
+    return
+  }
+
+  cleanupAiPanelResize(container)
+  cleanupExplainViewportListeners(container)
+  ensureExplainVisualStyles()
+  const effectivePolicy = resolveEffectiveExplainAiPolicy(state)
+
+  container.hidden = false
+  container.className = 'datanoa-ai-explain-panel'
+  if (container.dataset) {
+    container.dataset.phase = String(state.phase || '')
+    container.dataset.collapsed = collapsedFlag ? 'true' : 'false'
+    container.dataset.aiPolicy = effectivePolicy
+    container.dataset.explainView = viewState.activeView
+  }
+  clearNode(container)
+
+  const resizeEdge = callbacks?.resizeEdge === 'bottom' ? 'bottom' : 'top'
+  const isResizable =
+    (state.phase === 'ready' || state.phase === 'error' || hasExplainPlan) && !collapsedFlag
+  if (isResizable) {
+    restoreSavedContainerHeight(container, resizeEdge)
+  } else {
+    clearContainerHeightStyle(container)
+  }
+
+  if (isResizable && resizeEdge === 'top') {
+    container.appendChild(createAiPanelResizer(container, resizeEdge, callbacks?.onResize))
+  }
+
+  const switchExplainView = (nextView) => {
+    const cb = explainPanelCallbacksMap.get(container)
+    if (viewState.activeView === nextView && !collapsedFlag) return
+    viewState.activeView = nextView
+    cb?.onExplainViewChange?.(nextView)
+    if (collapsedFlag && typeof cb?.onToggleCollapsed === 'function') {
+      cb.onToggleCollapsed()
+      if (container.dataset?.collapsed === 'true') {
+        renderSharedExplainAiPanel(container, { ...state, explainViewMode: nextView, collapsed: false }, cb)
+      }
+      return
+    }
+    renderSharedExplainAiPanel(container, { ...state, explainViewMode: nextView }, cb)
+  }
+
+  const header = el('div', 'datanoa-ai-explain-bar')
+  const titleGroup = el('div', 'datanoa-ai-explain-title-group')
+  titleGroup.appendChild(el('span', 'datanoa-ai-explain-title', 'Execution Plan Analysis'))
+
+  if (state.phase === 'ready' && state.result && typeof state.result.durationMs === 'number') {
+    const metaPill = el(
+      'span',
+      'datanoa-ai-pill',
+      formatExplainMetaBadge(state.result.durationMs, state.result.language)
+    )
+    titleGroup.appendChild(metaPill)
+  }
+  appendPanelPrivacyPills(titleGroup, state)
+  appendAiPolicyPill(titleGroup, effectivePolicy)
+  header.appendChild(titleGroup)
+
+  const controls = el('div', 'datanoa-ai-explain-controls')
+
+  if (hasExplainPlan) {
+    const switcher = el('div', 'datanoa-explain-view-switcher')
+    switcher.setAttribute('role', 'tablist')
+    switcher.setAttribute('aria-label', 'EXPLAIN view mode')
+
+    const visualTab = el('button', 'datanoa-explain-view-tab', 'Visual Tree')
+    visualTab.type = 'button'
+    visualTab.setAttribute('role', 'tab')
+    visualTab.setAttribute('data-explain-view', 'visual')
+    visualTab.setAttribute('aria-selected', viewState.activeView === 'visual' ? 'true' : 'false')
+    visualTab.addEventListener('click', () => switchExplainView('visual'))
+
+    const rawTab = el('button', 'datanoa-explain-view-tab', 'Raw Plan')
+    rawTab.type = 'button'
+    rawTab.setAttribute('role', 'tab')
+    rawTab.setAttribute('data-explain-view', 'raw')
+    rawTab.setAttribute('aria-selected', viewState.activeView === 'raw' ? 'true' : 'false')
+    rawTab.addEventListener('click', () => switchExplainView('raw'))
+
+    const aiTab = el('button', 'datanoa-explain-view-tab')
+    aiTab.type = 'button'
+    aiTab.setAttribute('role', 'tab')
+    aiTab.setAttribute('data-explain-view', 'ai')
+    aiTab.setAttribute('aria-selected', viewState.activeView === 'ai' ? 'true' : 'false')
+    aiTab.appendChild(createTextOrSpan('AI Analysis'))
+    if (state.phase === 'loading' || state.phase === 'ready' || state.phase === 'error') {
+      const dotTone = state.phase === 'loading' ? 'info' : state.phase === 'ready' ? 'ok' : 'danger'
+      const dot = el('span', 'datanoa-explain-tab-dot')
+      dot.setAttribute('data-tone', dotTone)
+      dot.setAttribute('aria-hidden', 'true')
+      aiTab.appendChild(dot)
+    }
+    aiTab.addEventListener('click', () => switchExplainView('ai'))
+
+    switcher.appendChild(visualTab)
+    switcher.appendChild(rawTab)
+    switcher.appendChild(aiTab)
+    controls.appendChild(switcher)
+  }
+
+  const triggerAnalyze = () => {
+    const cb = explainPanelCallbacksMap.get(container)
+    if (effectivePolicy === 'never') return
+    if (hasExplainPlan) {
+      viewState.activeView = 'ai'
+      cb?.onExplainViewChange?.('ai')
+    }
+    if (effectivePolicy === 'ask') {
+      viewState.pendingAskConfirm = true
+      if (collapsedFlag && typeof cb?.onToggleCollapsed === 'function') {
+        cb.onToggleCollapsed()
+      }
+      renderSharedExplainAiPanel(
+        container,
+        {
+          ...state,
+          ...(hasExplainPlan ? { explainViewMode: 'ai' } : {}),
+          collapsed: false,
+        },
+        cb
+      )
+      return
+    }
+    cb?.onAnalyze?.({
+      confirmed: true,
+      ...(state.activeSchema ? { activeSchema: state.activeSchema } : {}),
+    })
+  }
+
+  if (state.phase === 'loading') {
+    const cancelBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Cancel')
+    cancelBtn.type = 'button'
+    cancelBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onCancel?.())
+    controls.appendChild(cancelBtn)
+  } else if (effectivePolicy === 'never') {
+    const label = state.phase === 'ready' || state.phase === 'error' ? 'Re-analyze' : 'Analyze with AI'
+    const disabledBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', label)
+    disabledBtn.type = 'button'
+    disabledBtn.disabled = true
+    disabledBtn.setAttribute('aria-disabled', 'true')
+    disabledBtn.setAttribute('data-ai-policy', 'never')
+    disabledBtn.title = 'AI assistance is disabled for this connection (policy: never). Visual EXPLAIN Tree remains available offline.'
+    controls.appendChild(disabledBtn)
+  } else if (!state.aiEnabled || !state.aiReady) {
+    const setupBtn = el('button', 'btn btn-primary btn-sm datanoa-ai-btn', 'Configure Explain & Fix AI')
+    setupBtn.type = 'button'
+    setupBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onConfigureAi?.())
+    controls.appendChild(setupBtn)
+  } else {
+    const label = state.phase === 'ready' || state.phase === 'error' ? 'Re-analyze' : 'Analyze with AI'
+    const cls =
+      state.phase === 'idle' && (!hasExplainPlan || viewState.activeView !== 'ai')
+        ? 'btn btn-primary btn-sm datanoa-ai-btn'
+        : 'btn btn-ghost btn-sm datanoa-ai-btn'
+    const analyzeBtn = el('button', cls, label)
+    analyzeBtn.type = 'button'
+    analyzeBtn.addEventListener('click', triggerAnalyze)
+    controls.appendChild(analyzeBtn)
+  }
+
+  const canCollapse = hasExplainPlan || state.phase === 'ready' || collapsedFlag
+  if (canCollapse) {
+    const collapseBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn datanoa-explain-collapse-btn')
+    collapseBtn.type = 'button'
+    collapseBtn.setAttribute('aria-expanded', collapsedFlag ? 'false' : 'true')
+    collapseBtn.setAttribute(
+      'aria-label',
+      collapsedFlag ? 'Expand Execution Plan panel' : 'Collapse Execution Plan panel'
+    )
+    collapseBtn.title = collapsedFlag ? 'Expand Execution Plan' : 'Collapse Execution Plan'
+    collapseBtn.appendChild(createChevronDownIcon())
+    collapseBtn.appendChild(el('span', 'datanoa-explain-collapse-label', collapsedFlag ? 'Expand' : 'Collapse'))
+    collapseBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onToggleCollapsed?.())
+    controls.appendChild(collapseBtn)
+  }
+
+  header.appendChild(controls)
+  container.appendChild(header)
+
+  if (collapsedFlag) {
+    return
+  }
+
+  if (viewState.pendingAskConfirm && effectivePolicy === 'ask' && state.phase !== 'loading') {
+    const confirmBar = el('div', 'datanoa-ai-confirm-bar')
+    confirmBar.setAttribute('role', 'region')
+    confirmBar.setAttribute('aria-label', 'Confirm AI EXPLAIN request')
+    const schemaNote = state.activeSchema ? ` (schema: ${state.activeSchema})` : ''
+    const hostNote = state.host ? ` to ${state.host}` : ''
+    const prodNote =
+      state.colorTag === 'prod' || String(state.colorTag).toLowerCase() === 'production'
+        ? ' [PROD connection]'
+        : ''
+    confirmBar.appendChild(
+      el(
+        'span',
+        'datanoa-ai-confirm-text',
+        `Confirm sending sanitized SQL, schema${schemaNote}, and EXPLAIN plan${hostNote}${prodNote}?`
+      )
+    )
+    const confirmActions = el('div', 'datanoa-ai-row-actions')
+    const confirmBtn = el(
+      'button',
+      'btn btn-primary btn-sm datanoa-ai-btn datanoa-ai-confirm-analyze-btn',
+      'Confirm & Analyze'
+    )
+    confirmBtn.type = 'button'
+    confirmBtn.addEventListener('click', () => {
+      viewState.pendingAskConfirm = false
+      if (hasExplainPlan) {
+        viewState.activeView = 'ai'
+        explainPanelCallbacksMap.get(container)?.onExplainViewChange?.('ai')
+      }
+      explainPanelCallbacksMap.get(container)?.onAnalyze?.({
+        confirmed: true,
+        ...(state.activeSchema ? { activeSchema: state.activeSchema } : {}),
+      })
+    })
+    const cancelConfirmBtn = el(
+      'button',
+      'btn btn-ghost btn-sm datanoa-ai-btn datanoa-ai-confirm-cancel-btn',
+      'Cancel'
+    )
+    cancelConfirmBtn.type = 'button'
+    cancelConfirmBtn.addEventListener('click', () => {
+      viewState.pendingAskConfirm = false
+      renderSharedExplainAiPanel(container, state, explainPanelCallbacksMap.get(container))
+    })
+    confirmActions.appendChild(confirmBtn)
+    confirmActions.appendChild(cancelConfirmBtn)
+    confirmBar.appendChild(confirmActions)
+    container.appendChild(confirmBar)
+  }
+
+  if (hasExplainPlan && (viewState.activeView === 'visual' || viewState.activeView === 'raw')) {
+    const scrollWrap = el('div', 'datanoa-ai-panel-scroll')
+    const visualNode = buildExplainVisualOrRawSection(container, state, callbacks, viewState)
+    if (visualNode) {
+      scrollWrap.appendChild(visualNode)
+    }
+    container.appendChild(scrollWrap)
+    if (isResizable && resizeEdge === 'bottom') {
+      container.appendChild(createAiPanelResizer(container, resizeEdge, callbacks?.onResize))
+    }
+    return
+  }
+
+  // Dedicated AI Analysis view (activeView === 'ai' or no structured explainPlan)
+  if (state.phase === 'idle') {
+    if (effectivePolicy === 'never') {
+      const scrollWrap = el('div', 'datanoa-ai-panel-scroll')
+      scrollWrap.appendChild(
+        el(
+          'p',
+          'datanoa-ai-hint',
+          hasExplainPlan
+            ? 'AI assistance is disabled for this connection (policy: never). Switch to Visual Tree or Raw Plan to inspect offline.'
+            : 'AI assistance is disabled for this connection (policy: never).'
+        )
+      )
+      container.appendChild(scrollWrap)
+      if (isResizable && resizeEdge === 'bottom') {
+        container.appendChild(createAiPanelResizer(container, resizeEdge, callbacks?.onResize))
+      }
+      return
+    }
+    if (!state.aiEnabled || !state.aiReady) {
+      const scrollWrap = el('div', 'datanoa-ai-panel-scroll')
+      const note = !state.aiEnabled
+        ? 'Explain & Fix AI is turned off. Enable Explain & Fix in AI SQL Assistant settings to analyze execution plans.'
+        : 'Explain & Fix AI setup is incomplete. Configure provider credentials in AI SQL Assistant settings to analyze this EXPLAIN plan.'
+      scrollWrap.appendChild(el('p', 'datanoa-ai-hint', note))
+      container.appendChild(scrollWrap)
+      if (isResizable && resizeEdge === 'bottom') {
+        container.appendChild(createAiPanelResizer(container, resizeEdge, callbacks?.onResize))
+      }
+      return
+    }
+    if (hasExplainPlan) {
+      const scrollWrap = el('div', 'datanoa-ai-panel-scroll')
+      const emptyBox = el('div', 'datanoa-explain-ai-empty')
+      emptyBox.appendChild(
+        el(
+          'p',
+          'datanoa-ai-hint',
+          'Run AI Analysis to detect bottlenecks, suggest indexes, and rewrite this query.'
+        )
+      )
+      const runBtn = el('button', 'btn btn-primary btn-sm datanoa-ai-btn', 'Analyze with AI')
+      runBtn.type = 'button'
+      runBtn.addEventListener('click', triggerAnalyze)
+      emptyBox.appendChild(runBtn)
+      scrollWrap.appendChild(emptyBox)
+      container.appendChild(scrollWrap)
+      if (isResizable && resizeEdge === 'bottom') {
+        container.appendChild(createAiPanelResizer(container, resizeEdge, callbacks?.onResize))
+      }
+    }
+    return
+  }
+
+  if (state.phase === 'loading') {
+    const scrollWrap = el('div', 'datanoa-ai-panel-scroll')
+    scrollWrap.appendChild(createAiLoadingNode('Analyzing execution plan and index opportunities...'))
+    container.appendChild(scrollWrap)
+    return
+  }
+
+  if (state.phase === 'error') {
+    const scrollWrap = el('div', 'datanoa-ai-panel-scroll')
+    const errWrap = el('div', 'datanoa-ai-error-box')
+    errWrap.setAttribute('role', 'alert')
+    errWrap.appendChild(el('div', 'datanoa-ai-error-text', state.error || 'Could not analyze execution plan'))
+    const errActions = el('div', 'datanoa-ai-row-actions')
+    const retryBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Retry')
+    retryBtn.type = 'button'
+    retryBtn.disabled = effectivePolicy === 'never'
+    retryBtn.addEventListener('click', triggerAnalyze)
+    const cfgBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'AI Settings')
+    cfgBtn.type = 'button'
+    cfgBtn.addEventListener('click', () => explainPanelCallbacksMap.get(container)?.onConfigureAi?.())
+    errActions.appendChild(retryBtn)
+    errActions.appendChild(cfgBtn)
+    errWrap.appendChild(errActions)
+    scrollWrap.appendChild(errWrap)
+    container.appendChild(scrollWrap)
+    if (isResizable && resizeEdge === 'bottom') {
+      container.appendChild(createAiPanelResizer(container, resizeEdge, callbacks?.onResize))
+    }
+    return
+  }
+
+  if (!state.result) {
+    return
+  }
+
+  const scrollWrap = el('div', 'datanoa-ai-panel-scroll')
+  scrollWrap.appendChild(buildExplainAiReadyBody(container, state, callbacks))
   container.appendChild(scrollWrap)
   if (isResizable && resizeEdge === 'bottom') {
     container.appendChild(createAiPanelResizer(container, resizeEdge, callbacks?.onResize))
@@ -1508,21 +2947,28 @@ export function renderSharedAiFixPanel(container, state, callbacks) {
     container.hidden = true
     if (container.dataset) {
       delete container.dataset.phase
+      delete container.dataset.aiPolicy
     }
+    fixPanelViewStateMap.delete(container)
     clearContainerHeightStyle(container)
     clearNode(container)
     return
   }
 
+  ensureExplainVisualStyles()
+  const effectivePolicy = resolveEffectiveExplainAiPolicy(state)
+  const viewState = getOrCreateFixViewState(container, state, effectivePolicy)
+
   container.hidden = false
   container.className = 'datanoa-ai-fix-panel'
   if (container.dataset) {
     container.dataset.phase = String(state.phase || '')
+    container.dataset.aiPolicy = effectivePolicy
   }
   clearNode(container)
 
   const resizeEdge = callbacks?.resizeEdge === 'top' ? 'top' : 'bottom'
-  const isResizable = state.phase === 'ready' || state.phase === 'error'
+  const isResizable = state.phase === 'ready' || state.phase === 'error' || state.phase === 'idle'
   if (isResizable) {
     restoreSavedContainerHeight(container, resizeEdge)
   } else {
@@ -1531,6 +2977,25 @@ export function renderSharedAiFixPanel(container, state, callbacks) {
 
   if (isResizable && resizeEdge === 'top') {
     container.appendChild(createAiPanelResizer(container, resizeEdge, callbacks?.onResize))
+  }
+
+  const dispatchFixRequest = (cb, triggerOptions) => {
+    if (typeof cb?.onFixQuery === 'function') {
+      cb.onFixQuery(triggerOptions)
+    } else {
+      cb?.onRetry?.(triggerOptions)
+    }
+  }
+
+  const triggerFix = () => {
+    const cb = fixPanelCallbacksMap.get(container)
+    if (effectivePolicy === 'never') return
+    if (effectivePolicy === 'ask') {
+      viewState.pendingAskConfirm = true
+      renderSharedAiFixPanel(container, state, cb)
+      return
+    }
+    dispatchFixRequest(cb, { confirmed: true })
   }
 
   const header = el('div', 'datanoa-ai-explain-bar')
@@ -1552,6 +3017,7 @@ export function renderSharedAiFixPanel(container, state, callbacks) {
     }
   }
   appendPanelPrivacyPills(titleGroup, state)
+  appendAiPolicyPill(titleGroup, effectivePolicy)
   header.appendChild(titleGroup)
 
   const controls = el('div', 'datanoa-ai-explain-controls')
@@ -1560,6 +3026,26 @@ export function renderSharedAiFixPanel(container, state, callbacks) {
     cancelBtn.type = 'button'
     cancelBtn.addEventListener('click', () => fixPanelCallbacksMap.get(container)?.onCancel?.())
     controls.appendChild(cancelBtn)
+  } else if (state.phase === 'idle') {
+    if (effectivePolicy === 'never') {
+      const disabledBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn datanoa-ai-fix-trigger-btn', 'Fix with AI')
+      disabledBtn.type = 'button'
+      disabledBtn.disabled = true
+      disabledBtn.setAttribute('aria-disabled', 'true')
+      disabledBtn.setAttribute('data-ai-policy', 'never')
+      disabledBtn.title = 'AI assistance is disabled for this connection (policy: never).'
+      controls.appendChild(disabledBtn)
+    } else if (!state.aiEnabled || !state.aiReady) {
+      const setupBtn = el('button', 'btn btn-primary btn-sm datanoa-ai-btn', 'Configure Explain & Fix AI')
+      setupBtn.type = 'button'
+      setupBtn.addEventListener('click', () => fixPanelCallbacksMap.get(container)?.onConfigureAi?.())
+      controls.appendChild(setupBtn)
+    } else {
+      const fixBtn = el('button', 'btn btn-primary btn-sm datanoa-ai-btn datanoa-ai-fix-trigger-btn', 'Fix with AI')
+      fixBtn.type = 'button'
+      fixBtn.addEventListener('click', triggerFix)
+      controls.appendChild(fixBtn)
+    }
   }
 
   if (state.phase !== 'ready') {
@@ -1571,6 +3057,80 @@ export function renderSharedAiFixPanel(container, state, callbacks) {
 
   header.appendChild(controls)
   container.appendChild(header)
+
+  if (viewState.pendingAskConfirm && effectivePolicy === 'ask' && state.phase !== 'loading') {
+    const confirmBar = el('div', 'datanoa-ai-confirm-bar')
+    confirmBar.setAttribute('role', 'region')
+    confirmBar.setAttribute('aria-label', 'Confirm AI Query Fix request')
+    const hostNote = state.host ? ` to ${state.host}` : ''
+    const prodNote =
+      state.colorTag === 'prod' || String(state.colorTag).toLowerCase() === 'production'
+        ? ' [PROD connection]'
+        : ''
+    confirmBar.appendChild(
+      el(
+        'span',
+        'datanoa-ai-confirm-text',
+        `Confirm sending sanitized SQL, error message, and schema${hostNote}${prodNote}?`
+      )
+    )
+    const confirmActions = el('div', 'datanoa-ai-row-actions')
+    const confirmBtn = el(
+      'button',
+      'btn btn-primary btn-sm datanoa-ai-btn datanoa-ai-confirm-fix-btn',
+      'Confirm & Fix (send SQL)'
+    )
+    confirmBtn.type = 'button'
+    confirmBtn.addEventListener('click', () => {
+      viewState.pendingAskConfirm = false
+      dispatchFixRequest(fixPanelCallbacksMap.get(container), { confirmed: true })
+    })
+    const cancelConfirmBtn = el(
+      'button',
+      'btn btn-ghost btn-sm datanoa-ai-btn datanoa-ai-confirm-cancel-btn',
+      'Cancel'
+    )
+    cancelConfirmBtn.type = 'button'
+    cancelConfirmBtn.addEventListener('click', () => {
+      viewState.pendingAskConfirm = false
+      renderSharedAiFixPanel(container, state, fixPanelCallbacksMap.get(container))
+    })
+    confirmActions.appendChild(confirmBtn)
+    confirmActions.appendChild(cancelConfirmBtn)
+    confirmBar.appendChild(confirmActions)
+    container.appendChild(confirmBar)
+  }
+
+  if (state.phase === 'idle') {
+    const scrollWrap = el('div', 'datanoa-ai-panel-scroll')
+    if (effectivePolicy === 'never') {
+      scrollWrap.appendChild(
+        el(
+          'p',
+          'datanoa-ai-hint datanoa-ai-policy-blocked-msg',
+          'AI assistance is disabled for this connection (policy: never).'
+        )
+      )
+    } else if (!state.aiEnabled || !state.aiReady) {
+      const note = !state.aiEnabled
+        ? 'Explain & Fix AI is turned off. Enable Explain & Fix in AI SQL Assistant settings to suggest SQL fixes.'
+        : 'Explain & Fix AI setup is incomplete. Configure provider credentials in AI SQL Assistant settings to suggest SQL fixes.'
+      scrollWrap.appendChild(el('p', 'datanoa-ai-hint', note))
+    } else if (effectivePolicy === 'ask' && !viewState.pendingAskConfirm) {
+      scrollWrap.appendChild(
+        el(
+          'p',
+          'datanoa-ai-hint',
+          'Explicit confirmation is required before sending SQL from this connection to AI (policy: ask).'
+        )
+      )
+    }
+    container.appendChild(scrollWrap)
+    if (isResizable && resizeEdge === 'bottom') {
+      container.appendChild(createAiPanelResizer(container, resizeEdge, callbacks?.onResize))
+    }
+    return
+  }
 
   if (state.phase === 'loading') {
     const scrollWrap = el('div', 'datanoa-ai-panel-scroll')
@@ -1585,14 +3145,33 @@ export function renderSharedAiFixPanel(container, state, callbacks) {
     const scrollWrap = el('div', 'datanoa-ai-panel-scroll')
     const errWrap = el('div', 'datanoa-ai-error-box')
     errWrap.setAttribute('role', 'alert')
-    errWrap.appendChild(
-      el('div', 'datanoa-ai-error-text', state.error || 'Could not suggest a SQL fix')
-    )
+    const errText =
+      effectivePolicy === 'never'
+        ? state.error || 'AI assistance is disabled for this connection (policy: never).'
+        : state.error || 'Could not suggest a SQL fix'
+    errWrap.appendChild(el('div', 'datanoa-ai-error-text', errText))
+    if (effectivePolicy === 'never') {
+      errWrap.appendChild(
+        el(
+          'div',
+          'datanoa-ai-hint datanoa-ai-policy-blocked-msg',
+          'AI Query Fix is blocked by connection policy (policy: never).'
+        )
+      )
+    }
     const errActions = el('div', 'datanoa-ai-row-actions')
-    if (state.aiEnabled && state.aiReady) {
-      const retryBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn', 'Retry')
+    if (effectivePolicy === 'never') {
+      const retryBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn datanoa-ai-fix-trigger-btn', 'Retry')
       retryBtn.type = 'button'
-      retryBtn.addEventListener('click', () => fixPanelCallbacksMap.get(container)?.onRetry?.())
+      retryBtn.disabled = true
+      retryBtn.setAttribute('aria-disabled', 'true')
+      retryBtn.setAttribute('data-ai-policy', 'never')
+      retryBtn.title = 'AI assistance is disabled for this connection (policy: never).'
+      errActions.appendChild(retryBtn)
+    } else if (state.aiEnabled && state.aiReady) {
+      const retryBtn = el('button', 'btn btn-ghost btn-sm datanoa-ai-btn datanoa-ai-fix-trigger-btn', 'Retry')
+      retryBtn.type = 'button'
+      retryBtn.addEventListener('click', triggerFix)
       errActions.appendChild(retryBtn)
     }
     const cfgLabel = state.aiEnabled && state.aiReady ? 'AI Settings' : 'Configure Explain & Fix AI'

@@ -127,6 +127,230 @@ export const EDITOR_MODALS_STYLE = `
     max-height: none;
   }
 
+  /* ER Diagram View */
+  .datanoa-er-view {
+    flex: 1 1 auto;
+    width: 100%;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-er-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .datanoa-er-toolbar-group {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .datanoa-er-search {
+    width: 180px;
+    min-width: 120px;
+  }
+
+  .datanoa-er-toggle-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11.5px;
+    color: var(--muted, var(--t2, #94a3b8));
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .datanoa-er-viewport {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
+    background: var(--bg);
+    cursor: grab;
+  }
+
+  .datanoa-er-viewport:active {
+    cursor: grabbing;
+  }
+
+  .datanoa-er-world {
+    position: absolute;
+    top: 0;
+    left: 0;
+    transform-origin: 0 0;
+  }
+
+  .datanoa-er-edges-svg {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    overflow: visible;
+  }
+
+  .datanoa-er-edge-path {
+    stroke: var(--border-strong, var(--border, #475569));
+    stroke-width: 1.5;
+    fill: none;
+  }
+
+  .datanoa-er-edge-group.is-cross-schema .datanoa-er-edge-path {
+    stroke: var(--cm-keyword, #a78bfa);
+    stroke-dasharray: 4 3;
+  }
+
+  .datanoa-er-edge-optional {
+    fill: var(--bg);
+    stroke: var(--border-strong, var(--border, #475569));
+    stroke-width: 1.5;
+  }
+
+  .datanoa-er-cards-layer {
+    position: absolute;
+    top: 0;
+    left: 0;
+  }
+
+  .datanoa-er-card {
+    position: absolute;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-control);
+    box-shadow: var(--menu-shadow);
+    overflow: hidden;
+    cursor: grab;
+    user-select: none;
+  }
+
+  .datanoa-er-card.is-selected,
+  .datanoa-er-card.is-search-match {
+    border-color: var(--accent-ring);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-ring) 32%, transparent);
+  }
+
+  .datanoa-er-card.is-search-dimmed {
+    opacity: 0.35;
+  }
+
+  .datanoa-er-card.is-selected {
+    opacity: 1;
+  }
+
+  .datanoa-er-card.is-stub {
+    background: var(--surface);
+    border-style: dashed;
+  }
+
+  .datanoa-er-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    padding: 0 8px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+    font-size: 12px;
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-er-card-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .datanoa-er-col-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 0 8px;
+    font-size: 11px;
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-er-world.is-lod-minimal .datanoa-er-card-cols {
+    display: none;
+  }
+
+  .datanoa-er-col-name {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .datanoa-er-col-type {
+    color: var(--muted, var(--t2, #94a3b8));
+    font-family: var(--mono-font);
+    font-size: 10.5px;
+    flex-shrink: 0;
+  }
+
+  .datanoa-er-key-tag {
+    font-size: 9.5px;
+    font-weight: 700;
+    padding: 0 3px;
+    border-radius: 3px;
+  }
+
+  .datanoa-er-key-tag.is-pk {
+    color: var(--warn);
+  }
+
+  .datanoa-er-key-tag.is-fk {
+    color: var(--info);
+  }
+
+  .datanoa-er-key-tag.is-uk {
+    color: var(--ok);
+  }
+
+  .datanoa-er-empty {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted, var(--t2, #94a3b8));
+    font-size: 13px;
+    pointer-events: none;
+  }
+
+  .datanoa-er-toast {
+    position: absolute;
+    right: 16px;
+    bottom: 16px;
+    z-index: 15;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: var(--popover);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-control);
+    box-shadow: var(--menu-shadow);
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+    font-size: 12px;
+  }
+
   .datanoa-section-title {
     font-size: 12.5px;
     font-weight: 600;
@@ -893,7 +1117,7 @@ export const EDITOR_MODALS_STYLE = `
 
   /* Add / Edit Database Connection Modal (Full Studio) */
   .datanoa-conn-modal {
-    width: min(640px, 94vw);
+    width: min(620px, 94vw);
     max-height: 88vh;
     display: flex;
     flex-direction: column;
@@ -907,7 +1131,11 @@ export const EDITOR_MODALS_STYLE = `
   .datanoa-conn-modal .datanoa-modal-body {
     flex: 1 1 auto;
     min-height: 0;
-    gap: 12px;
+    gap: 10px;
+  }
+
+  .datanoa-conn-modal .datanoa-modal-body > * {
+    flex-shrink: 0;
   }
 
   .datanoa-conn-row {
@@ -971,6 +1199,88 @@ export const EDITOR_MODALS_STYLE = `
     background: var(--surface);
   }
 
+  .datanoa-conn-quick-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-control);
+    background: var(--surface);
+  }
+
+  .datanoa-conn-discovery-section {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
+
+  .datanoa-conn-discovery-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .datanoa-conn-discovery-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+
+  .datanoa-conn-details-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-control);
+    background: color-mix(in srgb, var(--surface) 50%, var(--popover));
+    transition: border-color 180ms ease, background-color 180ms ease;
+  }
+
+  .datanoa-conn-details-card:focus-within {
+    border-color: color-mix(in srgb, var(--accent-ring) 55%, var(--border-strong));
+  }
+
+  .datanoa-conn-details-card.is-form-spotlight {
+    border-color: var(--accent-ring);
+    background: color-mix(in srgb, var(--accent-ring) 7%, var(--popover));
+  }
+
+  .datanoa-conn-details-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .datanoa-conn-details-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .datanoa-conn-source-pill {
+    display: inline-flex;
+    align-items: center;
+    height: 18px;
+    padding: 0 7px;
+    border-radius: 4px;
+    border: 1px solid color-mix(in srgb, var(--info) 38%, var(--border));
+    background: color-mix(in srgb, var(--info) 12%, var(--bg));
+    color: var(--info);
+    font-size: 11px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
   .datanoa-conn-section-label {
     font-size: 11.5px;
     font-weight: 600;
@@ -980,18 +1290,25 @@ export const EDITOR_MODALS_STYLE = `
 
   .datanoa-engine-grid {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 6px;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 4px;
+  }
+
+  @media (max-width: 520px) {
+    .datanoa-engine-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
   }
 
   .datanoa-engine-tile {
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
     align-items: center;
-    justify-content: center;
-    gap: 4px;
-    min-height: 52px;
-    padding: 6px 4px;
+    justify-content: flex-start;
+    gap: 6px;
+    height: 30px;
+    min-height: 30px;
+    padding: 0 8px;
     border: 1px solid var(--btn-border);
     border-radius: var(--radius);
     background: var(--btn-bg);
@@ -999,7 +1316,15 @@ export const EDITOR_MODALS_STYLE = `
     font: inherit;
     font-size: 12px;
     cursor: pointer;
+    min-width: 0;
+    text-align: left;
     transition: border-color 0.12s ease, background 0.12s ease;
+  }
+
+  .datanoa-engine-tile > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .datanoa-engine-tile:hover:not(:disabled) {
@@ -1035,7 +1360,8 @@ export const EDITOR_MODALS_STYLE = `
     grid-column: 1 / -1;
   }
 
-  .datanoa-conn-field > label {
+  .datanoa-conn-field > label,
+  .datanoa-conn-field > span {
     font-size: 11px;
     color: var(--muted);
   }
@@ -1043,6 +1369,7 @@ export const EDITOR_MODALS_STYLE = `
   .datanoa-conn-collapsible {
     display: flex;
     flex-direction: column;
+    flex-shrink: 0;
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--surface);
@@ -1052,17 +1379,17 @@ export const EDITOR_MODALS_STYLE = `
   .datanoa-conn-collapsible-head {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     width: 100%;
     min-height: 30px;
-    padding: 6px 10px;
+    padding: 5px 10px;
     border: 0;
     border-bottom: 1px solid transparent;
     background: transparent;
     color: var(--text);
     font: inherit;
     font-size: 12px;
-    font-weight: 600;
+    font-weight: 500;
     text-align: left;
     cursor: pointer;
   }
@@ -1098,16 +1425,21 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-conn-collapsible-pill {
-    flex: 0 0 auto;
-    padding: 1px 7px;
-    border: 1px solid var(--info);
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--info) 14%, transparent);
-    color: var(--info);
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
+    flex: 0 1 auto;
+    max-width: 60%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 1px 6px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--bg) 55%, var(--surface));
+    color: var(--muted);
+    font-family: var(--mono-font);
+    font-size: 11px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.01em;
   }
 
   .datanoa-conn-collapsible-body {
@@ -1139,8 +1471,12 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-conn-env-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
     height: 24px;
-    padding: 0 9px;
+    padding: 0 8px;
     border-radius: 4px;
     border: 1px solid var(--btn-border);
     background: var(--btn-bg);
@@ -1148,12 +1484,43 @@ export const EDITOR_MODALS_STYLE = `
     font: inherit;
     font-size: 12px;
     cursor: pointer;
+    transition: background-color 140ms cubic-bezier(0.22, 1, 0.36, 1), border-color 140ms cubic-bezier(0.22, 1, 0.36, 1), color 140ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .datanoa-conn-env-pill:hover {
+    background: var(--hover);
+    border-color: var(--border-strong);
+  }
+
+  .datanoa-conn-env-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .datanoa-conn-env-dot.env-dev {
+    background: var(--info);
+  }
+
+  .datanoa-conn-env-dot.env-staging {
+    background: var(--warn);
+  }
+
+  .datanoa-conn-env-dot.env-prod {
+    background: var(--danger);
   }
 
   .datanoa-conn-env-pill.active {
     border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
     background: color-mix(in srgb, var(--accent-ring) 14%, var(--bg));
     font-weight: 600;
+  }
+
+  .datanoa-conn-env-pill.active.env-dev {
+    border-color: var(--info);
+    background: color-mix(in srgb, var(--info) 14%, var(--bg));
+    color: var(--info);
   }
 
   .datanoa-conn-env-pill.active.env-prod {
@@ -1168,18 +1535,38 @@ export const EDITOR_MODALS_STYLE = `
     color: var(--warn);
   }
 
+  html.light .datanoa-conn-env-pill.active.env-dev,
+  body.light .datanoa-conn-env-pill.active.env-dev {
+    border-color: color-mix(in srgb, var(--info) 55%, var(--border));
+    background: color-mix(in srgb, var(--info) 10%, var(--bg));
+    color: var(--info);
+  }
+
+  html.light .datanoa-conn-env-pill.active.env-staging,
+  body.light .datanoa-conn-env-pill.active.env-staging {
+    border-color: color-mix(in srgb, var(--warn) 55%, var(--border));
+    background: color-mix(in srgb, var(--warn) 10%, var(--bg));
+    color: color-mix(in srgb, var(--warn) 82%, var(--text));
+  }
+
+  html.light .datanoa-conn-env-pill.active.env-prod,
+  body.light .datanoa-conn-env-pill.active.env-prod {
+    border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
+    background: color-mix(in srgb, var(--danger) 10%, var(--bg));
+    color: var(--danger);
+  }
+
   .datanoa-conn-discovered {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    padding: 8px 10px;
-    border: 1px dashed var(--border-strong);
-    border-radius: var(--radius);
-    background: var(--surface);
+    gap: 6px;
+    min-width: 0;
   }
 
   .datanoa-discovery-search {
     width: 100%;
+    height: 26px;
+    font-size: 12px;
     box-sizing: border-box;
   }
 
@@ -1187,22 +1574,25 @@ export const EDITOR_MODALS_STYLE = `
     display: flex;
     flex-direction: column;
     gap: 6px;
+    min-width: 0;
   }
 
   .datanoa-discovery-group {
+    flex-shrink: 0;
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    background: var(--card);
+    background: var(--surface);
     overflow: hidden;
+    min-width: 0;
   }
 
   .datanoa-discovery-head {
     display: flex;
     align-items: center;
-    gap: 7px;
+    gap: 6px;
     width: 100%;
-    min-height: 30px;
-    padding: 5px 10px;
+    min-height: 29px;
+    padding: 5px 8px;
     border: 0;
     background: transparent;
     color: var(--text);
@@ -1265,6 +1655,9 @@ export const EDITOR_MODALS_STYLE = `
   .datanoa-discovery-title {
     flex: 1 1 auto;
     min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .datanoa-discovery-count {
@@ -1276,97 +1669,132 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   .datanoa-discovery-body {
-    padding: 8px;
+    padding: 6px;
     border-top: 1px solid var(--border);
     background: color-mix(in srgb, var(--bg) 55%, var(--surface));
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
   }
 
   .datanoa-discovery-badges {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: 4px;
     flex-shrink: 0;
   }
 
   .datanoa-badge-neutral {
-    background: var(--surface);
+    background: var(--raised);
     color: var(--muted);
     border: 1px solid var(--border);
   }
 
   .datanoa-badge-ok {
-    background: color-mix(in srgb, var(--ok) 14%, transparent);
+    background: color-mix(in srgb, var(--ok) 14%, var(--bg));
     color: var(--ok);
-    border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent);
+    border: 1px solid color-mix(in srgb, var(--ok) 32%, var(--border));
   }
 
   .datanoa-badge-info {
-    background: color-mix(in srgb, var(--info) 14%, transparent);
+    background: color-mix(in srgb, var(--info) 14%, var(--bg));
     color: var(--info);
-    border: 1px solid color-mix(in srgb, var(--info) 45%, transparent);
+    border: 1px solid color-mix(in srgb, var(--info) 35%, var(--border));
   }
 
   .datanoa-badge-warn {
-    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    background: color-mix(in srgb, var(--warn) 14%, var(--bg));
     color: var(--warn);
-    border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warn) 32%, var(--border));
   }
 
   .datanoa-conn-chip-list {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    max-height: 180px;
+    max-height: 148px;
     overflow-y: auto;
   }
 
   .datanoa-conn-chip {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    padding: 5px 8px;
+    flex-direction: column;
+    gap: 2px;
+    width: 100%;
+    min-width: 0;
+    padding: 6px 8px;
     border: 1px solid var(--border);
-    border-radius: 4px;
-    background: var(--card);
+    border-radius: var(--radius);
+    background: var(--surface);
     color: var(--text);
     font: inherit;
     font-size: 12px;
     text-align: left;
     cursor: pointer;
+    transition: border-color 0.12s ease, background-color 0.12s ease;
   }
 
-  .datanoa-conn-chip:hover {
-    border-color: color-mix(in srgb, var(--accent-ring) 65%, var(--border-strong));
-    background: color-mix(in srgb, var(--accent-ring) 10%, var(--card));
-  }
-
+  .datanoa-conn-chip:hover,
   .datanoa-conn-chip.selected {
-    border-color: var(--accent-ring);
+    border-color: var(--primary);
+    background: var(--hover);
   }
 
-  .datanoa-conn-chip-main {
+  .datanoa-conn-chip-top {
     display: flex;
-    flex-direction: column;
-    gap: 1px;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    width: 100%;
     min-width: 0;
   }
 
   .datanoa-conn-chip-title {
-    display: inline-flex;
+    display: flex;
     align-items: center;
     gap: 6px;
-    font-weight: 600;
+    flex: 1 1 auto;
+    min-width: 0;
   }
 
-  .datanoa-conn-chip-sub {
-    color: var(--muted);
-    font-family: var(--mono-font);
-    font-size: 11px;
+  .datanoa-conn-chip-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    max-width: 440px;
+  }
+
+  .datanoa-conn-chip .datanoa-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.35;
+    white-space: nowrap;
+    flex-shrink: 0;
+    max-width: 65%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .datanoa-conn-chip .datanoa-discovery-badges .datanoa-badge {
+    max-width: none;
+  }
+
+  .datanoa-conn-chip-sub {
+    width: 100%;
+    min-width: 0;
+    color: var(--muted);
+    font-family: var(--mono-font);
+    font-size: 12px;
+    line-height: 1.4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .datanoa-modal-box.success {
@@ -1467,9 +1895,6 @@ export const EDITOR_MODALS_STYLE = `
   }
 
   @media (max-width: 700px) {
-    .datanoa-engine-grid {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
     .datanoa-conn-fields {
       grid-template-columns: minmax(0, 1fr);
     }
@@ -2222,5 +2647,151 @@ export const EDITOR_MODALS_STYLE = `
     .datanoa-skeleton-bar {
       animation: none;
     }
+
+    .datanoa-conn-details-card,
+    .datanoa-conn-chevron,
+    .datanoa-discovery-chevron,
+    .datanoa-engine-tile {
+      transition: none;
+    }
+  }
+
+  /* Vim Mode Pill, Prod AI Pill & Visual EXPLAIN Theme Parity (v1.3.0) */
+  .datanoa-vim-mode-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 6px;
+    border-radius: 3px;
+    border: 1px solid var(--border, var(--orca-border, #2a2a2a));
+    background: var(--surface, var(--orca-card, rgba(255, 255, 255, 0.05)));
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+    font-family: var(--mono-font, monospace);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .datanoa-vim-mode-pill[data-vim-mode="insert"] {
+    border-color: var(--ok, #22c55e);
+    color: var(--ok, #22c55e);
+  }
+
+  .datanoa-vim-mode-pill[data-vim-mode="visual"],
+  .datanoa-vim-mode-pill[data-vim-mode="visual-line"],
+  .datanoa-vim-mode-pill[data-vim-mode="visual-block"] {
+    border-color: var(--warn, #f59e0b);
+    color: var(--warn, #f59e0b);
+  }
+
+  .datanoa-ai-prod-pill[data-color-tag="prod"] {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--danger, var(--orca-destructive, #ef4444)) 55%, transparent);
+    background: color-mix(in srgb, var(--danger, var(--orca-destructive, #ef4444)) 14%, transparent);
+    color: var(--danger, var(--orca-destructive, #ef4444));
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .datanoa-explain-visual {
+    background: var(--bg, var(--orca-background, #000000));
+    border: 1px solid var(--border, var(--orca-border, #2a2a2a));
+    border-radius: var(--radius, 6px);
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-stale-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    border: 1px solid color-mix(in srgb, var(--warn, #f59e0b) 50%, transparent);
+    background: color-mix(in srgb, var(--warn, #f59e0b) 12%, transparent);
+    color: var(--warn, #f59e0b);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  /* Multi-Hop SSH Jump Hosts & TLS 1-Click Remedies (v1.3.0) */
+  .datanoa-jump-hops-section {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--border, var(--orca-border, #2a2a2a));
+  }
+
+  .datanoa-jump-hops-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+  }
+
+  .datanoa-jump-hops-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .datanoa-jump-hop-card {
+    border: 1px solid var(--border, var(--orca-border, #2a2a2a));
+    border-radius: var(--radius, 6px);
+    background: var(--surface, var(--orca-card, rgba(255, 255, 255, 0.03)));
+    padding: 8px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .datanoa-jump-hop-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--muted, var(--t2, #9aa4b2));
+  }
+
+  .datanoa-jump-hop-fields {
+    display: grid;
+    grid-template-columns: 1fr 78px 1fr 110px;
+    gap: 8px;
+  }
+
+  .datanoa-tls-remedy {
+    margin-top: 8px;
+    padding: 8px 12px;
+    border-radius: var(--radius, 6px);
+    border: 1px solid color-mix(in srgb, var(--warn, #f59e0b) 45%, transparent);
+    background: color-mix(in srgb, var(--warn, #f59e0b) 10%, transparent);
+    color: var(--text, var(--t1, var(--fg, #e6e6e6)));
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 12px;
+  }
+
+  .datanoa-tls-remedy.is-hard-error {
+    border-color: color-mix(in srgb, var(--danger, var(--orca-destructive, #ef4444)) 55%, transparent);
+    background: color-mix(in srgb, var(--danger, var(--orca-destructive, #ef4444)) 10%, transparent);
+  }
+
+  .datanoa-tls-remedy-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
   }
 `

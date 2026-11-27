@@ -15,6 +15,7 @@ import type {
   PreviewChangesResult,
   QueryResult,
   QueryResultSet,
+  SchemaErGraph,
   SchemaObject,
   SchemaObjectKind,
   TableBrowseResult,
@@ -23,6 +24,13 @@ import type {
   UpdateCellParams,
   UpdateCellResult,
 } from '../common/driver'
+import {
+  assembleSqliteErColumnsAndForeignKeys,
+  assembleSqliteUniqueSets,
+  buildSchemaErGraphFromCatalogRows,
+  type RawErTableRow,
+  type RawErUniqueSetRow,
+} from '../common/schema-er-graph'
 import {
   DatabaseDriverError,
   attachFailedStatementMeta,
@@ -458,6 +466,10 @@ export class LibsqlSession implements IDatabaseSession {
     return !this.isClosed
   }
 
+  clearSchemaCache(): void {
+    this.tableDetailsCache.clear()
+  }
+
   private buildHeaders(): Record<string, string> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -821,6 +833,321 @@ export class LibsqlSession implements IDatabaseSession {
     const details = await introspectSqliteTableDetails(this.queryExecutor, table, targetSchema)
     this.tableDetailsCache.set(targetSchema, 'main', table, details)
     return details
+  }
+
+  async introspectErGraph(schema?: string): Promise<SchemaErGraph> {
+    if (this.isClosed) {
+      throw new DatabaseDriverError('Session is closed', 'SESSION_CLOSED', 'libsql')
+    }
+    const targetSchema = (schema || 'main').trim() || 'main'
+    const prefix =
+      targetSchema.toLowerCase() === 'main' ? '' : `${quoteIdentForDialect(targetSchema, 'libsql')}.`
+    const masterRows = await this.queryExecutor(`
+      SELECT name, type AS kind, sql
+      FROM ${prefix}sqlite_master
+      WHERE type IN ('table', 'view')
+        AND name NOT LIKE 'sqlite!_%' ESCAPE '!'
+        AND UPPER(COALESCE(sql, '')) NOT LIKE 'CREATE VIRTUAL TABLE%'
+      ORDER BY name ASC;
+    `)
+
+    const tableSqlByName = new Map<string, string>()
+    const tables: RawErTableRow[] = []
+    for (const r of masterRows) {
+      if (typeof r.name !== 'string' || r.name.length === 0) continue
+      tables.push({
+        schema: targetSchema,
+        name: String(r.name),
+        kind: r.kind === 'view' ? 'view' : 'table',
+      })
+      if (typeof r.sql === 'string') {
+        tableSqlByName.set(String(r.name), r.sql)
+      }
+    }
+
+    if (tables.length === 0) {
+      return buildSchemaErGraphFromCatalogRows({
+        connectionId: this.profile.id,
+        schema: targetSchema,
+        completeness: 'full',
+        tables: [],
+        columns: [],
+        foreignKeys: [],
+      })
+    }
+
+    let rawColRows: Record<string, unknown>[] = []
+    let rawFkRows: Record<string, unknown>[] = []
+    let rawUniqRows: Record<string, unknown>[] = []
+    let partial = false
+    const pragmaSchemaArg =
+      targetSchema.toLowerCase() === 'main' ? '' : `, '${targetSchema.replace(/'/g, "''")}'`
+
+    const collectLibsqlUniqueViaPragma = async (): Promise<void> => {
+      const idxListRequests: Array<{ tableName: string; stmt: HranaExecuteStmt }> = []
+      for (const tbl of tables) {
+        if (tbl.kind === 'view') continue
+        const quoted = `"${tbl.name.replace(/"/g, '""')}"`
+        idxListRequests.push({
+          tableName: tbl.name,
+          stmt: { sql: `PRAGMA ${prefix}index_list(${quoted});`, args: [] },
+        })
+      }
+      if (idxListRequests.length === 0) return
+
+      const candidateIndexes: Array<{
+        tableName: string
+        indexName: string
+        isPartial: number
+        stmt: HranaExecuteStmt
+      }> = []
+      const { results: idxResults } = await this.sendHranaPipeline([
+        ...idxListRequests.map((r) => ({ type: 'execute' as const, stmt: r.stmt })),
+        { type: 'close' as const },
+      ])
+      for (let i = 0; i < idxListRequests.length; i++) {
+        const item = idxResults[i]
+        if (!item || item.type !== 'ok') continue
+        const idxList = hranaRowsToRecords(item.response?.result || {})
+        for (const il of idxList) {
+          if (Number(il.unique ?? 0) !== 1 || Number(il.partial ?? 0) !== 0) continue
+          const idxName = typeof il.name === 'string' ? il.name : ''
+          if (!idxName) continue
+          const escapedIdx = `"${idxName.replace(/"/g, '""')}"`
+          candidateIndexes.push({
+            tableName: idxListRequests[i].tableName,
+            indexName: idxName,
+            isPartial: Number(il.partial ?? 0),
+            stmt: { sql: `PRAGMA ${prefix}index_info(${escapedIdx});`, args: [] },
+          })
+        }
+      }
+      if (candidateIndexes.length === 0) return
+
+      const { results: infoResults } = await this.sendHranaPipeline([
+        ...candidateIndexes.map((c) => ({ type: 'execute' as const, stmt: c.stmt })),
+        { type: 'close' as const },
+      ])
+      for (let i = 0; i < candidateIndexes.length; i++) {
+        const item = infoResults[i]
+        if (!item || item.type !== 'ok') continue
+        const meta = candidateIndexes[i]
+        const infoRows = hranaRowsToRecords(item.response?.result || {})
+        for (const ii of infoRows) {
+          rawUniqRows.push({
+            table_name: meta.tableName,
+            index_name: meta.indexName,
+            is_partial: meta.isPartial,
+            seqno: ii.seqno,
+            cid: ii.cid,
+            col_name: ii.name,
+          })
+        }
+      }
+    }
+
+    try {
+      const [colRes, fkRes] = await this.executePipeline([
+        {
+          sql: `
+            SELECT m.name AS table_name,
+                   p.name AS col_name,
+                   p.type AS col_type,
+                   p."notnull" AS col_notnull,
+                   p.pk AS col_pk,
+                   p.hidden AS col_hidden
+            FROM ${prefix}sqlite_master m
+            JOIN pragma_table_xinfo(m.name${pragmaSchemaArg}) p
+            WHERE m.type IN ('table', 'view')
+              AND m.name NOT LIKE 'sqlite!_%' ESCAPE '!'
+              AND UPPER(COALESCE(m.sql, '')) NOT LIKE 'CREATE VIRTUAL TABLE%'
+            ORDER BY m.name ASC, p.cid ASC;
+          `,
+          args: [],
+        },
+        {
+          sql: `
+            SELECT m.name AS table_name,
+                   f.id AS fk_id,
+                   f.seq AS seq,
+                   f."table" AS to_table,
+                   f."from" AS from_col,
+                   f."to" AS to_col,
+                   f.on_delete AS on_delete,
+                   f.on_update AS on_update
+            FROM ${prefix}sqlite_master m
+            JOIN pragma_foreign_key_list(m.name${pragmaSchemaArg}) f
+            WHERE m.type = 'table'
+              AND m.name NOT LIKE 'sqlite!_%' ESCAPE '!'
+              AND UPPER(COALESCE(m.sql, '')) NOT LIKE 'CREATE VIRTUAL TABLE%'
+            ORDER BY m.name ASC, f.id ASC, f.seq ASC;
+          `,
+          args: [],
+        },
+      ])
+      rawColRows = hranaRowsToRecords(colRes)
+      rawFkRows = hranaRowsToRecords(fkRes)
+      try {
+        const [uniqRes] = await this.executePipeline([
+          {
+            sql: `
+              SELECT m.name AS table_name,
+                     il.name AS index_name,
+                     il.partial AS is_partial,
+                     ii.seqno AS seqno,
+                     ii.cid AS cid,
+                     ii.name AS col_name
+              FROM ${prefix}sqlite_master m
+              JOIN pragma_index_list(m.name${pragmaSchemaArg}) il
+              JOIN pragma_index_info(il.name${pragmaSchemaArg}) ii
+              WHERE m.type = 'table'
+                AND m.name NOT LIKE 'sqlite!_%' ESCAPE '!'
+                AND UPPER(COALESCE(m.sql, '')) NOT LIKE 'CREATE VIRTUAL TABLE%'
+                AND il."unique" = 1
+              ORDER BY m.name ASC, il.name ASC, ii.seqno ASC;
+            `,
+            args: [],
+          },
+        ])
+        rawUniqRows = hranaRowsToRecords(uniqRes)
+      } catch {
+        try {
+          await collectLibsqlUniqueViaPragma()
+        } catch {
+          rawUniqRows = []
+        }
+      }
+    } catch {
+      const batchRequests: Array<{
+        tableName: string
+        kind: 'col' | 'fk' | 'idx'
+        stmt: HranaExecuteStmt
+      }> = []
+      for (const tbl of tables) {
+        const quoted = `"${tbl.name.replace(/"/g, '""')}"`
+        batchRequests.push({
+          tableName: tbl.name,
+          kind: 'col',
+          stmt: { sql: `PRAGMA ${prefix}table_xinfo(${quoted});`, args: [] },
+        })
+        if (tbl.kind !== 'view') {
+          batchRequests.push({
+            tableName: tbl.name,
+            kind: 'fk',
+            stmt: { sql: `PRAGMA ${prefix}foreign_key_list(${quoted});`, args: [] },
+          })
+          batchRequests.push({
+            tableName: tbl.name,
+            kind: 'idx',
+            stmt: { sql: `PRAGMA ${prefix}index_list(${quoted});`, args: [] },
+          })
+        }
+      }
+
+      const candidateIndexes: Array<{
+        tableName: string
+        indexName: string
+        isPartial: number
+        stmt: HranaExecuteStmt
+      }> = []
+      try {
+        const { results } = await this.sendHranaPipeline([
+          ...batchRequests.map((b) => ({ type: 'execute' as const, stmt: b.stmt })),
+          { type: 'close' as const },
+        ])
+        for (let i = 0; i < batchRequests.length; i++) {
+          const item = results[i]
+          if (!item || item.type !== 'ok') {
+            partial = true
+            continue
+          }
+          const recs = hranaRowsToRecords(item.response?.result || {})
+          const meta = batchRequests[i]
+          if (meta.kind === 'col') {
+            for (const r of recs) {
+              rawColRows.push({
+                table_name: meta.tableName,
+                col_name: r.name,
+                col_type: r.type,
+                col_notnull: r.notnull,
+                col_pk: r.pk,
+                col_hidden: r.hidden,
+              })
+            }
+          } else if (meta.kind === 'fk') {
+            for (const r of recs) {
+              rawFkRows.push({
+                table_name: meta.tableName,
+                fk_id: r.id,
+                seq: r.seq,
+                to_table: r.table,
+                from_col: r.from,
+                to_col: r.to,
+                on_delete: r.on_delete,
+                on_update: r.on_update,
+              })
+            }
+          } else {
+            for (const il of recs) {
+              if (Number(il.unique ?? 0) !== 1 || Number(il.partial ?? 0) !== 0) continue
+              const idxName = typeof il.name === 'string' ? il.name : ''
+              if (!idxName) continue
+              const escapedIdx = `"${idxName.replace(/"/g, '""')}"`
+              candidateIndexes.push({
+                tableName: meta.tableName,
+                indexName: idxName,
+                isPartial: Number(il.partial ?? 0),
+                stmt: { sql: `PRAGMA ${prefix}index_info(${escapedIdx});`, args: [] },
+              })
+            }
+          }
+        }
+        if (candidateIndexes.length > 0) {
+          const { results: infoResults } = await this.sendHranaPipeline([
+            ...candidateIndexes.map((c) => ({ type: 'execute' as const, stmt: c.stmt })),
+            { type: 'close' as const },
+          ])
+          for (let i = 0; i < candidateIndexes.length; i++) {
+            const item = infoResults[i]
+            if (!item || item.type !== 'ok') continue
+            const meta = candidateIndexes[i]
+            const infoRows = hranaRowsToRecords(item.response?.result || {})
+            for (const ii of infoRows) {
+              rawUniqRows.push({
+                table_name: meta.tableName,
+                index_name: meta.indexName,
+                is_partial: meta.isPartial,
+                seqno: ii.seqno,
+                cid: ii.cid,
+                col_name: ii.name,
+              })
+            }
+          }
+        }
+      } catch {
+        // Return partial graph cleanly if remote pipeline fallback fails
+        partial = true
+      }
+    }
+
+    const uniqueSets: RawErUniqueSetRow[] = assembleSqliteUniqueSets(targetSchema, rawUniqRows)
+    const { columns, foreignKeys } = assembleSqliteErColumnsAndForeignKeys({
+      schema: targetSchema,
+      tables,
+      tableSqlByName,
+      rawColRows,
+      rawFkRows,
+    })
+
+    return buildSchemaErGraphFromCatalogRows({
+      connectionId: this.profile.id,
+      schema: targetSchema,
+      completeness: partial ? 'lite' : 'full',
+      tables,
+      columns,
+      uniqueSets,
+      foreignKeys,
+    })
   }
 
   async fetchPage(params: FetchPageParams): Promise<TableBrowseResult> {

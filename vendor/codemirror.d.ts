@@ -6,3 +6,4 @@ export { autocompletion, completionKeymap, completionStatus, closeCompletion, ac
 export { search, searchKeymap, highlightSelectionMatches, openSearchPanel } from '@codemirror/search';
 export { sql, SQLite, PostgreSQL, MySQL, MariaSQL, schemaCompletionSource, type SQLDialect } from '@codemirror/lang-sql';
 export { tags } from '@lezer/highlight';
+export { vim, getCM, Vim, type vimState, type CodeMirror } from '@replit/codemirror-vim';

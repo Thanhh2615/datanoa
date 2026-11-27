@@ -1,11 +1,36 @@
+export type CollapsibleSelectBadgeTone =
+  | 'neutral'
+  | 'dev'
+  | 'staging'
+  | 'prod'
+  | 'info'
+  | 'warn'
+
+export interface CollapsibleSelectBadge {
+  text: string
+  tone?: CollapsibleSelectBadgeTone
+}
+
 export interface CollapsibleSelectOptions {
   tooltipPrefix?: string
   searchPlaceholder?: string
   searchAriaLabel?: string
+  /**
+   * Collapsed folder keys. When an `<optgroup>` sets `data-section-key` (or `data-group-key`),
+   * that disambiguated key is stored here instead of the display label to avoid collisions
+   * between user folders and built-in sections (such as "General (Ungrouped)").
+   */
   collapsedFolders?: Set<string>
   defaultCollapseNonActiveFolders?: boolean
   onFolderToggle?: (collapsedFolders: Set<string>) => void
   leadingIconType?: 'none' | 'workspace' | 'db'
+  popoverMinWidth?: number
+  popoverMaxHeight?: number
+  showTriggerBadges?: boolean
+  reorderConnections?: boolean
+  reorderFolders?: boolean
+  onReorderConnections?: (folderKey: string, orderedIds: string[]) => void | Promise<unknown>
+  onReorderFolders?: (orderedFolders: string[]) => void | Promise<unknown>
   onOpen?: () => void
 }
 
@@ -21,6 +46,7 @@ export interface CollapsibleSelectClasses {
   trigger: string
   leadIcon: string
   label: string
+  triggerBadges?: string
   chev: string
   popover: string
   head: string
@@ -32,7 +58,11 @@ export interface CollapsibleSelectClasses {
   itemText: string
   itemLabel: string
   itemSub: string
+  itemBadges?: string
   itemCheck: string
+  badge?: string
+  dragHandle?: string
+  dragSpacer?: string
   folderHead: string
   folderIcon: string
   folderName: string

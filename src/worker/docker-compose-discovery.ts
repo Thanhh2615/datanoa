@@ -1,5 +1,5 @@
 // Hybrid Docker Compose Auto-Discovery:
-// Combines cross-platform read-only Docker CLI inspection (Ork DB pattern expanded for Windows & 10 engines)
+// Combines cross-platform read-only Docker CLI inspection (expanded for Windows & 10 engines)
 // with a bounded zero-dependency static Compose YAML + .env parser.
 
 import { execFile } from 'node:child_process'
@@ -105,7 +105,8 @@ export function detectDockerTargetLocality(
       'config.json'
     )
   try {
-    if (fs.existsSync(configPath)) {
+    const st = fs.lstatSync(configPath)
+    if (!st.isSymbolicLink() && st.isFile() && st.size <= MAX_COMPOSE_FILE_BYTES) {
       const raw = fs.readFileSync(configPath, 'utf8')
       const parsed = JSON.parse(raw) as { currentContext?: unknown }
       const currentContext =

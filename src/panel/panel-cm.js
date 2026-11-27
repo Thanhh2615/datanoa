@@ -34,7 +34,13 @@ import {
   bracketMatching,
   placeholder,
 } from '../../vendor/codemirror.js'
-import { clearGhostEffect, createCmInlineAiExtension } from '../shared-cm-inline-ai.js'
+import { clearGhostEffect, createCmInlineAiExtension, notifyAiAvailabilityChanged } from '../shared-cm-inline-ai.js'
+import {
+  createCmKeymapExtension,
+  getVimModeSnapshot,
+  isModalKeymapActive,
+  normalizeShortcutSettings,
+} from '../shared-cm-keymap.js'
 import {
   clearDbSqlErrorEffect,
   createCmSqlLintExtension,
@@ -611,6 +617,8 @@ export function createPanelCodeMirrorEditor(options) {
   const completionCompartment = new Compartment()
   const themeCompartment = new Compartment()
   const placeholderCompartment = new Compartment()
+  const keymapCompartment = new Compartment()
+  let currentKeymapSettings = normalizeShortcutSettings(options?.keymapSettings)
 
   function syncEmptyAttr(view) {
     if (!parent) return
@@ -625,29 +633,27 @@ export function createPanelCodeMirrorEditor(options) {
     return buildPanelCompletionExtension(currentDialect, currentSchema, currentTable)
   }
 
-  const runKeymap = keymap.of([
-    {
-      key: 'Mod-Enter',
-      run: () => {
+  function buildKeymapExtension() {
+    return createCmKeymapExtension({
+      editorKeymap: currentKeymapSettings.editorKeymap,
+      shortcutRunStatement: currentKeymapSettings.shortcutRunStatement,
+      shortcutRunAll: currentKeymapSettings.shortcutRunAll,
+      shortcutFormatSql: currentKeymapSettings.shortcutFormatSql,
+      onRunStatement: () => {
         onExecute?.()
         return true
       },
-    },
-    {
-      key: 'Mod-Shift-Enter',
-      run: () => {
+      onRunAll: () => {
         onExecuteAll?.()
         return true
       },
-    },
-    {
-      key: 'Shift-Alt-f',
-      run: () => {
+      onFormatSql: () => {
         onFormatSql?.()
         return true
       },
-    },
-  ])
+      onVimModeChange: options?.onVimModeChange,
+    })
+  }
 
   const state = EditorState.create({
     doc: String(initialDoc || ''),
@@ -670,7 +676,7 @@ export function createPanelCodeMirrorEditor(options) {
       ...(options?.aiInline
         ? [createCmInlineAiExtension({ ...options.aiInline, getDialect: () => currentDialect })]
         : []),
-      runKeymap,
+      keymapCompartment.of(buildKeymapExtension()),
       keymap.of([
         ...completionKeymap,
         ...searchKeymap,
@@ -775,6 +781,22 @@ export function createPanelCodeMirrorEditor(options) {
         ),
       })
     },
+    applyKeymapSettings(nextSettings) {
+      currentKeymapSettings = normalizeShortcutSettings(nextSettings)
+      view.dispatch({
+        effects: keymapCompartment.reconfigure(buildKeymapExtension()),
+      })
+      options?.onVimModeChange?.(getVimModeSnapshot(view))
+    },
+    getVimModeSnapshot() {
+      return getVimModeSnapshot(view)
+    },
+    isVimTargetEvent(target) {
+      if (!isModalKeymapActive(view)) return false
+      if (!(target instanceof Node)) return false
+      const el = target instanceof Element ? target : target.parentElement
+      return Boolean(el && (el.closest?.('.cm-content') || view.contentDOM.contains(el)))
+    },
     openFindReplace() {
       view.focus()
       openSearchPanel(view)
@@ -784,6 +806,9 @@ export function createPanelCodeMirrorEditor(options) {
     },
     clearAiGhost() {
       view.dispatch({ effects: clearGhostEffect.of(undefined) })
+    },
+    notifyAiAvailabilityChanged() {
+      notifyAiAvailabilityChanged(view)
     },
     setDbSyntaxError(errorMessage, targetRange, driverOverride) {
       const clean = String(errorMessage || '').trim()

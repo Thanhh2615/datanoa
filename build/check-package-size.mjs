@@ -21,7 +21,7 @@ const EXCLUDED_DIRS = new Set([
   'dist',
   'release',
 ])
-const EXCLUDED_FILES = new Set(['vitest.config.ts'])
+const EXCLUDED_FILES = new Set(['vitest.config.ts', 'package-lock.json'])
 const MAX_VENDOR_FILE_BYTES = 1024 * 1024 // 1 MiB
 const MAX_TOTAL_BYTES = 25_000_000 // 25 MB package budget, inclusive
 

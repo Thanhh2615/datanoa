@@ -21,10 +21,87 @@ export type ConnectionColorTag = 'none' | 'dev' | 'staging' | 'prod'
 export type ConnectionAiPolicy = 'allow' | 'ask' | 'never'
 
 /** TLS negotiation mode for TCP engines (`auto` keeps legacy profile.ssl / cloud auto-SSL behaviour) */
-export type SslMode = 'auto' | 'disable' | 'require' | 'verify-ca' | 'verify-full'
+export type SslMode = 'auto' | 'disable' | 'require' | 'verify-ca' | 'verify-full' | 'strict'
 
-/** SSH bastion authentication method (non-interactive; OS `ssh -N -L`) */
+/** Studio editor pane / visualization mode */
+export type StudioViewMode = 'split' | 'grid' | 'sql' | 'inspector' | 'er'
+
+/** SSH bastion authentication method (non-interactive; OS `ssh -N -L` or in-process ssh2) */
 export type SshAuthMethod = 'agent' | 'key' | 'password'
+
+/** Intermediate SSH jump-host hop preceding the final SSH bastion */
+export interface SshJumpHostProfile {
+  hopId: string
+  host: string
+  port?: number
+  user?: string
+  authMethod?: SshAuthMethod
+  privateKeyPath?: string
+  hasPassphrase?: boolean
+  hasPassword?: boolean
+}
+
+/** Ephemeral per-hop SSH secret payload passed during connection.save / connection.test (never stored on profile) */
+export interface SshJumpHopSecret {
+  password?: string
+  passphrase?: string
+}
+
+export type SshHostKeyChallengeReason = 'unknown' | 'mismatch' | 'revoked'
+export type SshHostKeyDecision = 'trust-once' | 'save' | 'replace' | 'cancel'
+
+export interface SshHostKeyChallenge {
+  challengeId: string
+  panelId?: string
+  connectionId?: string
+  host: string
+  port: number
+  keyType: string
+  keyBlob: string
+  fingerprintSha256: string
+  reason: SshHostKeyChallengeReason
+  knownHostsPath?: string
+  knownHostsReadOnly?: boolean
+  line?: number
+  existingFingerprintSha256?: string
+  existingKeyType?: string
+  hopIndex?: number
+  hopCount?: number
+  retryToken?: string
+}
+
+export type TlsFailureKind =
+  | 'ServerRequiresTls'
+  | 'ServerRefusedTls'
+  | 'ServerRequiresStrict'
+  | 'ServerRefusedStrict'
+  | 'UnknownIssuer'
+  | 'NameMismatch'
+  | 'Expired'
+  | 'NotYetValid'
+  | 'Revoked'
+  | 'HandshakeRejected'
+  | 'CaFileInvalid'
+  | 'ClientIdentityInvalid'
+  | 'Other'
+
+export type TlsRemedyAction = 'ChangeEncryption' | 'ChooseCaCert' | 'SetServerName'
+
+export interface TlsFailure {
+  kind: TlsFailureKind
+  summary: string
+  detail?: string
+  canRetryWithFix: boolean
+  remedy?: TlsRemedyAction
+  suggestedSslMode?: SslMode
+  suggestedServerName?: string
+  certificateSubject?: string
+  certificateIssuer?: string
+  certificateSan?: string[]
+  validFrom?: string
+  validTo?: string
+  fingerprintSha256?: string
+}
 
 export interface ConnectionProfile {
   id: string
@@ -58,6 +135,7 @@ export interface ConnectionProfile {
   sslKeyPath?: string
   hasSslKeyPassphrase?: boolean
   sslRejectUnauthorized?: boolean
+  tlsServername?: string
   // --- SSH Tunnel (bastion) ---
   sshEnabled?: boolean
   sshHost?: string
@@ -67,8 +145,15 @@ export interface ConnectionProfile {
   sshPrivateKeyPath?: string
   hasSshPassphrase?: boolean
   hasSshPassword?: boolean
+  /** Optional ordered intermediate SSH jump hosts preceding the final bastion */
+  sshJumpHosts?: SshJumpHostProfile[]
   /** Optional per-connection AI policy override ('allow' | 'ask' | 'never'). */
   aiPolicy?: ConnectionAiPolicy
+}
+
+/** Connection profile payload accepted on save/test where `aiPolicy: null` explicitly clears any stored override. */
+export type ConnectionProfileInput = Omit<ConnectionProfile, 'aiPolicy'> & {
+  aiPolicy?: ConnectionAiPolicy | null
 }
 
 export type SchemaObjectKind =
@@ -144,6 +229,132 @@ export interface TableDetails {
   strict?: boolean
   withoutRowid?: boolean
   ddl?: string
+  /** Introspection completeness ('lite' from ER fallback vs 'full' with DDL/triggers/inbound FKs) */
+  completeness?: 'lite' | 'full'
+}
+
+export interface SchemaCatalogObjectsResult {
+  data: SchemaObject[]
+  stale: boolean
+  staleReason?: string
+  cachedAt: number
+  revision: number
+  generation?: number
+  truncated?: boolean
+}
+
+export interface SchemaErColumn {
+  name: string
+  type: string
+  nullable: boolean
+  isPrimaryKey: boolean
+  isForeignKey?: boolean
+  isUnique?: boolean
+}
+
+export interface SchemaErNode {
+  id: string
+  schema: string
+  name: string
+  kind: 'table' | 'view' | 'external_stub'
+  columns: SchemaErColumn[]
+  primaryKey: string[]
+  uniqueColumnSets?: string[][]
+}
+
+export interface SchemaErEdgeColumnPair {
+  fromColumn: string
+  toColumn: string
+}
+
+export interface SchemaErEdge {
+  id: string
+  constraintName?: string
+  fromNodeId: string
+  toNodeId: string
+  fromSchema: string
+  fromTable: string
+  toSchema: string
+  toTable: string
+  columnPairs: SchemaErEdgeColumnPair[]
+  unique: boolean
+  optional: boolean
+  crossSchema?: boolean
+  onDelete?: string
+  onUpdate?: string
+}
+
+export interface SchemaErGraph {
+  connectionId: string
+  schema?: string
+  completeness: 'full' | 'lite'
+  truncated?: boolean
+  totalTableCount?: number
+  nodes: SchemaErNode[]
+  edges: SchemaErEdge[]
+  generatedAt: number
+}
+
+export type ConditionalHighlightOperator =
+  | 'eq'
+  | 'neq'
+  | 'contains'
+  | 'not_contains'
+  | 'starts_with'
+  | 'ends_with'
+  | 'like'
+  | 'not_like'
+  | 'ilike'
+  | 'gt'
+  | 'gte'
+  | 'lt'
+  | 'lte'
+  | 'between'
+  | 'in'
+  | 'not_in'
+  | 'is_null'
+  | 'is_not_null'
+  | 'regex'
+
+export type ConditionalHighlightTone = 'info' | 'ok' | 'warn' | 'danger' | 'accent'
+
+export interface ConditionalHighlightRule {
+  id: string
+  enabled: boolean
+  column: string
+  operator: ConditionalHighlightOperator
+  value?: string
+  valueTo?: string
+  values?: string[]
+  caseSensitive?: boolean
+  target: 'row' | 'cell'
+  tone: ConditionalHighlightTone
+}
+
+export interface TableDisplayStateEntry {
+  columnOrder?: string[]
+  hiddenColumns?: string[]
+  pinnedColumns?: string[]
+  columnWidths?: Record<string, number>
+  wrapCells?: boolean
+  wrapMaxLines?: number
+  highlightRules?: ConditionalHighlightRule[]
+  updatedAt: number
+  revision: number
+}
+
+export interface ErNodePosition {
+  x: number
+  y: number
+}
+
+export interface ErLayoutStateEntry {
+  positions: Record<string, ErNodePosition>
+  compactMode?: boolean
+  hideOrphans?: boolean
+  collapseJunctions?: boolean
+  updatedAt: number
+  revision: number
 }
 
 export interface SavedQueryEntry {
@@ -189,6 +400,64 @@ export interface QueryResultSourceTable {
   schema?: string
 }
 
+export type ExplainSeverity = 'critical' | 'high' | 'moderate' | 'low' | 'neutral'
+
+export interface ExplainMissingIndex {
+  table: string
+  equalityColumns?: string[]
+  inequalityColumns?: string[]
+  includeColumns?: string[]
+  impact?: number
+  ddl: string
+}
+
+export interface ExplainPlanNode {
+  id: string
+  parentId: string | null
+  nodeType: string
+  relation?: string
+  alias?: string
+  indexName?: string
+  joinType?: string
+  startupCost?: number | null
+  totalCost?: number | null
+  exclusiveCost?: number | null
+  costFraction?: number | null
+  planRows?: number | null
+  planWidth?: number | null
+  actualStartupTimeMs?: number | null
+  actualTotalTimeMs?: number | null
+  exclusiveTimeMs?: number | null
+  timeFraction?: number | null
+  actualRows?: number | null
+  totalActualRows?: number | null
+  actualLoops?: number | null
+  workersPlanned?: number | null
+  workersLaunched?: number | null
+  processCount?: number
+  isInitPlan?: boolean
+  severity?: ExplainSeverity
+  warnings?: string[]
+  details?: Record<string, string | number | boolean>
+  children: ExplainPlanNode[]
+}
+
+export interface ParsedExplainPlan {
+  format: string
+  dialect?: DatabaseDriverType
+  planningTimeMs?: number | null
+  executionTimeMs?: number | null
+  totalCost?: number | null
+  totalExclusiveCost?: number | null
+  totalActualTimeMs?: number | null
+  nodeCount: number
+  truncated?: boolean
+  warnings?: string[]
+  missingIndexes?: ExplainMissingIndex[]
+  root: ExplainPlanNode | null
+  rawText?: string
+}
+
 export interface QueryResultSet {
   index: number
   sqlPreview?: string
@@ -203,6 +472,7 @@ export interface QueryResultSet {
   truncated: boolean
   isSelect: boolean
   sourceTable?: QueryResultSourceTable
+  explainPlan?: ParsedExplainPlan
 }
 
 export interface QueryExecutionError {
@@ -210,6 +480,7 @@ export interface QueryExecutionError {
   code?: string
   failedStatementIndex?: number
   statementCount?: number
+  tlsFailure?: TlsFailure
 }
 
 export interface QueryResult {
@@ -223,6 +494,7 @@ export interface QueryResult {
   sourceTable?: QueryResultSourceTable
   resultSets?: QueryResultSet[]
   executionError?: QueryExecutionError
+  explainPlan?: ParsedExplainPlan
 }
 
 export interface TableBrowseResult {
@@ -291,6 +563,9 @@ export interface ParsedConnectionUriResult {
 /** Storage key for persisting saved connections */
 export const SAVED_CONNECTIONS_STORAGE_KEY = 'datanoa.savedConnections'
 
+/** Storage key for persisting custom connection folder order */
+export const SAVED_FOLDER_ORDER_STORAGE_KEY = 'datanoa.folderOrder'
+
 /** Storage key for active connection */
 export const ACTIVE_CONNECTION_STORAGE_KEY = 'datanoa.activeConnectionId'
 
@@ -307,12 +582,14 @@ interface DatanoaPluginRequests {
   }
   'connection.save': {
     input: {
-      profile: ConnectionProfile
+      profile: ConnectionProfileInput
       password?: string
       authToken?: string
       sslKeyPassphrase?: string
       sshPassphrase?: string
       sshPassword?: string
+      sshJumpHopSecrets?: Record<string, SshJumpHopSecret>
+      sshExplicitlyDisabled?: boolean
       sourceConnectionId?: string
     }
     output: { ok: boolean; id: string }
@@ -321,17 +598,64 @@ interface DatanoaPluginRequests {
     input: { id: string }
     output: { ok: boolean }
   }
+  'connections.reorder': {
+    input: {
+      folder?: string
+      orderedIds: string[]
+    }
+    output: {
+      ok: boolean
+      changed: boolean
+      connections: ConnectionProfile[]
+    }
+  }
+  'folders.order.get': {
+    input?: Record<string, never>
+    output: {
+      folderOrder: string[]
+    }
+  }
+  'folders.reorder': {
+    input: {
+      orderedFolders: string[]
+    }
+    output: {
+      ok: boolean
+      changed: boolean
+      folderOrder: string[]
+    }
+  }
   'connection.test': {
     input: {
-      profile: ConnectionProfile
+      profile: ConnectionProfileInput
       password?: string
       authToken?: string
       sslKeyPassphrase?: string
       sshPassphrase?: string
       sshPassword?: string
+      sshJumpHopSecrets?: Record<string, SshJumpHopSecret>
       sourceConnectionId?: string
+      sshRetryToken?: string
     }
-    output: { ok: boolean; message?: string }
+    output: {
+      ok: boolean
+      message?: string
+      tlsFailure?: TlsFailure
+      sshChallenge?: SshHostKeyChallenge
+    }
+  }
+  'ssh.hostKey.resolve': {
+    input: {
+      challengeId: string
+      decision: SshHostKeyDecision
+    }
+    output: {
+      ok: boolean
+      decision: SshHostKeyDecision
+      savedPath?: string
+      challenge?: SshHostKeyChallenge
+      retryToken?: string
+    }
   }
   'connection.parseUri': {
     input: { uri?: string; candidateId?: string }
@@ -340,6 +664,19 @@ interface DatanoaPluginRequests {
   'schema.listObjects': {
     input: { connectionId: string; schema?: string }
     output: SchemaObject[]
+  }
+  'schema.listObjectsCatalog': {
+    input: { connectionId: string; schema?: string; forceRefresh?: boolean }
+    output: SchemaCatalogObjectsResult
+  }
+  'schema.erGraph': {
+    input: {
+      connectionId: string
+      schema?: string
+      includeViews?: boolean
+      forceRefresh?: boolean
+    }
+    output: SchemaErGraph
   }
   'schema.tableDetails': {
     input: { connectionId: string; table: string; schema?: string }
@@ -388,6 +725,8 @@ interface DatanoaPluginRequests {
       connectionId: string
       queryId: string
       sql: string
+      templateSql?: string
+      historySql?: string
       maxRows?: number
       structuredError?: boolean
     }
@@ -402,8 +741,19 @@ interface DatanoaPluginRequests {
     output: { files: { name: string; filePath: string; sizeBytes: number; sizeLabel: string }[] }
   }
   'studio.open': {
-    input: { connectionId?: string; table?: string; schema?: string; sql?: string }
-    output: { ok: boolean; path?: string; message?: string }
+    input: {
+      connectionId?: string
+      table?: string
+      schema?: string
+      sql?: string
+      viewMode?: StudioViewMode
+      action?: 'import'
+    }
+    output: { ok: boolean; path?: string; message?: string; navToken?: string }
+  }
+  'studio.navToken.consume': {
+    input: { navToken: string }
+    output: { consumed: boolean; alreadyConsumed: boolean }
   }
   'workspace.detectConnections': {
     input: { folderPath?: string }
@@ -441,6 +791,49 @@ interface DatanoaPluginRequests {
       statements: string[]
     }
   }
+  'data.copyImport.open': {
+    input: {
+      connectionId: string
+      table: string
+      schema?: string
+      columns: string[]
+    }
+    output: {
+      ok: boolean
+      importId?: string
+      fallbackReason?: string
+      useLegacyBatch?: boolean
+    }
+  }
+  'data.copyImport.write': {
+    input: {
+      importId: string
+      rows: Array<Record<string, unknown> | unknown[]>
+    }
+    output: {
+      ok: boolean
+      bytesWritten: number
+      rowCount: number
+    }
+  }
+  'data.copyImport.commit': {
+    input: {
+      importId: string
+    }
+    output: {
+      ok: boolean
+      inserted: number
+    }
+  }
+  'data.copyImport.abort': {
+    input: {
+      importId: string
+      reason?: string
+    }
+    output: {
+      ok: boolean
+    }
+  }
   'data.previewChanges': {
     input: DataChangesInput
     output: { statements: string[] }
@@ -450,7 +843,13 @@ interface DatanoaPluginRequests {
     output: { ddl: string }
   }
   'query.explain': {
-    input: { connectionId: string; sql: string; queryId?: string }
+    input: {
+      connectionId: string
+      sql: string
+      templateSql?: string
+      historySql?: string
+      queryId?: string
+    }
     output: QueryResult
   }
   'query.history.list': {
@@ -594,16 +993,73 @@ interface DatanoaPluginRequests {
     }
     output: { ok: true; updatedAt: number }
   }
+  'ui.tableDisplayState.get': {
+    input: { tableKey: string }
+    output: {
+      tableKey: string
+      entry: TableDisplayStateEntry | null
+      revision: number
+    }
+  }
+  'ui.tableDisplayState.patch': {
+    input: {
+      tableKey: string
+      patch: Partial<Omit<TableDisplayStateEntry, 'updatedAt' | 'revision'>>
+      baseRevision?: number
+    }
+    output: {
+      ok: boolean
+      tableKey: string
+      entry: TableDisplayStateEntry | null
+      revision: number
+    }
+  }
+  'ui.tableDisplayState.reset': {
+    input: { tableKey?: string; connectionId?: string }
+    output: { ok: boolean; removedCount: number }
+  }
+  'ui.erLayoutState.get': {
+    input: { schemaKey: string }
+    output: {
+      schemaKey: string
+      entry: ErLayoutStateEntry | null
+      revision: number
+    }
+  }
+  'ui.erLayoutState.patch': {
+    input: {
+      schemaKey: string
+      patch: Partial<Omit<ErLayoutStateEntry, 'updatedAt' | 'revision'>>
+    }
+    output: {
+      ok: boolean
+      schemaKey: string
+      entry: ErLayoutStateEntry | null
+      revision: number
+    }
+  }
+  'ui.erLayoutState.reset': {
+    input: { schemaKey?: string; connectionId?: string }
+    output: { ok: boolean; removedCount: number }
+  }
   'ai.status.get': {
     input?: Record<string, never>
     output: AiStatusSnapshot
   }
   'ai.key.set': {
-    input: { key: string; baseUrl?: string; role?: AiRole }
+    input: { key: string; baseUrl?: string; role?: AiRole; clearSynced?: boolean }
     output: { hasKey: boolean; role?: AiRole }
   }
   'ai.provider.test': {
-    input: { role?: AiRole } | undefined
+    input:
+      | {
+          role?: AiRole
+          format?: AiProviderFormat
+          baseUrl?: string
+          model?: string
+          key?: string
+        }
+      | undefined
     output: { ok: boolean; message: string; ms: number | null; role?: AiRole }
   }
   'ai.models.list': {
@@ -633,6 +1089,7 @@ interface DatanoaPluginRequests {
   'ai.complete': {
     input: {
       connectionId?: string
+      fromConnection?: boolean
       dialect: DatabaseDriverType
       prefix: string
       suffix: string
@@ -641,6 +1098,7 @@ interface DatanoaPluginRequests {
       schemaMap?: Record<string, string[]>
       manual?: boolean
       mode?: 'auto' | 'complete' | 'edit'
+      confirmed?: boolean
     }
     output: {
       suggestion: string
@@ -653,18 +1111,23 @@ interface DatanoaPluginRequests {
   'ai.explainAnalyze': {
     input: {
       connectionId?: string
+      fromConnection?: boolean
       dialect: DatabaseDriverType
       sql: string
       planColumns: { name: string; type: string }[]
       planRows: unknown[][]
+      explainPlan?: ParsedExplainPlan
+      activeSchema?: string
       language?: AiExplainLanguage
       uiLocale?: string
+      confirmed?: boolean
     }
     output: AiExplainAnalysisResult
   }
   'ai.fixQuery': {
     input: {
       connectionId?: string
+      fromConnection?: boolean
       dialect: DatabaseDriverType
       sql: string
       errorMessage: string
@@ -673,6 +1136,7 @@ interface DatanoaPluginRequests {
       schemaMap?: Record<string, string[]>
       language?: AiExplainLanguage
       uiLocale?: string
+      confirmed?: boolean
     }
     output: AiFixQueryResult
   }
@@ -855,8 +1319,34 @@ interface DatanoaPluginPanelEvents {
     table: string
     primaryKeys: Record<string, unknown>
     column: string
+    truncated?: boolean
   }
   'ai.status.changed': AiStatusSnapshot
+  'ssh.hostKeyChallenge': SshHostKeyChallenge
+  'ssh.hostKeyResolved': {
+    challengeId: string
+    decision: SshHostKeyDecision
+  }
+  'ui.tableDisplayState.changed': {
+    tableKey: string
+    entry: TableDisplayStateEntry | null
+    revision: number
+    bulkReset?: boolean
+    connectionId?: string
+    all?: boolean
+    tableKeys?: string[]
+    revisions?: Record<string, number>
+  }
+  'studio.opened': {
+    connectionId: string | null
+    table: string | null
+    schema: string | null
+    viewMode?: StudioViewMode | null
+    action?: 'import'
+    navToken?: string
+    workspaceId?: string
+    docPath?: string
+  }
 }
 
 export type PluginPanelEvents = DatanoaPluginPanelEvents

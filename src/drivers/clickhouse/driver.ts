@@ -430,6 +430,10 @@ export class ClickHouseSession implements IDatabaseSession {
     return !this.isClosed
   }
 
+  clearSchemaCache(): void {
+    this.tableDetailsCache.clear()
+  }
+
   private getDatabase(): string {
     return this.profile.database || 'default'
   }

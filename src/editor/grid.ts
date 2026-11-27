@@ -7,7 +7,33 @@ import type {
   QueryResult,
   ForeignKeyInfo,
   DatabaseDriverType,
+  ConditionalHighlightRule,
+  TableDisplayStateEntry,
 } from '../protocol.js'
+import {
+  RowHeightIndex,
+  clampWrapMaxLines,
+  countNormalizedLines,
+  isWrappableCellValue,
+  DEFAULT_LINE_HEIGHT_PX,
+  DEFAULT_WRAP_MAX_LINES,
+} from '../shared-row-height-index.js'
+import {
+  HIGHLIGHT_CSS_CLASSES,
+  CONDITIONAL_HIGHLIGHT_OPERATORS,
+  HIGHLIGHT_TONES,
+  areHighlightRulesEqual,
+  buildColumnKeyResolver,
+  computePinnedColumnsViewportCap,
+  computeScrollLeftForFocusedCell,
+  createHighlightEvaluator,
+  normalizeTableDisplayStateEntry,
+  parseOccurrenceColumnKey,
+  type ColumnKeyResolver,
+  type EvaluatedRowHighlight,
+} from '../shared-table-display.js'
+
+const HIGHLIGHT_TONE_CLASSES = Object.values(HIGHLIGHT_CSS_CLASSES)
 import {
   formatDataExport,
   buildQuickFilterPredicate,
@@ -52,6 +78,7 @@ import {
 } from './grid-icons.js'
 import {
   computeInitialColumnWidthsForGrid,
+  computeInitialTransposedColumnWidths,
   computeFilteredRowIndices,
   computeGridFindMatches,
   compareGridCellValues,
@@ -107,6 +134,10 @@ interface DragSelectionState {
   lastClientY: number
   lastRow: number | null
   lastCol: number | null
+  cachedContainerRect: DOMRect | null
+  cachedHeaderH: number
+  moveRafId: number | null
+  pendingMove: { target: EventTarget | null; x: number; y: number } | null
   autoScrollRafId: number | null
   summaryRafId: number | null
   summaryDirty: boolean
@@ -119,6 +150,30 @@ interface PooledGridRow {
   tr: HTMLTableRowElement
   rowNumTd: HTMLTableCellElement
   dataCells: HTMLTableCellElement[]
+  cellByModelCol: Map<number, HTMLTableCellElement>
+}
+
+interface PooledNormalHeaderCell {
+  th: HTMLTableCellElement
+  inner: HTMLDivElement
+  labelEl: HTMLSpanElement
+  filterBtn: HTMLButtonElement
+  selectBtn: HTMLButtonElement
+  pinIcon: HTMLSpanElement | null
+  sortIcon: HTMLSpanElement | null
+  sortDir: 'ASC' | 'DESC' | null
+}
+
+interface PooledTransposedRow {
+  tr: HTMLTableRowElement
+  labelTd: HTMLTableCellElement
+  fieldNameSpan: HTMLSpanElement
+  pkSpan: HTMLSpanElement | null
+  typeSpan: HTMLSpanElement | null
+  leftSpacerTd: HTMLTableCellElement | null
+  dataCells: HTMLTableCellElement[]
+  moreTd: HTMLTableCellElement | null
+  rightSpacerTd: HTMLTableCellElement | null
 }
 
 interface RenderedWindowSnapshot {
@@ -127,11 +182,16 @@ interface RenderedWindowSnapshot {
   dataVersion: number
   filterVersion: number
   colLayoutVersion: number
+  wrapVersion: number
   totalRows: number
   colSpan: number
 }
 
 const DEFAULT_ROWNUM_WIDTH_PX = 44
+const DEFAULT_TRANSPOSED_FIELD_WIDTH_PX = 180
+const DEFAULT_TRANSPOSED_ROW_WIDTH_PX = 180
+const DEFAULT_TRANSPOSED_MORE_WIDTH_PX = 150
+const TRANSPOSED_MORE_COL_INDEX = -2
 
 export interface GridRuntimeSnapshot {
   model: GridModel | null
@@ -186,6 +246,7 @@ export interface VirtualDataGridOptions {
   ) => void
   onNavigateForeignKey?: (refTable: string, refColumn: string, value: unknown) => void
   onColumnConfigChange?: (config: { hidden: string[]; pinned: string[] }) => void
+  onTableDisplayStateChange?: (entry: TableDisplayStateEntry) => void
   onFindStateChange?: (state: { total: number; activeIndex: number }) => void
 }
 
@@ -215,6 +276,14 @@ export class VirtualDataGrid {
   private sortDirection?: 'ASC' | 'DESC'
   private batchMode = false
   private isTransposed = false
+  private transposedFieldWidth = DEFAULT_TRANSPOSED_FIELD_WIDTH_PX
+  private transposedFieldWidthInitialized = false
+  private transposedRowWidths = new Map<number, number>()
+  private transposedMoreWidth = DEFAULT_TRANSPOSED_MORE_WIDTH_PX
+  private transposedWidthsByTable = new Map<
+    string,
+    { fieldWidth: number; rowWidths: Map<number, number>; moreWidth: number }
+  >()
   private clientFilter = ''
   private clientColumnFilters: ClientColumnFilter[] = []
   private tableName = 'table_name'
@@ -235,18 +304,57 @@ export class VirtualDataGrid {
 
   private mountedRowsByVisRow = new Map<number, PooledGridRow>()
   private freeRowPool: PooledGridRow[] = []
+  private freeCellPool: HTMLTableCellElement[] = []
   private isPoolMountedInTbody = false
+  private cachedHeaderModelRef: GridModel | null = null
+  private cachedHeaderTr: HTMLTableRowElement | null = null
+  private cachedRowNumTh: HTMLTableCellElement | null = null
+  private cachedColPoolByModelIdx = new Map<number, HTMLTableColElement>()
+  private cachedThPoolByModelIdx = new Map<number, PooledNormalHeaderCell>()
+  private headerHeightMeasuredTransposed: boolean | null = null
+  private colKeyResolverHeaders: readonly string[] | null = null
+  private colKeyResolverCache: ColumnKeyResolver | null = null
+  private cachedVisibleColsLayoutVersion = -1
+  private cachedVisibleColsModelRef: GridModel | null = null
+  private cachedVisibleColsResult: number[] = []
+  private mountedTransposedRowsByFieldIdx = new Map<number, PooledTransposedRow>()
+  private freeTransposedRowPool: PooledTransposedRow[] = []
+  private isTransposedPoolMounted = false
+  private lastTransposedWindow: RenderedWindowSnapshot | null = null
+  private lastTransposedHStart = 0
+  private lastTransposedHEnd = 0
+  private lastScrollLeft = -1
   private topSpacerTr: HTMLTableRowElement | null = null
   private topSpacerTd: HTMLTableCellElement | null = null
   private bottomSpacerTr: HTMLTableRowElement | null = null
   private bottomSpacerTd: HTMLTableCellElement | null = null
   private resizeObserver: ResizeObserver | null = null
+  private resizeObserverRafId: number | null = null
   private lastObservedHeight = 0
+  private lastObservedWidth = 0
+  private isViewportResizing = false
+  private cachedHeaderHeightPx = 26
 
   private readonly selection = new GridSelectionModel()
   private foreignKeyByColumn = new Map<string, ForeignKeyInfo>()
   private hiddenColumns = new Set<string>()
   private pinnedColumns: string[] = []
+  private columnOrder: string[] = []
+  private wrapCells = false
+  private wrapMaxLines: number = DEFAULT_WRAP_MAX_LINES
+  private wrapVersion = 0
+  private highlightRules: ConditionalHighlightRule[] = []
+  private readonly rowHeightIndex = new RowHeightIndex({
+    baseRowHeightPx: ROW_HEIGHT_PX,
+    lineHeightPx: DEFAULT_LINE_HEIGHT_PX,
+    maxLines: DEFAULT_WRAP_MAX_LINES,
+    wrapEnabled: false,
+  })
+  private readonly highlightEvaluator = createHighlightEvaluator()
+  private tableDisplayRevision = 0
+  private userResizedColumnKeys = new Set<string>()
+  private lastUserResizeCacheKey = ''
+  private draggedHeaderName: string | null = null
   private interactionLocked = false
 
   private findQuery = ''
@@ -286,6 +394,7 @@ export class VirtualDataGrid {
   } | null = null
   private resizeRafId: number | null = null
   private activeResizeHandle: HTMLDivElement | null = null
+  private activeResizeGuideEl: HTMLDivElement | null = null
   private dragState: DragSelectionState | null = null
   private handledMouseDownClick = false
   private suppressSortClickUntil = 0
@@ -304,6 +413,7 @@ export class VirtualDataGrid {
   private onColumnHeaderFilter?: VirtualDataGridOptions['onColumnHeaderFilter']
   private onNavigateForeignKey?: VirtualDataGridOptions['onNavigateForeignKey']
   private onColumnConfigChange?: VirtualDataGridOptions['onColumnConfigChange']
+  private onTableDisplayStateChange?: VirtualDataGridOptions['onTableDisplayStateChange']
   private onFindStateChange?: VirtualDataGridOptions['onFindStateChange']
 
   // Shared non-bubbling fallback handlers for synthetic non-bubbling cell events (e.g. Gate C tests)
@@ -333,6 +443,7 @@ export class VirtualDataGrid {
     this.onColumnHeaderFilter = options.onColumnHeaderFilter
     this.onNavigateForeignKey = options.onNavigateForeignKey
     this.onColumnConfigChange = options.onColumnConfigChange
+    this.onTableDisplayStateChange = options.onTableDisplayStateChange
     this.onFindStateChange = options.onFindStateChange
 
     this.initDOM()
@@ -366,17 +477,31 @@ export class VirtualDataGrid {
       if (this.contextMenuEl) {
         this.closeContextMenu()
       }
-      if (this.isTransposed || !this.tableContainerEl) return
+      if (!this.tableContainerEl) return
       const curTop = this.tableContainerEl.scrollTop
-      // Pure horizontal scroll (scrollLeft change) with unchanged data/filter/layout: 0 DOM rebuilds
-      if (
-        curTop === this.lastScrollTop &&
-        this.lastRenderedWindow !== null &&
-        this.lastRenderedWindow.dataVersion === this.dataVersion &&
-        this.lastRenderedWindow.filterVersion === this.filterVersion &&
-        this.lastRenderedWindow.colLayoutVersion === this.colLayoutVersion
-      ) {
-        return
+      const curLeft = this.tableContainerEl.scrollLeft
+      const activeWin = this.isTransposed ? this.lastTransposedWindow : this.lastRenderedWindow
+      const versionsMatch =
+        activeWin !== null &&
+        activeWin.dataVersion === this.dataVersion &&
+        activeWin.filterVersion === this.filterVersion &&
+        activeWin.colLayoutVersion === this.colLayoutVersion
+      if (curTop === this.lastScrollTop && versionsMatch) {
+        if (!this.isTransposed) {
+          return
+        }
+        if (curLeft === this.lastScrollLeft) {
+          return
+        }
+        // In transposed mode, only schedule horizontal window update if [hStart, hEnd) actually shifts
+        const indices = this.getFilteredRowIndices()
+        const capped = indices.slice(0, 100)
+        const hasOverflow = indices.length > 100
+        const nextH = this.computeTransposedColRange(capped, hasOverflow)
+        if (nextH.hStart === this.lastTransposedHStart && nextH.hEnd === this.lastTransposedHEnd) {
+          this.lastScrollLeft = curLeft
+          return
+        }
       }
       if (typeof requestAnimationFrame === 'function') {
         if (this.rafHandle !== null) return
@@ -388,14 +513,49 @@ export class VirtualDataGrid {
         this.renderVisibleRows()
       }
     }
-    this.tableContainerEl.addEventListener('scroll', this.scrollListener)
+    this.tableContainerEl.addEventListener('scroll', this.scrollListener, { passive: true })
 
     if (typeof ResizeObserver === 'function') {
       this.resizeObserver = new ResizeObserver((entries) => {
         const entry = entries[0]
         const nextH = entry?.contentRect?.height ?? this.tableContainerEl?.clientHeight ?? 0
-        if (nextH > 0 && Math.abs(nextH - this.lastObservedHeight) >= 1) {
-          this.lastObservedHeight = nextH
+        const nextW = entry?.contentRect?.width ?? this.tableContainerEl?.clientWidth ?? 0
+        const heightChanged = nextH > 0 && Math.abs(nextH - this.lastObservedHeight) >= 1
+        const widthChanged =
+          this.isTransposed && nextW > 0 && Math.abs(nextW - this.lastObservedWidth) >= 4
+        if (!heightChanged && !widthChanged) return
+
+        // During an active vertical pane drag, skip shrink-only DOM churn and avoid 1-frame-late
+        // ResizeObserver layout ping-pong unless newly exposed rows exceed the mounted buffer.
+        if (this.isViewportResizing && !widthChanged) {
+          if (nextH <= this.lastObservedHeight) {
+            return
+          }
+          const activeWin = this.isTransposed ? this.lastTransposedWindow : this.lastRenderedWindow
+          if (activeWin && this.tableContainerEl) {
+            const neededEnd = Math.ceil((this.tableContainerEl.scrollTop + nextH) / ROW_HEIGHT_PX) + 1
+            if (activeWin.boundedEnd >= Math.min(activeWin.totalRows, neededEnd)) {
+              this.lastObservedHeight = nextH
+              return
+            }
+          }
+        }
+
+        if (nextH > 0) this.lastObservedHeight = nextH
+        if (nextW > 0) this.lastObservedWidth = nextW
+        if (typeof requestAnimationFrame === 'function') {
+          if (this.resizeObserverRafId === null) {
+            let ranSync = false
+            const id = requestAnimationFrame(() => {
+              ranSync = true
+              this.resizeObserverRafId = null
+              this.handleViewportResize()
+            })
+            if (!ranSync) {
+              this.resizeObserverRafId = id
+            }
+          }
+        } else {
           this.handleViewportResize()
         }
       })
@@ -545,33 +705,222 @@ export class VirtualDataGrid {
   private invalidateFilterCache(): void {
     this.filterStateStamp++
     this.filterVersion++
+    this.syncRowHeightIndex()
   }
 
   private invalidateDataCache(): void {
     this.dataVersion++
+    this.highlightEvaluator.clear()
+    this.syncRowHeightIndex()
   }
 
   private invalidateColLayoutCache(): void {
     this.colLayoutVersion++
+    this.cachedVisibleColsLayoutVersion = -1
+  }
+
+  private resetHeaderPool(): void {
+    this.cachedHeaderModelRef = null
+    this.cachedHeaderTr = null
+    this.cachedRowNumTh = null
+    this.cachedColPoolByModelIdx.clear()
+    this.cachedThPoolByModelIdx.clear()
+    this.headerHeightMeasuredTransposed = null
+  }
+
+  private getColKeyResolver(): ColumnKeyResolver | null {
+    const model = this.model
+    if (!model || model.headers.length === 0) return null
+    if (
+      this.colKeyResolverCache &&
+      this.colKeyResolverHeaders === model.headers &&
+      this.colKeyResolverCache.occKeys.length === model.headers.length
+    ) {
+      return this.colKeyResolverCache
+    }
+    this.colKeyResolverHeaders = model.headers
+    this.colKeyResolverCache = buildColumnKeyResolver(model.headers)
+    return this.colKeyResolverCache
+  }
+
+  private measureWrapRowsRange(
+    visibleRows: readonly number[],
+    startVisRow: number,
+    endVisRow: number
+  ): void {
+    const model = this.model
+    if (!model || !this.wrapCells || this.isTransposed || visibleRows.length === 0) return
+    const lo = Math.max(0, startVisRow)
+    const hi = Math.min(visibleRows.length, endVisRow)
+    if (lo >= hi) return
+
+    const visibleCols = this.getVisibleColumnIndices()
+    const colMeta = visibleCols.map((colIdx) => {
+      const colDef = model.columns[colIdx]
+      const colType = colDef && 'type' in colDef ? colDef.type : undefined
+      const widthPx = Math.max(48, this.columnWidths[colIdx] ?? 120)
+      const charsPerLine = Math.max(8, Math.floor((widthPx - 14) / 7.5))
+      return {
+        colIdx,
+        header: model.headers[colIdx] ?? '',
+        colType,
+        charsPerLine,
+      }
+    })
+    for (let visRow = lo; visRow < hi; visRow++) {
+      const rowData = model.rows[visibleRows[visRow]]
+      if (!rowData) continue
+      let maxRowLines = 1
+      for (const meta of colMeta) {
+        const val = getCellValue(rowData, meta.colIdx, meta.header)
+        if (!isWrappableCellValue(val, meta.colType)) continue
+        let lines = countNormalizedLines(val, this.wrapMaxLines)
+        if (typeof val === 'string' && val.length > meta.charsPerLine) {
+          const wrappedEstimate = Math.ceil(val.length / meta.charsPerLine)
+          if (wrappedEstimate > lines) {
+            lines = Math.min(this.wrapMaxLines, wrappedEstimate)
+          }
+        }
+        if (lines > maxRowLines) {
+          maxRowLines = lines
+          if (maxRowLines >= this.wrapMaxLines) break
+        }
+      }
+      this.rowHeightIndex.setRowLines(visRow, maxRowLines)
+    }
+  }
+
+  private syncRowHeightIndex(options?: { layoutOnly?: boolean; skipWrapScan?: boolean }): void {
+    const activeWrap = this.wrapCells && !this.isTransposed
+    this.rowHeightIndex.setWrapEnabled(activeWrap)
+    this.rowHeightIndex.setMaxLines(this.wrapMaxLines)
+    if (!this.model || this.isTransposed) {
+      if (this.rowHeightIndex.rowCount !== 0) {
+        this.rowHeightIndex.reset(0)
+      }
+      return
+    }
+    const visibleRows = this.getFilteredRowIndices()
+    if (options?.layoutOnly && this.rowHeightIndex.rowCount === visibleRows.length) {
+      if (!activeWrap || options?.skipWrapScan || visibleRows.length === 0) return
+      if (visibleRows.length <= 64) {
+        this.measureWrapRowsRange(visibleRows, 0, visibleRows.length)
+      } else {
+        const clientHeight = this.tableContainerEl?.clientHeight || 440
+        const scrollTop = Math.max(0, this.tableContainerEl?.scrollTop ?? 0)
+        const range = this.rowHeightIndex.getVisibleRange(scrollTop, clientHeight, 5)
+        this.measureWrapRowsRange(visibleRows, range.start, range.end)
+      }
+      return
+    }
+    this.rowHeightIndex.reset(visibleRows.length)
+    if (!activeWrap || visibleRows.length === 0) return
+    if (visibleRows.length <= 64) {
+      this.measureWrapRowsRange(visibleRows, 0, visibleRows.length)
+    } else {
+      const clientHeight = this.tableContainerEl?.clientHeight || 440
+      const scrollTop = Math.max(0, this.tableContainerEl?.scrollTop ?? 0)
+      const range = this.rowHeightIndex.getVisibleRange(scrollTop, clientHeight, 5)
+      this.measureWrapRowsRange(visibleRows, range.start, range.end)
+    }
+  }
+
+  private evaluateRowHighlightState(
+    model: GridModel | null,
+    rowIndex: number
+  ): EvaluatedRowHighlight | null {
+    const rowData = model?.rows[rowIndex]
+    if (!model || this.isTransposed || this.highlightRules.length === 0 || !rowData) {
+      return null
+    }
+    return this.highlightEvaluator.evaluateRow({
+      row: rowData,
+      columns: model.headers,
+      rules: this.highlightRules,
+      rowKey: rowIndex,
+      rowRevision: this.dataVersion,
+    })
+  }
+
+  private resolveCellHighlightClass(
+    evaluatedHighlight: EvaluatedRowHighlight | null,
+    occKeys: readonly string[] | null,
+    colIdx: number,
+    header: string
+  ): string | null {
+    if (!evaluatedHighlight) return null
+    const occKey = occKeys ? occKeys[colIdx] : undefined
+    return (
+      (occKey ? evaluatedHighlight.cellClassesByKey[occKey] : undefined) ??
+      evaluatedHighlight.cellClassesByKey[header] ??
+      null
+    )
+  }
+
+  private resetPooledRowStyles(pooled: PooledGridRow): void {
+    pooled.tr.style.height = ''
+    pooled.rowNumTd.style.height = ''
+    for (const td of pooled.dataCells) {
+      td.style.height = ''
+    }
   }
 
   private resetRowPoolMountState(): void {
     for (const pooled of this.mountedRowsByVisRow.values()) {
+      this.resetPooledRowStyles(pooled)
       if (this.freeRowPool.length < 120) {
         this.freeRowPool.push(pooled)
       }
     }
     this.mountedRowsByVisRow.clear()
     this.isPoolMountedInTbody = false
+    for (const pooled of this.mountedTransposedRowsByFieldIdx.values()) {
+      pooled.tr.style.height = ''
+      if (this.freeTransposedRowPool.length < 80) {
+        this.freeTransposedRowPool.push(pooled)
+      }
+    }
+    this.mountedTransposedRowsByFieldIdx.clear()
+    this.isTransposedPoolMounted = false
     this.lastRenderedWindow = null
+    this.lastTransposedWindow = null
+    this.lastTransposedHStart = 0
+    this.lastTransposedHEnd = 0
     this.lastScrollTop = -1
+    this.lastScrollLeft = -1
+  }
+
+  public setViewportResizing(resizing: boolean): void {
+    const next = Boolean(resizing)
+    if (this.isViewportResizing === next) return
+    this.isViewportResizing = next
+    if (next) {
+      if (this.resizeObserverRafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(this.resizeObserverRafId)
+        this.resizeObserverRafId = null
+      }
+      if (this.tableContainerEl) {
+        const curH = this.tableContainerEl.clientHeight
+        if (curH > 0) this.lastObservedHeight = curH
+      }
+    } else {
+      this.handleViewportResize()
+    }
   }
 
   public handleViewportResize(): void {
-    if (!this.tableContainerEl || this.isTransposed || this.isLoading || !this.model) return
+    if (this.resizeObserverRafId !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(this.resizeObserverRafId)
+      this.resizeObserverRafId = null
+    }
+    if (!this.tableContainerEl || this.isLoading || !this.model) return
     const nextH = this.tableContainerEl.clientHeight
+    const nextW = this.tableContainerEl.clientWidth
     if (nextH > 0) {
       this.lastObservedHeight = nextH
+    }
+    if (nextW > 0) {
+      this.lastObservedWidth = nextW
     }
     this.renderVisibleRows()
   }
@@ -622,12 +971,19 @@ export class VirtualDataGrid {
   }
 
   public setTransposed(enabled: boolean): void {
+    const modeChanged = this.isTransposed !== enabled
     if (this.activeEditor) {
       this.flushActiveEditorBeforeRebuild()
     }
     this.isTransposed = enabled
     this.invalidateColLayoutCache()
+    this.resetHeaderPool()
     this.resetRowPoolMountState()
+    this.syncRowHeightIndex()
+    if (modeChanged && this.tableContainerEl) {
+      this.tableContainerEl.scrollTop = 0
+      this.tableContainerEl.scrollLeft = 0
+    }
     this.closeContextMenu()
     this.closeBulkFillPopover()
     this.closeColumnFilterPopover()
@@ -635,7 +991,7 @@ export class VirtualDataGrid {
       this.tableEl.className = enabled ? 'datanoa-grid-table transposed' : 'datanoa-grid-table'
     }
     this.renderHeader()
-    this.renderVisibleRows()
+    this.renderVisibleRows(true)
   }
 
   public getTransposed(): boolean {
@@ -760,6 +1116,7 @@ export class VirtualDataGrid {
       this.findActiveIndex = -1
       this.invalidateDataCache()
       this.invalidateFilterCache()
+      this.resetHeaderPool()
       this.resetRowPoolMountState()
       this.renderHeader()
       this.renderVisibleRows()
@@ -784,11 +1141,129 @@ export class VirtualDataGrid {
     }
   }
 
-  public setData(data: TableBrowseResult | QueryResult): void {
+  private capturePreservedStagedDeltas(nextHeaders: readonly string[], nextPrimaryKey: readonly string[]) {
+    const empty = {
+      inserts: [] as Array<{
+        record: Record<string, unknown>
+        origin: InternalRowState['origin']
+        dirtyCols: Map<string, unknown>
+      }>,
+      existingByPk: new Map<string, { deleted: boolean; dirtyCols: Map<string, unknown> }>(),
+    }
+    const prevModel = this.model
+    if (!prevModel || this.getStagedCount() === 0) return empty
+
+    const oldHeaderIdx = new Map<string, number>()
+    for (let c = 0; c < prevModel.headers.length; c++) {
+      const h = prevModel.headers[c]
+      if (!oldHeaderIdx.has(h)) oldHeaderIdx.set(h, c)
+    }
+
+    const canMatchPk =
+      prevModel.primaryKey.length > 0 &&
+      nextPrimaryKey.length === prevModel.primaryKey.length &&
+      prevModel.primaryKey.every((pk, i) => nextPrimaryKey[i] === pk) &&
+      nextPrimaryKey.every((pk) => nextHeaders.includes(pk))
+
+    for (let r = 0; r < this.rowStates.length; r++) {
+      const rs = this.rowStates[r]
+      if (!rs) continue
+      if (rs.kind === 'inserted') {
+        if (rs.deleted) continue
+        const liveRow = prevModel.rows[r] ?? rs.original
+        empty.inserts.push({
+          record: rowToPlainRecord(prevModel.headers, liveRow),
+          origin: rs.origin,
+          dirtyCols: new Map(rs.dirtyCols),
+        })
+        continue
+      }
+      if (!canMatchPk || (!rs.deleted && rs.dirtyCols.size === 0)) continue
+      const pkKey = JSON.stringify(
+        prevModel.primaryKey.map((pk) => {
+          const idx = oldHeaderIdx.get(pk)
+          return idx !== undefined ? getCellValue(rs.original, idx, pk) : undefined
+        })
+      )
+      empty.existingByPk.set(pkKey, {
+        deleted: rs.deleted,
+        dirtyCols: new Map(rs.dirtyCols),
+      })
+    }
+    return empty
+  }
+
+  private applyPreservedStagedDeltas(
+    preserved: ReturnType<VirtualDataGrid['capturePreservedStagedDeltas']>,
+    headers: readonly string[],
+    primaryKey: readonly string[]
+  ): void {
+    const model = this.model
+    if (!model || !model.canEdit) return
+    const headerIdx = new Map<string, number>()
+    for (let c = 0; c < headers.length; c++) {
+      const h = headers[c]
+      if (!headerIdx.has(h)) headerIdx.set(h, c)
+    }
+
+    if (preserved.existingByPk.size > 0 && primaryKey.length > 0) {
+      for (let r = 0; r < this.rowStates.length; r++) {
+        const rs = this.rowStates[r]
+        if (!rs || rs.kind !== 'existing') continue
+        const pkKey = JSON.stringify(
+          primaryKey.map((pk) => {
+            const idx = headerIdx.get(pk)
+            return idx !== undefined ? getCellValue(rs.original, idx, pk) : undefined
+          })
+        )
+        const delta = preserved.existingByPk.get(pkKey)
+        if (!delta) continue
+        rs.deleted = delta.deleted
+        const filteredDirty = new Map<string, unknown>()
+        for (const [colName, val] of delta.dirtyCols) {
+          const colIdx = headerIdx.get(colName)
+          if (colIdx === undefined) continue
+          filteredDirty.set(colName, val)
+          setCellValue(model.rows[r], colIdx, colName, val)
+        }
+        rs.dirtyCols = filteredDirty
+      }
+    }
+
+    for (const ins of preserved.inserts) {
+      const rowRecord: Record<string, unknown> = {}
+      const dirtyCols = new Map<string, unknown>()
+      for (const h of headers) {
+        if (Object.prototype.hasOwnProperty.call(ins.record, h)) {
+          rowRecord[h] = ins.record[h]
+        }
+        if (ins.dirtyCols.has(h)) {
+          dirtyCols.set(h, ins.dirtyCols.get(h))
+        }
+      }
+      model.rows.push(rowRecord)
+      this.rowStates.push({
+        kind: 'inserted',
+        ...(ins.origin ? { origin: ins.origin } : {}),
+        deleted: false,
+        original: {},
+        dirtyCols,
+      })
+    }
+  }
+
+  public setData(
+    data: TableBrowseResult | QueryResult,
+    options?: { preserveStagedDeltas?: boolean }
+  ): void {
     this.isLoading = false
     this.cleanupColumnResize()
     this.cleanupDragSelection()
     const formatted = formatGridModel(data)
+    const preserved =
+      options?.preserveStagedDeltas && formatted.canEdit
+        ? this.capturePreservedStagedDeltas(formatted.headers, formatted.primaryKey)
+        : null
     const clonedRows = formatted.rows.map((r) => cloneRow(r))
 
     this.model = {
@@ -806,6 +1281,9 @@ export class VirtualDataGrid {
       original: row,
       dirtyCols: new Map<string, unknown>(),
     }))
+    if (preserved) {
+      this.applyPreservedStagedDeltas(preserved, formatted.headers, formatted.primaryKey)
+    }
 
     this.clientColumnFilters = []
     this.selection.clear()
@@ -818,13 +1296,22 @@ export class VirtualDataGrid {
     this.invalidateDataCache()
     this.invalidateFilterCache()
     this.invalidateColLayoutCache()
+    this.colKeyResolverHeaders = null
+    this.colKeyResolverCache = null
+    this.resetHeaderPool()
     this.resetRowPoolMountState()
 
     if (this.model.headers.length === 0) {
       this.rowNumWidth = DEFAULT_ROWNUM_WIDTH_PX
       this.columnWidths = []
+      this.userResizedColumnKeys.clear()
+      this.lastUserResizeCacheKey = ''
     } else {
       const cacheKey = this.getColumnCacheKey(this.model.headers)
+      if (cacheKey !== this.lastUserResizeCacheKey) {
+        this.userResizedColumnKeys.clear()
+        this.lastUserResizeCacheKey = cacheKey
+      }
       const cached = this.columnWidthsByTable.get(cacheKey)
       if (cached && cached.columnWidths.length === this.model.headers.length) {
         this.rowNumWidth = cached.rowNumWidth
@@ -840,6 +1327,8 @@ export class VirtualDataGrid {
         }
       }
     }
+    this.syncTransposedWidthsForModel()
+    this.syncRowHeightIndex()
 
     if (this.findQuery) {
       this.recomputeFindMatches()
@@ -852,83 +1341,414 @@ export class VirtualDataGrid {
 
     this.renderHeader()
     this.renderVisibleRows()
-    this.onStageChange?.(0)
+    this.onStageChange?.(this.getStagedCount())
     this.notifyAllSelectionListeners()
   }
 
-  public getColumnConfig(): { hidden: string[]; pinned: string[]; allColumns: string[] } {
-    const allColumns = this.model ? [...this.model.headers] : []
-    const headerSet = new Set(allColumns)
-    const hidden =
-      allColumns.length > 0
-        ? allColumns.filter((h) => this.hiddenColumns.has(h))
-        : Array.from(this.hiddenColumns)
-    const pinned =
-      allColumns.length > 0
-        ? this.pinnedColumns.filter((h) => headerSet.has(h) && !this.hiddenColumns.has(h))
-        : [...this.pinnedColumns]
-    return { hidden, pinned, allColumns }
+  private resolveCanonicalColumnKey(rawKey: string): string {
+    const trimmed = rawKey.trim()
+    if (!trimmed) return ''
+    const resolver = this.getColKeyResolver()
+    if (!resolver) return trimmed
+    return resolver.resolveKey(trimmed) ?? trimmed
+  }
+
+  private getHeaderOccurrenceCounts(): Map<string, number> {
+    const resolver = this.getColKeyResolver()
+    if (resolver) return resolver.nameCounts
+    return new Map<string, number>()
+  }
+
+  private toDisplayColumnKey(
+    occKey: string,
+    counts: Map<string, number>,
+    resolver?: ColumnKeyResolver | null
+  ): string {
+    const parsed = parseOccurrenceColumnKey(occKey)
+    if (!parsed) return occKey
+    if ((counts.get(parsed.name) ?? 0) > 1) return occKey
+    const activeResolver = resolver ?? this.getColKeyResolver()
+    if (
+      activeResolver &&
+      activeResolver.occKeySet.has(parsed.name) &&
+      activeResolver.resolveKey(parsed.name) !== occKey
+    ) {
+      return occKey
+    }
+    return parsed.name
+  }
+
+  private getOrderedColumnNames(): string[] {
+    const resolver = this.getColKeyResolver()
+    if (!resolver) return [...this.columnOrder]
+    const occKeys = resolver.occKeys
+    const occKeySet = resolver.occKeySet
+    const ordered: string[] = []
+    const seen = new Set<string>()
+    for (const rawKey of this.columnOrder) {
+      const resolved = resolver.resolveKey(rawKey)
+      if (resolved && occKeySet.has(resolved) && !seen.has(resolved)) {
+        seen.add(resolved)
+        ordered.push(resolved)
+      }
+    }
+    for (const k of occKeys) {
+      if (!seen.has(k)) {
+        seen.add(k)
+        ordered.push(k)
+      }
+    }
+    return ordered
+  }
+
+  private getResolvedHiddenKeySet(): Set<string> {
+    const resolver = this.getColKeyResolver()
+    if (!resolver) return new Set(this.hiddenColumns)
+    const out = new Set<string>()
+    for (const rawKey of this.hiddenColumns) {
+      const resolved = resolver.resolveKey(rawKey)
+      if (resolved) out.add(resolved)
+    }
+    return out
+  }
+
+  private getResolvedPinnedKeys(hiddenSet: Set<string>): string[] {
+    const resolver = this.getColKeyResolver()
+    if (!resolver) {
+      return this.pinnedColumns.filter((k) => !hiddenSet.has(k))
+    }
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const rawKey of this.pinnedColumns) {
+      const resolved = resolver.resolveKey(rawKey)
+      if (resolved && !hiddenSet.has(resolved) && !seen.has(resolved)) {
+        seen.add(resolved)
+        out.push(resolved)
+      }
+    }
+    return out
+  }
+
+  private notifyTableDisplayStateChanged(): void {
+    if (!this.onTableDisplayStateChange) return
+    this.onTableDisplayStateChange(this.exportTableDisplayStateEntry())
+  }
+
+  public getColumnConfig(): { hidden: string[]; pinned: string[]; allColumns: string[]; order: string[] } {
+    const resolver = this.getColKeyResolver()
+    const orderedKeys = this.getOrderedColumnNames()
+    const counts = this.getHeaderOccurrenceCounts()
+    const hiddenSet = this.getResolvedHiddenKeySet()
+    const pinnedKeys = this.getResolvedPinnedKeys(hiddenSet)
+    if (orderedKeys.length === 0) {
+      return {
+        hidden: Array.from(hiddenSet),
+        pinned: pinnedKeys,
+        allColumns: [],
+        order: [],
+      }
+    }
+    const allColumns = orderedKeys.map((k) => this.toDisplayColumnKey(k, counts, resolver))
+    const hidden = orderedKeys
+      .filter((k) => hiddenSet.has(k))
+      .map((k) => this.toDisplayColumnKey(k, counts, resolver))
+    const pinned = pinnedKeys.map((k) => this.toDisplayColumnKey(k, counts, resolver))
+    return { hidden, pinned, allColumns, order: [...allColumns] }
+  }
+
+  public setWrapCells(enabled: boolean, maxLines = this.wrapMaxLines): void {
+    this.wrapCells = Boolean(enabled)
+    this.wrapMaxLines = clampWrapMaxLines(maxLines)
+    this.wrapVersion++
+    this.syncRowHeightIndex()
+    this.renderVisibleRows(true)
+    this.notifyTableDisplayStateChanged()
+  }
+
+  public getWrapCellsConfig(): { wrapCells: boolean; wrapMaxLines: number } {
+    return { wrapCells: this.wrapCells, wrapMaxLines: this.wrapMaxLines }
+  }
+
+  public setHighlightRules(rules: readonly ConditionalHighlightRule[]): void {
+    this.highlightRules = rules.map((r) => ({ ...r }))
+    this.highlightEvaluator.clear()
+    this.wrapVersion++
+    this.renderVisibleRows(true)
+    this.notifyTableDisplayStateChanged()
+  }
+
+  public getHighlightRules(): ConditionalHighlightRule[] {
+    return this.highlightRules.map((r) => ({ ...r }))
+  }
+
+  public reorderColumn(
+    fromName: string,
+    toName: string,
+    placement: 'before' | 'after' = 'before'
+  ): void {
+    const ordered = this.getOrderedColumnNames()
+    const fromKey = this.resolveCanonicalColumnKey(fromName)
+    const toKey = this.resolveCanonicalColumnKey(toName)
+    const fromIdx = ordered.indexOf(fromKey)
+    const toIdx = ordered.indexOf(toKey)
+    if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return
+    ordered.splice(fromIdx, 1)
+    let insertIdx = ordered.indexOf(toKey)
+    if (insertIdx < 0) return
+    if (placement === 'after') insertIdx += 1
+    ordered.splice(insertIdx, 0, fromKey)
+    this.columnOrder = ordered
+    this.applyColumnLayoutRefresh(true, { skipWrapScan: true })
+    this.notifyTableDisplayStateChanged()
+  }
+
+  public moveColumnOrderByOffset(colName: string, delta: -1 | 1): boolean {
+    const ordered = this.getOrderedColumnNames()
+    const colKey = this.resolveCanonicalColumnKey(colName)
+    const idx = ordered.indexOf(colKey)
+    const nextIdx = idx + delta
+    if (idx < 0 || nextIdx < 0 || nextIdx >= ordered.length) return false
+    const copy = [...ordered]
+    const [item] = copy.splice(idx, 1)
+    copy.splice(nextIdx, 0, item)
+    this.columnOrder = copy
+    this.applyColumnLayoutRefresh(true, { skipWrapScan: true })
+    this.notifyTableDisplayStateChanged()
+    return true
+  }
+
+  public resizeColumn(colIndex: number, widthPx: number): void {
+    if (!this.model || colIndex < 0 || colIndex >= this.model.headers.length) return
+    const clamped = Math.max(48, Math.min(2000, Math.round(widthPx)))
+    this.columnWidths[colIndex] = clamped
+    const occKey = this.getColKeyResolver()?.occKeys[colIndex]
+    if (occKey) {
+      this.userResizedColumnKeys.add(occKey)
+    }
+    const colEl = this.dataColElByModelIdx.get(colIndex)
+    if (colEl) colEl.style.width = `${clamped}px`
+    const thEl = this.headerThByModelIdx.get(colIndex)
+    if (thEl) thEl.style.width = `${clamped}px`
+    this.invalidateColLayoutCache()
+    this.renderHeader()
+    this.syncRowHeightIndex()
+    this.renderVisibleRows(true)
+    this.saveColumnWidthsToCache()
+    this.notifyTableDisplayStateChanged()
+  }
+
+  public scrollToRow(visRow: number): void {
+    if (!this.tableContainerEl || !this.model || this.isTransposed) return
+    const visibleRows = this.getFilteredRowIndices()
+    if (visibleRows.length === 0) return
+    const clampedRow = Math.max(0, Math.min(visibleRows.length - 1, Math.trunc(visRow)))
+    const bounds = this.rowHeightIndex.getRowBounds(clampedRow)
+    const clientHeight = this.tableContainerEl.clientHeight || 440
+    const targetTop = Math.max(0, bounds.top - Math.floor(clientHeight / 3))
+    this.tableContainerEl.scrollTop = targetTop
+    this.renderVisibleRows(true)
+  }
+
+  public getRowHeightIndexSnapshot(): {
+    rowCount: number
+    wrapEnabled: boolean
+    maxLines: number
+    getRowHeight: (row: number) => number
+    getRowOffset: (row: number) => number
+  } {
+    return {
+      rowCount: this.rowHeightIndex.rowCount,
+      wrapEnabled: this.rowHeightIndex.wrapEnabled,
+      maxLines: this.rowHeightIndex.maxLines,
+      getRowHeight: (r: number) => this.rowHeightIndex.getRowHeight(r),
+      getRowOffset: (r: number) => this.rowHeightIndex.getRowOffset(r),
+    }
+  }
+
+  public exportTableDisplayStateEntry(): TableDisplayStateEntry {
+    const columnWidthsByKey: Record<string, number> = {}
+    const resolver = this.getColKeyResolver()
+    if (resolver) {
+      const occKeys = resolver.occKeys
+      for (let i = 0; i < occKeys.length; i++) {
+        const occKey = occKeys[i]
+        if (!this.userResizedColumnKeys.has(occKey)) continue
+        const w = this.columnWidths[i]
+        if (typeof w === 'number' && Number.isFinite(w)) {
+          columnWidthsByKey[occKey] = Math.round(w)
+        }
+      }
+    }
+    const hiddenSet = this.getResolvedHiddenKeySet()
+    const pinnedKeys = this.getResolvedPinnedKeys(hiddenSet)
+    return {
+      columnOrder: this.getOrderedColumnNames(),
+      hiddenColumns: Array.from(hiddenSet),
+      pinnedColumns: pinnedKeys,
+      columnWidths: columnWidthsByKey,
+      wrapCells: this.wrapCells,
+      wrapMaxLines: this.wrapMaxLines,
+      highlightRules: this.highlightRules.map((r) => ({ ...r })),
+      updatedAt: Date.now(),
+      revision: this.tableDisplayRevision,
+    }
+  }
+
+  public applyTableDisplayState(rawEntry: TableDisplayStateEntry | null): void {
+    const prevRules = this.highlightRules
+    const prevWrap = this.wrapCells
+    const prevMaxLines = this.wrapMaxLines
+    const prevWidths = [...this.columnWidths]
+    const entry = rawEntry ? normalizeTableDisplayStateEntry(rawEntry) : null
+    this.userResizedColumnKeys.clear()
+    if (!entry) {
+      this.columnOrder = []
+      this.hiddenColumns.clear()
+      this.pinnedColumns = []
+      this.wrapCells = false
+      this.wrapMaxLines = DEFAULT_WRAP_MAX_LINES
+      this.highlightRules = []
+      this.tableDisplayRevision = 0
+      if (this.model && this.model.headers.length > 0) {
+        this.columnWidths = this.computeInitialColumnWidths(this.model)
+      }
+    } else {
+      const resolver = this.getColKeyResolver()
+      const occKeys = resolver ? resolver.occKeys : []
+      this.columnOrder = Array.isArray(entry.columnOrder)
+        ? entry.columnOrder.map((k) => (resolver ? resolver.resolveKey(k) ?? k : k))
+        : []
+      this.hiddenColumns = new Set(
+        (entry.hiddenColumns ?? []).map((k) => (resolver ? resolver.resolveKey(k) ?? k : k))
+      )
+      const orderedKeys = this.getOrderedColumnNames()
+      if (orderedKeys.length > 0 && orderedKeys.every((k) => this.hiddenColumns.has(k))) {
+        this.hiddenColumns.delete(orderedKeys[0])
+      }
+      this.pinnedColumns = Array.isArray(entry.pinnedColumns)
+        ? entry.pinnedColumns.map((k) => (resolver ? resolver.resolveKey(k) ?? k : k))
+        : []
+      this.wrapCells = Boolean(entry.wrapCells)
+      this.wrapMaxLines = clampWrapMaxLines(entry.wrapMaxLines)
+      this.highlightRules = Array.isArray(entry.highlightRules)
+        ? entry.highlightRules.map((r) => ({ ...r }))
+        : []
+      this.tableDisplayRevision = typeof entry.revision === 'number' ? entry.revision : 0
+      if (resolver && entry.columnWidths) {
+        for (const [rawKey, w] of Object.entries(entry.columnWidths)) {
+          if (typeof w !== 'number' || !Number.isFinite(w) || w < 48 || w > 2000) continue
+          const colIdx = resolver.resolveIndex(rawKey)
+          if (colIdx >= 0) {
+            this.columnWidths[colIdx] = Math.round(w)
+            const occKey = occKeys[colIdx]
+            if (occKey) {
+              this.userResizedColumnKeys.add(occKey)
+            }
+          }
+        }
+      }
+    }
+    const rulesChanged = !areHighlightRulesEqual(prevRules, this.highlightRules)
+    const wrapChanged = prevWrap !== this.wrapCells || prevMaxLines !== this.wrapMaxLines
+    const widthsChanged =
+      prevWidths.length !== this.columnWidths.length ||
+      prevWidths.some((w, i) => w !== this.columnWidths[i])
+    if (rulesChanged) {
+      this.highlightEvaluator.clear()
+    }
+    if (rulesChanged || wrapChanged) {
+      this.wrapVersion++
+    }
+    this.applyColumnLayoutRefresh(false, {
+      layoutOnly: !wrapChanged && !widthsChanged,
+    })
   }
 
   public setColumnVisibility(colName: string, visible: boolean): void {
-    const name = colName.trim()
-    if (!name) return
+    const key = this.resolveCanonicalColumnKey(colName)
+    if (!key) return
     if (!visible) {
-      if (this.model && this.model.headers.length > 0) {
-        const remaining = this.model.headers.filter(
-          (h) => h !== name && !this.hiddenColumns.has(h)
-        )
+      const resolver = this.getColKeyResolver()
+      if (resolver) {
+        const occKeys = resolver.occKeys
+        const hiddenSet = this.getResolvedHiddenKeySet()
+        const remaining = occKeys.filter((k) => k !== key && !hiddenSet.has(k))
         if (remaining.length === 0) {
           this.onNotify?.('At least one column must remain visible')
           return
         }
       }
-      this.hiddenColumns.add(name)
-      this.pinnedColumns = this.pinnedColumns.filter((p) => p !== name)
+      this.hiddenColumns.add(key)
+      this.pinnedColumns = this.pinnedColumns.filter(
+        (p) => this.resolveCanonicalColumnKey(p) !== key
+      )
     } else {
-      this.hiddenColumns.delete(name)
+      this.hiddenColumns.delete(key)
+      const parsed = parseOccurrenceColumnKey(key)
+      if (parsed && parsed.occurrence === 1) {
+        this.hiddenColumns.delete(parsed.name)
+      }
     }
-    this.applyColumnLayoutRefresh(true)
+    this.applyColumnLayoutRefresh(true, { layoutOnly: true })
+    this.notifyTableDisplayStateChanged()
   }
 
   public showAllColumns(): void {
     this.hiddenColumns.clear()
-    this.applyColumnLayoutRefresh(true)
+    this.applyColumnLayoutRefresh(true, { layoutOnly: true })
+    this.notifyTableDisplayStateChanged()
   }
 
   public togglePinColumn(colName: string): void {
-    const name = colName.trim()
-    if (!name) return
-    const existingIdx = this.pinnedColumns.indexOf(name)
+    const key = this.resolveCanonicalColumnKey(colName)
+    if (!key) return
+    const existingIdx = this.pinnedColumns.findIndex(
+      (p) => this.resolveCanonicalColumnKey(p) === key
+    )
+    let wasHidden = false
     if (existingIdx >= 0) {
       this.pinnedColumns.splice(existingIdx, 1)
     } else {
-      this.hiddenColumns.delete(name)
-      this.pinnedColumns.push(name)
+      wasHidden = this.getResolvedHiddenKeySet().has(key)
+      this.hiddenColumns.delete(key)
+      const parsed = parseOccurrenceColumnKey(key)
+      if (parsed && parsed.occurrence === 1) {
+        this.hiddenColumns.delete(parsed.name)
+      }
+      this.pinnedColumns.push(key)
     }
-    this.applyColumnLayoutRefresh(true)
+    this.applyColumnLayoutRefresh(true, { layoutOnly: true, skipWrapScan: !wasHidden })
+    this.notifyTableDisplayStateChanged()
   }
 
   public setColumnConfig(config: { hidden: string[]; pinned: string[] }): void {
-    this.hiddenColumns = new Set(config.hidden)
+    this.hiddenColumns = new Set(
+      config.hidden.map((k) => this.resolveCanonicalColumnKey(k)).filter(Boolean)
+    )
     const seen = new Set<string>()
     this.pinnedColumns = []
-    for (const col of config.pinned) {
-      if (!seen.has(col) && !this.hiddenColumns.has(col)) {
+    for (const rawCol of config.pinned) {
+      const col = this.resolveCanonicalColumnKey(rawCol)
+      if (col && !seen.has(col) && !this.hiddenColumns.has(col)) {
         seen.add(col)
         this.pinnedColumns.push(col)
       }
     }
-    if (this.model && this.model.headers.length > 0) {
-      const anyVisible = this.model.headers.some((h) => !this.hiddenColumns.has(h))
+    const resolver = this.getColKeyResolver()
+    if (resolver) {
+      const occKeys = resolver.occKeys
+      const anyVisible = occKeys.some((k) => !this.hiddenColumns.has(k))
       if (!anyVisible) {
-        this.hiddenColumns.delete(this.model.headers[0])
+        this.hiddenColumns.delete(occKeys[0])
       }
     }
-    this.applyColumnLayoutRefresh(false)
+    this.applyColumnLayoutRefresh(false, { layoutOnly: true })
   }
 
-  private applyColumnLayoutRefresh(notifyCallback: boolean): void {
+  private applyColumnLayoutRefresh(
+    notifyCallback: boolean,
+    syncOpts?: { layoutOnly?: boolean; skipWrapScan?: boolean }
+  ): void {
     this.invalidateColLayoutCache()
     this.selection.clear()
     this.selectedRowIndex = null
@@ -937,8 +1757,9 @@ export class VirtualDataGrid {
       this.recomputeFindMatches()
       this.onFindStateChange?.({ total: this.findMatches.length, activeIndex: this.findActiveIndex })
     }
+    this.syncRowHeightIndex(syncOpts)
     this.renderHeader()
-    this.renderVisibleRows()
+    this.renderVisibleRows(true)
     this.notifyAllSelectionListeners()
     if (notifyCallback) {
       const cfg = this.getColumnConfig()
@@ -947,14 +1768,22 @@ export class VirtualDataGrid {
   }
 
   private getVisibleColumnIndices(): number[] {
-    if (!this.model || this.model.headers.length === 0) return []
-    const headers = this.model.headers
+    const resolver = this.getColKeyResolver()
+    if (!resolver || !this.model) return []
+    if (
+      this.cachedVisibleColsLayoutVersion === this.colLayoutVersion &&
+      this.cachedVisibleColsModelRef === this.model
+    ) {
+      return this.cachedVisibleColsResult
+    }
+    const orderedKeys = this.getOrderedColumnNames()
+    const hiddenSet = this.getResolvedHiddenKeySet()
+    const pinnedKeys = this.getResolvedPinnedKeys(hiddenSet)
     const pinnedIndices: number[] = []
     const pinnedSet = new Set<number>()
 
-    for (const pinnedName of this.pinnedColumns) {
-      if (this.hiddenColumns.has(pinnedName)) continue
-      const idx = headers.indexOf(pinnedName)
+    for (const pinnedKey of pinnedKeys) {
+      const idx = resolver.resolveIndex(pinnedKey)
       if (idx >= 0 && !pinnedSet.has(idx)) {
         pinnedIndices.push(idx)
         pinnedSet.add(idx)
@@ -962,31 +1791,48 @@ export class VirtualDataGrid {
     }
 
     const regularIndices: number[] = []
-    for (let i = 0; i < headers.length; i++) {
-      if (pinnedSet.has(i) || this.hiddenColumns.has(headers[i])) continue
+    for (const key of orderedKeys) {
+      if (hiddenSet.has(key)) continue
+      const i = resolver.resolveIndex(key)
+      if (i < 0 || pinnedSet.has(i)) continue
       regularIndices.push(i)
     }
 
     const combined = [...pinnedIndices, ...regularIndices]
-    if (combined.length === 0) {
-      return [0]
-    }
-    return combined
+    const result = combined.length === 0 ? [0] : combined
+    this.cachedVisibleColsLayoutVersion = this.colLayoutVersion
+    this.cachedVisibleColsModelRef = this.model
+    this.cachedVisibleColsResult = result
+    return result
   }
 
   private getPinnedVisibleCount(visibleCols: number[]): number {
-    if (!this.model || visibleCols.length === 0 || this.pinnedColumns.length === 0) return 0
-    const pinnedNameSet = new Set(this.pinnedColumns)
-    let count = 0
+    const resolver = this.getColKeyResolver()
+    if (!resolver || visibleCols.length === 0 || this.pinnedColumns.length === 0) return 0
+    const occKeys = resolver.occKeys
+    const hiddenSet = this.getResolvedHiddenKeySet()
+    const pinnedKeySet = new Set(this.getResolvedPinnedKeys(hiddenSet))
+    const candidatePinnedKeys: string[] = []
+    const widthsByKey: Record<string, number> = {}
     for (const colIdx of visibleCols) {
-      const header = this.model.headers[colIdx]
-      if (pinnedNameSet.has(header) && !this.hiddenColumns.has(header)) {
-        count++
+      const occKey = occKeys[colIdx]
+      if (occKey && pinnedKeySet.has(occKey) && !hiddenSet.has(occKey)) {
+        candidatePinnedKeys.push(occKey)
+        widthsByKey[occKey] = this.columnWidths[colIdx] ?? 120
       } else {
         break
       }
     }
-    return count
+    if (candidatePinnedKeys.length === 0) return 0
+    const viewportWidthPx = this.tableContainerEl?.clientWidth || 1024
+    const capResult = computePinnedColumnsViewportCap({
+      pinnedKeys: candidatePinnedKeys,
+      widthsByKey,
+      viewportWidthPx,
+      rowNumWidthPx: this.rowNumWidth,
+      defaultColWidthPx: 120,
+    })
+    return capResult.activePinnedKeys.length
   }
 
   private computePinnedLeftOffsets(visibleCols: number[], pinnedCount: number): number[] {
@@ -1234,18 +2080,35 @@ export class VirtualDataGrid {
     const pinnedCount = this.getPinnedVisibleCount(visibleCols)
     if (visCol < pinnedCount) return
 
+    const stickyWidth = this.getStickyColumnsWidth()
     const contRect = this.tableContainerEl.getBoundingClientRect?.()
     const tdRect = td.getBoundingClientRect?.()
-    if (!contRect || !tdRect || contRect.width <= 0 || tdRect.width <= 0) return
+    if (contRect && tdRect && contRect.width > 0 && tdRect.width > 0) {
+      const visibleLeftEdge = contRect.left + stickyWidth
+      if (tdRect.left < visibleLeftEdge) {
+        const overlap = visibleLeftEdge - tdRect.left
+        this.tableContainerEl.scrollLeft = Math.max(0, this.tableContainerEl.scrollLeft - overlap - 8)
+      } else if (tdRect.right > contRect.right) {
+        const overflow = tdRect.right - contRect.right
+        this.tableContainerEl.scrollLeft += overflow + 8
+      }
+      return
+    }
 
-    const stickyWidth = this.getStickyColumnsWidth()
-    const visibleLeftEdge = contRect.left + stickyWidth
-    if (tdRect.left < visibleLeftEdge) {
-      const overlap = visibleLeftEdge - tdRect.left
-      this.tableContainerEl.scrollLeft = Math.max(0, this.tableContainerEl.scrollLeft - overlap - 8)
-    } else if (tdRect.right > contRect.right) {
-      const overflow = tdRect.right - contRect.right
-      this.tableContainerEl.scrollLeft += overflow + 8
+    let cellLeftPx = this.rowNumWidth
+    for (let i = 0; i < visCol && i < visibleCols.length; i++) {
+      cellLeftPx += this.columnWidths[visibleCols[i]] ?? 120
+    }
+    const cellWidthPx = this.columnWidths[visibleCols[visCol]] ?? 120
+    const nextScrollLeft = computeScrollLeftForFocusedCell({
+      cellLeftPx,
+      cellWidthPx,
+      scrollLeftPx: this.tableContainerEl.scrollLeft,
+      viewportWidthPx: this.tableContainerEl.clientWidth || 640,
+      totalPinnedWidthPx: stickyWidth,
+    })
+    if (nextScrollLeft !== this.tableContainerEl.scrollLeft) {
+      this.tableContainerEl.scrollLeft = nextScrollLeft
     }
   }
 
@@ -1296,12 +2159,21 @@ export class VirtualDataGrid {
     let targetTd = this.tbodyEl.querySelector(
       `td[data-vis-row="${match.row}"][data-vis-col="${match.col}"]`
     )
-    if (!targetTd && !this.isTransposed) {
+    if (!targetTd) {
       const clientHeight = this.tableContainerEl.clientHeight || 440
+      const targetLineTop = this.isTransposed
+        ? match.col * ROW_HEIGHT_PX
+        : this.rowHeightIndex.getRowBounds(match.row).top
       this.tableContainerEl.scrollTop = Math.max(
         0,
-        match.row * ROW_HEIGHT_PX - Math.floor(clientHeight / 2)
+        targetLineTop - Math.floor(clientHeight / 2)
       )
+      if (this.isTransposed) {
+        const capped = this.getFilteredRowIndices().slice(0, 100)
+        const targetX = this.computeTransposedColLeftOffset(capped, match.row)
+        const visibleW = Math.max(160, (this.tableContainerEl.clientWidth || 640) - this.transposedFieldWidth)
+        this.tableContainerEl.scrollLeft = Math.max(0, targetX - Math.floor(visibleW / 3))
+      }
       this.renderVisibleRows()
       targetTd = this.tbodyEl.querySelector(
         `td[data-vis-row="${match.row}"][data-vis-col="${match.col}"]`
@@ -1316,20 +2188,146 @@ export class VirtualDataGrid {
     return `${this.dialect}\u0000${this.tableName}\u0000${headers.join('\u0001')}`
   }
 
+  private getTransposedCacheKey(headers: string[], rowCount: number): string {
+    return `${this.getColumnCacheKey(headers)}\u0000${rowCount}`
+  }
+
   private saveColumnWidthsToCache(): void {
     if (!this.model || this.model.headers.length === 0) return
     this.columnWidthsByTable.set(this.getColumnCacheKey(this.model.headers), {
       rowNumWidth: this.rowNumWidth,
       columnWidths: [...this.columnWidths],
     })
+    if (this.isTransposed || this.transposedFieldWidthInitialized) {
+      this.transposedWidthsByTable.set(
+        this.getTransposedCacheKey(this.model.headers, this.model.rows.length),
+        {
+          fieldWidth: this.transposedFieldWidth,
+          rowWidths: new Map(this.transposedRowWidths),
+          moreWidth: this.transposedMoreWidth,
+        }
+      )
+    }
   }
 
   private computeInitialColumnWidths(model: GridModel): number[] {
     return computeInitialColumnWidthsForGrid(model, this.rowNumWidth)
   }
 
+  private syncTransposedWidthsForModel(): void {
+    if (!this.model || this.model.headers.length === 0) {
+      this.transposedFieldWidth = DEFAULT_TRANSPOSED_FIELD_WIDTH_PX
+      this.transposedFieldWidthInitialized = false
+      this.transposedRowWidths.clear()
+      this.transposedMoreWidth = DEFAULT_TRANSPOSED_MORE_WIDTH_PX
+      return
+    }
+    const tCacheKey = this.getTransposedCacheKey(this.model.headers, this.model.rows.length)
+    const cachedTransposed = this.transposedWidthsByTable.get(tCacheKey)
+    if (cachedTransposed) {
+      this.transposedFieldWidth = cachedTransposed.fieldWidth
+      this.transposedRowWidths = new Map(cachedTransposed.rowWidths)
+      this.transposedMoreWidth = cachedTransposed.moreWidth
+      this.transposedFieldWidthInitialized = true
+    } else {
+      this.transposedFieldWidth = DEFAULT_TRANSPOSED_FIELD_WIDTH_PX
+      this.transposedFieldWidthInitialized = false
+      this.transposedRowWidths.clear()
+      this.transposedMoreWidth = DEFAULT_TRANSPOSED_MORE_WIDTH_PX
+    }
+  }
+
+  private shiftTransposedRowWidthsAfterSplice(removedIdx: number): void {
+    if (this.transposedRowWidths.size === 0) return
+    const next = new Map<number, number>()
+    for (const [k, width] of this.transposedRowWidths.entries()) {
+      if (k < removedIdx) {
+        next.set(k, width)
+      } else if (k > removedIdx) {
+        next.set(k - 1, width)
+      }
+    }
+    this.transposedRowWidths = next
+  }
+
+  private getTransposedRowWidth(rowIdx: number): number {
+    return this.transposedRowWidths.get(rowIdx) ?? DEFAULT_TRANSPOSED_ROW_WIDTH_PX
+  }
+
+  private ensureTransposedWidths(
+    indices: readonly number[],
+    visibleCols: readonly number[]
+  ): void {
+    const model = this.model
+    if (!model) return
+    const capped = indices.slice(0, 100)
+    const missingRow = capped.some((rowIdx) => !this.transposedRowWidths.has(rowIdx))
+    if (this.transposedFieldWidthInitialized && !missingRow) return
+
+    const computed = computeInitialTransposedColumnWidths(model, capped, visibleCols)
+    if (!this.transposedFieldWidthInitialized) {
+      this.transposedFieldWidth = computed.fieldWidth
+      this.transposedFieldWidthInitialized = true
+    }
+    for (let i = 0; i < capped.length; i++) {
+      const rowIdx = capped[i]
+      if (!this.transposedRowWidths.has(rowIdx)) {
+        this.transposedRowWidths.set(
+          rowIdx,
+          computed.rowWidths[i] ?? DEFAULT_TRANSPOSED_ROW_WIDTH_PX
+        )
+      }
+    }
+    this.saveColumnWidthsToCache()
+  }
+
+  private getResizeTargetWidth(colIndex: number, thEl: HTMLTableCellElement): number {
+    if (this.isTransposed) {
+      if (colIndex === -1) return this.transposedFieldWidth
+      if (colIndex === TRANSPOSED_MORE_COL_INDEX) return this.transposedMoreWidth
+      return this.transposedRowWidths.get(colIndex) || thEl.offsetWidth || DEFAULT_TRANSPOSED_ROW_WIDTH_PX
+    }
+    if (colIndex === -1) return this.rowNumWidth
+    return this.columnWidths[colIndex] || thEl.offsetWidth || 150
+  }
+
+  private setResizeTargetWidth(colIndex: number, width: number): void {
+    if (this.isTransposed) {
+      if (colIndex === -1) {
+        this.transposedFieldWidth = width
+        this.transposedFieldWidthInitialized = true
+      } else if (colIndex === TRANSPOSED_MORE_COL_INDEX) {
+        this.transposedMoreWidth = width
+      } else {
+        this.transposedRowWidths.set(colIndex, width)
+      }
+      return
+    }
+    if (colIndex === -1) {
+      this.rowNumWidth = width
+    } else {
+      this.columnWidths[colIndex] = width
+    }
+  }
+
   private updateTableWidthOnly(): void {
-    if (!this.tableEl || this.isTransposed) return
+    if (!this.tableEl) return
+    if (this.isTransposed) {
+      const indices = this.getFilteredRowIndices()
+      if (!this.model || this.model.headers.length === 0 || indices.length === 0) {
+        this.tableEl.style.width = '100%'
+        return
+      }
+      const cappedIndices = indices.slice(0, 100)
+      let totalWidth =
+        this.transposedFieldWidth +
+        cappedIndices.reduce((sum, rowIdx) => sum + this.getTransposedRowWidth(rowIdx), 0)
+      if (indices.length > 100) {
+        totalWidth += this.transposedMoreWidth
+      }
+      this.tableEl.style.width = `${totalWidth}px`
+      return
+    }
     if (!this.model || this.model.headers.length === 0) {
       this.tableEl.style.width = '100%'
       return
@@ -1378,6 +2376,7 @@ export class VirtualDataGrid {
     const paired = model.rows.map((row, idx) => ({
       row,
       state: this.rowStates[idx],
+      origIdx: idx,
     }))
 
     paired.sort((a, b) =>
@@ -1390,6 +2389,14 @@ export class VirtualDataGrid {
 
     model.rows = paired.map((p) => p.row)
     this.rowStates = paired.map((p) => p.state)
+    if (this.transposedRowWidths.size > 0) {
+      const remapped = new Map<number, number>()
+      paired.forEach((p, newIdx) => {
+        const w = this.transposedRowWidths.get(p.origIdx)
+        if (w !== undefined) remapped.set(newIdx, w)
+      })
+      this.transposedRowWidths = remapped
+    }
     this.invalidateDataCache()
     this.invalidateFilterCache()
     this.selection.clear()
@@ -1536,14 +2543,17 @@ export class VirtualDataGrid {
     if (!this.tbodyEl) return
 
     if (this.isTransposed) {
-      const cells = this.tbodyEl.querySelectorAll('td[data-row-index][data-col-index]')
-      cells.forEach((cell) => {
-        if (!(cell instanceof HTMLElement)) return
-        const r = parseOptionalInt(cell.dataset.rowIndex)
-        const c = parseOptionalInt(cell.dataset.colIndex)
-        const isFocus = r === this.selectedRowIndex && c === this.selectedColIndex
-        cell.classList.toggle('datanoa-cell-selected', isFocus)
+      this.tbodyEl.querySelectorAll('td.datanoa-cell-selected').forEach((cell) => {
+        if (cell instanceof HTMLElement) {
+          cell.classList.remove('datanoa-cell-selected')
+        }
       })
+      if (this.selectedRowIndex !== null && this.selectedColIndex !== null) {
+        const liveTd = this.findLiveCell(this.selectedRowIndex, this.selectedColIndex)
+        if (liveTd) {
+          liveTd.classList.add('datanoa-cell-selected')
+        }
+      }
       return
     }
 
@@ -1841,8 +2851,12 @@ export class VirtualDataGrid {
     }
 
     // 2. Clamp pointer strictly inside the scrollable data viewport (excluding header & sticky gutter)
-    const rect = container.getBoundingClientRect?.()
-    const headerH = this.theadEl?.getBoundingClientRect?.().height || this.theadEl?.offsetHeight || 26
+    const cachedRect = this.dragState?.cachedContainerRect ?? null
+    const rect =
+      cachedRect && cachedRect.width > 0 && cachedRect.height > 0
+        ? cachedRect
+        : container.getBoundingClientRect?.()
+    const headerH = this.dragState?.cachedHeaderH || this.cachedHeaderHeightPx || 26
     const stickyW = this.getStickyColumnsWidth()
     let clampedX = x
     let clampedY = y
@@ -1886,10 +2900,18 @@ export class VirtualDataGrid {
     // 3. Mathematical fallback from clamped viewport coordinates + scroll offsets
     if (!rect || rect.width <= 0 || rect.height <= 0) return null
     const relY = Math.max(0, clampedY - (rect.top + headerH))
-    const vr = Math.max(
-      0,
-      Math.min(visibleRows.length - 1, Math.floor((container.scrollTop + relY) / ROW_HEIGHT_PX))
-    )
+    const vr = this.isTransposed
+      ? Math.max(
+          0,
+          Math.min(visibleRows.length - 1, Math.floor((container.scrollTop + relY) / ROW_HEIGHT_PX))
+        )
+      : Math.max(
+          0,
+          Math.min(
+            visibleRows.length - 1,
+            this.rowHeightIndex.findRowAtOffset(container.scrollTop + relY)
+          )
+        )
     if (mode === 'row') {
       return { vr, vc: null }
     }
@@ -1967,59 +2989,97 @@ export class VirtualDataGrid {
       scheduleDeferredSummary()
     }
 
+    const stepAutoScroll = () => {
+      if (!this.dragState || !this.tableContainerEl) return
+      this.dragState.autoScrollRafId = null
+      const cachedRect = this.dragState.cachedContainerRect
+      const rect =
+        cachedRect && cachedRect.width > 0 && cachedRect.height > 0
+          ? cachedRect
+          : this.tableContainerEl.getBoundingClientRect()
+      const headerH = this.dragState.cachedHeaderH || this.cachedHeaderHeightPx || 26
+      const stickyW = this.getStickyColumnsWidth()
+      const topZone = rect.top + headerH + 20
+      const bottomZone = rect.bottom - 24
+      const leftZone = rect.left + Math.min(stickyW, Math.max(0, rect.width * 0.4)) + 20
+      const rightZone = rect.right - 24
+
+      let dy = 0
+      let dx = 0
+      if (this.dragState.lastClientY < topZone) dy = -16
+      else if (this.dragState.lastClientY > bottomZone) dy = 16
+      if (this.dragState.lastClientX < leftZone) dx = -24
+      else if (this.dragState.lastClientX > rightZone) dx = 24
+
+      if (dx !== 0 || dy !== 0) {
+        const prevTop = this.tableContainerEl.scrollTop
+        const prevLeft = this.tableContainerEl.scrollLeft
+        this.tableContainerEl.scrollTop += dy
+        this.tableContainerEl.scrollLeft += dx
+        if (
+          this.tableContainerEl.scrollTop !== prevTop ||
+          this.tableContainerEl.scrollLeft !== prevLeft
+        ) {
+          if (this.tableContainerEl.scrollTop !== prevTop) {
+            this.renderVisibleRows()
+          }
+          extendFromTargetOrPoint(null, this.dragState.lastClientX, this.dragState.lastClientY)
+          this.dragState.autoScrollRafId = requestAnimationFrame(stepAutoScroll)
+        }
+      }
+    }
+
     const scheduleAutoScroll = (): void => {
       if (!this.dragState || !this.tableContainerEl) return
       if (this.dragState.autoScrollRafId !== null || typeof requestAnimationFrame !== 'function') {
         return
       }
-      const step = () => {
-        if (!this.dragState || !this.tableContainerEl) return
-        this.dragState.autoScrollRafId = null
-        const rect = this.tableContainerEl.getBoundingClientRect()
-        const headerH =
-          this.theadEl?.getBoundingClientRect?.().height || this.theadEl?.offsetHeight || 26
-        const stickyW = this.getStickyColumnsWidth()
-        const topZone = rect.top + headerH + 20
-        const bottomZone = rect.bottom - 24
-        const leftZone = rect.left + Math.min(stickyW, Math.max(0, rect.width * 0.4)) + 20
-        const rightZone = rect.right - 24
+      this.dragState.autoScrollRafId = requestAnimationFrame(stepAutoScroll)
+    }
 
-        let dy = 0
-        let dx = 0
-        if (this.dragState.lastClientY < topZone) dy = -16
-        else if (this.dragState.lastClientY > bottomZone) dy = 16
-        if (this.dragState.lastClientX < leftZone) dx = -24
-        else if (this.dragState.lastClientX > rightZone) dx = 24
-
-        if (dx !== 0 || dy !== 0) {
-          const prevTop = this.tableContainerEl.scrollTop
-          const prevLeft = this.tableContainerEl.scrollLeft
-          this.tableContainerEl.scrollTop += dy
-          this.tableContainerEl.scrollLeft += dx
-          if (
-            this.tableContainerEl.scrollTop !== prevTop ||
-            this.tableContainerEl.scrollLeft !== prevLeft
-          ) {
-            if (this.tableContainerEl.scrollTop !== prevTop) {
-              this.renderVisibleRows()
-            }
-            extendFromTargetOrPoint(null, this.dragState.lastClientX, this.dragState.lastClientY)
-            this.dragState.autoScrollRafId = requestAnimationFrame(step)
-          }
-        }
-      }
-      this.dragState.autoScrollRafId = requestAnimationFrame(step)
+    const flushPendingMove = (): void => {
+      if (!this.dragState) return
+      this.dragState.moveRafId = null
+      const pending = this.dragState.pendingMove
+      this.dragState.pendingMove = null
+      if (!pending) return
+      extendFromTargetOrPoint(pending.target, pending.x, pending.y)
+      scheduleAutoScroll()
     }
 
     const moveListener = (moveEvent: MouseEvent) => {
       if (!this.dragState) return
       this.dragState.lastClientX = moveEvent.clientX
       this.dragState.lastClientY = moveEvent.clientY
-      extendFromTargetOrPoint(moveEvent.target, moveEvent.clientX, moveEvent.clientY)
-      scheduleAutoScroll()
+      this.dragState.pendingMove = {
+        target: moveEvent.target,
+        x: moveEvent.clientX,
+        y: moveEvent.clientY,
+      }
+      if (typeof requestAnimationFrame === 'function') {
+        if (this.dragState.moveRafId === null) {
+          let ranSync = false
+          const id = requestAnimationFrame(() => {
+            ranSync = true
+            flushPendingMove()
+          })
+          if (!ranSync && this.dragState) {
+            this.dragState.moveRafId = id
+          }
+        }
+      } else {
+        flushPendingMove()
+      }
     }
 
     const upListener = () => {
+      if (this.dragState?.pendingMove) {
+        if (this.dragState.moveRafId !== null && typeof cancelAnimationFrame === 'function') {
+          cancelAnimationFrame(this.dragState.moveRafId)
+          this.dragState.moveRafId = null
+        }
+        flushPendingMove()
+      }
       this.cleanupDragSelection()
     }
 
@@ -2027,12 +3087,20 @@ export class VirtualDataGrid {
       this.cleanupDragSelection()
     }
 
+    const initialRect = this.tableContainerEl?.getBoundingClientRect?.() ?? null
+    const initialHeaderH =
+      this.theadEl?.getBoundingClientRect?.().height || this.cachedHeaderHeightPx || 26
+
     this.dragState = {
       mode,
       lastClientX: clientX,
       lastClientY: clientY,
       lastRow: initialFocus ? initialFocus.row : null,
       lastCol: initialFocus ? initialFocus.col : null,
+      cachedContainerRect: initialRect && initialRect.width > 0 ? initialRect : null,
+      cachedHeaderH: initialHeaderH,
+      moveRafId: null,
+      pendingMove: null,
       autoScrollRafId: null,
       summaryRafId: null,
       summaryDirty: false,
@@ -2048,6 +3116,9 @@ export class VirtualDataGrid {
   private cleanupDragSelection(): void {
     if (!this.dragState) return
     const hadDirtySummary = this.dragState.summaryDirty
+    if (this.dragState.moveRafId !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(this.dragState.moveRafId)
+    }
     if (this.dragState.autoScrollRafId !== null && typeof cancelAnimationFrame === 'function') {
       cancelAnimationFrame(this.dragState.autoScrollRafId)
     }
@@ -2239,9 +3310,22 @@ export class VirtualDataGrid {
     const focus = this.selection.getFocus()
     if (!focus || !this.tableContainerEl || !this.tbodyEl) return
     if (this.isTransposed) {
-      const td = this.tbodyEl.querySelector(
+      let td = this.tbodyEl.querySelector(
         `td[data-vis-row="${focus.row}"][data-vis-col="${focus.col}"]`
       )
+      if (!td) {
+        const clientHeight = this.tableContainerEl.clientHeight || 440
+        const targetTop = Math.max(0, focus.col * ROW_HEIGHT_PX - Math.floor(clientHeight / 2))
+        this.tableContainerEl.scrollTop = targetTop
+        const capped = this.getFilteredRowIndices().slice(0, 100)
+        const targetX = this.computeTransposedColLeftOffset(capped, focus.row)
+        const visibleW = Math.max(160, (this.tableContainerEl.clientWidth || 640) - this.transposedFieldWidth)
+        this.tableContainerEl.scrollLeft = Math.max(0, targetX - Math.floor(visibleW / 3))
+        this.renderVisibleRows()
+        td = this.tbodyEl.querySelector(
+          `td[data-vis-row="${focus.row}"][data-vis-col="${focus.col}"]`
+        )
+      }
       if (td instanceof HTMLElement) {
         td.scrollIntoView?.({ block: 'nearest', inline: 'nearest' })
       }
@@ -2252,7 +3336,8 @@ export class VirtualDataGrid {
     )
     if (!td) {
       const clientHeight = this.tableContainerEl.clientHeight || 440
-      const targetTop = Math.max(0, focus.row * ROW_HEIGHT_PX - Math.floor(clientHeight / 2))
+      const targetRowTop = this.rowHeightIndex.getRowBounds(focus.row).top
+      const targetTop = Math.max(0, targetRowTop - Math.floor(clientHeight / 2))
       this.tableContainerEl.scrollTop = targetTop
       this.renderVisibleRows()
       td = this.tbodyEl.querySelector(
@@ -2375,13 +3460,190 @@ export class VirtualDataGrid {
     }
   }
 
+  private buildTransposedHeaderCell(
+    labelText: string,
+    colIndex: number,
+    widthPx: number,
+    extraClass?: string,
+    attachHandle = true
+  ): HTMLTableCellElement {
+    const th = document.createElement('th')
+    th.className = extraClass ? `datanoa-th ${extraClass}` : 'datanoa-th'
+    if (attachHandle) {
+      th.style.width = `${widthPx}px`
+    }
+    const inner = document.createElement('div')
+    inner.className = 'datanoa-th-inner'
+    const label = document.createElement('span')
+    label.className = 'datanoa-th-label'
+    label.textContent = labelText
+    label.title = labelText
+    inner.appendChild(label)
+    th.appendChild(inner)
+    if (attachHandle) {
+      th.appendChild(this.createResizeHandle(colIndex, th))
+    }
+    return th
+  }
+
+  private syncOrderedChildren(
+    parent: HTMLElement,
+    desired: readonly HTMLElement[]
+  ): void {
+    const desiredSet = new Set<HTMLElement>(desired)
+    let child: Element | null = parent.firstElementChild
+    while (child) {
+      const next = child.nextElementSibling
+      if (!desiredSet.has(child as HTMLElement)) {
+        child.remove()
+      }
+      child = next
+    }
+    for (let i = 0; i < desired.length; i++) {
+      const target = desired[i]
+      const currentAtIdx = parent.children[i]
+      if (currentAtIdx !== target) {
+        parent.insertBefore(target, currentAtIdx ?? null)
+      }
+    }
+  }
+
+  private buildNormalHeaderCell(
+    modelColIdx: number,
+    header: string,
+    colOccKey: string
+  ): PooledNormalHeaderCell {
+    const th = document.createElement('th')
+    th.className = 'datanoa-th'
+    th.dataset.colIndex = String(modelColIdx)
+
+    const inner = document.createElement('div')
+    inner.className = 'datanoa-th-inner'
+
+    const labelEl = document.createElement('span')
+    labelEl.className = 'datanoa-th-label'
+    labelEl.textContent = header
+    labelEl.title = header
+    inner.appendChild(labelEl)
+
+    const filterBtn = document.createElement('button')
+    filterBtn.type = 'button'
+    filterBtn.className = 'datanoa-col-filter-btn'
+    filterBtn.setAttribute('aria-label', `Filter column ${header}`)
+    filterBtn.appendChild(createColFilterSvg())
+    filterBtn.addEventListener('mousedown', (e) => {
+      e.stopPropagation()
+    })
+    filterBtn.addEventListener('click', (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      this.openColumnFilterPopover(header, filterBtn)
+    })
+    inner.appendChild(filterBtn)
+
+    const selectBtn = document.createElement('button')
+    selectBtn.type = 'button'
+    selectBtn.className = 'datanoa-col-select-btn'
+    selectBtn.title = `Select column "${header}"`
+    selectBtn.setAttribute('aria-label', `Select column ${header}`)
+    selectBtn.appendChild(createColSelectSvg())
+    selectBtn.addEventListener('mousedown', (e) => {
+      e.stopPropagation()
+    })
+    selectBtn.addEventListener('click', (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      this.focusGridContainer()
+      const visCol = parseOptionalInt(th.dataset.visCol) ?? 0
+      const rowCount = this.getFilteredRowIndices().length
+      this.selection.selectColumn(visCol, rowCount, {
+        shift: e.shiftKey,
+        toggle: e.ctrlKey || e.metaKey,
+      })
+      this.syncSelectionClasses()
+      this.notifyAllSelectionListeners()
+    })
+    inner.appendChild(selectBtn)
+
+    th.appendChild(inner)
+    th.appendChild(this.createResizeHandle(modelColIdx, th))
+
+    th.addEventListener('click', (e) => {
+      if (Date.now() < this.suppressSortClickUntil) return
+      if (e.shiftKey || e.ctrlKey || e.metaKey) {
+        e.preventDefault()
+        this.focusGridContainer()
+        const visCol = parseOptionalInt(th.dataset.visCol) ?? 0
+        const rowCount = this.getFilteredRowIndices().length
+        this.selection.selectColumn(visCol, rowCount, {
+          shift: e.shiftKey,
+          toggle: e.ctrlKey || e.metaKey,
+        })
+        this.syncSelectionClasses()
+        this.notifyAllSelectionListeners()
+        return
+      }
+      this.handleHeaderClick(header)
+    })
+
+    th.addEventListener('contextmenu', (e) => {
+      e.preventDefault()
+      const visCol = parseOptionalInt(th.dataset.visCol) ?? 0
+      this.openHeaderContextMenu(e.clientX, e.clientY, modelColIdx, visCol, header, th)
+    })
+
+    th.draggable = true
+    th.addEventListener('dragstart', (e) => {
+      this.draggedHeaderName = colOccKey
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move'
+        e.dataTransfer.setData('text/plain', colOccKey)
+      }
+    })
+    th.addEventListener('dragover', (e) => {
+      if (this.draggedHeaderName && this.draggedHeaderName !== colOccKey) {
+        e.preventDefault()
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+        th.classList.add('datanoa-th-drop-target')
+      }
+    })
+    th.addEventListener('dragleave', () => {
+      th.classList.remove('datanoa-th-drop-target')
+    })
+    th.addEventListener('drop', (e) => {
+      e.preventDefault()
+      th.classList.remove('datanoa-th-drop-target')
+      const from = this.draggedHeaderName || e.dataTransfer?.getData('text/plain') || ''
+      this.draggedHeaderName = null
+      if (from && from !== colOccKey) {
+        this.reorderColumn(from, colOccKey, 'before')
+      }
+    })
+    th.addEventListener('dragend', () => {
+      this.draggedHeaderName = null
+      th.classList.remove('datanoa-th-drop-target')
+    })
+
+    return {
+      th,
+      inner,
+      labelEl,
+      filterBtn,
+      selectBtn,
+      pinIcon: null,
+      sortIcon: null,
+      sortDir: null,
+    }
+  }
+
   private renderHeader(): void {
     this.cleanupColumnResize()
     if (!this.theadEl) return
-    this.theadEl.innerHTML = ''
-    this.headerThByModelIdx.clear()
 
     if (this.isLoading) {
+      this.resetHeaderPool()
+      this.theadEl.innerHTML = ''
+      this.headerThByModelIdx.clear()
       this.clearColgroup()
       const tr = document.createElement('tr')
       const thIdx = document.createElement('th')
@@ -2403,43 +3665,108 @@ export class VirtualDataGrid {
     }
 
     const model = this.model
-    if (!model) return
-
-    const tr = document.createElement('tr')
+    if (!model) {
+      this.resetHeaderPool()
+      this.theadEl.innerHTML = ''
+      this.headerThByModelIdx.clear()
+      return
+    }
 
     if (this.isTransposed) {
-      this.clearColgroup()
-      const thField = document.createElement('th')
-      thField.className = 'datanoa-th datanoa-th-row-label'
-      thField.textContent = 'Field'
-      tr.appendChild(thField)
-
+      this.resetHeaderPool()
+      this.theadEl.innerHTML = ''
+      this.headerThByModelIdx.clear()
+      const tr = document.createElement('tr')
       const indices = this.getFilteredRowIndices()
+      const visibleCols = this.getVisibleColumnIndices()
+      if (model.headers.length === 0 || indices.length === 0) {
+        this.clearColgroup()
+        const thField = this.buildTransposedHeaderCell(
+          'Field',
+          -1,
+          this.transposedFieldWidth,
+          'datanoa-th-row-label',
+          false
+        )
+        tr.appendChild(thField)
+        this.theadEl.appendChild(tr)
+        this.updateTableWidthOnly()
+        return
+      }
+
+      this.ensureTransposedWidths(indices, visibleCols)
       const cappedIndices = indices.slice(0, 100)
+      const colgroup = this.colgroupEl
+      this.dataColElByModelIdx.clear()
+      if (colgroup) {
+        colgroup.innerHTML = ''
+        const fieldCol = document.createElement('col')
+        fieldCol.style.width = `${this.transposedFieldWidth}px`
+        colgroup.appendChild(fieldCol)
+        this.rowNumColEl = fieldCol
+
+        for (const rowIdx of cappedIndices) {
+          const rowCol = document.createElement('col')
+          rowCol.style.width = `${this.getTransposedRowWidth(rowIdx)}px`
+          colgroup.appendChild(rowCol)
+          this.dataColElByModelIdx.set(rowIdx, rowCol)
+        }
+        if (indices.length > 100) {
+          const moreCol = document.createElement('col')
+          moreCol.style.width = `${this.transposedMoreWidth}px`
+          colgroup.appendChild(moreCol)
+          this.dataColElByModelIdx.set(TRANSPOSED_MORE_COL_INDEX, moreCol)
+        }
+      }
+
+      tr.appendChild(
+        this.buildTransposedHeaderCell(
+          'Field',
+          -1,
+          this.transposedFieldWidth,
+          'datanoa-th-row-label'
+        )
+      )
+
       for (const rowIdx of cappedIndices) {
         const state = this.rowStates[rowIdx]
-        const th = document.createElement('th')
-        th.className = 'datanoa-th'
-        th.style.minWidth = '140px'
         const suffix =
           state?.kind === 'inserted' ? ' (+)' : state?.deleted ? ' (DEL)' : ''
-        th.textContent = `Row ${rowIdx + 1}${suffix}`
-        tr.appendChild(th)
+        tr.appendChild(
+          this.buildTransposedHeaderCell(
+            `Row ${rowIdx + 1}${suffix}`,
+            rowIdx,
+            this.getTransposedRowWidth(rowIdx),
+            'datanoa-th-transpose-row'
+          )
+        )
       }
       if (indices.length > 100) {
-        const moreTh = document.createElement('th')
-        moreTh.className = 'datanoa-th'
-        moreTh.style.minWidth = '140px'
-        moreTh.textContent = `+${indices.length - 100} more rows`
-        tr.appendChild(moreTh)
+        tr.appendChild(
+          this.buildTransposedHeaderCell(
+            `+${indices.length - 100} more rows`,
+            TRANSPOSED_MORE_COL_INDEX,
+            this.transposedMoreWidth,
+            'datanoa-th-transpose-row'
+          )
+        )
       }
       this.theadEl.appendChild(tr)
+      this.updateTableWidthOnly()
+      if (this.headerHeightMeasuredTransposed !== true) {
+        const measuredH = this.theadEl.offsetHeight || 0
+        this.cachedHeaderHeightPx = measuredH > 0 && measuredH <= 80 ? measuredH : 26
+        this.headerHeightMeasuredTransposed = true
+      }
       return
     }
 
     if (model.headers.length === 0) {
+      this.resetHeaderPool()
+      this.theadEl.innerHTML = ''
+      this.headerThByModelIdx.clear()
       this.clearColgroup()
-      this.theadEl.appendChild(tr)
+      this.theadEl.appendChild(document.createElement('tr'))
       return
     }
 
@@ -2447,163 +3774,165 @@ export class VirtualDataGrid {
     const pinnedCount = this.getPinnedVisibleCount(visibleCols)
     const pinnedOffsets = this.computePinnedLeftOffsets(visibleCols, pinnedCount)
 
-    const colgroup = this.colgroupEl
-    this.dataColElByModelIdx.clear()
-    if (colgroup) {
-      colgroup.innerHTML = ''
+    const canReuseHeaderDom =
+      this.cachedHeaderModelRef === model &&
+      this.cachedHeaderTr !== null &&
+      this.cachedHeaderTr.parentNode === this.theadEl &&
+      this.cachedRowNumTh !== null &&
+      this.rowNumColEl !== null
+
+    if (!canReuseHeaderDom) {
+      this.resetHeaderPool()
+      this.theadEl.innerHTML = ''
+      if (this.colgroupEl) {
+        this.colgroupEl.innerHTML = ''
+      }
+      this.cachedHeaderModelRef = model
       const idxCol = document.createElement('col')
       idxCol.className = 'datanoa-col-rownum'
-      idxCol.style.width = `${this.rowNumWidth}px`
-      colgroup.appendChild(idxCol)
       this.rowNumColEl = idxCol
 
-      for (const modelColIdx of visibleCols) {
-        const col = document.createElement('col')
-        col.style.width = `${this.columnWidths[modelColIdx] ?? 120}px`
-        colgroup.appendChild(col)
-        this.dataColElByModelIdx.set(modelColIdx, col)
-      }
+      const thIdx = document.createElement('th')
+      thIdx.className = 'datanoa-th datanoa-th-rownum'
+      thIdx.title = 'Click to select all visible cells (Ctrl+A)'
+      const idxInner = document.createElement('div')
+      idxInner.className = 'datanoa-th-inner'
+      const idxLabel = document.createElement('span')
+      idxLabel.className = 'datanoa-th-label'
+      idxLabel.textContent = '#'
+      idxInner.appendChild(idxLabel)
+      thIdx.appendChild(idxInner)
+      thIdx.appendChild(this.createResizeHandle(-1, thIdx))
+      thIdx.addEventListener('click', () => {
+        if (Date.now() < this.suppressSortClickUntil) return
+        this.focusGridContainer()
+        this.selectAll()
+      })
+      this.cachedRowNumTh = thIdx
+
+      const tr = document.createElement('tr')
+      this.cachedHeaderTr = tr
+      this.theadEl.appendChild(tr)
     }
 
-    // Standard mode: sticky corner `#` gutter (click selects all)
-    const thIdx = document.createElement('th')
-    thIdx.className = 'datanoa-th datanoa-th-rownum'
-    thIdx.style.width = `${this.rowNumWidth}px`
-    thIdx.title = 'Click to select all visible cells (Ctrl+A)'
-    const idxInner = document.createElement('div')
-    idxInner.className = 'datanoa-th-inner'
-    const idxLabel = document.createElement('span')
-    idxLabel.className = 'datanoa-th-label'
-    idxLabel.textContent = '#'
-    idxInner.appendChild(idxLabel)
-    thIdx.appendChild(idxInner)
-    thIdx.appendChild(this.createResizeHandle(-1, thIdx))
-    thIdx.addEventListener('click', () => {
-      if (Date.now() < this.suppressSortClickUntil) return
-      this.focusGridContainer()
-      this.selectAll()
-    })
-    tr.appendChild(thIdx)
+    const rowNumWidthPx = `${this.rowNumWidth}px`
+    if (this.rowNumColEl && this.rowNumColEl.style.width !== rowNumWidthPx) {
+      this.rowNumColEl.style.width = rowNumWidthPx
+    }
+    if (this.cachedRowNumTh && this.cachedRowNumTh.style.width !== rowNumWidthPx) {
+      this.cachedRowNumTh.style.width = rowNumWidthPx
+    }
 
-    visibleCols.forEach((modelColIdx, visCol) => {
+    const tr = this.cachedHeaderTr
+    if (!tr) return
+    const colgroup = this.colgroupEl
+    this.dataColElByModelIdx.clear()
+    this.headerThByModelIdx.clear()
+
+    const desiredCols: HTMLElement[] = this.rowNumColEl ? [this.rowNumColEl] : []
+    const desiredThs: HTMLElement[] = this.cachedRowNumTh ? [this.cachedRowNumTh] : []
+    const headerOccKeys = this.getColKeyResolver()?.occKeys ?? []
+    const activeFilterCols =
+      this.clientColumnFilters.length > 0
+        ? new Set(this.clientColumnFilters.map((f) => f.column))
+        : null
+
+    for (let visCol = 0; visCol < visibleCols.length; visCol++) {
+      const modelColIdx = visibleCols[visCol]
       const header = model.headers[modelColIdx]
-      const th = document.createElement('th')
+      const colOccKey = headerOccKeys[modelColIdx] ?? header
+      const colWidthPx = `${this.columnWidths[modelColIdx] ?? 120}px`
+
+      let colEl = this.cachedColPoolByModelIdx.get(modelColIdx)
+      if (!colEl) {
+        colEl = document.createElement('col')
+        this.cachedColPoolByModelIdx.set(modelColIdx, colEl)
+      }
+      if (colEl.style.width !== colWidthPx) {
+        colEl.style.width = colWidthPx
+      }
+      this.dataColElByModelIdx.set(modelColIdx, colEl)
+      desiredCols.push(colEl)
+
+      let entry = this.cachedThPoolByModelIdx.get(modelColIdx)
+      if (!entry) {
+        entry = this.buildNormalHeaderCell(modelColIdx, header, colOccKey)
+        this.cachedThPoolByModelIdx.set(modelColIdx, entry)
+      }
+      const { th, inner, labelEl, filterBtn } = entry
       const isSorted = this.sortColumn === header
       const isPinned = visCol < pinnedCount
       const isLastPinned = isPinned && visCol === pinnedCount - 1
       const isSelectedCol = this.selection.isColSelected(visCol)
 
-      th.className = 'datanoa-th'
-      if (isSorted) th.classList.add('sorted')
-      if (isSelectedCol) th.classList.add('datanoa-th-selected')
-      if (isPinned) {
-        th.classList.add('datanoa-col-pinned')
-        th.style.left = `${pinnedOffsets[visCol]}px`
-      }
-      if (isLastPinned) {
-        th.classList.add('datanoa-col-pinned-last')
-      }
-      th.style.width = `${this.columnWidths[modelColIdx] ?? 120}px`
-      th.dataset.visCol = String(visCol)
-      th.dataset.colIndex = String(modelColIdx)
-
-      const inner = document.createElement('div')
-      inner.className = 'datanoa-th-inner'
+      th.classList.toggle('sorted', isSorted)
+      th.classList.toggle('datanoa-th-selected', isSelectedCol)
+      th.classList.toggle('datanoa-col-pinned', isPinned)
+      th.classList.toggle('datanoa-col-pinned-last', isLastPinned)
+      const nextLeft = isPinned ? `${pinnedOffsets[visCol]}px` : ''
+      if (th.style.left !== nextLeft) th.style.left = nextLeft
+      if (th.style.width !== colWidthPx) th.style.width = colWidthPx
+      const visColStr = String(visCol)
+      if (th.dataset.visCol !== visColStr) th.dataset.visCol = visColStr
 
       if (isPinned) {
-        const pinIcon = document.createElement('span')
-        pinIcon.className = 'datanoa-th-pin-icon'
-        pinIcon.title = 'Pinned column'
-        pinIcon.appendChild(createPinSvg())
-        inner.appendChild(pinIcon)
+        if (!entry.pinIcon) {
+          const pinIcon = document.createElement('span')
+          pinIcon.className = 'datanoa-th-pin-icon'
+          pinIcon.title = 'Pinned column'
+          pinIcon.appendChild(createPinSvg())
+          entry.pinIcon = pinIcon
+        }
+        if (entry.pinIcon.parentNode !== inner) {
+          inner.insertBefore(entry.pinIcon, labelEl)
+        }
+      } else if (entry.pinIcon && entry.pinIcon.parentNode === inner) {
+        entry.pinIcon.remove()
       }
 
-      const label = document.createElement('span')
-      label.className = 'datanoa-th-label'
-      label.textContent = header
-      label.title = header
-      inner.appendChild(label)
-
-      const colFilterBtn = document.createElement('button')
-      colFilterBtn.type = 'button'
-      const hasColFilter = this.clientColumnFilters.some((f) => f.column === header)
-      colFilterBtn.className = `datanoa-col-filter-btn${hasColFilter ? ' active' : ''}`
-      colFilterBtn.title = hasColFilter
+      const hasColFilter = activeFilterCols !== null && activeFilterCols.has(header)
+      filterBtn.classList.toggle('active', hasColFilter)
+      const nextFilterTitle = hasColFilter
         ? `Filter active on "${header}" — click to edit`
         : `Filter column "${header}"`
-      colFilterBtn.setAttribute('aria-label', `Filter column ${header}`)
-      colFilterBtn.appendChild(createColFilterSvg())
-      colFilterBtn.addEventListener('mousedown', (e) => {
-        e.stopPropagation()
-      })
-      colFilterBtn.addEventListener('click', (e) => {
-        e.preventDefault()
-        e.stopPropagation()
-        this.openColumnFilterPopover(header, colFilterBtn)
-      })
-      inner.appendChild(colFilterBtn)
-
-      const colSelectBtn = document.createElement('button')
-      colSelectBtn.type = 'button'
-      colSelectBtn.className = 'datanoa-col-select-btn'
-      colSelectBtn.title = `Select column "${header}"`
-      colSelectBtn.setAttribute('aria-label', `Select column ${header}`)
-      colSelectBtn.appendChild(createColSelectSvg())
-      colSelectBtn.addEventListener('mousedown', (e) => {
-        e.stopPropagation()
-      })
-      colSelectBtn.addEventListener('click', (e) => {
-        e.preventDefault()
-        e.stopPropagation()
-        this.focusGridContainer()
-        const rowCount = this.getFilteredRowIndices().length
-        this.selection.selectColumn(visCol, rowCount, {
-          shift: e.shiftKey,
-          toggle: e.ctrlKey || e.metaKey,
-        })
-        this.syncSelectionClasses()
-        this.notifyAllSelectionListeners()
-      })
-      inner.appendChild(colSelectBtn)
-
-      if (isSorted) {
-        const sortIcon = document.createElement('span')
-        sortIcon.className = 'datanoa-th-sort-icon'
-        sortIcon.appendChild(createSortArrowSvg(this.sortDirection === 'DESC' ? 'DESC' : 'ASC'))
-        inner.appendChild(sortIcon)
+      if (filterBtn.title !== nextFilterTitle) {
+        filterBtn.title = nextFilterTitle
       }
 
-      th.appendChild(inner)
-      th.appendChild(this.createResizeHandle(modelColIdx, th))
-
-      th.addEventListener('click', (e) => {
-        if (Date.now() < this.suppressSortClickUntil) return
-        if (e.shiftKey || e.ctrlKey || e.metaKey) {
-          e.preventDefault()
-          this.focusGridContainer()
-          const rowCount = this.getFilteredRowIndices().length
-          this.selection.selectColumn(visCol, rowCount, {
-            shift: e.shiftKey,
-            toggle: e.ctrlKey || e.metaKey,
-          })
-          this.syncSelectionClasses()
-          this.notifyAllSelectionListeners()
-          return
+      if (isSorted) {
+        const dir: 'ASC' | 'DESC' = this.sortDirection === 'DESC' ? 'DESC' : 'ASC'
+        if (!entry.sortIcon) {
+          const sortIcon = document.createElement('span')
+          sortIcon.className = 'datanoa-th-sort-icon'
+          entry.sortIcon = sortIcon
         }
-        this.handleHeaderClick(header)
-      })
-
-      th.addEventListener('contextmenu', (e) => {
-        e.preventDefault()
-        this.openHeaderContextMenu(e.clientX, e.clientY, modelColIdx, visCol, header, th)
-      })
+        if (entry.sortDir !== dir || entry.sortIcon.childElementCount === 0) {
+          entry.sortIcon.textContent = ''
+          entry.sortIcon.appendChild(createSortArrowSvg(dir))
+          entry.sortDir = dir
+        }
+        if (entry.sortIcon.parentNode !== inner) {
+          inner.appendChild(entry.sortIcon)
+        }
+      } else if (entry.sortIcon && entry.sortIcon.parentNode === inner) {
+        entry.sortIcon.remove()
+      }
 
       this.headerThByModelIdx.set(modelColIdx, th)
-      tr.appendChild(th)
-    })
+      desiredThs.push(th)
+    }
 
-    this.theadEl.appendChild(tr)
+    if (colgroup) {
+      this.syncOrderedChildren(colgroup, desiredCols)
+    }
+    this.syncOrderedChildren(tr, desiredThs)
+
     this.updateTableWidthOnly()
+    if (this.headerHeightMeasuredTransposed !== false) {
+      const measuredH = this.theadEl.offsetHeight || 0
+      this.cachedHeaderHeightPx = measuredH > 0 && measuredH <= 80 ? measuredH : 26
+      this.headerHeightMeasuredTransposed = false
+    }
   }
 
   private handleHeaderClick(header: string, forcedDirection?: 'ASC' | 'DESC'): void {
@@ -2638,9 +3967,68 @@ export class VirtualDataGrid {
       this.activeResizeHandle.classList.remove('resizing')
       this.activeResizeHandle = null
     }
+    if (this.activeResizeGuideEl) {
+      this.activeResizeGuideEl.remove()
+      this.activeResizeGuideEl = null
+    }
+    if (this.tableContainerEl) {
+      this.tableContainerEl.classList.remove('datanoa-grid-resizing')
+    }
     if (typeof document !== 'undefined' && document.body) {
       document.body.style.cursor = ''
       document.body.style.userSelect = ''
+    }
+  }
+
+  private computeTransposedAutoFitWidth(model: GridModel, colIndex: number): number {
+    const visibleCols = this.getVisibleColumnIndices()
+    if (colIndex === -1) {
+      let maxChars = 'Field'.length + 1
+      for (const modelColIdx of visibleCols) {
+        const header = model.headers[modelColIdx] ?? ''
+        const isPk = model.primaryKey.includes(header)
+        const colDef = model.columns[modelColIdx]
+        const colType = colDef && 'type' in colDef && colDef.type ? ` : ${colDef.type}` : ''
+        maxChars = Math.max(maxChars, header.length + (isPk ? 5 : 0) + colType.length)
+      }
+      return Math.max(80, Math.min(480, Math.round(maxChars * 7.5 + 28)))
+    }
+    if (colIndex === TRANSPOSED_MORE_COL_INDEX) {
+      const moreCount = Math.max(1, this.getFilteredRowIndices().length - 100)
+      const maxChars = Math.max(
+        `+${moreCount} more rows`.length,
+        `... (${moreCount} more)`.length
+      )
+      return Math.max(90, Math.min(360, Math.round(maxChars * 7.5 + 24)))
+    }
+    const rowIdx = colIndex
+    const rowData = model.rows[rowIdx]
+    const state = this.rowStates[rowIdx]
+    const suffix = state?.kind === 'inserted' ? ' (+)' : state?.deleted ? ' (DEL)' : ''
+    let maxChars = `Row ${rowIdx + 1}${suffix}`.length + 2
+    for (const modelColIdx of visibleCols) {
+      const header = model.headers[modelColIdx] ?? ''
+      const colDef = model.columns[modelColIdx]
+      const colType = colDef && 'type' in colDef ? colDef.type : undefined
+      const raw = rowData ? getCellValue(rowData, modelColIdx, header) : undefined
+      const text =
+        state?.kind === 'inserted' && raw === undefined && !state.dirtyCols.has(header)
+          ? '(default)'
+          : formatCellValue(raw, colType).text
+      maxChars = Math.max(maxChars, Math.min(text.length, 80))
+    }
+    return Math.max(80, Math.min(480, Math.round(maxChars * 7.5 + 24)))
+  }
+
+  private syncTransposedHorizontalWindowAfterResize(): void {
+    if (!this.isTransposed || !this.model || this.isLoading) return
+    const indices = this.getFilteredRowIndices()
+    if (indices.length === 0) return
+    const capped = indices.slice(0, 100)
+    const hasOverflow = indices.length > 100
+    const nextH = this.computeTransposedColRange(capped, hasOverflow)
+    if (nextH.hStart !== this.lastTransposedHStart || nextH.hEnd !== this.lastTransposedHEnd) {
+      this.renderVisibleRows()
     }
   }
 
@@ -2651,7 +4039,10 @@ export class VirtualDataGrid {
       colIndex === -1 ? this.rowNumColEl : (this.dataColElByModelIdx.get(colIndex) ?? null)
 
     let fittedWidth: number
-    if (colIndex === -1) {
+    if (this.isTransposed) {
+      fittedWidth = this.computeTransposedAutoFitWidth(model, colIndex)
+      this.setResizeTargetWidth(colIndex, fittedWidth)
+    } else if (colIndex === -1) {
       const maxDigits = Math.max(1, String(model.rows.length).length + 1)
       fittedWidth = Math.max(44, Math.min(480, Math.round(maxDigits * 7.5 + 24)))
       this.rowNumWidth = fittedWidth
@@ -2677,14 +4068,29 @@ export class VirtualDataGrid {
       }
       fittedWidth = Math.max(64, Math.min(480, Math.round(maxChars * 7.5 + 24)))
       this.columnWidths[colIndex] = fittedWidth
+      const occKey = this.getColKeyResolver()?.occKeys[colIndex]
+      if (occKey) {
+        this.userResizedColumnKeys.add(occKey)
+      }
     }
 
     if (colEl) colEl.style.width = `${fittedWidth}px`
     thEl.style.width = `${fittedWidth}px`
     this.updateTableWidthOnly()
-    this.updatePinnedOffsets()
+    if (!this.isTransposed) {
+      this.updatePinnedOffsets()
+    }
     this.invalidateColLayoutCache()
+    if (this.isTransposed) {
+      if (this.lastTransposedWindow) {
+        this.lastTransposedWindow.colLayoutVersion = this.colLayoutVersion
+      }
+      this.syncTransposedHorizontalWindowAfterResize()
+    }
     this.saveColumnWidthsToCache()
+    if (!this.isTransposed && colIndex >= 0) {
+      this.notifyTableDisplayStateChanged()
+    }
     this.suppressSortClickUntil = Date.now() + 250
   }
 
@@ -2697,11 +4103,14 @@ export class VirtualDataGrid {
     this.cleanupColumnResize()
 
     const startX = e.clientX
-    const startWidth =
-      colIndex === -1
-        ? this.rowNumWidth
-        : this.columnWidths[colIndex] || thEl.offsetWidth || 150
-    const minWidth = colIndex === -1 ? 36 : 50
+    const startWidth = this.getResizeTargetWidth(colIndex, thEl)
+    const minWidth = this.isTransposed
+      ? colIndex === -1
+        ? 80
+        : 64
+      : colIndex === -1
+        ? 36
+        : 50
     const colEl =
       colIndex === -1 ? this.rowNumColEl : (this.dataColElByModelIdx.get(colIndex) ?? null)
     let didMove = false
@@ -2726,6 +4135,11 @@ export class VirtualDataGrid {
 
     const useRafOnly =
       typeof requestAnimationFrame === 'function' && isNativeDomElement(thEl)
+    const mountedRowCount = this.tbodyEl?.children.length ?? 0
+    const colCount = this.isTransposed
+      ? Math.min(this.getFilteredRowIndices().length, 100) + 1
+      : visibleCols.length + 1
+    const useGuideLine = this.isTransposed || mountedRowCount * Math.max(1, colCount) >= 400
 
     this.activeResizeHandle = handleEl
     handleEl.classList.add('resizing')
@@ -2736,6 +4150,37 @@ export class VirtualDataGrid {
 
     let pendingWidth = startWidth
     let lastAppliedWidth = startWidth
+    let guideEl: HTMLDivElement | null = null
+    let baseGuideX = startX
+    let guideMinX = -Infinity
+    let guideMaxX = Infinity
+
+    if (useGuideLine && typeof document !== 'undefined') {
+      if (this.tableContainerEl) {
+        this.tableContainerEl.classList.add('datanoa-grid-resizing')
+      }
+      const handleRect = handleEl.getBoundingClientRect?.()
+      const containerRect = this.tableContainerEl?.getBoundingClientRect?.()
+      if (handleRect && handleRect.width > 0) {
+        baseGuideX = handleRect.left + handleRect.width / 2
+      }
+      if (containerRect && containerRect.width > 0) {
+        guideMinX = containerRect.left
+        guideMaxX = containerRect.right
+      }
+      guideEl = document.createElement('div')
+      guideEl.className = 'datanoa-resize-guide'
+      const guideTop = containerRect && containerRect.height > 0 ? Math.round(containerRect.top) : 0
+      const guideHeight =
+        containerRect && containerRect.height > 0 ? Math.round(containerRect.height) : 440
+      guideEl.style.top = `${guideTop}px`
+      guideEl.style.height = `${guideHeight}px`
+      const clampedInitX = Math.max(guideMinX, Math.min(guideMaxX, Math.round(baseGuideX)))
+      guideEl.style.transform = `translate3d(${clampedInitX}px, 0, 0)`
+      const hostParent = document.body || this.container
+      hostParent.appendChild(guideEl)
+      this.activeResizeGuideEl = guideEl
+    }
 
     const applyCachedPinnedOffsets = () => {
       if (pinnedCount === 0) return
@@ -2751,10 +4196,19 @@ export class VirtualDataGrid {
       }
     }
 
+    const applyGuidePosition = () => {
+      this.resizeRafId = null
+      if (!guideEl) return
+      const rawX = Math.round(baseGuideX + (pendingWidth - startWidth))
+      const clampedX = Math.max(guideMinX, Math.min(guideMaxX, rawX))
+      guideEl.style.transform = `translate3d(${clampedX}px, 0, 0)`
+    }
+
     const applyPendingResizeDom = () => {
       this.resizeRafId = null
       if (pendingWidth === lastAppliedWidth) return
       lastAppliedWidth = pendingWidth
+      this.setResizeTargetWidth(colIndex, pendingWidth)
       if (colEl) colEl.style.width = `${pendingWidth}px`
       thEl.style.width = `${pendingWidth}px`
       this.updateTableWidthOnly()
@@ -2769,17 +4223,16 @@ export class VirtualDataGrid {
       const newWidth = Math.max(minWidth, Math.round(startWidth + delta))
       if (newWidth === pendingWidth) return
       pendingWidth = newWidth
-      if (colIndex === -1) {
-        this.rowNumWidth = newWidth
-      } else {
-        this.columnWidths[colIndex] = newWidth
+      if (!useGuideLine) {
+        this.setResizeTargetWidth(colIndex, newWidth)
       }
+      const tickFn = useGuideLine ? applyGuidePosition : applyPendingResizeDom
       if (useRafOnly) {
         if (this.resizeRafId === null) {
-          this.resizeRafId = requestAnimationFrame(applyPendingResizeDom)
+          this.resizeRafId = requestAnimationFrame(tickFn)
         }
       } else {
-        applyPendingResizeDom()
+        tickFn()
       }
     }
 
@@ -2788,15 +4241,33 @@ export class VirtualDataGrid {
         cancelAnimationFrame(this.resizeRafId)
         this.resizeRafId = null
       }
-      if (pendingWidth !== lastAppliedWidth) {
+      const committedChange = pendingWidth !== lastAppliedWidth
+      if (committedChange) {
         applyPendingResizeDom()
       }
       this.cleanupColumnResize()
-      if (didMove) {
+      if (didMove || committedChange) {
         this.invalidateColLayoutCache()
+        if (this.isTransposed) {
+          if (this.lastTransposedWindow) {
+            this.lastTransposedWindow.colLayoutVersion = this.colLayoutVersion
+          }
+          this.syncTransposedHorizontalWindowAfterResize()
+        } else if (this.lastRenderedWindow) {
+          this.lastRenderedWindow.colLayoutVersion = this.colLayoutVersion
+        }
+      }
+      if (didMove) {
         this.suppressSortClickUntil = Date.now() + 250
       }
       this.saveColumnWidthsToCache()
+      if (!this.isTransposed && colIndex >= 0 && (didMove || committedChange) && this.model) {
+        const occKey = this.getColKeyResolver()?.occKeys[colIndex]
+        if (occKey) {
+          this.userResizedColumnKeys.add(occKey)
+        }
+        this.notifyTableDisplayStateChanged()
+      }
     }
 
     this.resizeListeners = { move: onMouseMove, up: finishResize, blur: finishResize }
@@ -2866,17 +4337,37 @@ export class VirtualDataGrid {
     return td
   }
 
+  private acquirePooledDataCell(): HTMLTableCellElement {
+    const reused = this.freeCellPool.pop()
+    if (reused) {
+      return reused
+    }
+    return this.createPooledDataCell()
+  }
+
+  private releasePooledDataCell(td: HTMLTableCellElement): void {
+    td.remove()
+    if (this.freeCellPool.length < 512) {
+      td.className = 'datanoa-td'
+      if (td.style.left) td.style.left = ''
+      this.freeCellPool.push(td)
+    }
+  }
+
   private acquirePooledRow(colCount: number): PooledGridRow {
     const existing = this.freeRowPool.pop()
     if (existing) {
+      this.resetPooledRowStyles(existing)
+      delete existing.tr.dataset.wrapped
+      existing.cellByModelCol.clear()
       while (existing.dataCells.length < colCount) {
-        const td = this.createPooledDataCell()
+        const td = this.acquirePooledDataCell()
         existing.dataCells.push(td)
         existing.tr.appendChild(td)
       }
       while (existing.dataCells.length > colCount) {
         const removed = existing.dataCells.pop()
-        removed?.remove()
+        if (removed) this.releasePooledDataCell(removed)
       }
       return existing
     }
@@ -2886,11 +4377,11 @@ export class VirtualDataGrid {
     tr.appendChild(rowNumTd)
     const dataCells = new Array<HTMLTableCellElement>(colCount)
     for (let i = 0; i < colCount; i++) {
-      const td = this.createPooledDataCell()
+      const td = this.acquirePooledDataCell()
       dataCells[i] = td
       tr.appendChild(td)
     }
-    return { tr, rowNumTd, dataCells }
+    return { tr, rowNumTd, dataCells, cellByModelCol: new Map<number, HTMLTableCellElement>() }
   }
 
   private flushActiveEditorBeforeRebuild(): void {
@@ -2959,11 +4450,24 @@ export class VirtualDataGrid {
     if (rowState?.kind === 'inserted') trClass += ' datanoa-row-inserted'
     if (rowState?.deleted) trClass += ' datanoa-row-deleted'
     if (isRowSel) trClass += ' datanoa-row-selected'
+    const isWrapped = this.wrapCells && !this.isTransposed
+    if (isWrapped) trClass += ' datanoa-tr-wrap'
+    const evaluatedHighlight = this.evaluateRowHighlightState(model, rowIndex)
+    if (evaluatedHighlight?.rowClass) {
+      trClass += ` ${evaluatedHighlight.rowClass}`
+    }
 
     const { tr, rowNumTd, dataCells } = pooled
     tr.className = trClass
     tr.dataset.rowIndex = String(rowIndex)
     tr.dataset.visRow = String(visRow)
+    if (isWrapped) {
+      tr.dataset.wrapped = 'true'
+      tr.style.height = `${this.rowHeightIndex.getRowHeight(visRow)}px`
+    } else {
+      delete tr.dataset.wrapped
+      if (tr.style.height) tr.style.height = ''
+    }
 
     rowNumTd.className = isRowSel
       ? 'datanoa-td datanoa-td-rownum row-selected'
@@ -3003,6 +4507,9 @@ export class VirtualDataGrid {
     }
 
     const colCount = visibleCols.length
+    const occKeys =
+      evaluatedHighlight && colCount > 0 ? (this.getColKeyResolver()?.occKeys ?? null) : null
+    pooled.cellByModelCol.clear()
     for (let visCol = 0; visCol < colCount; visCol++) {
       const colIdx = visibleCols[visCol]
       const header = model.headers[colIdx]
@@ -3011,7 +4518,9 @@ export class VirtualDataGrid {
       td.dataset.colIndex = String(colIdx)
       td.dataset.visRow = String(visRow)
       td.dataset.visCol = String(visCol)
+      pooled.cellByModelCol.set(colIdx, td)
       const rawValue = getCellValue(rowData, colIdx, header)
+      const cellHl = this.resolveCellHighlightClass(evaluatedHighlight, occKeys, colIdx, header)
       this.applyCellDisplay(
         td,
         rowIndex,
@@ -3024,9 +4533,157 @@ export class VirtualDataGrid {
         focus,
         activeMatch,
         visCol < pinnedCount ? pinnedOffsets[visCol] : null,
-        visCol < pinnedCount && visCol === pinnedCount - 1
+        visCol < pinnedCount && visCol === pinnedCount - 1,
+        cellHl
       )
     }
+  }
+
+  private patchMountedRowColumnsInPlace(
+    pooled: PooledGridRow,
+    visRow: number,
+    rowIndex: number,
+    model: GridModel,
+    visibleCols: number[],
+    visibleColSet: ReadonlySet<number>,
+    pinnedCount: number,
+    pinnedOffsets: number[],
+    focus: CellCoord | null,
+    activeMatch: CellCoord | null,
+    occKeys: readonly string[] | null
+  ): void {
+    const { tr, rowNumTd } = pooled
+    const isWrapped = this.wrapCells && !this.isTransposed
+    if (isWrapped) {
+      const nextH = `${this.rowHeightIndex.getRowHeight(visRow)}px`
+      if (tr.style.height !== nextH) tr.style.height = nextH
+    } else if (tr.style.height) {
+      tr.style.height = ''
+    }
+
+    const isRowSel = this.selection.isRowSelected(visRow)
+    tr.classList.toggle('datanoa-row-selected', isRowSel)
+    rowNumTd.classList.toggle('row-selected', isRowSel)
+
+    // Remove cells belonging to newly hidden columns
+    for (const [colIdx, oldTd] of Array.from(pooled.cellByModelCol.entries())) {
+      if (!visibleColSet.has(colIdx)) {
+        pooled.cellByModelCol.delete(colIdx)
+        this.releasePooledDataCell(oldTd)
+      }
+    }
+
+    const rowData = model.rows[rowIndex]
+    const rowState = this.rowStates[rowIndex]
+    const hasSelection = !this.selection.isEmpty() || focus !== null
+    const hasFind = this.findMatchKeys.size > 0
+    let evaluatedHighlight: EvaluatedRowHighlight | null | undefined
+    const nextDataCells = new Array<HTMLTableCellElement>(visibleCols.length)
+
+    for (let visCol = 0; visCol < visibleCols.length; visCol++) {
+      const colIdx = visibleCols[visCol]
+      let td = pooled.cellByModelCol.get(colIdx)
+      const pinnedLeft = visCol < pinnedCount ? pinnedOffsets[visCol] : null
+      const isLastPinned = pinnedLeft !== null && visCol === pinnedCount - 1
+      const visColStr = String(visCol)
+
+      if (!td) {
+        td = this.acquirePooledDataCell()
+        td.dataset.rowIndex = String(rowIndex)
+        td.dataset.colIndex = String(colIdx)
+        td.dataset.visRow = String(visRow)
+        td.dataset.visCol = visColStr
+        if (evaluatedHighlight === undefined) {
+          evaluatedHighlight = this.evaluateRowHighlightState(model, rowIndex)
+        }
+        const header = model.headers[colIdx]
+        const rawValue = getCellValue(rowData, colIdx, header)
+        const cellHl = this.resolveCellHighlightClass(evaluatedHighlight, occKeys, colIdx, header)
+        this.applyCellDisplay(
+          td,
+          rowIndex,
+          colIdx,
+          visRow,
+          visCol,
+          header,
+          rawValue,
+          rowState,
+          focus,
+          activeMatch,
+          pinnedLeft,
+          isLastPinned,
+          cellHl
+        )
+        pooled.cellByModelCol.set(colIdx, td)
+      } else {
+        if (td.dataset.visCol !== visColStr) td.dataset.visCol = visColStr
+        if (pinnedLeft !== null) {
+          const leftPx = `${pinnedLeft}px`
+          if (!td.classList.contains('datanoa-col-pinned')) td.classList.add('datanoa-col-pinned')
+          td.classList.toggle('datanoa-col-pinned-last', isLastPinned)
+          if (td.style.left !== leftPx) td.style.left = leftPx
+        } else {
+          if (td.classList.contains('datanoa-col-pinned')) td.classList.remove('datanoa-col-pinned')
+          if (td.classList.contains('datanoa-col-pinned-last')) {
+            td.classList.remove('datanoa-col-pinned-last')
+          }
+          if (td.style.left) td.style.left = ''
+        }
+        if (hasSelection) {
+          const inRange = this.selection.isSelected(visRow, visCol)
+          const isFocus = focus !== null && focus.row === visRow && focus.col === visCol
+          td.classList.toggle('datanoa-cell-selected', isFocus)
+          td.classList.toggle('datanoa-cell-in-range', inRange)
+          if (inRange) {
+            const edges = this.selection.getCellSelectionEdges(visRow, visCol)
+            td.classList.toggle('datanoa-range-top', edges.top)
+            td.classList.toggle('datanoa-range-right', edges.right)
+            td.classList.toggle('datanoa-range-bottom', edges.bottom)
+            td.classList.toggle('datanoa-range-left', edges.left)
+          } else if (
+            td.classList.contains('datanoa-range-top') ||
+            td.classList.contains('datanoa-range-right') ||
+            td.classList.contains('datanoa-range-bottom') ||
+            td.classList.contains('datanoa-range-left')
+          ) {
+            td.classList.remove(
+              'datanoa-range-top',
+              'datanoa-range-right',
+              'datanoa-range-bottom',
+              'datanoa-range-left'
+            )
+          }
+        } else if (
+          td.classList.contains('datanoa-cell-selected') ||
+          td.classList.contains('datanoa-cell-in-range')
+        ) {
+          td.classList.remove(
+            'datanoa-cell-selected',
+            'datanoa-cell-in-range',
+            'datanoa-range-top',
+            'datanoa-range-right',
+            'datanoa-range-bottom',
+            'datanoa-range-left'
+          )
+        }
+        if (hasFind) {
+          const isMatch = this.findMatchKeys.has(`${visRow}:${visCol}`)
+          const isActive =
+            isMatch && activeMatch !== null && activeMatch.row === visRow && activeMatch.col === visCol
+          td.classList.toggle('datanoa-cell-match', isMatch)
+          td.classList.toggle('datanoa-cell-match-active', isActive)
+        } else if (td.classList.contains('datanoa-cell-match')) {
+          td.classList.remove('datanoa-cell-match', 'datanoa-cell-match-active')
+        }
+      }
+
+      const curChild = tr.children[visCol + 1]
+      if (curChild !== td) {
+        tr.insertBefore(td, curChild ?? null)
+      }
+      nextDataCells[visCol] = td
+    }
+    pooled.dataCells = nextDataCells
   }
 
   private renderVisibleRows(force = false): void {
@@ -3075,12 +4732,18 @@ export class VirtualDataGrid {
     let indices = this.getFilteredRowIndices()
 
     if (this.isTransposed) {
-      this.resetRowPoolMountState()
+      if (this.isPoolMountedInTbody) {
+        this.resetRowPoolMountState()
+      }
       if (this.tableEl) {
         this.tableEl.classList.remove('datanoa-grid-empty-table', 'datanoa-grid-empty-no-cols')
       }
-      this.renderTransposedBody(indices)
+      this.renderTransposedBody(indices, force)
       return
+    }
+
+    if (!this.isTransposed && this.isTransposedPoolMounted) {
+      this.resetRowPoolMountState()
     }
 
     const visibleCols = this.getVisibleColumnIndices()
@@ -3110,10 +4773,14 @@ export class VirtualDataGrid {
 
     const clientHeight = this.tableContainerEl.clientHeight || 440
     let totalVisibleRows = indices.length
-    const headerH = this.theadEl?.offsetHeight || 28
+    const headerH = this.cachedHeaderHeightPx || 26
     const bottomCushionPx = 28
     const computeWindowBounds = (rowCount: number) => {
-      const maxTop = Math.max(0, headerH + rowCount * ROW_HEIGHT_PX + bottomCushionPx - clientHeight)
+      if (this.rowHeightIndex.rowCount !== rowCount) {
+        this.syncRowHeightIndex()
+      }
+      const totalDataH = this.rowHeightIndex.getTotalHeight()
+      const maxTop = Math.max(0, headerH + totalDataH + bottomCushionPx - clientHeight)
       const rawTop = this.tableContainerEl?.scrollTop ?? 0
       const clampedTop = Math.max(0, Math.min(rawTop, maxTop))
       if (this.tableContainerEl) {
@@ -3124,13 +4791,15 @@ export class VirtualDataGrid {
         }
         this.lastScrollTop = this.tableContainerEl.scrollTop
       }
-      const { startIndex, endIndex } = calculateVisibleWindow(clampedTop, clientHeight)
+      const range = this.rowHeightIndex.getVisibleRange(clampedTop, clientHeight, 5)
       return {
-        boundedStart: Math.max(0, startIndex - 5),
-        boundedEnd: Math.min(rowCount, endIndex + 5),
+        boundedStart: range.start,
+        boundedEnd: range.end,
+        topSpacerPx: range.topSpacerPx,
+        bottomSpacerPx: range.bottomSpacerPx,
       }
     }
-    let { boundedStart, boundedEnd } = computeWindowBounds(totalVisibleRows)
+    let { boundedStart, boundedEnd, topSpacerPx, bottomSpacerPx } = computeWindowBounds(totalVisibleRows)
 
     // Window cache hit: unchanged visible row window & data/filter/layout versions -> 0 DOM mutations
     const prevWin = this.lastRenderedWindow
@@ -3143,6 +4812,7 @@ export class VirtualDataGrid {
       prevWin.dataVersion === this.dataVersion &&
       prevWin.filterVersion === this.filterVersion &&
       prevWin.colLayoutVersion === this.colLayoutVersion &&
+      prevWin.wrapVersion === this.wrapVersion &&
       prevWin.totalRows === totalVisibleRows &&
       prevWin.colSpan === colSpan
     ) {
@@ -3156,6 +4826,7 @@ export class VirtualDataGrid {
       prevWin.dataVersion === this.dataVersion &&
       prevWin.filterVersion === this.filterVersion &&
       prevWin.colLayoutVersion === this.colLayoutVersion &&
+      prevWin.wrapVersion === this.wrapVersion &&
       prevWin.totalRows === totalVisibleRows &&
       prevWin.colSpan === colSpan
 
@@ -3192,6 +4863,8 @@ export class VirtualDataGrid {
           const recomputed = computeWindowBounds(totalVisibleRows)
           boundedStart = recomputed.boundedStart
           boundedEnd = recomputed.boundedEnd
+          topSpacerPx = recomputed.topSpacerPx
+          bottomSpacerPx = recomputed.bottomSpacerPx
         }
       }
     }
@@ -3207,7 +4880,7 @@ export class VirtualDataGrid {
     bottomTd.colSpan = colSpan
     if (remainingRows > 0) {
       bottomTr.className = ''
-      bottomTd.style.height = `${remainingRows * ROW_HEIGHT_PX + bottomCushionPx}px`
+      bottomTd.style.height = `${bottomSpacerPx + bottomCushionPx}px`
       bottomTd.style.pointerEvents = ''
     } else {
       bottomTr.className = 'datanoa-grid-bottom-cushion'
@@ -3220,6 +4893,7 @@ export class VirtualDataGrid {
       for (const [vr, pooled] of Array.from(this.mountedRowsByVisRow.entries())) {
         if (vr < boundedStart || vr >= boundedEnd) {
           pooled.tr.remove()
+          this.resetPooledRowStyles(pooled)
           this.mountedRowsByVisRow.delete(vr)
           if (this.freeRowPool.length < 120) {
             this.freeRowPool.push(pooled)
@@ -3229,7 +4903,7 @@ export class VirtualDataGrid {
 
       if (boundedStart > 0) {
         topTd.colSpan = colSpan
-        topTd.style.height = `${boundedStart * ROW_HEIGHT_PX}px`
+        topTd.style.height = `${topSpacerPx}px`
         if (topTr.parentNode !== this.tbodyEl) {
           this.tbodyEl.insertBefore(topTr, this.tbodyEl.firstChild)
         }
@@ -3239,6 +4913,10 @@ export class VirtualDataGrid {
 
       if (bottomTr.parentNode !== this.tbodyEl) {
         this.tbodyEl.appendChild(bottomTr)
+      }
+
+      if (this.wrapCells && !this.isTransposed && totalVisibleRows > 64) {
+        this.measureWrapRowsRange(indices, boundedStart, boundedEnd)
       }
 
       const overlapStart = Math.max(boundedStart, prevWin.boundedStart)
@@ -3312,9 +4990,82 @@ export class VirtualDataGrid {
           this.tbodyEl.insertBefore(botFrag, bottomTr)
         }
       }
+    } else if (
+      this.isPoolMountedInTbody &&
+      prevWin !== null &&
+      prevWin.dataVersion === this.dataVersion &&
+      prevWin.filterVersion === this.filterVersion &&
+      prevWin.totalRows === totalVisibleRows &&
+      prevWin.boundedStart === boundedStart &&
+      prevWin.boundedEnd === boundedEnd &&
+      this.mountedRowsByVisRow.size === boundedEnd - boundedStart
+    ) {
+      // Incremental in-place update on mounted window (no tbody.innerHTML = '', no tr detach)
+      if (boundedStart > 0) {
+        topTd.colSpan = colSpan
+        topTd.style.height = `${topSpacerPx}px`
+        if (topTr.parentNode !== this.tbodyEl) {
+          this.tbodyEl.insertBefore(topTr, this.tbodyEl.firstChild)
+        }
+      } else if (topTr.parentNode === this.tbodyEl) {
+        topTr.remove()
+      }
+      if (bottomTr.parentNode !== this.tbodyEl) {
+        this.tbodyEl.appendChild(bottomTr)
+      }
+
+      const layoutOnlyDelta = prevWin.wrapVersion === this.wrapVersion
+      if (layoutOnlyDelta) {
+        const visibleColSet = new Set<number>(visibleCols)
+        const occKeys =
+          this.highlightRules.length > 0 ? (this.getColKeyResolver()?.occKeys ?? null) : null
+        for (let visRow = boundedStart; visRow < boundedEnd; visRow++) {
+          const pooled = this.mountedRowsByVisRow.get(visRow)
+          if (!pooled) continue
+          this.patchMountedRowColumnsInPlace(
+            pooled,
+            visRow,
+            indices[visRow],
+            model,
+            visibleCols,
+            visibleColSet,
+            pinnedCount,
+            pinnedOffsets,
+            focus,
+            activeMatch,
+            occKeys
+          )
+        }
+      } else {
+        for (let visRow = boundedStart; visRow < boundedEnd; visRow++) {
+          const pooled = this.mountedRowsByVisRow.get(visRow)
+          if (!pooled) continue
+          while (pooled.dataCells.length < visibleCols.length) {
+            const td = this.acquirePooledDataCell()
+            pooled.dataCells.push(td)
+            pooled.tr.appendChild(td)
+          }
+          while (pooled.dataCells.length > visibleCols.length) {
+            const removed = pooled.dataCells.pop()
+            if (removed) this.releasePooledDataCell(removed)
+          }
+          this.patchPooledRow(
+            pooled,
+            visRow,
+            indices[visRow],
+            model,
+            visibleCols,
+            pinnedCount,
+            pinnedOffsets,
+            focus,
+            activeMatch
+          )
+        }
+      }
     } else {
       // Full pool mount via a single DocumentFragment
       for (const pooled of this.mountedRowsByVisRow.values()) {
+        this.resetPooledRowStyles(pooled)
         if (this.freeRowPool.length < 120) {
           this.freeRowPool.push(pooled)
         }
@@ -3325,7 +5076,7 @@ export class VirtualDataGrid {
       const frag = document.createDocumentFragment()
       if (boundedStart > 0) {
         topTd.colSpan = colSpan
-        topTd.style.height = `${boundedStart * ROW_HEIGHT_PX}px`
+        topTd.style.height = `${topSpacerPx}px`
         frag.appendChild(topTr)
       }
 
@@ -3357,75 +5108,649 @@ export class VirtualDataGrid {
       dataVersion: this.dataVersion,
       filterVersion: this.filterVersion,
       colLayoutVersion: this.colLayoutVersion,
+      wrapVersion: this.wrapVersion,
       totalRows: totalVisibleRows,
       colSpan,
     }
   }
 
-  private renderTransposedBody(indices: number[]): void {
+  private computeTransposedColRange(
+    activeCapped: readonly number[],
+    activeHasOverflow: boolean
+  ): { hStart: number; hEnd: number } {
+    const totalDataCols = activeCapped.length + (activeHasOverflow ? 1 : 0)
+    const clientWidth = this.tableContainerEl?.clientWidth ?? 0
+    if (totalDataCols <= 16 || !this.tableContainerEl || clientWidth <= 0) {
+      return { hStart: 0, hEnd: totalDataCols }
+    }
+    const scrollLeft = Math.max(0, this.tableContainerEl.scrollLeft)
+    const visibleViewportW = Math.max(160, clientWidth - this.transposedFieldWidth)
+    const viewRight = scrollLeft + visibleViewportW
+
+    let x = 0
+    let visStart = totalDataCols - 1
+    let visEnd = 0
+    let foundStart = false
+    for (let i = 0; i < totalDataCols; i++) {
+      const colW =
+        i < activeCapped.length
+          ? this.getTransposedRowWidth(activeCapped[i])
+          : this.transposedMoreWidth
+      const nextX = x + colW
+      if (!foundStart && nextX > scrollLeft) {
+        visStart = i
+        foundStart = true
+      }
+      if (x < viewRight) {
+        visEnd = i + 1
+      } else if (foundStart) {
+        break
+      }
+      x = nextX
+    }
+    if (!foundStart) {
+      visStart = Math.max(0, totalDataCols - 1)
+      visEnd = totalDataCols
+    }
+    const hStart = Math.max(0, visStart - 3)
+    const hEnd = Math.min(totalDataCols, Math.max(visStart + 1, visEnd) + 4)
+    return { hStart, hEnd }
+  }
+
+  private computeTransposedColLeftOffset(
+    activeCapped: readonly number[],
+    targetDataColIdx: number
+  ): number {
+    let x = 0
+    const limit = Math.max(0, Math.min(targetDataColIdx, activeCapped.length))
+    for (let i = 0; i < limit; i++) {
+      x += this.getTransposedRowWidth(activeCapped[i])
+    }
+    return x
+  }
+
+  private reconcilePooledTransposedRowCells(
+    pooled: PooledTransposedRow,
+    visibleDataColCount: number,
+    showMoreTd: boolean,
+    leftSpan: number,
+    rightSpan: number
+  ): void {
+    const { tr, labelTd } = pooled
+    if (leftSpan > 0) {
+      if (!pooled.leftSpacerTd) {
+        const sp = document.createElement('td')
+        sp.className = 'datanoa-td datanoa-h-spacer'
+        pooled.leftSpacerTd = sp
+      }
+      pooled.leftSpacerTd.colSpan = leftSpan
+      if (pooled.leftSpacerTd.parentNode !== tr || labelTd.nextSibling !== pooled.leftSpacerTd) {
+        tr.insertBefore(pooled.leftSpacerTd, labelTd.nextSibling)
+      }
+    } else if (pooled.leftSpacerTd && pooled.leftSpacerTd.parentNode === tr) {
+      pooled.leftSpacerTd.remove()
+    }
+
+    if (rightSpan > 0) {
+      if (!pooled.rightSpacerTd) {
+        const sp = document.createElement('td')
+        sp.className = 'datanoa-td datanoa-h-spacer'
+        pooled.rightSpacerTd = sp
+      }
+      pooled.rightSpacerTd.colSpan = rightSpan
+      if (pooled.rightSpacerTd.parentNode !== tr || tr.lastChild !== pooled.rightSpacerTd) {
+        tr.appendChild(pooled.rightSpacerTd)
+      }
+    } else if (pooled.rightSpacerTd && pooled.rightSpacerTd.parentNode === tr) {
+      pooled.rightSpacerTd.remove()
+    }
+
+    const tailRef =
+      pooled.rightSpacerTd && pooled.rightSpacerTd.parentNode === tr ? pooled.rightSpacerTd : null
+
+    if (showMoreTd) {
+      if (!pooled.moreTd) {
+        const moreTd = document.createElement('td')
+        moreTd.className = 'datanoa-td datanoa-cell-null'
+        pooled.moreTd = moreTd
+      }
+      if (pooled.moreTd.parentNode !== tr || pooled.moreTd.nextSibling !== tailRef) {
+        tr.insertBefore(pooled.moreTd, tailRef)
+      }
+    } else if (pooled.moreTd && pooled.moreTd.parentNode === tr) {
+      pooled.moreTd.remove()
+    }
+
+    const dataInsertRef =
+      pooled.moreTd && pooled.moreTd.parentNode === tr ? pooled.moreTd : tailRef
+
+    while (pooled.dataCells.length < visibleDataColCount) {
+      const td = this.createPooledDataCell()
+      pooled.dataCells.push(td)
+      tr.insertBefore(td, dataInsertRef)
+    }
+    while (pooled.dataCells.length > visibleDataColCount) {
+      const removed = pooled.dataCells.pop()
+      removed?.remove()
+    }
+  }
+
+  private acquirePooledTransposedRow(
+    visibleDataColCount: number,
+    showMoreTd: boolean,
+    leftSpan: number,
+    rightSpan: number
+  ): PooledTransposedRow {
+    const existing = this.freeTransposedRowPool.pop()
+    if (existing) {
+      this.reconcilePooledTransposedRowCells(
+        existing,
+        visibleDataColCount,
+        showMoreTd,
+        leftSpan,
+        rightSpan
+      )
+      return existing
+    }
+
+    const tr = document.createElement('tr')
+    const labelTd = document.createElement('td')
+    labelTd.className = 'datanoa-td datanoa-th-row-label'
+    const fieldNameSpan = document.createElement('span')
+    fieldNameSpan.className = 'datanoa-transpose-field-name'
+    labelTd.appendChild(fieldNameSpan)
+    tr.appendChild(labelTd)
+
+    let leftSpacerTd: HTMLTableCellElement | null = null
+    if (leftSpan > 0) {
+      leftSpacerTd = document.createElement('td')
+      leftSpacerTd.className = 'datanoa-td datanoa-h-spacer'
+      leftSpacerTd.colSpan = leftSpan
+      tr.appendChild(leftSpacerTd)
+    }
+
+    const dataCells = new Array<HTMLTableCellElement>(visibleDataColCount)
+    for (let i = 0; i < visibleDataColCount; i++) {
+      const td = this.createPooledDataCell()
+      dataCells[i] = td
+      tr.appendChild(td)
+    }
+
+    let moreTd: HTMLTableCellElement | null = null
+    if (showMoreTd) {
+      moreTd = document.createElement('td')
+      moreTd.className = 'datanoa-td datanoa-cell-null'
+      tr.appendChild(moreTd)
+    }
+
+    let rightSpacerTd: HTMLTableCellElement | null = null
+    if (rightSpan > 0) {
+      rightSpacerTd = document.createElement('td')
+      rightSpacerTd.className = 'datanoa-td datanoa-h-spacer'
+      rightSpacerTd.colSpan = rightSpan
+      tr.appendChild(rightSpacerTd)
+    }
+
+    return {
+      tr,
+      labelTd,
+      fieldNameSpan,
+      pkSpan: null,
+      typeSpan: null,
+      leftSpacerTd,
+      dataCells,
+      moreTd,
+      rightSpacerTd,
+    }
+  }
+
+  private patchPooledTransposedRow(
+    pooled: PooledTransposedRow,
+    visCol: number,
+    colIdx: number,
+    model: GridModel,
+    activeCapped: readonly number[],
+    hStart: number,
+    visibleDataEnd: number,
+    totalFilteredRows: number,
+    showMoreTd: boolean,
+    focus: CellCoord | null,
+    activeMatch: CellCoord | null
+  ): void {
+    const header = model.headers[colIdx]
+    const { tr, labelTd, fieldNameSpan, dataCells } = pooled
+    tr.className = visCol % 2 === 1 ? 'datanoa-tr datanoa-tr-even' : 'datanoa-tr'
+    tr.dataset.visCol = String(visCol)
+    tr.dataset.colIndex = String(colIdx)
+
+    const isPk = model.primaryKey.includes(header)
+    const colDef = model.columns[colIdx]
+    const colType = colDef && 'type' in colDef && colDef.type ? ` : ${colDef.type}` : ''
+
+    fieldNameSpan.textContent = header
+    if (isPk) {
+      if (!pooled.pkSpan) {
+        const pkSpan = document.createElement('span')
+        pkSpan.className = 'datanoa-transpose-pk'
+        pkSpan.textContent = ' [PK]'
+        pooled.pkSpan = pkSpan
+      }
+      if (pooled.pkSpan.parentNode !== labelTd) {
+        if (pooled.typeSpan && pooled.typeSpan.parentNode === labelTd) {
+          labelTd.insertBefore(pooled.pkSpan, pooled.typeSpan)
+        } else {
+          labelTd.appendChild(pooled.pkSpan)
+        }
+      }
+    } else if (pooled.pkSpan && pooled.pkSpan.parentNode === labelTd) {
+      pooled.pkSpan.remove()
+    }
+
+    if (colType) {
+      if (!pooled.typeSpan) {
+        const typeSpan = document.createElement('span')
+        typeSpan.className = 'datanoa-transpose-type'
+        pooled.typeSpan = typeSpan
+      }
+      pooled.typeSpan.textContent = colType
+      if (pooled.typeSpan.parentNode !== labelTd) {
+        labelTd.appendChild(pooled.typeSpan)
+      }
+    } else if (pooled.typeSpan && pooled.typeSpan.parentNode === labelTd) {
+      pooled.typeSpan.remove()
+    }
+
+    labelTd.title = `${header}${isPk ? ' [PK]' : ''}${colType}`
+
+    const visibleDataCount = Math.max(0, visibleDataEnd - hStart)
+    for (let slot = 0; slot < visibleDataCount; slot++) {
+      const visRow = hStart + slot
+      const rowIndex = activeCapped[visRow]
+      const rowData = model.rows[rowIndex]
+      const rowState = this.rowStates[rowIndex]
+      const td = dataCells[slot]
+      td.dataset.rowIndex = String(rowIndex)
+      td.dataset.colIndex = String(colIdx)
+      td.dataset.visRow = String(visRow)
+      td.dataset.visCol = String(visCol)
+      const rawValue = getCellValue(rowData, colIdx, header)
+      this.applyCellDisplay(
+        td,
+        rowIndex,
+        colIdx,
+        visRow,
+        visCol,
+        header,
+        rawValue,
+        rowState,
+        focus,
+        activeMatch,
+        null,
+        false
+      )
+      if (rowState?.kind === 'inserted') td.classList.add('datanoa-row-inserted')
+      if (rowState?.deleted) td.classList.add('datanoa-row-deleted')
+    }
+
+    if (showMoreTd && pooled.moreTd) {
+      pooled.moreTd.textContent = `... (${totalFilteredRows - 100} more)`
+    }
+  }
+
+  private renderTransposedBody(indices: number[], force = false): void {
     const tbody = this.tbodyEl
     const model = this.model
     if (!tbody || !model) return
-    if (this.activeEditor) {
-      this.flushActiveEditorBeforeRebuild()
-    }
-    tbody.innerHTML = ''
 
     if (indices.length === 0) {
+      if (this.activeEditor) {
+        this.flushActiveEditorBeforeRebuild()
+      }
+      this.resetRowPoolMountState()
+      tbody.innerHTML = ''
+      if (this.tableEl) {
+        this.tableEl.classList.add('datanoa-grid-empty-table')
+      }
+      this.updateTableWidthOnly()
       this.renderEmptyStateRow(1)
       return
     }
+    if (this.tableEl) {
+      this.tableEl.classList.remove('datanoa-grid-empty-table')
+    }
 
-    const frag = document.createDocumentFragment()
     const visibleCols = this.getVisibleColumnIndices()
+    const totalFields = visibleCols.length
+    let activeIndices = indices
+    let activeCapped = activeIndices.slice(0, 100)
+    let activeHasOverflow = activeIndices.length > 100
+    let totalDataCols = activeCapped.length + (activeHasOverflow ? 1 : 0)
+    let activeColSpan = 1 + totalDataCols
+
+    const clientHeight = this.tableContainerEl?.clientHeight ?? 0
+    const bottomCushionPx = 28
+    const computeTransposedRange = (fieldCount: number) => {
+      if (fieldCount > 16 && this.tableContainerEl && clientHeight > 0) {
+        const headerH = this.cachedHeaderHeightPx || 26
+        const maxTop = Math.max(0, headerH + fieldCount * ROW_HEIGHT_PX + bottomCushionPx - clientHeight)
+        const rawTop = this.tableContainerEl.scrollTop
+        const clampedTop = Math.max(0, Math.min(rawTop, maxTop))
+        if (rawTop > maxTop + ROW_HEIGHT_PX * 3) {
+          this.tableContainerEl.scrollTop = maxTop
+        }
+        this.lastScrollTop = this.tableContainerEl.scrollTop
+        const { startIndex, endIndex } = calculateVisibleWindow(clampedTop, clientHeight)
+        return {
+          boundedStart: Math.max(0, startIndex - 5),
+          boundedEnd: Math.min(fieldCount, endIndex + 5),
+        }
+      }
+      if (this.tableContainerEl) {
+        this.lastScrollTop = this.tableContainerEl.scrollTop
+      }
+      return { boundedStart: 0, boundedEnd: fieldCount }
+    }
+
+    let { boundedStart, boundedEnd } = computeTransposedRange(totalFields)
+    let { hStart, hEnd } = this.computeTransposedColRange(activeCapped, activeHasOverflow)
+    if (this.tableContainerEl) {
+      this.lastScrollLeft = this.tableContainerEl.scrollLeft
+    }
+
+    const prevWin = this.lastTransposedWindow
+    const hChanged = hStart !== this.lastTransposedHStart || hEnd !== this.lastTransposedHEnd
+    if (
+      !force &&
+      !hChanged &&
+      this.isTransposedPoolMounted &&
+      prevWin !== null &&
+      prevWin.boundedStart === boundedStart &&
+      prevWin.boundedEnd === boundedEnd &&
+      prevWin.dataVersion === this.dataVersion &&
+      prevWin.filterVersion === this.filterVersion &&
+      prevWin.colLayoutVersion === this.colLayoutVersion &&
+      prevWin.totalRows === totalFields &&
+      prevWin.colSpan === activeColSpan
+    ) {
+      return
+    }
+
+    let canSlide =
+      !force &&
+      this.isTransposedPoolMounted &&
+      prevWin !== null &&
+      prevWin.dataVersion === this.dataVersion &&
+      prevWin.filterVersion === this.filterVersion &&
+      prevWin.colLayoutVersion === this.colLayoutVersion &&
+      prevWin.totalRows === totalFields &&
+      prevWin.colSpan === activeColSpan
+
+    if (this.activeEditor !== null) {
+      let keepEditorAlive = false
+      if (canSlide && !hChanged) {
+        const edVisCol = parseOptionalInt(this.activeEditor.td.dataset.visCol)
+        const edVisRow = parseOptionalInt(this.activeEditor.td.dataset.visRow)
+        if (
+          edVisCol !== null &&
+          edVisCol >= boundedStart &&
+          edVisCol < boundedEnd &&
+          this.mountedTransposedRowsByFieldIdx.has(edVisCol) &&
+          (edVisRow === null || (edVisRow >= hStart && edVisRow < Math.min(hEnd, activeCapped.length)))
+        ) {
+          keepEditorAlive = true
+        }
+      }
+      if (!keepEditorAlive) {
+        const preDataVer = this.dataVersion
+        const preFilterVer = this.filterVersion
+        this.flushActiveEditorBeforeRebuild()
+        if (this.dataVersion !== preDataVer || this.filterVersion !== preFilterVer) {
+          canSlide = false
+          activeIndices = this.getFilteredRowIndices()
+          this.renderHeader()
+          if (activeIndices.length === 0) {
+            this.resetRowPoolMountState()
+            tbody.innerHTML = ''
+            if (this.tableEl) this.tableEl.classList.add('datanoa-grid-empty-table')
+            this.updateTableWidthOnly()
+            this.renderEmptyStateRow(1)
+            return
+          }
+          activeCapped = activeIndices.slice(0, 100)
+          activeHasOverflow = activeIndices.length > 100
+          totalDataCols = activeCapped.length + (activeHasOverflow ? 1 : 0)
+          activeColSpan = 1 + totalDataCols
+          const recomputed = computeTransposedRange(totalFields)
+          boundedStart = recomputed.boundedStart
+          boundedEnd = recomputed.boundedEnd
+          const recomputedH = this.computeTransposedColRange(activeCapped, activeHasOverflow)
+          hStart = recomputedH.hStart
+          hEnd = recomputedH.hEnd
+        }
+      }
+    }
+
+    const visibleDataEnd = Math.min(hEnd, activeCapped.length)
+    const visibleDataCount = Math.max(0, visibleDataEnd - hStart)
+    const showMoreTd = activeHasOverflow && hEnd === totalDataCols
+    const leftSpan = hStart
+    const rightSpan = Math.max(0, totalDataCols - hEnd)
+
     const focus = this.selection.getFocus()
     const activeMatch =
       this.findActiveIndex >= 0 ? (this.findMatches[this.findActiveIndex] ?? null) : null
-    visibleCols.forEach((colIdx, visCol) => {
-      const header = model.headers[colIdx]
-      const tr = document.createElement('tr')
-      tr.className = visCol % 2 === 1 ? 'datanoa-tr datanoa-tr-even' : 'datanoa-tr'
+    const { topTr, topTd, bottomTr, bottomTd } = this.ensureSpacerRows()
+    const remainingFields = totalFields - boundedEnd
 
-      const isPk = model.primaryKey.includes(header)
-      const colDef = model.columns[colIdx]
-      const colType = colDef && 'type' in colDef && colDef.type ? ` : ${colDef.type}` : ''
+    bottomTd.colSpan = activeColSpan
+    if (remainingFields > 0) {
+      bottomTr.className = ''
+      bottomTd.style.height = `${remainingFields * ROW_HEIGHT_PX + bottomCushionPx}px`
+      bottomTd.style.pointerEvents = ''
+    } else {
+      bottomTr.className = 'datanoa-grid-bottom-cushion'
+      bottomTd.style.height = `${bottomCushionPx}px`
+      bottomTd.style.pointerEvents = 'none'
+    }
 
-      const labelTd = document.createElement('td')
-      labelTd.className = 'datanoa-td datanoa-th-row-label'
-      labelTd.textContent = `${header}${isPk ? ' [PK]' : ''}${colType}`
-      tr.appendChild(labelTd)
-
-      const cappedIndices = indices.slice(0, 100)
-      cappedIndices.forEach((rowIndex, visRow) => {
-        const rowData = model.rows[rowIndex]
-        const rowState = this.rowStates[rowIndex]
-        const td = this.createDataCell(
-          rowIndex,
-          colIdx,
-          visRow,
-          visCol,
-          header,
-          rowData,
-          rowState,
-          focus,
-          activeMatch,
-          null,
-          false
-        )
-        if (rowState?.kind === 'inserted') td.classList.add('datanoa-row-inserted')
-        if (rowState?.deleted) td.classList.add('datanoa-row-deleted')
-        tr.appendChild(td)
-      })
-      if (indices.length > 100) {
-        const moreTd = document.createElement('td')
-        moreTd.className = 'datanoa-td datanoa-cell-null'
-        moreTd.textContent = `... (${indices.length - 100} more)`
-        tr.appendChild(moreTd)
+    if (canSlide && prevWin) {
+      // Incremental sliding-window update: recycle ONLY field rows leaving [boundedStart, boundedEnd)
+      for (const [vc, pooled] of Array.from(this.mountedTransposedRowsByFieldIdx.entries())) {
+        if (vc < boundedStart || vc >= boundedEnd) {
+          pooled.tr.remove()
+          this.mountedTransposedRowsByFieldIdx.delete(vc)
+          if (this.freeTransposedRowPool.length < 80) {
+            this.freeTransposedRowPool.push(pooled)
+          }
+        }
       }
 
-      frag.appendChild(tr)
-    })
-    tbody.appendChild(frag)
+      // If horizontal window shifted, update surviving mounted rows in-place (preserving <tr> identity)
+      if (hChanged) {
+        for (const [vc, pooled] of this.mountedTransposedRowsByFieldIdx.entries()) {
+          this.reconcilePooledTransposedRowCells(
+            pooled,
+            visibleDataCount,
+            showMoreTd,
+            leftSpan,
+            rightSpan
+          )
+          this.patchPooledTransposedRow(
+            pooled,
+            vc,
+            visibleCols[vc],
+            model,
+            activeCapped,
+            hStart,
+            visibleDataEnd,
+            activeIndices.length,
+            showMoreTd,
+            focus,
+            activeMatch
+          )
+        }
+      }
+
+      if (boundedStart > 0) {
+        topTd.colSpan = activeColSpan
+        topTd.style.height = `${boundedStart * ROW_HEIGHT_PX}px`
+        if (topTr.parentNode !== tbody) {
+          tbody.insertBefore(topTr, tbody.firstChild)
+        }
+      } else if (topTr.parentNode === tbody) {
+        topTr.remove()
+      }
+
+      if (bottomTr.parentNode !== tbody) {
+        tbody.appendChild(bottomTr)
+      }
+
+      const overlapStart = Math.max(boundedStart, prevWin.boundedStart)
+      const overlapEnd = Math.min(boundedEnd, prevWin.boundedEnd)
+      const hasOverlap =
+        overlapStart < overlapEnd && this.mountedTransposedRowsByFieldIdx.size > 0
+
+      if (!hasOverlap) {
+        const frag = document.createDocumentFragment()
+        for (let visCol = boundedStart; visCol < boundedEnd; visCol++) {
+          const pooled = this.acquirePooledTransposedRow(
+            visibleDataCount,
+            showMoreTd,
+            leftSpan,
+            rightSpan
+          )
+          this.patchPooledTransposedRow(
+            pooled,
+            visCol,
+            visibleCols[visCol],
+            model,
+            activeCapped,
+            hStart,
+            visibleDataEnd,
+            activeIndices.length,
+            showMoreTd,
+            focus,
+            activeMatch
+          )
+          this.mountedTransposedRowsByFieldIdx.set(visCol, pooled)
+          frag.appendChild(pooled.tr)
+        }
+        tbody.insertBefore(frag, bottomTr)
+      } else {
+        if (boundedStart < overlapStart) {
+          const topFrag = document.createDocumentFragment()
+          for (let visCol = boundedStart; visCol < overlapStart; visCol++) {
+            const pooled = this.acquirePooledTransposedRow(
+              visibleDataCount,
+              showMoreTd,
+              leftSpan,
+              rightSpan
+            )
+            this.patchPooledTransposedRow(
+              pooled,
+              visCol,
+              visibleCols[visCol],
+              model,
+              activeCapped,
+              hStart,
+              visibleDataEnd,
+              activeIndices.length,
+              showMoreTd,
+              focus,
+              activeMatch
+            )
+            this.mountedTransposedRowsByFieldIdx.set(visCol, pooled)
+            topFrag.appendChild(pooled.tr)
+          }
+          const refNode = topTr.parentNode === tbody ? topTr.nextSibling : tbody.firstChild
+          tbody.insertBefore(topFrag, refNode)
+        }
+
+        if (overlapEnd < boundedEnd) {
+          const botFrag = document.createDocumentFragment()
+          for (let visCol = overlapEnd; visCol < boundedEnd; visCol++) {
+            const pooled = this.acquirePooledTransposedRow(
+              visibleDataCount,
+              showMoreTd,
+              leftSpan,
+              rightSpan
+            )
+            this.patchPooledTransposedRow(
+              pooled,
+              visCol,
+              visibleCols[visCol],
+              model,
+              activeCapped,
+              hStart,
+              visibleDataEnd,
+              activeIndices.length,
+              showMoreTd,
+              focus,
+              activeMatch
+            )
+            this.mountedTransposedRowsByFieldIdx.set(visCol, pooled)
+            botFrag.appendChild(pooled.tr)
+          }
+          tbody.insertBefore(botFrag, bottomTr)
+        }
+      }
+    } else {
+      for (const pooled of this.mountedTransposedRowsByFieldIdx.values()) {
+        if (this.freeTransposedRowPool.length < 80) {
+          this.freeTransposedRowPool.push(pooled)
+        }
+      }
+      this.mountedTransposedRowsByFieldIdx.clear()
+      tbody.innerHTML = ''
+
+      const frag = document.createDocumentFragment()
+      if (boundedStart > 0) {
+        topTd.colSpan = activeColSpan
+        topTd.style.height = `${boundedStart * ROW_HEIGHT_PX}px`
+        frag.appendChild(topTr)
+      }
+
+      for (let visCol = boundedStart; visCol < boundedEnd; visCol++) {
+        const pooled = this.acquirePooledTransposedRow(
+          visibleDataCount,
+          showMoreTd,
+          leftSpan,
+          rightSpan
+        )
+        this.patchPooledTransposedRow(
+          pooled,
+          visCol,
+          visibleCols[visCol],
+          model,
+          activeCapped,
+          hStart,
+          visibleDataEnd,
+          activeIndices.length,
+          showMoreTd,
+          focus,
+          activeMatch
+        )
+        this.mountedTransposedRowsByFieldIdx.set(visCol, pooled)
+        frag.appendChild(pooled.tr)
+      }
+
+      frag.appendChild(bottomTr)
+      tbody.appendChild(frag)
+      this.isTransposedPoolMounted = true
+    }
+
+    this.lastTransposedHStart = hStart
+    this.lastTransposedHEnd = hEnd
+    this.lastTransposedWindow = {
+      boundedStart,
+      boundedEnd,
+      dataVersion: this.dataVersion,
+      filterVersion: this.filterVersion,
+      colLayoutVersion: this.colLayoutVersion,
+      wrapVersion: this.wrapVersion,
+      totalRows: totalFields,
+      colSpan: activeColSpan,
+    }
   }
 
   private applyCellDisplay(
@@ -3440,7 +5765,8 @@ export class VirtualDataGrid {
     focus: CellCoord | null,
     activeMatch: CellCoord | null,
     pinnedLeftPx: number | null,
-    isLastPinned: boolean
+    isLastPinned: boolean,
+    cellHighlightClass: string | null = null
   ): void {
     const colDef = this.model?.columns[colIdx]
     const colType = colDef && 'type' in colDef ? colDef.type : undefined
@@ -3514,14 +5840,23 @@ export class VirtualDataGrid {
         if (edges.bottom) cls += ' datanoa-range-bottom'
         if (edges.left) cls += ' datanoa-range-left'
       }
-      if (this.findMatchKeys.size > 0 && this.findMatchKeys.has(`${visRow}:${visCol}`)) {
-        cls += ' datanoa-cell-match'
-        if (activeMatch !== null && activeMatch.row === visRow && activeMatch.col === visCol) {
-          cls += ' datanoa-cell-match-active'
-        }
-      }
     } else if (this.selectedRowIndex === rowIndex && this.selectedColIndex === colIdx) {
       cls += ' datanoa-cell-selected'
+    }
+
+    if (this.wrapCells && !this.isTransposed) {
+      cls += ' datanoa-cell-wrap'
+    }
+
+    if (cellHighlightClass) {
+      cls += ` datanoa-hl-cell ${cellHighlightClass}`
+    }
+
+    if (this.findMatchKeys.size > 0 && this.findMatchKeys.has(`${visRow}:${visCol}`)) {
+      cls += ' datanoa-cell-match'
+      if (activeMatch !== null && activeMatch.row === visRow && activeMatch.col === visCol) {
+        cls += ' datanoa-cell-match-active'
+      }
     }
 
     td.className = cls
@@ -3663,6 +5998,9 @@ export class VirtualDataGrid {
     const model = this.model
     if (typeof document === 'undefined' || !model) return
 
+    const occKey = this.getColKeyResolver()?.occKeys[modelColIdx] ?? header
+    const hiddenSet = this.getResolvedHiddenKeySet()
+    const pinnedSet = new Set(this.getResolvedPinnedKeys(hiddenSet))
     this.contextMenuEl = buildGridHeaderContextMenu({
       clientX,
       clientY,
@@ -3670,7 +6008,7 @@ export class VirtualDataGrid {
       header,
       model,
       dialect: this.dialect,
-      isPinned: this.pinnedColumns.includes(header),
+      isPinned: pinnedSet.has(occKey),
       visibleColsCount: this.getVisibleColumnIndices().length,
       rowIndices: this.getFilteredRowIndices(),
       closeMenu: () => this.closeContextMenu(),
@@ -3682,8 +6020,8 @@ export class VirtualDataGrid {
       },
       onNotify: this.onNotify,
       onSort: (dir) => this.handleHeaderClick(header, dir),
-      togglePin: () => this.togglePinColumn(header),
-      hideColumn: () => this.setColumnVisibility(header, false),
+      togglePin: () => this.togglePinColumn(occKey),
+      hideColumn: () => this.setColumnVisibility(occKey, false),
       autoFitColumn: () => this.autoFitColumn(modelColIdx, thEl),
     })
   }
@@ -3833,8 +6171,12 @@ export class VirtualDataGrid {
       return
     }
     const clientHeight = this.tableContainerEl.clientHeight || 440
-    const headerH = this.theadEl?.offsetHeight || 28
-    const targetTop = Math.max(0, headerH + totalVisibleRows * ROW_HEIGHT_PX + 28 - clientHeight)
+    const headerH = this.cachedHeaderHeightPx || this.theadEl?.offsetHeight || 28
+    const totalDataH =
+      this.rowHeightIndex.rowCount === totalVisibleRows
+        ? this.rowHeightIndex.getTotalHeight()
+        : totalVisibleRows * ROW_HEIGHT_PX
+    const targetTop = Math.max(0, headerH + totalDataH + 28 - clientHeight)
     this.tableContainerEl.scrollTop = targetTop
     this.renderVisibleRows()
     if (this.tableContainerEl.scrollHeight > clientHeight) {
@@ -4079,6 +6421,7 @@ export class VirtualDataGrid {
     if (state.kind === 'inserted') {
       model.rows.splice(idx, 1)
       this.rowStates.splice(idx, 1)
+      this.shiftTransposedRowWidthsAfterSplice(idx)
       this.selection.clear()
       if (this.selectedRowIndex !== null) {
         this.selectedRowIndex =
@@ -4168,6 +6511,7 @@ export class VirtualDataGrid {
       for (const idx of insertedIndices) {
         model.rows.splice(idx, 1)
         this.rowStates.splice(idx, 1)
+        this.shiftTransposedRowWidthsAfterSplice(idx)
         changedCount++
       }
       this.selection.clear()
@@ -4643,6 +6987,7 @@ export class VirtualDataGrid {
 
     model.rows = keptRows
     this.rowStates = keptStates
+    this.syncTransposedWidthsForModel()
     this.activeEditor = null
     this.selection.clear()
     this.invalidateDataCache()
@@ -4885,6 +7230,7 @@ export class VirtualDataGrid {
     columnName: string,
     value: unknown
   ): void {
+    const model = this.model
     const rowState = this.rowStates[rowIndex]
     const vr = parseOptionalInt(td.dataset.visRow) ?? 0
     const vc = parseOptionalInt(td.dataset.visCol) ?? 0
@@ -4893,6 +7239,22 @@ export class VirtualDataGrid {
     const pinnedOffsets = this.isTransposed ? [] : this.computePinnedLeftOffsets(visibleCols, pinnedCount)
     const activeMatch =
       this.findActiveIndex >= 0 ? (this.findMatches[this.findActiveIndex] ?? null) : null
+    const evaluatedHighlight = this.evaluateRowHighlightState(model, rowIndex)
+    const occKeys =
+      evaluatedHighlight && model ? (this.getColKeyResolver()?.occKeys ?? null) : null
+    const cellHl = this.resolveCellHighlightClass(evaluatedHighlight, occKeys, colIndex, columnName)
+
+    if (!this.isTransposed) {
+      const tr = td.parentElement
+      if (tr) {
+        for (const cls of HIGHLIGHT_TONE_CLASSES) {
+          tr.classList.remove(cls)
+        }
+        if (evaluatedHighlight?.rowClass) {
+          tr.classList.add(evaluatedHighlight.rowClass)
+        }
+      }
+    }
 
     this.applyCellDisplay(
       td,
@@ -4906,7 +7268,8 @@ export class VirtualDataGrid {
       this.selection.getFocus(),
       activeMatch,
       !this.isTransposed && vc < pinnedCount ? pinnedOffsets[vc] : null,
-      !this.isTransposed && vc < pinnedCount && vc === pinnedCount - 1
+      !this.isTransposed && vc < pinnedCount && vc === pinnedCount - 1,
+      cellHl
     )
   }
 
@@ -5241,6 +7604,14 @@ export class VirtualDataGrid {
       dirtyCols: new Map(st.dirtyCols),
     }))
     const fkSeen = new Set<ForeignKeyInfo>(this.foreignKeyByColumn.values())
+    const counts = this.getHeaderOccurrenceCounts()
+    const resolvedHiddenSet = this.model ? this.getResolvedHiddenKeySet() : null
+    const hiddenColumns = resolvedHiddenSet
+      ? Array.from(resolvedHiddenSet).map((k) => this.toDisplayColumnKey(k, counts))
+      : Array.from(this.hiddenColumns)
+    const pinnedColumns = resolvedHiddenSet
+      ? this.getResolvedPinnedKeys(resolvedHiddenSet).map((k) => this.toDisplayColumnKey(k, counts))
+      : [...this.pinnedColumns]
     return {
       model,
       rowStates,
@@ -5250,8 +7621,8 @@ export class VirtualDataGrid {
       clientColumnFilters: this.clientColumnFilters.map((f) => ({ ...f })),
       findQuery: this.findQuery,
       findActiveIndex: this.findActiveIndex,
-      hiddenColumns: Array.from(this.hiddenColumns),
-      pinnedColumns: [...this.pinnedColumns],
+      hiddenColumns,
+      pinnedColumns,
       scrollTop: this.tableContainerEl?.scrollTop ?? 0,
       scrollLeft: this.tableContainerEl?.scrollLeft ?? 0,
       tableName: this.tableName,
@@ -5315,6 +7686,9 @@ export class VirtualDataGrid {
     this.invalidateDataCache()
     this.invalidateFilterCache()
     this.invalidateColLayoutCache()
+    this.colKeyResolverHeaders = null
+    this.colKeyResolverCache = null
+    this.resetHeaderPool()
     this.resetRowPoolMountState()
 
     if (!this.model || this.model.headers.length === 0) {
@@ -5331,6 +7705,7 @@ export class VirtualDataGrid {
         this.columnWidths = this.computeInitialColumnWidths(this.model)
       }
     }
+    this.syncTransposedWidthsForModel()
 
     if (this.findQuery) {
       this.recomputeFindMatches()
@@ -5362,6 +7737,10 @@ export class VirtualDataGrid {
     if (this.rafHandle !== null && typeof cancelAnimationFrame === 'function') {
       cancelAnimationFrame(this.rafHandle)
       this.rafHandle = null
+    }
+    if (this.resizeObserverRafId !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(this.resizeObserverRafId)
+      this.resizeObserverRafId = null
     }
     if (this.resizeObserver) {
       this.resizeObserver.disconnect()
@@ -5443,8 +7822,16 @@ export class VirtualDataGrid {
     this.closeColumnFilterPopover()
     this.mountedRowsByVisRow.clear()
     this.freeRowPool.length = 0
+    this.freeCellPool.length = 0
     this.isPoolMountedInTbody = false
+    this.resetHeaderPool()
+    this.colKeyResolverHeaders = null
+    this.colKeyResolverCache = null
+    this.mountedTransposedRowsByFieldIdx.clear()
+    this.freeTransposedRowPool.length = 0
+    this.isTransposedPoolMounted = false
     this.lastRenderedWindow = null
+    this.lastTransposedWindow = null
     this.topSpacerTr = null
     this.topSpacerTd = null
     this.bottomSpacerTr = null

@@ -3,7 +3,7 @@
   "manifestVersion": 2,
   "id": "datanoa",
   "name": "Datanoa Studio",
-  "version": "1.2.3",
+  "version": "1.3.0",
   "license": "MIT",
   "author": {
     "name": "Thanhh2615",
@@ -14,41 +14,47 @@
   "icon": "assets/icon.png",
   "cover": {
     "path": "images/cover.webp",
-    "alt": "Datanoa Studio v1.2.3 database client and SQL studio for Orca with multi-tab SQL editor, AI SQL Assistant, data grid, and schema explorer"
+    "alt": "Datanoa Studio v1.3.0 database client and SQL studio for Orca showing Studio Split View and interactive ER Diagram"
   },
   "screenshots": [
     {
       "path": "images/studio-split-view.webp",
-      "alt": "Datanoa Studio split view with multi-tab SQL console, AI inline ghost completion and EXPLAIN plan analyzer, transactions, data grid, and JSON inspector",
-      "caption": "Multi-tab SQL console, AI inline completion & EXPLAIN analyzer, transactions, and data grid",
+      "alt": "Datanoa Studio Split View with 5 view tabs, inline AI SQL ghost completion, manual transaction toolbar, data grid, and JSON Value Inspector",
+      "caption": "Split View: SQL console, inline AI ghost completion, manual TX, data grid & JSON inspector",
+      "theme": "dark"
+    },
+    {
+      "path": "images/er-diagram.webp",
+      "alt": "Datanoa interactive ER Diagram showing PostgreSQL table cards, PK/FK/UK badges, Crow's Foot relationships, zoom fit, and Mermaid/DOT/SVG/PNG export",
+      "caption": "Interactive ER Diagram with PK/FK/UK badges, Crow's Foot edges & Mermaid/DOT/SVG/PNG export",
+      "theme": "dark"
+    },
+    {
+      "path": "images/visual-explain.webp",
+      "alt": "Datanoa SQL Console Visual EXPLAIN Tree highlighting Seq Scan bottleneck alongside Missing Index DDL hints and AI Execution Plan Analysis",
+      "caption": "Visual EXPLAIN Tree with bottleneck severity, index hints & AI Execution Plan Analysis",
       "theme": "dark"
     },
     {
       "path": "images/studio-connection-modal.webp",
-      "alt": "Datanoa Connection Manager with 12 built-in engines, 7 local BYOD driver slots, SSH tunnels, TLS/mTLS, folders, and workspace auto-discovery",
-      "caption": "12 built-in engines, 7 local BYOD drivers, SSH tunnels, TLS/mTLS, and workspace auto-discovery",
-      "theme": "dark"
-    },
-    {
-      "path": "images/schema-designer.webp",
-      "alt": "Datanoa visual table designer showing staged column edits, data types, foreign keys, indexes, and live SQL migration preview",
-      "caption": "Visual table designer with staged schema edits and live SQL migration preview",
+      "alt": "Datanoa Connection Manager with 12 built-in engines, 7 BYOD drivers, verified PostgreSQL TLS/SSH settings, and workspace auto-discovery",
+      "caption": "12 built-in engines, 7 BYOD drivers, verified TLS/SSH settings & workspace discovery",
       "theme": "dark"
     },
     {
       "path": "images/studio-light-theme.webp",
-      "alt": "Datanoa Studio in light theme with compact table bar, grouped schema objects, pinned columns, and find highlighting",
-      "caption": "Light theme with compact table bar, grouped schema objects, and pinned columns",
+      "alt": "Datanoa Studio Light Theme Data Grid with quick table switcher bar, pinned columns, and conditional row/cell highlighting",
+      "caption": "Light theme Data Grid with pinned columns, conditional highlighting & quick table switcher",
       "theme": "light"
     },
     {
       "path": "images/side-panel-explorer.webp",
-      "alt": "Datanoa Side Panel with schema explorer tree, data grid with live aggregates, multi-tab SQL runner, and AI EXPLAIN",
-      "caption": "Docked Side Panel explorer, data grid, multi-tab SQL runner, and AI assistant",
+      "alt": "Datanoa Docked Side Panel showing multi-engine Schema Explorer folders, staged Data Grid edits with aggregates, and Visual EXPLAIN SQL runner",
+      "caption": "Docked Side Panel: multi-engine explorer, staged Data Grid & SQL Visual EXPLAIN",
       "theme": "dark"
     }
   ],
-  "description": "Database client and SQL studio for Orca with real-time SQL syntax diagnostics and an opt-in dual-role AI SQL Assistant (inline ghost completion, inline statement edits, Fix with AI, and EXPLAIN plan analyzer). Browse schemas, edit and import data, design tables, and run SQL, MQL, or Redis queries over SSH and TLS across 12 built-in engines (SQLite, PostgreSQL, MySQL, MariaDB, CockroachDB, ClickHouse, Redis, LibSQL/Turso, Cloudflare D1, MSSQL, Oracle, MongoDB) plus 7 local BYOD drivers.",
+  "description": "Multi-engine database client & SQL studio for Orca: 12 built-in engines (PostgreSQL, MySQL, MariaDB, SQLite, CockroachDB, ClickHouse, MSSQL, Oracle, MongoDB, Redis, LibSQL/Turso, D1) + 7 BYOD drivers. Interactive ER diagrams, Visual EXPLAIN trees, Vim/custom keymaps, virtual grid & table designer, SSH tunnels/TLS, and opt-in AI SQL Assistant (inline ghost completion & EXPLAIN analysis).",
   "engines": {
     "orca": ">=1.4.248"
   },
@@ -248,6 +254,45 @@
         "description": "Instruction or chat model used for EXPLAIN analysis and Fix with AI when not synced.",
         "type": "string",
         "default": "gpt-4o-mini"
+      },
+      {
+        "key": "editorKeymap",
+        "title": "SQL Editor Keymap",
+        "description": "Keybinding preset used by the CodeMirror SQL editor in Studio and Side Panel.",
+        "type": "string",
+        "enum": [
+          "default",
+          "vim"
+        ],
+        "enumLabels": [
+          "Default (Standard)",
+          "Vim (Modal)"
+        ],
+        "default": "default"
+      },
+      {
+        "key": "shortcutRunStatement",
+        "title": "Shortcut: Run Statement",
+        "description": "CodeMirror keybinding to execute the active SQL statement (e.g. Mod-Enter, F5). System/clipboard and Ctrl+Alt combinations are ignored.",
+        "type": "string",
+        "default": "Mod-Enter",
+        "placeholder": "Mod-Enter"
+      },
+      {
+        "key": "shortcutRunAll",
+        "title": "Shortcut: Run All Statements",
+        "description": "CodeMirror keybinding to execute all SQL statements in the editor (e.g. Mod-Shift-Enter). System/clipboard and Ctrl+Alt combinations are ignored.",
+        "type": "string",
+        "default": "Mod-Shift-Enter",
+        "placeholder": "Mod-Shift-Enter"
+      },
+      {
+        "key": "shortcutFormatSql",
+        "title": "Shortcut: Format SQL",
+        "description": "CodeMirror keybinding to format SQL in the editor (e.g. Shift-Alt-f, Mod-Shift-f). System/clipboard and Ctrl+Alt combinations are ignored.",
+        "type": "string",
+        "default": "Shift-Alt-f",
+        "placeholder": "Shift-Alt-f"
       }
     ]
   },

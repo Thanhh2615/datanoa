@@ -5,6 +5,8 @@ import type {
   ConnectionProfile,
   DatabaseDriverType,
   DataChangesInput,
+  ParsedExplainPlan,
+  SchemaErGraph,
   SchemaObject,
   SchemaObjectKind,
   ColumnInfo,
@@ -21,6 +23,8 @@ import type {
 export type {
   ConnectionProfile,
   DataChangesInput,
+  ParsedExplainPlan,
+  SchemaErGraph,
   SchemaObject,
   SchemaObjectKind,
   ColumnInfo,
@@ -357,6 +361,35 @@ export class HealthPolicy {
   }
 }
 
+export interface ExplainResult {
+  columns: { name: string; type: string }[]
+  rows: unknown[][]
+  rawText?: string
+  formatHint?: string
+  executionTimeMs?: number
+  explainPlan?: ParsedExplainPlan
+}
+
+export interface CopyImportOpenOptions {
+  table: string
+  schema?: string
+  columns: string[]
+  signal?: AbortSignal
+}
+
+export interface CopyImportWriteResult {
+  bytesWritten: number
+  rowCount: number
+}
+
+export interface CopyImportStreamHandle {
+  readonly supported: boolean
+  readonly fallbackReason?: string
+  writeRows(rows: Array<Record<string, unknown> | unknown[]>): Promise<CopyImportWriteResult>
+  commit(): Promise<{ inserted: number }>
+  abort(reason?: string): Promise<void>
+}
+
 export interface IDatabaseSession {
   readonly driverType: DriverType
   readonly profile: ConnectionProfile
@@ -410,6 +443,18 @@ export interface IDatabaseSession {
 
   /** Cancels an actively running query by queryId */
   cancelQuery(queryId: string): Promise<{ ok: boolean }>
+
+  /** Optional driver-specific EXPLAIN execution hook */
+  runExplain?(sql: string, signal?: AbortSignal): Promise<ExplainResult | null>
+
+  /** Optional fast-path ER graph introspection hook */
+  introspectErGraph?(schema?: string): Promise<SchemaErGraph>
+
+  /** Optional hook to invalidate cached schema metadata inside the driver session */
+  clearSchemaCache?(): void
+
+  /** Optional streaming COPY/bulk-import opener (e.g. PostgreSQL COPY ... FROM STDIN) */
+  openCopyImport?(opts: CopyImportOpenOptions): Promise<CopyImportStreamHandle>
 
   /** Returns current transaction state */
   getTransactionState(): TransactionState

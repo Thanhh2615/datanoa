@@ -68,6 +68,14 @@ export class PanelGridSelection {
     return false
   }
 
+  hasColSelected(c) {
+    for (let i = 0; i < this.ranges.length; i++) {
+      const rg = this.ranges[i]
+      if (c >= rg.c1 && c <= rg.c2) return true
+    }
+    return false
+  }
+
   contains(r, c) {
     for (let i = 0; i < this.ranges.length; i++) {
       const rg = this.ranges[i]
@@ -387,9 +395,15 @@ export class PanelGridSelection {
     return parts.join(' · ')
   }
 
+  detachCell(td) {
+    if (!td) return
+    this.highlightedTds.delete(td)
+  }
+
   detachRow(tr) {
     if (!tr) return
-    if (this.highlightedTrs.delete(tr)) {
+    const wasTrackedTr = this.highlightedTrs.delete(tr)
+    if (wasTrackedTr || (this.isTransposed() && this.highlightedTds.size > 0)) {
       const cells = tr.children
       for (let i = 0; i < cells.length; i++) {
         this.highlightedTds.delete(cells[i])
@@ -399,6 +413,28 @@ export class PanelGridSelection {
 
   applyClassesToRow(tr, r) {
     if (!tr || !Number.isFinite(r) || this.ranges.length === 0) return
+    const transposed = Boolean(this.isTransposed())
+    if (transposed) {
+      if (!this.hasColSelected(r)) return
+      const cells = tr.children
+      for (let i = 0; i < cells.length; i++) {
+        const td = cells[i]
+        if (!(td instanceof HTMLElement) || td.dataset.rowIdx === undefined || td.dataset.colIdx === undefined) continue
+        const rowI = Number(td.dataset.rowIdx)
+        const colI = Number(td.dataset.colIdx)
+        const inRange = this.contains(rowI, colI)
+        const isFocus = Boolean(this.focus && this.focus.r === rowI && this.focus.c === colI)
+        if (!inRange && !isFocus) continue
+        td.classList.toggle('cell-in-range', inRange)
+        td.classList.toggle('range-top', inRange && !this.contains(rowI, colI - 1))
+        td.classList.toggle('range-right', inRange && !this.contains(rowI + 1, colI))
+        td.classList.toggle('range-bottom', inRange && !this.contains(rowI, colI + 1))
+        td.classList.toggle('range-left', inRange && !this.contains(rowI - 1, colI))
+        td.classList.toggle('cell-selected', isFocus)
+        this.highlightedTds.add(td)
+      }
+      return
+    }
     if (!this.hasRowSelected(r)) return
     tr.classList.add('row-selected')
     this.highlightedTrs.add(tr)
@@ -437,14 +473,36 @@ export class PanelGridSelection {
 
     const tbody = tbl.tBodies?.[0] || tbl.querySelector('tbody')
     if (!tbody) return
+    const transposed = Boolean(this.isTransposed())
     const nextTrs = new Set()
     const nextTds = new Set()
     const rows = tbody.children
     for (let i = 0; i < rows.length; i++) {
       const tr = rows[i]
       if (!(tr instanceof HTMLElement) || tr.dataset.rowIdx === undefined) continue
-      const r = Number(tr.dataset.rowIdx)
-      if (!this.hasRowSelected(r)) continue
+      const trIdx = Number(tr.dataset.rowIdx)
+      if (transposed) {
+        if (!this.hasColSelected(trIdx)) continue
+        const cells = tr.children
+        for (let j = 0; j < cells.length; j++) {
+          const td = cells[j]
+          if (!(td instanceof HTMLElement) || td.dataset.rowIdx === undefined || td.dataset.colIdx === undefined) continue
+          const r = Number(td.dataset.rowIdx)
+          const c = Number(td.dataset.colIdx)
+          const inRange = this.contains(r, c)
+          const isFocus = Boolean(this.focus && this.focus.r === r && this.focus.c === c)
+          if (!inRange && !isFocus) continue
+          nextTds.add(td)
+          td.classList.toggle('cell-in-range', inRange)
+          td.classList.toggle('range-top', inRange && !this.contains(r, c - 1))
+          td.classList.toggle('range-right', inRange && !this.contains(r + 1, c))
+          td.classList.toggle('range-bottom', inRange && !this.contains(r, c + 1))
+          td.classList.toggle('range-left', inRange && !this.contains(r - 1, c))
+          td.classList.toggle('cell-selected', isFocus)
+        }
+        continue
+      }
+      if (!this.hasRowSelected(trIdx)) continue
       nextTrs.add(tr)
       if (!this.highlightedTrs.has(tr)) tr.classList.add('row-selected')
       const cells = tr.children
@@ -452,15 +510,15 @@ export class PanelGridSelection {
         const td = cells[j]
         if (!(td instanceof HTMLElement) || td.dataset.colIdx === undefined) continue
         const c = Number(td.dataset.colIdx)
-        const inRange = this.contains(r, c)
-        const isFocus = Boolean(this.focus && this.focus.r === r && this.focus.c === c)
+        const inRange = this.contains(trIdx, c)
+        const isFocus = Boolean(this.focus && this.focus.r === trIdx && this.focus.c === c)
         if (!inRange && !isFocus) continue
         nextTds.add(td)
         td.classList.toggle('cell-in-range', inRange)
-        td.classList.toggle('range-top', inRange && !this.contains(r - 1, c))
-        td.classList.toggle('range-right', inRange && !this.contains(r, c + 1))
-        td.classList.toggle('range-bottom', inRange && !this.contains(r + 1, c))
-        td.classList.toggle('range-left', inRange && !this.contains(r, c - 1))
+        td.classList.toggle('range-top', inRange && !this.contains(trIdx - 1, c))
+        td.classList.toggle('range-right', inRange && !this.contains(trIdx, c + 1))
+        td.classList.toggle('range-bottom', inRange && !this.contains(trIdx + 1, c))
+        td.classList.toggle('range-left', inRange && !this.contains(trIdx, c - 1))
         td.classList.toggle('cell-selected', isFocus)
       }
     }

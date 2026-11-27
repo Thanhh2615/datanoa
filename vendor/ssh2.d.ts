@@ -3,6 +3,7 @@ import type { Duplex } from 'node:stream'
 export interface Ssh2ConnectConfig {
   host?: string
   port?: number
+  sock?: Duplex
   username?: string
   password?: string
   privateKey?: Buffer | string
@@ -14,6 +15,9 @@ export interface Ssh2ConnectConfig {
   keepaliveCountMax?: number
   hostHash?: 'sha256' | 'md5'
   hostVerifier?: (key: Buffer | string, verify?: (valid: boolean) => void) => boolean | void
+  algorithms?: {
+    serverHostKey?: string[]
+  }
 }
 
 export interface Ssh2ClientChannel extends Duplex {

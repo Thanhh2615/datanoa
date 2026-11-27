@@ -101,6 +101,15 @@ export declare function scanQuotedSegmentEnd(
 export declare function scanLineCommentEnd(sql: string, start: number): number
 export declare function scanBlockCommentEnd(sql: string, start: number, nested?: boolean): number
 export declare function splitMssqlBatches(script: string): string[]
+export declare function matchMssqlShowplanDirective(
+  sql: string,
+  phase?: 'ON' | 'OFF'
+): 'SHOWPLAN_ALL' | 'SHOWPLAN_TEXT' | 'SHOWPLAN_XML' | null
+export declare function isMssqlShowplanBatchHead(sql: string): boolean
+export declare function splitExplainTargetStatements(
+  sql: string,
+  dialect?: DatabaseDriverType
+): string[]
 export declare function splitOracleSlashChunks(script: string): string[]
 export declare function splitSqlStatements(
   script: string,
@@ -116,6 +125,11 @@ export declare function isolateActiveSqlStatement(
   suffix: string,
   dialect?: DatabaseDriverType
 ): IsolatedAiSqlStatement
+
+export declare function isSqlClauseColumnContext(
+  before: string,
+  dialect?: DatabaseDriverType
+): boolean
 
 export type SqlExecutionMode = 'caret' | 'all' | 'explain'
 
@@ -175,6 +189,7 @@ export declare function stripLeadingSqlComments(
 ): string
 export interface StripCommentsDetailedOptions {
   preserveMysqlExecComments?: boolean
+  preserveLiterals?: boolean
   literalPlaceholder?: string
   identPlaceholder?: string
   backslashOverride?: boolean
@@ -183,6 +198,7 @@ export interface StripCommentsDetailedResult {
   text: string
   hasUnclosedQuote: boolean
   hasUnclosedComment: boolean
+  endsInLineComment: boolean
 }
 export declare function stripCommentsAndLiteralsDetailed(
   sql: string,
@@ -193,6 +209,10 @@ export declare function stripCommentsAndLiterals(
   sql: string,
   dialect?: DatabaseDriverType,
   preserveMysqlExecComments?: boolean
+): string
+export declare function stripSqlCommentsOnly(
+  sql: string,
+  dialect?: DatabaseDriverType
 ): string
 export declare function containsDdlStatement(
   sql: string,

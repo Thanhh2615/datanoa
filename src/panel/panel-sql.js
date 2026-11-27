@@ -21,13 +21,23 @@ import {
   createPanelConsoleTabsManager,
 } from './panel-sql-tabs.js'
 import { createPanelCodeMirrorEditor } from './panel-cm.js'
+import { isActiveSqlStatementSensitive } from '../shared-cm-inline-ai.js'
 import {
   renderAiStatusButtonContent,
   renderSharedAiFixPanel,
   renderSharedExplainAiPanel,
   resolveExplainAiPhase,
 } from '../shared-ai-ui.js'
-import { remapSqlTargetRange, resolveSqlReplacementSpan } from '../shared-sql-core.js'
+import {
+  remapSqlTargetRange,
+  resolveSqlReplacementSpan,
+  splitExplainTargetStatements,
+} from '../shared-sql-core.js'
+import { extractSqlParameters } from '../shared-sql-params.js'
+import {
+  createRememberedBindParamsStore,
+  openSharedBindParamsModal,
+} from '../shared-bind-params-modal.js'
 import { resolveExecutionErrorFixTarget } from '../shared-sql-diagnostics.js'
 import { containsSensitiveSqlText } from '../shared-sql-safety.js'
 import {
@@ -96,12 +106,7 @@ export function findMongoStatementAtOffset(script, offset) {
 }
 
 export function splitPanelTargetStatements(sql, driver) {
-  const trimmed = String(sql || '').trim()
-  if (!trimmed) return []
-  if (driver === 'redis') return [trimmed]
-  return splitSqlStatements(trimmed, driver)
-    .map((s) => s.text.trim())
-    .filter(Boolean)
+  return splitExplainTargetStatements(sql, driver)
 }
 
 export function createPanelSqlController(ctx) {
@@ -140,6 +145,7 @@ export function createPanelSqlController(ctx) {
   let aiFixAbort = null
   let aiFixSeq = 0
   let aiFixState = null
+  let pendingConfirmedInlineAi = null
   let boundFixAiBtn = null
   let activeSqlBannerKey = null
   let lastSqlBannerConnId = null
@@ -323,6 +329,30 @@ export function createPanelSqlController(ctx) {
   let customSqlEditorHeight = null
   let activeResizerCleanup = null
   let cmEditor = null
+
+  function syncSqlVimModePill(snap) {
+    const pill = $('sqlVimModePill')
+    if (!pill) return
+    if (!snap || snap.preset !== 'vim' || !snap.badge) {
+      pill.hidden = true
+      pill.dataset.vimMode = 'normal'
+      pill.textContent = 'NORMAL'
+      return
+    }
+    pill.hidden = false
+    pill.dataset.vimMode = snap.mode || 'normal'
+    pill.textContent = snap.badge
+  }
+
+  function applySqlKeymapSettings(nextSettings) {
+    cmEditor?.applyKeymapSettings?.(nextSettings)
+    syncSqlVimModePill(cmEditor?.getVimModeSnapshot?.())
+  }
+
+  function isSqlVimEscapeTarget(target) {
+    return Boolean(cmEditor?.isVimTargetEvent?.(target))
+  }
+
   if (mountEl) {
     try {
       cmEditor = createPanelCodeMirrorEditor({
@@ -335,27 +365,104 @@ export function createPanelSqlController(ctx) {
             (document.documentElement.classList.contains('light') ||
               document.body?.classList.contains('light'))
         ),
+        onVimModeChange: (snap) => syncSqlVimModePill(snap),
         aiInline: {
-          isEnabled: () => isPanelAiReady() && Boolean(state.activeConnectionId),
+          isEnabled: () => isPanelAiReady() && Boolean(getActiveConn()),
+          getConnectionId: () => state.activeConnectionId,
           requestCompletion: async ({ prefix, suffix, signal, manual, mode }) => {
             const conn = getActiveConn()
             if (!conn) return null
-            if (containsSensitiveSqlText(`${prefix}${suffix}`)) return null
-            return await rpc(
-              'ai.complete',
-              {
-                connectionId: conn.id,
-                dialect: conn.driver || 'sqlite',
-                prefix,
-                suffix,
-                ...(manual ? { manual: true } : {}),
-                ...(mode && mode !== 'auto' ? { mode } : {}),
-                activeSchema: state.activeSchema || undefined,
-                activeTable: state.activeTable || undefined,
-                schemaMap: currentSchemaMap,
-              },
-              { signal, timeoutMs: 18000 }
+            if (isActiveSqlStatementSensitive(prefix, suffix, conn.driver || 'sqlite', mode)) return null
+            const reqMode = mode === 'edit' ? 'edit' : manual ? 'complete' : 'auto'
+            const pending = pendingConfirmedInlineAi
+            const isConfirmedManual = Boolean(
+              manual &&
+                (reqMode === 'edit' || reqMode === 'complete') &&
+                pending &&
+                pending.connectionId === conn.id &&
+                pending.mode === reqMode &&
+                pending.prefix === prefix &&
+                pending.suffix === suffix
             )
+            if (manual) {
+              pendingConfirmedInlineAi = null
+            }
+            try {
+              return await rpc(
+                'ai.complete',
+                {
+                  connectionId: conn.id,
+                  dialect: conn.driver || 'sqlite',
+                  prefix,
+                  suffix,
+                  ...(manual ? { manual: true } : {}),
+                  ...(mode && mode !== 'auto' ? { mode } : {}),
+                  ...(isConfirmedManual ? { confirmed: true } : {}),
+                  activeSchema: state.activeSchema || undefined,
+                  activeTable: state.activeTable || undefined,
+                  schemaMap: currentSchemaMap,
+                },
+                { signal, timeoutMs: 25000 }
+              )
+            } catch (err) {
+              if (!signal?.aborted) {
+                void onRefreshAiStatus?.()
+              }
+              throw err
+            }
+          },
+          onRequestError: (err, ctx) => {
+            const errMode = ctx?.mode === 'complete' ? 'complete' : 'edit'
+            const msg =
+              err instanceof Error
+                ? err.message
+                : String(err || (errMode === 'complete' ? 'AI completion failed' : 'Inline AI edit failed'))
+            const targetConnId = ctx?.connectionId ?? state.activeConnectionId
+            const conn = targetConnId ? getConnById?.(targetConnId) || null : null
+            const rawPolicy = conn?.aiPolicy
+            const rawTag = String(conn?.colorTag || '').trim().toLowerCase()
+            const effectivePolicy =
+              rawPolicy === 'never' || rawPolicy === 'ask' || rawPolicy === 'allow'
+                ? rawPolicy
+                : rawTag === 'prod' || rawTag === 'production'
+                  ? 'ask'
+                  : 'allow'
+            const isBlocked = /ai\.blocked/i.test(msg)
+            const isNever = /\bpolicy:\s*never\b|disabled for this connection/i.test(msg) || effectivePolicy === 'never'
+            if (isBlocked && !isNever && targetConnId) {
+              const retryLabel =
+                errMode === 'complete' ? 'Confirm & Retry AI Completion' : 'Confirm & Retry AI Edit'
+              const boundPrefix = typeof ctx?.prefix === 'string' ? ctx.prefix : ''
+              const boundSuffix = typeof ctx?.suffix === 'string' ? ctx.suffix : ''
+              showBanner(msg, 'warn', {
+                retryLabel,
+                onRetry: () => {
+                  pendingConfirmedInlineAi = {
+                    connectionId: targetConnId,
+                    mode: errMode,
+                    prefix: boundPrefix,
+                    suffix: boundSuffix,
+                  }
+                  cmEditor?.focus?.()
+                  cmEditor?.view?.contentDOM?.dispatchEvent(
+                    new KeyboardEvent(
+                      'keydown',
+                      errMode === 'complete'
+                        ? { key: 'Tab', code: 'Tab', bubbles: true, cancelable: true }
+                        : {
+                            key: '\\',
+                            code: 'Backslash',
+                            altKey: true,
+                            bubbles: true,
+                            cancelable: true,
+                          }
+                    )
+                  )
+                },
+              })
+              return
+            }
+            showBanner(msg, 'danger')
           },
           onMetric: (id, kind) => {
             void rpc('ai.metrics.event', { id, kind }).catch(() => {})
@@ -370,6 +477,7 @@ export function createPanelSqlController(ctx) {
           scheduleSavePanelViewState?.(350)
         },
       })
+      syncSqlVimModePill(cmEditor?.getVimModeSnapshot?.())
     } catch {
       cmEditor = null
     }
@@ -383,7 +491,10 @@ export function createPanelSqlController(ctx) {
     return Number(tabSql.clientHeight) || 0
   }
 
-  function applySqlEditorHeight(desiredPx, { persist = false, preservePreferred = false } = {}) {
+  function applySqlEditorHeight(
+    desiredPx,
+    { persist = false, preservePreferred = false, cachedContainerH = null, skipMeasure = false } = {}
+  ) {
     if (!mountEl) return PANEL_SQL_EDITOR_DEFAULT_HEIGHT
     const parsed = Number(desiredPx)
     const preferredClamped = Number.isFinite(parsed)
@@ -392,7 +503,7 @@ export function createPanelSqlController(ctx) {
           Math.min(PANEL_SQL_EDITOR_HARD_MAX_HEIGHT, Math.round(parsed))
         )
       : PANEL_SQL_EDITOR_DEFAULT_HEIGHT
-    const containerH = getSqlContainerHeight()
+    const containerH = cachedContainerH !== null ? cachedContainerH : getSqlContainerHeight()
     const bounds = computePanelSqlEditorBounds(containerH)
     const clamped = clampPanelSqlEditorHeight(preferredClamped, containerH)
     if (!preservePreferred) {
@@ -404,7 +515,9 @@ export function createPanelSqlController(ctx) {
       resizerEl.setAttribute('aria-valuemax', String(bounds.max))
       resizerEl.setAttribute('aria-valuenow', String(clamped))
     }
-    cmEditor?.view?.requestMeasure?.()
+    if (!skipMeasure) {
+      cmEditor?.view?.requestMeasure?.()
+    }
     if (persist) {
       scheduleSavePanelViewState?.(150)
     }
@@ -432,12 +545,21 @@ export function createPanelSqlController(ctx) {
     return customSqlEditorHeight
   }
 
+  let activeSqlDragCancel = null
+
   if (mountEl && resizerEl && typeof window !== 'undefined') {
     let activeDrag = null
+    let windowResizeRafId = null
+    let windowResizeRafPending = false
+
     const stopDrag = (shouldPersist) => {
       if (!activeDrag) return
-      const { kind, onMove, onEnd } = activeDrag
+      const { kind, onMove, onEnd, onKeyDown, flushPending, cancelRaf, tabSql } = activeDrag
       activeDrag = null
+      cancelRaf()
+      if (shouldPersist) {
+        flushPending()
+      }
       if (kind === 'pointer') {
         window.removeEventListener('pointermove', onMove)
         window.removeEventListener('pointerup', onEnd)
@@ -447,15 +569,20 @@ export function createPanelSqlController(ctx) {
         window.removeEventListener('mouseup', onEnd)
       }
       window.removeEventListener('blur', onEnd)
+      window.removeEventListener('keydown', onKeyDown)
       resizerEl.classList.remove('is-resizing')
+      tabSql?.classList?.remove('is-split-resizing')
       if (document.body) {
         document.body.style.cursor = ''
         document.body.style.userSelect = ''
       }
+      ctx.setPanelViewportResizing?.(false)
+      cmEditor?.view?.requestMeasure?.()
       if (shouldPersist) {
         scheduleSavePanelViewState?.(150)
       }
     }
+    activeSqlDragCancel = () => stopDrag(false)
 
     const startDrag = (e) => {
       if (e.button !== undefined && e.button !== 0) return
@@ -463,27 +590,79 @@ export function createPanelSqlController(ctx) {
       e.preventDefault()
       const kind = e.type === 'pointerdown' ? 'pointer' : 'mouse'
       const startY = Number(e.clientY) || 0
+      const tabSql = $('tabSql')
+      const cachedContainerH = getSqlContainerHeight()
+      const bounds = computePanelSqlEditorBounds(cachedContainerH)
       const rectH = mountEl.getBoundingClientRect?.().height
       const startH =
         Number.isFinite(rectH) && rectH > 0
           ? rectH
           : clampPanelSqlEditorHeight(
               customSqlEditorHeight ?? PANEL_SQL_EDITOR_DEFAULT_HEIGHT,
-              getSqlContainerHeight()
+              cachedContainerH
             )
+      let pendingH = clampPanelSqlEditorHeight(startH, cachedContainerH)
+      let lastAppliedH = -1
+      let dragRafId = null
+      let dragRafPending = false
 
+      resizerEl.setAttribute('aria-valuemin', String(bounds.min))
+      resizerEl.setAttribute('aria-valuemax', String(bounds.max))
       resizerEl.classList.add('is-resizing')
+      tabSql?.classList?.add('is-split-resizing')
+      ctx.setPanelViewportResizing?.(true)
       if (document.body) {
         document.body.style.cursor = 'row-resize'
         document.body.style.userSelect = 'none'
       }
 
+      const flushPending = () => {
+        dragRafPending = false
+        dragRafId = null
+        if (pendingH === lastAppliedH) return
+        lastAppliedH = pendingH
+        applySqlEditorHeight(pendingH, {
+          persist: false,
+          cachedContainerH,
+          skipMeasure: true,
+        })
+      }
+
+      const cancelRaf = () => {
+        dragRafPending = false
+        if (dragRafId !== null && typeof cancelAnimationFrame === 'function') {
+          cancelAnimationFrame(dragRafId)
+          dragRafId = null
+        }
+      }
+
       const onMove = (moveEv) => {
+        if (moveEv.isTrusted && typeof moveEv.buttons === 'number' && moveEv.buttons === 0) {
+          stopDrag(true)
+          return
+        }
         const dy = (Number(moveEv.clientY) || 0) - startY
-        applySqlEditorHeight(startH + dy, { persist: false })
+        const nextH = Math.max(bounds.min, Math.min(bounds.max, Math.round(startH + dy)))
+        if (nextH === pendingH) return
+        pendingH = nextH
+        if (typeof requestAnimationFrame === 'function') {
+          if (!dragRafPending) {
+            dragRafPending = true
+            const id = requestAnimationFrame(flushPending)
+            dragRafId = dragRafPending ? id : null
+          }
+        } else {
+          flushPending()
+        }
       }
       const onEnd = () => stopDrag(true)
-      activeDrag = { kind, onMove, onEnd }
+      const onKeyDown = (keyEv) => {
+        if (keyEv.key === 'Escape') {
+          keyEv.preventDefault()
+          stopDrag(false)
+        }
+      }
+      activeDrag = { kind, onMove, onEnd, onKeyDown, flushPending, cancelRaf, tabSql }
       if (kind === 'pointer') {
         window.addEventListener('pointermove', onMove)
         window.addEventListener('pointerup', onEnd)
@@ -493,6 +672,7 @@ export function createPanelSqlController(ctx) {
         window.addEventListener('mouseup', onEnd)
       }
       window.addEventListener('blur', onEnd)
+      window.addEventListener('keydown', onKeyDown)
     }
 
     const onDblClick = () => {
@@ -521,7 +701,21 @@ export function createPanelSqlController(ctx) {
       applySqlEditorHeight(targetH, { persist: true })
     }
 
-    const onWindowResize = () => applyClampedSqlEditorHeight()
+    const onWindowResize = () => {
+      if (typeof requestAnimationFrame === 'function') {
+        if (!windowResizeRafPending) {
+          windowResizeRafPending = true
+          const id = requestAnimationFrame(() => {
+            windowResizeRafPending = false
+            windowResizeRafId = null
+            applyClampedSqlEditorHeight()
+          })
+          windowResizeRafId = windowResizeRafPending ? id : null
+        }
+      } else {
+        applyClampedSqlEditorHeight()
+      }
+    }
     resizerEl.addEventListener('pointerdown', startDrag)
     resizerEl.addEventListener('mousedown', startDrag)
     resizerEl.addEventListener('dblclick', onDblClick)
@@ -530,6 +724,11 @@ export function createPanelSqlController(ctx) {
 
     activeResizerCleanup = () => {
       stopDrag(false)
+      windowResizeRafPending = false
+      if (windowResizeRafId !== null && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(windowResizeRafId)
+        windowResizeRafId = null
+      }
       resizerEl.removeEventListener('pointerdown', startDrag)
       resizerEl.removeEventListener('mousedown', startDrag)
       resizerEl.removeEventListener('dblclick', onDblClick)
@@ -577,6 +776,9 @@ export function createPanelSqlController(ctx) {
     currentSchemaMap = schemaMap && typeof schemaMap === 'object' ? schemaMap : {}
     currentSchemaTable = activeTable || undefined
     cmEditor?.setSchema?.(currentSchemaMap, currentSchemaTable)
+    if (isPanelAiReady() && getActiveConn()) {
+      cmEditor?.notifyAiAvailabilityChanged?.()
+    }
   }
 
   function setSqlColorScheme(isLight) {
@@ -690,6 +892,9 @@ export function createPanelSqlController(ctx) {
 
     cmEditor?.setPlaceholder?.(getPanelEditorPlaceholder(conn.driver))
     setSqlDialect(conn.driver || 'sqlite')
+    if (isPanelAiReady()) {
+      cmEditor?.notifyAiAvailabilityChanged?.()
+    }
   }
 
   function renderConsoleTabs() {
@@ -922,12 +1127,9 @@ export function createPanelSqlController(ctx) {
       return
     }
 
-    const fixDialect =
-      ((current.executedConnId ?? current.originConnId)
-        ? getConnById?.(current.executedConnId ?? current.originConnId)
-        : null)?.driver ||
-      getActiveConn()?.driver ||
-      'sqlite'
+    const fixConnId = current.executedConnId ?? current.originConnId
+    const fixConn = fixConnId ? getConnById?.(fixConnId) || null : null
+    const fixDialect = fixConn?.driver || 'sqlite'
     renderSharedAiFixPanel(
       panel,
       {
@@ -937,6 +1139,9 @@ export function createPanelSqlController(ctx) {
         dialect: fixDialect,
         destination: exp?.destination,
         host: exp?.host,
+        colorTag: fixConn?.colorTag,
+        aiPolicy: fixConn?.aiPolicy,
+        pendingConfirm: Boolean(current.pendingConfirm),
         result: current.result || null,
         error: current.error || null,
       },
@@ -992,8 +1197,11 @@ export function createPanelSqlController(ctx) {
         onCopySql: (sql) => {
           void copyText(sql, 'Fixed SQL copied')
         },
-        onRetry: () => {
-          void handleFixWithAiClick()
+        onFixQuery: (fixOpts) => {
+          void handleFixWithAiClick(fixOpts)
+        },
+        onRetry: (fixOpts) => {
+          void handleFixWithAiClick(fixOpts)
         },
         onCancel: () => {
           clearAiFixPanel()
@@ -1009,7 +1217,7 @@ export function createPanelSqlController(ctx) {
     )
   }
 
-  async function handleFixWithAiClick() {
+  async function handleFixWithAiClick(options = {}) {
     const tab = consoleTabs.getActiveTab()
     const idx = tab?.activeResultSetIndex || 0
     const rsState = tab?.resultStates?.[idx]
@@ -1047,10 +1255,67 @@ export function createPanelSqlController(ctx) {
       return
     }
 
-    const conn = tab.executedConnectionId
-      ? getConnById?.(tab.executedConnectionId) || getActiveConn()
-      : getActiveConn()
-    const executedConnId = conn?.id || originConnId
+    const recordedConnId =
+      typeof tab.executedConnectionId === 'string' && tab.executedConnectionId.length > 0
+        ? tab.executedConnectionId
+        : typeof b.connectionId === 'string' && b.connectionId.length > 0
+          ? b.connectionId
+          : undefined
+    const lookupConnId = recordedConnId ?? originConnId
+    const conn = lookupConnId ? getConnById?.(lookupConnId) || null : null
+    const executedConnId = recordedConnId ?? conn?.id ?? originConnId
+
+    const rawPolicy = conn?.aiPolicy
+    const rawTag = String(conn?.colorTag || '').trim().toLowerCase()
+    const effectivePolicy =
+      rawPolicy === 'never' || rawPolicy === 'ask' || rawPolicy === 'allow'
+        ? rawPolicy
+        : rawTag === 'prod' || rawTag === 'production'
+          ? 'ask'
+          : 'allow'
+
+    if (effectivePolicy === 'never') {
+      aiFixSeq += 1
+      aiFixAbort?.abort()
+      aiFixAbort = null
+      aiFixState = {
+        phase: 'error',
+        result: null,
+        error: 'AI assistance is disabled for this connection (policy: never).',
+        failedSql,
+        errorMessage,
+        fixTargetRange,
+        originTabId,
+        originResultSetIndex,
+        originConnId,
+        executedConnId,
+        originLastResult,
+      }
+      renderAiFixPanel()
+      return
+    }
+
+    if (effectivePolicy === 'ask' && options?.confirmed !== true) {
+      aiFixSeq += 1
+      aiFixAbort?.abort()
+      aiFixAbort = null
+      aiFixState = {
+        phase: 'idle',
+        pendingConfirm: true,
+        result: null,
+        error: null,
+        failedSql,
+        errorMessage,
+        fixTargetRange,
+        originTabId,
+        originResultSetIndex,
+        originConnId,
+        executedConnId,
+        originLastResult,
+      }
+      renderAiFixPanel()
+      return
+    }
 
     if (containsSensitiveSqlText(failedSql) || containsSensitiveSqlText(errorMessage)) {
       aiFixSeq += 1
@@ -1101,13 +1366,15 @@ export function createPanelSqlController(ctx) {
       const result = await rpc(
         'ai.fixQuery',
         {
-          connectionId: conn?.id,
+          connectionId: executedConnId ?? '',
+          fromConnection: true,
           dialect: conn?.driver || 'sqlite',
           sql: failedSql,
           errorMessage,
           activeSchema: isSameActiveConn ? state.activeSchema || undefined : undefined,
           activeTable: isSameActiveConn ? state.activeTable || undefined : undefined,
           schemaMap: isSameActiveConn ? currentSchemaMap : {},
+          ...(options?.confirmed === true ? { confirmed: true } : {}),
           language: ai?.explainLanguage || 'auto',
           uiLocale: typeof window !== 'undefined' ? window.orca?.locale : undefined,
         },
@@ -1171,6 +1438,7 @@ export function createPanelSqlController(ctx) {
         originTabId,
         originResultSetIndex,
         originConnId,
+        executedConnId,
         originLastResult,
       }
       const latest = consoleTabs.getResultTabState(originResultSetIndex, originTabId)
@@ -1185,6 +1453,9 @@ export function createPanelSqlController(ctx) {
     } finally {
       if (aiFixAbort === ac) {
         aiFixAbort = null
+      }
+      if (!ac.signal.aborted) {
+        void onRefreshAiStatus?.()
       }
     }
   }
@@ -1371,13 +1642,66 @@ export function createPanelSqlController(ctx) {
     })
   }
 
-  function attachPanelExplainTargets(resultStates, res, overallSql, driver, execRange) {
+  function formatExplainRawRowsText(rs) {
+    if (!rs || !Array.isArray(rs.rows) || rs.rows.length === 0) return ''
+    const cols = Array.isArray(rs.columns) ? rs.columns : []
+    const formatCell = (val) => {
+      if (val === null || val === undefined) return ''
+      if (typeof val === 'string') return val
+      try {
+        return JSON.stringify(val, null, 2)
+      } catch {
+        return String(val)
+      }
+    }
+    if (cols.length <= 1) {
+      const colName = cols[0]?.name
+      const lines = []
+      for (const row of rs.rows) {
+        if (Array.isArray(row)) {
+          lines.push(formatCell(row[0]))
+        } else if (row && typeof row === 'object') {
+          const val = colName && colName in row ? row[colName] : Object.values(row)[0]
+          lines.push(formatCell(val))
+        } else {
+          lines.push(formatCell(row))
+        }
+      }
+      return lines.join('\n')
+    }
+    const header = cols.map((c) => String(c.name ?? '')).join('\t')
+    const body = rs.rows.map((row) =>
+      cols
+        .map((c, idx) => {
+          const raw = Array.isArray(row) ? row[idx] : row?.[c.name]
+          return raw === null || raw === undefined
+            ? 'NULL'
+            : typeof raw === 'object'
+              ? JSON.stringify(raw)
+              : String(raw)
+        })
+        .join('\t')
+    )
+    return [header, ...body].join('\n')
+  }
+
+  function attachPanelExplainTargets(resultStates, res, overallSql, driver, execRange, meta = {}) {
     const sets = getEffectiveResultSets(res, overallSql)
     const stmtSlices =
       execRange && driver !== 'redis' ? splitSqlStatements(execRange.sql, driver) : []
     sets.forEach((rs, idx) => {
       const st = resultStates[idx]
       if (!st) return
+      st.connectionId = meta.connectionId
+      st.dialect = meta.dialect || driver
+      st.activeSchema = meta.activeSchema
+      if (meta.colorTag !== undefined) st.colorTag = meta.colorTag
+      if (meta.aiPolicy !== undefined) st.aiPolicy = meta.aiPolicy
+      const rawRowsText = formatExplainRawRowsText(rs)
+      if (rawRowsText) {
+        st.rawPlanText = rawRowsText
+        rs.rawPlanText = rawRowsText
+      }
       const stmtSql = String(st.statementSql || rs.sql || overallSql || '').trim()
       if (!stmtSql) return
       st.explainTargetRange = resolvePanelStatementRange(
@@ -1441,29 +1765,47 @@ export function createPanelSqlController(ctx) {
       rsState.explainAnalysis
     )
 
-    const explainConn = tab.executedConnectionId
-      ? getConnById?.(tab.executedConnectionId)
-      : getActiveConn()
+    const explainConnId = rsState.connectionId ?? tab.executedConnectionId
+    const explainConn = explainConnId ? getConnById?.(explainConnId) : getActiveConn()
     $('sqlResultWrap')?.classList?.toggle?.(
       'has-explain-ai-panel',
       !rsState.explainAnalysisCollapsed
     )
+    const resolvedSchema =
+      'activeSchema' in rsState ? rsState.activeSchema : state.activeSchema || undefined
+    const explainPanelState = {
+      phase,
+      aiEnabled: Boolean(exp?.enabled),
+      aiReady: explainReady,
+      explainLanguage: ai?.explainLanguage || 'auto',
+      dialect: explainConn?.driver || rsState.dialect || 'sqlite',
+      destination: exp?.destination,
+      host: exp?.host,
+      colorTag: explainConn?.colorTag ?? rsState.colorTag,
+      aiPolicy: explainConn?.aiPolicy ?? rsState.aiPolicy,
+      activeSchema: resolvedSchema,
+      explainPlan: rs.explainPlan ?? null,
+      rawPlanText: rsState.rawPlanText || rs.rawPlanText || null,
+      ...(rsState.explainViewMode === 'visual' ||
+      rsState.explainViewMode === 'raw' ||
+      rsState.explainViewMode === 'ai'
+        ? { explainViewMode: rsState.explainViewMode }
+        : {}),
+      result: rsState.explainAnalysis || null,
+      error: rsState.explainAnalysisError || null,
+      collapsed: Boolean(rsState.explainAnalysisCollapsed),
+    }
     renderSharedExplainAiPanel(
       panel,
+      explainPanelState,
       {
-        phase,
-        aiEnabled: Boolean(exp?.enabled),
-        aiReady: explainReady,
-        explainLanguage: ai?.explainLanguage || 'auto',
-        dialect: explainConn?.driver || 'sqlite',
-        destination: exp?.destination,
-        host: exp?.host,
-        result: rsState.explainAnalysis || null,
-        error: rsState.explainAnalysisError || null,
-        collapsed: Boolean(rsState.explainAnalysisCollapsed),
-      },
-      {
-        onAnalyze: () => void runExplainAiAnalysis(tab.id, idx),
+        onAnalyze: (analyzeOpts) => void runExplainAiAnalysis(tab.id, idx, analyzeOpts),
+        onExplainViewChange: (nextView) => {
+          explainPanelState.explainViewMode = nextView
+          const cur = consoleTabs.getResultTabState(idx, tab.id)
+          if (!cur) return
+          consoleTabs.setResultTabState(idx, { ...cur, explainViewMode: nextView }, tab.id)
+        },
         onConfigureAi: () => {
           void openAiSettingsModal?.('explain')
         },
@@ -1575,7 +1917,7 @@ export function createPanelSqlController(ctx) {
     )
   }
 
-  async function runExplainAiAnalysis(tabId, resultSetIndex) {
+  async function runExplainAiAnalysis(tabId, resultSetIndex, analyzeOpts = {}) {
     const tab = consoleTabs.getTabs().find((t) => t.id === tabId)
     if (!tab?.lastResult) return
     const originLastResult = tab.lastResult
@@ -1596,6 +1938,7 @@ export function createPanelSqlController(ctx) {
           explainAnalysisError:
             'Explain & Fix AI is not configured or disabled. Enable Explain & Fix in AI Settings to analyze query plans.',
           explainAnalysisCollapsed: false,
+          explainViewMode: 'ai',
         },
         tabId
       )
@@ -1616,6 +1959,7 @@ export function createPanelSqlController(ctx) {
           explainAnalysisError:
             'Query appears to contain sensitive credentials/secrets and was not sent to AI.',
           explainAnalysisCollapsed: false,
+          explainViewMode: 'ai',
         },
         tabId
       )
@@ -1630,25 +1974,33 @@ export function createPanelSqlController(ctx) {
     explainAiLoadingTarget = { tabId, resultSetIndex, originLastResult }
     consoleTabs.setResultTabState(
       resultSetIndex,
-      { ...rsState, explainAnalysisError: null, explainAnalysisCollapsed: false },
+      { ...rsState, explainAnalysisError: null, explainAnalysisCollapsed: false, explainViewMode: 'ai' },
       tabId
     )
     renderExplainAiForActiveTab()
 
-    const conn = tab.executedConnectionId
-      ? getConnById?.(tab.executedConnectionId)
-      : getActiveConn()
+    const explainConnId = rsState.connectionId ?? tab.executedConnectionId
+    const conn = explainConnId ? getConnById?.(explainConnId) || null : getActiveConn()
     const ai = getAiStatus?.()
+    const activeSchema =
+      analyzeOpts?.activeSchema ??
+      ('activeSchema' in rsState ? rsState.activeSchema : state.activeSchema || undefined)
 
     try {
       const result = await rpc(
         'ai.explainAnalyze',
         {
-          connectionId: conn?.id,
-          dialect: conn?.driver || 'sqlite',
+          connectionId: conn?.id ?? explainConnId ?? '',
+          fromConnection: true,
+          dialect: conn?.driver || rsState.dialect || 'sqlite',
           sql,
           planColumns: (rs.columns || []).map((c) => ({ name: c.name, type: c.type || '' })),
           planRows: rs.rows || [],
+          ...(rs.explainPlan ? { explainPlan: rs.explainPlan } : {}),
+          ...(activeSchema ? { activeSchema } : {}),
+          ...(analyzeOpts?.confirmed !== undefined
+            ? { confirmed: Boolean(analyzeOpts.confirmed) }
+            : {}),
           language: ai?.explainLanguage || 'auto',
           uiLocale: typeof window !== 'undefined' ? window.orca?.locale : undefined,
         },
@@ -1691,6 +2043,9 @@ export function createPanelSqlController(ctx) {
         explainAiLoadingTarget = null
       }
       renderExplainAiForActiveTab()
+      if (!ac.signal.aborted) {
+        void onRefreshAiStatus?.()
+      }
     }
   }
 
@@ -1698,6 +2053,8 @@ export function createPanelSqlController(ctx) {
     syncPanelAiButton()
     if (!isPanelAiReady()) {
       cmEditor?.clearAiGhost?.()
+    } else if (getActiveConn()) {
+      cmEditor?.notifyAiAvailabilityChanged?.()
     }
     if (aiFixState && aiFixState.phase !== 'hidden') {
       renderAiFixPanel()
@@ -2416,12 +2773,24 @@ export function createPanelSqlController(ctx) {
       expectedStatementCount
     )
     if (mode === 'explain') {
+      const execConnId = opts.connId ?? state.activeConnectionId ?? undefined
+      const execConn = execConnId ? getConnById?.(execConnId) : getActiveConn()
       attachPanelExplainTargets(
         resultStates,
         res,
         overallSql,
         resolvedDriver,
-        opts.execRange || null
+        opts.execRange || null,
+        {
+          connectionId: execConnId,
+          dialect: resolvedDriver,
+          activeSchema:
+            'executedActiveSchema' in opts
+              ? opts.executedActiveSchema
+              : state.activeSchema || undefined,
+          colorTag: execConn?.colorTag,
+          aiPolicy: execConn?.aiPolicy,
+        }
       )
     }
     consoleTabs.setResultForTab(
@@ -2492,7 +2861,15 @@ export function createPanelSqlController(ctx) {
     }
   }
 
-  async function executeExplainBatch({ statements, runConnId, queryId, runSeq, onProgress }) {
+  async function executeExplainBatch({
+    statements,
+    templateSql,
+    templateStatements,
+    runConnId,
+    queryId,
+    runSeq,
+    onProgress,
+  }) {
     const overallStart = performance.now()
     const collectedSets = []
     let firstNonError = null
@@ -2504,6 +2881,12 @@ export function createPanelSqlController(ctx) {
         throw cancelErr
       }
       const stmtSql = statements[i]
+      const stmtTemplateSql =
+        statements.length === 1
+          ? templateSql || undefined
+          : Array.isArray(templateStatements) && templateStatements.length === statements.length
+            ? templateStatements[i]
+            : undefined
       const workerQid = statements.length === 1 ? queryId : `${queryId}_${i}`
       state.activeWorkerQueryId = workerQid
       onProgress(statements.length > 1 ? `Explaining ${i + 1}/${statements.length}` : 'Explaining')
@@ -2511,7 +2894,12 @@ export function createPanelSqlController(ctx) {
       try {
         const singleRes = await rpc(
           'query.explain',
-          { connectionId: runConnId, queryId: workerQid, sql: stmtSql },
+          {
+            connectionId: runConnId,
+            queryId: workerQid,
+            sql: stmtSql,
+            ...(stmtTemplateSql ? { templateSql: stmtTemplateSql } : {}),
+          },
           { timeoutMs: QUERY_TIMEOUT_MS }
         )
         if (runSeq !== sqlRunSeq || state.activeConnectionId !== runConnId) return null
@@ -2532,6 +2920,7 @@ export function createPanelSqlController(ctx) {
           rowCount: singleRes?.rowCount ?? (singleRes?.rows ? singleRes.rows.length : 0),
           truncated: Boolean(singleRes?.truncated),
           isSelect: true,
+          ...(singleRes?.explainPlan ? { explainPlan: singleRes.explainPlan } : {}),
         })
       } catch (stmtErr) {
         if (runSeq !== sqlRunSeq || state.activeConnectionId !== runConnId) return null
@@ -2561,7 +2950,7 @@ export function createPanelSqlController(ctx) {
     return buildCombinedExplainResult(collectedSets, firstNonError, totalMs)
   }
 
-  async function executeSingleQueryRun({ sql, runConnId, queryId, runSeq }) {
+  async function executeSingleQueryRun({ sql, templateSql, runConnId, queryId, runSeq }) {
     let configuredMaxRows
     if (typeof window.orca?.settings?.get === 'function') {
       try {
@@ -2589,6 +2978,7 @@ export function createPanelSqlController(ctx) {
       connectionId: runConnId,
       queryId,
       sql,
+      ...(templateSql ? { templateSql } : {}),
       structuredError: true,
       ...(configuredMaxRows ? { maxRows: configuredMaxRows } : {}),
     }
@@ -2598,7 +2988,18 @@ export function createPanelSqlController(ctx) {
 
   async function executeResolvedSql(snapshot) {
     if (!snapshot || !snapshot.runConnId || state.activeQueryId) return
-    const { sql, statements, mode, runConnId, runDriver, originTabId, execRange } = snapshot
+    const {
+      sql,
+      templateSql,
+      templateStatements,
+      statements,
+      mode,
+      runConnId,
+      runDriver,
+      originTabId,
+      execRange,
+      executedActiveSchema,
+    } = snapshot
     if (state.activeConnectionId !== runConnId) return
 
     clearAiFixPanel()
@@ -2652,6 +3053,8 @@ export function createPanelSqlController(ctx) {
       if (mode === 'explain') {
         const combinedRes = await executeExplainBatch({
           statements,
+          templateSql,
+          templateStatements,
           runConnId,
           queryId,
           runSeq,
@@ -2666,15 +3069,16 @@ export function createPanelSqlController(ctx) {
           originTabId,
           connId: runConnId,
           runDriver,
+          executedActiveSchema,
           execRange,
-          rawStatements: statements,
-          overallSql: sql,
+          rawStatements: templateStatements || statements,
+          overallSql: templateSql || sql,
           defaultIndex: 0,
         })
         return
       }
 
-      const outcome = await executeSingleQueryRun({ sql, runConnId, queryId, runSeq })
+      const outcome = await executeSingleQueryRun({ sql, templateSql, runConnId, queryId, runSeq })
       stopTimer()
       if (outcome.stale || runSeq !== sqlRunSeq || state.activeConnectionId !== runConnId) {
         if (panelContainsDdlStatement(sql, runDriver) && getConnById(runConnId)) {
@@ -2753,24 +3157,10 @@ export function createPanelSqlController(ctx) {
     }
   }
 
-  async function runSql(mode = 'caret', options = {}) {
-    if (!state.activeConnectionId || state.activeQueryId) return
-    const conn = getActiveConn()
-    const runConnId = state.activeConnectionId
-    const runDriver = conn?.driver || 'sqlite'
-    const originTabId = consoleTabs.getActiveTabId()
-    const resolved = resolveTargetSql(mode, getSqlText(), runDriver)
-    if (!resolved) return
-    const snapshot = Object.freeze({
-      sql: resolved.sql,
-      statements: Object.freeze([...resolved.statements]),
-      execRange: resolved.execRange || null,
-      mode,
-      runConnId,
-      runDriver,
-      originTabId,
-    })
+  const bindParamsMemoryStore = createRememberedBindParamsStore()
 
+  async function runResolvedSnapshotWithDangerGuard(snapshot, options = {}) {
+    const conn = getConnById?.(snapshot.runConnId) || getActiveConn()
     if (!options?.skipDangerGuard && !conn?.readOnly) {
       const findings = analyzeDangerousSql(snapshot.sql, snapshot.runDriver)
       if (findings.length > 0) {
@@ -2797,6 +3187,70 @@ export function createPanelSqlController(ctx) {
     }
 
     await executeResolvedSql(snapshot)
+  }
+
+  async function runSql(mode = 'caret', options = {}) {
+    if (!state.activeConnectionId || state.activeQueryId) return
+    const conn = getActiveConn()
+    const runConnId = state.activeConnectionId
+    const runDriver = conn?.driver || 'sqlite'
+    const executedActiveSchema = state.activeSchema || undefined
+    const originTabId = consoleTabs.getActiveTabId()
+    const resolved = resolveTargetSql(mode, getSqlText(), runDriver)
+    if (!resolved) return
+
+    if (!options?.skipBindCheck && runDriver !== 'redis') {
+      const detectedParams = extractSqlParameters(resolved.sql, runDriver)
+      if (detectedParams.length > 0) {
+        const bindRes = await openSharedBindParamsModal({
+          sql: resolved.sql,
+          dialect: runDriver,
+          params: detectedParams,
+          action: mode === 'explain' ? 'explain' : 'run',
+          memoryStore: bindParamsMemoryStore,
+          scopeKey: runConnId || 'default',
+        })
+        if (!bindRes || typeof bindRes.boundSql !== 'string') return
+        if (
+          state.activeConnectionId !== runConnId ||
+          consoleTabs.getActiveTabId() !== originTabId
+        ) {
+          showBanner?.(
+            'Execution cancelled: active connection or tab changed before confirmation.',
+            'warn'
+          )
+          return
+        }
+        const boundStatements = splitPanelTargetStatements(bindRes.boundSql, runDriver)
+        if (boundStatements.length === 0) return
+        const boundSnapshot = Object.freeze({
+          sql: bindRes.boundSql,
+          templateSql: resolved.sql,
+          templateStatements: Object.freeze([...resolved.statements]),
+          statements: Object.freeze([...boundStatements]),
+          execRange: resolved.execRange || null,
+          mode,
+          runConnId,
+          runDriver,
+          originTabId,
+          executedActiveSchema,
+        })
+        await runResolvedSnapshotWithDangerGuard(boundSnapshot, options)
+        return
+      }
+    }
+
+    const snapshot = Object.freeze({
+      sql: resolved.sql,
+      statements: Object.freeze([...resolved.statements]),
+      execRange: resolved.execRange || null,
+      mode,
+      runConnId,
+      runDriver,
+      originTabId,
+      executedActiveSchema,
+    })
+    await runResolvedSnapshotWithDangerGuard(snapshot, options)
   }
 
   async function loadQueryHistory() {
@@ -2958,6 +3412,8 @@ export function createPanelSqlController(ctx) {
     setSqlSchema,
     setSqlColorScheme,
     setSqlTypography,
+    applySqlKeymapSettings,
+    isSqlVimEscapeTarget,
     openSqlFindReplace,
     destroySqlEditor,
     renderConsoleTabs,
@@ -2991,6 +3447,8 @@ export function createPanelSqlController(ctx) {
     getSqlEditorHeight,
     setSqlEditorHeight,
     applyClampedSqlEditorHeight,
+    cancelSqlEditorDrag: () => activeSqlDragCancel?.(),
     onAiStatusChanged,
+    notifyAiAvailabilityChanged: onAiStatusChanged,
   }
 }

@@ -61,23 +61,147 @@ export async function rpc(name, input, options) {
   throw new Error('Orca IPC bridge is unavailable')
 }
 
+const SIDEBAR_NEAR_BLACK_MAX_CHANNEL = 24
+const SIDEBAR_LUM_EPSILON = 1e-4
+const OPAQUE_ALPHA_THRESHOLD = 0.99
+const NUMERIC_TOKEN_RE = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?$/
+
+function parseNumericChannels(inner) {
+  const parts = inner
+    .replace(/\//g, ' ')
+    .replace(/,/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+  if (parts.length < 3 || parts.length > 4) return null
+  const values = []
+  for (const part of parts) {
+    if (!NUMERIC_TOKEN_RE.test(part)) return null
+    const n = Number(part)
+    if (!Number.isFinite(n)) return null
+    values.push(n)
+  }
+  if (values.length === 4 && values[3] < OPAQUE_ALPHA_THRESHOLD) return null
+  return values
+}
+
+export function parseComputedRgb(raw) {
+  if (typeof raw !== 'string') return null
+  const text = raw.trim().toLowerCase()
+  if (!text || text === 'transparent') return null
+
+  const srgbMatch = text.match(/^color\(\s*srgb\s+([^)]+)\)$/)
+  if (srgbMatch) {
+    const nums = parseNumericChannels(srgbMatch[1])
+    if (!nums) return null
+    return [
+      Math.max(0, Math.min(255, Math.round(nums[0] * 255))),
+      Math.max(0, Math.min(255, Math.round(nums[1] * 255))),
+      Math.max(0, Math.min(255, Math.round(nums[2] * 255))),
+    ]
+  }
+
+  const rgbMatch = text.match(/^rgba?\(([^)]+)\)$/)
+  if (!rgbMatch) return null
+  const nums = parseNumericChannels(rgbMatch[1])
+  if (!nums) return null
+  return [
+    Math.max(0, Math.min(255, nums[0])),
+    Math.max(0, Math.min(255, nums[1])),
+    Math.max(0, Math.min(255, nums[2])),
+  ]
+}
+
+function relativeLuminance(rgb) {
+  return 0.2126 * srgbLin(rgb[0]) + 0.7152 * srgbLin(rgb[1]) + 0.0722 * srgbLin(rgb[2])
+}
+
+/**
+ * Orca's 22-token frame allowlist omits `--sidebar` while painting RightSidebar with `bg-sidebar`.
+ * Derive the matching sidebar surface from `--orca-background` and `--orca-card` across all Orca theme archetypes:
+ * - Light themes: use `--orca-card` when darker than `--background`, or subtle 98% tint on pure `#ffffff` (Orca Default Light `#fafafa`).
+ * - Dark themes with `--card < --background` (Tokyo Night, Catppuccin, One Dark Pro, GitHub Dark, VS Code Modern): `--card === --sidebar`.
+ * - Dark themes with `--card > --background` on near-black canvas (Orca Default Dark `#0a0a0a`): `--card === --sidebar` (`#171717`).
+ * - Dark themes with `--card > --background` on slate/mid-dark canvas (Dracula `#282a36`, Nord, Gruvbox Dark): recess `--background` 82% (`#21222c` on Dracula).
+ * - Flat themes (`--card === --background`): keep `--orca-background`.
+ */
+export function resolveOrcaSidebarBackground(bgRgb, cardRgb) {
+  if (!bgRgb || !cardRgb) return null
+  const lumBg = relativeLuminance(bgRgb)
+  const lumCard = relativeLuminance(cardRgb)
+  const isLight = lumBg > 0.45
+
+  if (isLight) {
+    if (lumCard < lumBg - SIDEBAR_LUM_EPSILON) return 'var(--orca-card)'
+    if (bgRgb[0] >= 252 && bgRgb[1] >= 252 && bgRgb[2] >= 252) {
+      return 'color-mix(in srgb, var(--orca-background) 98%, var(--orca-foreground))'
+    }
+    return null
+  }
+
+  if (lumCard < lumBg - SIDEBAR_LUM_EPSILON) return 'var(--orca-card)'
+  if (lumCard > lumBg + SIDEBAR_LUM_EPSILON) {
+    const maxChannel = Math.max(bgRgb[0], bgRgb[1], bgRgb[2])
+    if (maxChannel <= SIDEBAR_NEAR_BLACK_MAX_CHANNEL) return 'var(--orca-card)'
+    return 'color-mix(in srgb, var(--orca-background) 82%, #000000)'
+  }
+  return null
+}
+
+function probeComputedBackgroundRgb(cssExpr) {
+  if (typeof document === 'undefined' || !document.body) return null
+  const getStyle =
+    typeof window !== 'undefined' && typeof window.getComputedStyle === 'function'
+      ? window.getComputedStyle
+      : globalThis.getComputedStyle
+  if (typeof getStyle !== 'function') return null
+  const probe = document.createElement('div')
+  probe.style.position = 'absolute'
+  probe.style.visibility = 'hidden'
+  probe.style.background = cssExpr
+  document.body.appendChild(probe)
+  try {
+    return parseComputedRgb(getStyle(probe)?.backgroundColor)
+  } finally {
+    probe.remove()
+  }
+}
+
+function applyResolvedSidebarBackground(bgRgb) {
+  if (typeof document === 'undefined' || !document.documentElement) return
+  if (!bgRgb) {
+    document.documentElement.style.removeProperty('--panel-bg')
+    return
+  }
+  const cardRgb = probeComputedBackgroundRgb('var(--orca-card, rgba(0, 0, 0, 0))')
+  const sidebarExpr = resolveOrcaSidebarBackground(bgRgb, cardRgb)
+  if (sidebarExpr) {
+    document.documentElement.style.setProperty('--panel-bg', sidebarExpr)
+  } else {
+    document.documentElement.style.removeProperty('--panel-bg')
+  }
+}
+
+export function syncSidebarBackgroundFromTokens() {
+  try {
+    const bgRgb = probeComputedBackgroundRgb('var(--orca-background, #000000)')
+    applyResolvedSidebarBackground(bgRgb)
+  } catch {}
+}
+
 export function syncThemeFromTokens() {
   try {
-    const probe = document.createElement('div')
-    probe.style.position = 'absolute'
-    probe.style.visibility = 'hidden'
-    probe.style.background = 'var(--orca-background, #000000)'
-    document.body.appendChild(probe)
-    const bg = getComputedStyle(probe).backgroundColor
-    probe.remove()
-    const m = bg.match(/[\d.]+/g)
-    if (!m || (m.length > 3 && Number(m[3]) === 0)) return
-    const lum = 0.2126 * srgbLin(Number(m[0])) + 0.7152 * srgbLin(Number(m[1])) + 0.0722 * srgbLin(Number(m[2]))
-    const isLight = lum > 0.45
+    const bgRgb = probeComputedBackgroundRgb('var(--orca-background, #000000)')
+    if (!bgRgb) {
+      applyResolvedSidebarBackground(null)
+      return
+    }
+    const isLight = relativeLuminance(bgRgb) > 0.45
     document.documentElement.classList.toggle('light', isLight)
     document.documentElement.classList.toggle('dark', !isLight)
     document.body?.classList.toggle('light', isLight)
     document.body?.classList.toggle('dark', !isLight)
+    applyResolvedSidebarBackground(bgRgb)
   } catch {}
 }
 
@@ -101,8 +225,74 @@ export async function syncOrcaTypography() {
   } catch {}
 }
 
+const V2_TABLE_KEY_COMPONENT_RE = /[:%|]|^\s|\s$/
+
 export function makeTableKey(connectionId, tableName, schemaName) {
+  const rawConn = connectionId == null ? '' : String(connectionId)
+  const conn = rawConn.trim().length > 0 ? rawConn : 'none'
+  const sch = schemaName == null ? '' : String(schemaName)
+  const tbl = tableName == null ? '' : String(tableName)
+  if (
+    conn === 'v2' ||
+    V2_TABLE_KEY_COMPONENT_RE.test(conn) ||
+    V2_TABLE_KEY_COMPONENT_RE.test(sch) ||
+    V2_TABLE_KEY_COMPONENT_RE.test(tbl)
+  ) {
+    return `v2:${encodeURIComponent(conn)}:${encodeURIComponent(sch)}:${encodeURIComponent(tbl)}`
+  }
+  return `${conn}:${sch}:${tbl}`
+}
+
+export function makeLegacyTableKey(connectionId, tableName, schemaName) {
   return `${connectionId || 'none'}:${schemaName || ''}:${tableName || ''}`
+}
+
+export function canUseLegacyTableKeyFallback(connectionId, tableName, schemaName) {
+  const rawConn = connectionId == null ? '' : String(connectionId)
+  const conn = rawConn.trim().length > 0 ? rawConn : 'none'
+  const sch = schemaName == null ? '' : String(schemaName)
+  const tbl = tableName == null ? '' : String(tableName)
+  return (
+    conn !== 'v2' &&
+    !V2_TABLE_KEY_COMPONENT_RE.test(conn) &&
+    !V2_TABLE_KEY_COMPONENT_RE.test(sch) &&
+    !V2_TABLE_KEY_COMPONENT_RE.test(tbl)
+  )
+}
+
+export function normalizeTableKey(rawKey) {
+  const raw = rawKey == null ? '' : String(rawKey)
+  if (!raw.startsWith('v2:')) return raw
+  const parts = raw.slice(3).split(':')
+  if (parts.length !== 3) return raw
+  try {
+    return makeTableKey(
+      decodeURIComponent(parts[0]),
+      decodeURIComponent(parts[2]),
+      decodeURIComponent(parts[1])
+    )
+  } catch {
+    return raw
+  }
+}
+
+export function tableKeyMatchesConnection(key, connectionId) {
+  if (typeof key !== 'string' || !key || typeof connectionId !== 'string' || !connectionId) {
+    return false
+  }
+  const conn = connectionId.trim()
+  if (!conn) return false
+  if (key.startsWith('v2:')) {
+    const parts = key.slice(3).split(':')
+    if (parts.length !== 3) return false
+    try {
+      const decodedConn = decodeURIComponent(parts[0])
+      return decodedConn === connectionId || decodedConn === conn
+    } catch {
+      return false
+    }
+  }
+  return key.startsWith(`${connectionId}:`) || key.startsWith(`${conn}:`)
 }
 
 export function encodeTableSelectValue(schemaName, tableName) {
@@ -299,6 +489,7 @@ const panelSelectController = createCollapsibleSelectController({
     trigger: 'custom-select-trigger',
     leadIcon: 'custom-select-lead-icon',
     label: 'custom-select-label',
+    triggerBadges: 'custom-select-trigger-badges',
     chev: 'custom-select-chev',
     popover: 'custom-select-popover',
     head: 'custom-select-head',
@@ -310,7 +501,11 @@ const panelSelectController = createCollapsibleSelectController({
     itemText: 'custom-select-item-text',
     itemLabel: 'custom-select-item-label',
     itemSub: 'custom-select-item-sub',
+    itemBadges: 'custom-select-item-badges',
+    badge: 'cs-badge',
     itemCheck: 'custom-select-item-check',
+    dragHandle: 'custom-select-drag-handle',
+    dragSpacer: 'custom-select-drag-spacer',
     folderHead: 'custom-select-folder-head',
     folderIcon: 'custom-select-folder-icon',
     folderName: 'custom-select-folder-name',
@@ -318,9 +513,9 @@ const panelSelectController = createCollapsibleSelectController({
     empty: 'custom-select-empty',
   },
   layout: {
-    minWidth: 250,
+    minWidth: 320,
     margin: 6,
-    maxHeight: 320,
+    maxHeight: 440,
     vwFallback: 360,
     vhFallback: 640,
     gap: 8,
@@ -328,7 +523,7 @@ const panelSelectController = createCollapsibleSelectController({
   },
   syncProp: '_customDropdownSync',
   apiProp: '_customDropdownApi',
-  closeOnRefresh: true,
+  closeOnRefresh: false,
   fallbackQuerySelected: false,
   setActionAriaLabel: true,
   expandTitle: 'Expand all folders in dropdown',
@@ -397,9 +592,9 @@ export function $(id) {
   return document.getElementById(id)
 }
 
-export async function writeTextToClipboard(text) {
-  const val = String(text ?? '')
+function execCommandCopyFallback(val) {
   let copied = false
+  if (typeof document === 'undefined' || !document.body) return false
   try {
     const prevActive =
       typeof HTMLElement !== 'undefined' && document.activeElement instanceof HTMLElement
@@ -428,7 +623,9 @@ export async function writeTextToClipboard(text) {
       }
     } catch {}
     try {
-      copied = Boolean(document.execCommand('copy'))
+      if (typeof document.execCommand === 'function') {
+        copied = Boolean(document.execCommand('copy'))
+      }
     } catch {}
     ta.remove()
     if (prevActive && typeof prevActive.focus === 'function') {
@@ -439,15 +636,21 @@ export async function writeTextToClipboard(text) {
       }
     }
   } catch {}
+  return copied
+}
 
-  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+export async function writeTextToClipboard(text) {
+  const val = String(text ?? '')
+  const syncCopied = execCommandCopyFallback(val)
+  if (typeof navigator !== 'undefined' && typeof navigator.clipboard?.writeText === 'function') {
     try {
       await navigator.clipboard.writeText(val)
-      copied = true
-    } catch {}
+      return true
+    } catch {
+      // Preserve synchronous activation copy success when async Clipboard API rejects
+    }
   }
-
-  return copied
+  return syncCopied
 }
 
 export function syncVirtualTableWindow({
@@ -456,25 +659,50 @@ export function syncVirtualTableWindow({
   start,
   end,
   rowHeightPx,
+  topSpacerPx,
+  bottomSpacerPx,
   createRow,
   selectionController,
   onBeforeDetachRow,
   force = false,
 }) {
-  if (!force && start === virt.start && end === virt.end) {
+  const { tbody, topSpacerTr, topSpacerTd, bottomSpacerTr, bottomSpacerTd } = virt
+  const topPx =
+    typeof topSpacerPx === 'number' && Number.isFinite(topSpacerPx)
+      ? Math.max(0, Math.round(topSpacerPx))
+      : start * rowHeightPx
+  const bottomPx =
+    typeof bottomSpacerPx === 'number' && Number.isFinite(bottomSpacerPx)
+      ? Math.max(0, Math.round(bottomSpacerPx))
+      : Math.max(0, (total - end) * rowHeightPx)
+
+  const prevTopStr = topSpacerTd?.style.height || ''
+  const prevBottomStr = bottomSpacerTd?.style.height || ''
+  const nextTopStr = `${topPx}px`
+  const nextBottomStr = `${bottomPx}px`
+  const spacersChanged =
+    virt.topSpacerPx !== topPx ||
+    virt.bottomSpacerPx !== bottomPx ||
+    prevTopStr !== nextTopStr ||
+    prevBottomStr !== nextBottomStr
+
+  if (!force && start === virt.start && end === virt.end && !spacersChanged) {
     return false
   }
 
-  const { tbody, topSpacerTr, topSpacerTd, bottomSpacerTr, bottomSpacerTd } = virt
-  const topPx = start * rowHeightPx
-  const bottomPx = Math.max(0, (total - end) * rowHeightPx)
   if (topSpacerTr && topSpacerTd) {
     topSpacerTr.style.display = topPx > 0 ? '' : 'none'
-    topSpacerTd.style.height = `${topPx}px`
+    topSpacerTd.style.height = nextTopStr
   }
   if (bottomSpacerTr && bottomSpacerTd) {
     bottomSpacerTr.style.display = bottomPx > 0 ? '' : 'none'
-    bottomSpacerTd.style.height = `${bottomPx}px`
+    bottomSpacerTd.style.height = nextBottomStr
+  }
+  virt.topSpacerPx = topPx
+  virt.bottomSpacerPx = bottomPx
+
+  if (!force && start === virt.start && end === virt.end) {
+    return true
   }
 
   const isDomEl = (node) =>

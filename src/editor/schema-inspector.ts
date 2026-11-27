@@ -35,6 +35,7 @@ import {
   REFERENTIAL_ACTIONS,
   normalizeTableDetailsForDraft,
 } from './schema-ddl.js'
+import { copyTextFallback } from './db-icons.js'
 
 export {
   escapeHtml,
@@ -54,7 +55,7 @@ export interface SchemaInspectorOptions {
   referenceTables?: string[]
   isManualTxActive?: () => boolean
   onInsertDdl?: (ddl: string) => void
-  onCopyDdl?: (ddl: string) => void
+  onCopyDdl?: (ddl: string, copied?: boolean) => void
   onOpenDdlInConsole?: (ddl: string) => void
   onApplyMigration?: (
     statements: string[],
@@ -141,7 +142,8 @@ export class SchemaInspectorView {
   private comboOutsideCleanup: (() => void) | null = null
   private seqCounter = 1
   private onInsertDdl?: (ddl: string) => void
-  private onCopyDdl?: (ddl: string) => void
+  private onCopyDdl?: (ddl: string, copied?: boolean) => void
+  private copyResetTimers = new WeakMap<HTMLButtonElement, ReturnType<typeof setTimeout>>()
   private onOpenDdlInConsole?: (ddl: string) => void
   private isManualTxActive?: () => boolean
   private onApplyMigration?: (
@@ -902,13 +904,13 @@ export class SchemaInspectorView {
     copyBtn.disabled = plan.statements.length === 0
     copyBtn.addEventListener?.('click', () => {
       if (this.isMigrating) return
-      this.copyTextToClipboard(plan.statements.join('\n\n'))
-      copyBtn.textContent = 'Copied'
-      setTimeout(() => {
-        if (!this.isMigrating) {
-          copyBtn.textContent = 'Copy SQL'
-        }
-      }, 1200)
+      void this.handleCopyButtonClick(
+        copyBtn,
+        plan.statements.join('\n\n'),
+        'Copy SQL',
+        1200,
+        () => !this.isMigrating
+      )
     })
 
     const cancelBtn = document.createElement('button')
@@ -991,32 +993,31 @@ export class SchemaInspectorView {
     this.render()
   }
 
-  private copyTextToClipboard(text: string): void {
-    if (typeof document !== 'undefined' && document.body) {
-      const ta = document.createElement('textarea')
-      ta.value = text
-      ta.setAttribute('readonly', '')
-      ta.style.position = 'fixed'
-      ta.style.top = '-9999px'
-      ta.style.left = '-9999px'
-      ta.style.opacity = '0'
-      document.body.appendChild(ta)
-      ta.focus()
-      ta.select()
-      try {
-        if (typeof ta.setSelectionRange === 'function') {
-          ta.setSelectionRange(0, text.length)
-        }
-        document.execCommand?.('copy')
-      } catch {
-        // Ignore fallback failure
-      }
-      ta.remove()
+  private async handleCopyButtonClick(
+    btn: HTMLButtonElement,
+    text: string,
+    defaultLabel: string,
+    resetDelayMs: number,
+    canReset?: () => boolean
+  ): Promise<void> {
+    const copied = await this.copyTextToClipboard(text)
+    if (!copied) return
+    const prevTimer = this.copyResetTimers.get(btn)
+    if (prevTimer !== undefined) {
+      clearTimeout(prevTimer)
     }
-    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-      void Promise.resolve(navigator.clipboard.writeText(text)).catch(() => {})
-    }
-    this.onCopyDdl?.(text)
+    btn.textContent = 'Copied'
+    const timer = setTimeout(() => {
+      if (canReset && !canReset()) return
+      btn.textContent = defaultLabel
+    }, resetDelayMs)
+    this.copyResetTimers.set(btn, timer)
+  }
+
+  private async copyTextToClipboard(text: string): Promise<boolean> {
+    const copied = await copyTextFallback(text)
+    this.onCopyDdl?.(text, copied)
+    return copied
   }
 
   public clear(): void {
@@ -1650,11 +1651,7 @@ export class SchemaInspectorView {
       copyMigrationBtn.textContent = 'Copy SQL'
       copyMigrationBtn.addEventListener?.('click', () => {
         const sql = this.stageUiRefs.previewPre?.textContent || ''
-        this.copyTextToClipboard(sql)
-        copyMigrationBtn.textContent = 'Copied'
-        setTimeout(() => {
-          copyMigrationBtn.textContent = 'Copy SQL'
-        }, 1200)
+        void this.handleCopyButtonClick(copyMigrationBtn, sql, 'Copy SQL', 1200)
       })
 
       const openInConsoleBtn = document.createElement('button')
@@ -1730,11 +1727,7 @@ export class SchemaInspectorView {
       copyBtn.textContent = 'Copy DDL'
       if (typeof copyBtn.addEventListener === 'function') {
         copyBtn.addEventListener('click', () => {
-          this.copyTextToClipboard(ddlText)
-          copyBtn.textContent = 'Copied'
-          setTimeout(() => {
-            copyBtn.textContent = 'Copy DDL'
-          }, 1400)
+          void this.handleCopyButtonClick(copyBtn, ddlText, 'Copy DDL', 1400)
         })
       }
 
@@ -2629,11 +2622,7 @@ export class SchemaInspectorView {
     copyBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-copy-ddl-btn'
     copyBtn.textContent = 'Copy DDL'
     copyBtn.addEventListener?.('click', () => {
-      this.copyTextToClipboard(ddlText)
-      copyBtn.textContent = 'Copied'
-      setTimeout(() => {
-        copyBtn.textContent = 'Copy DDL'
-      }, 1400)
+      void this.handleCopyButtonClick(copyBtn, ddlText, 'Copy DDL', 1400)
     })
     headerRight.appendChild(copyBtn)
 

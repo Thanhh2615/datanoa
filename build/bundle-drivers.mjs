@@ -1,10 +1,11 @@
 /**
  * build/bundle-drivers.mjs
- * Bundles iconv-lite, pg, mysql2, mongodb, mssql, oracledb, @codemirror/*, and node-sql-parser into standalone vendor modules.
+ * Bundles iconv-lite, big-integer, pg, mysql2, mongodb, mssql, oracledb, @codemirror/*, node-sql-parser, and ssh2 into standalone vendor modules.
  * Enforces Orca's 1 MiB per-file limit and CSP rules (zero eval / Function / escape runs).
  */
 import esbuild from 'esbuild'
 import fs from 'node:fs'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -12,6 +13,7 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const projectRoot = path.resolve(__dirname, '..')
 const vendorDir = path.resolve(projectRoot, 'vendor')
+const nodeRequire = createRequire(import.meta.url)
 
 const MAX_BYTES = 1024 * 1024 // 1,048,576 bytes (1 MiB Orca ceiling)
 
@@ -39,6 +41,8 @@ const PINNED_VENDOR_VERSIONS = {
   '@codemirror/state': '6.7.6',
   '@codemirror/view': '6.43.15',
   '@lezer/highlight': '1.2.5',
+  '@replit/codemirror-vim': '6.4.0',
+  '@replit/codemirror-vim-core': '0.1.0',
   'node-sql-parser': '5.4.0',
   'big-integer': '1.6.52',
   ssh2: '1.17.0',
@@ -82,17 +86,15 @@ function createMockAwsSslPlugin(state) {
 
 // Plugin to replace whatwg-url with Node's native globalThis.URL / URLSearchParams (removing
 // tr46 \uNNNN escape tables and whatwg-url's eval("(async function* () {})")), stub unused
-// mongocryptd CSFLE child_process spawning, replace dynamic import('os') with static require('os'),
-// and guard bson against any eval("(async function* () {})") probes.
+// client-side-encryption (CSFLE) and GridFS submodules, replace dynamic import('os') with static
+// require('os'), and guard bson against any eval("(async function* () {})") probes.
 function createMongoCleanPlugin(state) {
   const expectedWhatwgImporter = path.resolve(
     projectRoot,
     'node_modules/mongodb-connection-string-url/lib/index.js'
   )
-  const expectedMongocryptdPath = path.resolve(
-    projectRoot,
-    'node_modules/mongodb/lib/client-side-encryption/mongocryptd_manager.js'
-  )
+  const expectedCsfleDir = path.resolve(projectRoot, 'node_modules/mongodb/lib/client-side-encryption')
+  const expectedGridfsDir = path.resolve(projectRoot, 'node_modules/mongodb/lib/gridfs')
   const expectedRuntimeAdaptersPath = path.resolve(
     projectRoot,
     'node_modules/mongodb/lib/runtime_adapters.js'
@@ -117,39 +119,89 @@ function createMongoCleanPlugin(state) {
         loader: 'js',
       }))
       build.onLoad(
-        { filter: /[\\/]mongodb[\\/]lib[\\/]client-side-encryption[\\/]mongocryptd_manager\.js$/ },
+        { filter: /[\\/]mongodb[\\/]lib[\\/]client-side-encryption[\\/].*\.js$/ },
         args => {
-          if (path.resolve(args.path) !== expectedMongocryptdPath) {
+          const resolved = path.resolve(args.path)
+          if (!resolved.startsWith(expectedCsfleDir + path.sep)) {
             throw new Error(
-              `[bundle-drivers] mongo-clean mongocryptd_manager matched unexpected path: ${args.path} (expected ${expectedMongocryptdPath})`
+              `[bundle-drivers] mongo-clean client-side-encryption matched unexpected path: ${args.path}`
             )
           }
-          state.mongocryptdReplacements += 1
+          state.csfleReplacements += 1
+          const base = path.basename(resolved)
+          if (base === 'errors.js') {
+            return {
+              contents: `'use strict';
+class MongoCryptError extends Error { constructor(msg, opts) { super(msg, opts); this.name = 'MongoCryptError'; } }
+class MongoCryptInvalidArgumentError extends MongoCryptError { constructor(msg) { super(msg); this.name = 'MongoCryptInvalidArgumentError'; } }
+class MongoCryptAzureKMSRequestError extends MongoCryptError { constructor(msg, body) { super(msg); this.body = body; this.name = 'MongoCryptAzureKMSRequestError'; } }
+class MongoCryptCreateDataKeyError extends MongoCryptError { constructor(dk, o) { super(o?.cause?.message ?? 'CreateDataKeyError'); this.encryptedFields = dk; this.name = 'MongoCryptCreateDataKeyError'; } }
+class MongoCryptCreateEncryptedCollectionError extends MongoCryptError { constructor(ef, o) { super(o?.cause?.message ?? 'CreateEncryptedCollectionError'); this.encryptedFields = ef; this.name = 'MongoCryptCreateEncryptedCollectionError'; } }
+class MongoCryptKMSRequestNetworkTimeoutError extends MongoCryptError { constructor(msg) { super(msg); this.name = 'MongoCryptKMSRequestNetworkTimeoutError'; } }
+module.exports = { MongoCryptError, MongoCryptInvalidArgumentError, MongoCryptAzureKMSRequestError, MongoCryptCreateDataKeyError, MongoCryptCreateEncryptedCollectionError, MongoCryptKMSRequestNetworkTimeoutError };`,
+              loader: 'js',
+            }
+          }
+          if (base === 'auto_encrypter.js') {
+            return {
+              contents: `'use strict';
+const AutoEncryptionLoggerLevel = Object.freeze({ FatalError: 0, Error: 1, Warning: 2, Info: 3, Trace: 4 });
+class AutoEncrypter {
+  constructor() { throw new Error('Datanoa bundled MongoDB driver does not support CSFLE / AutoEncrypter.'); }
+  async init() { throw new Error('Datanoa bundled MongoDB driver does not support CSFLE / AutoEncrypter.'); }
+  async close() {}
+}
+module.exports = { AutoEncrypter, AutoEncryptionLoggerLevel };`,
+              loader: 'js',
+            }
+          }
+          if (base === 'client_encryption.js') {
+            return {
+              contents: `'use strict';
+class ClientEncryption {
+  constructor() { throw new Error('Datanoa bundled MongoDB driver does not support CSFLE / ClientEncryption.'); }
+}
+module.exports = { ClientEncryption };`,
+              loader: 'js',
+            }
+          }
           return {
             contents: `'use strict';
 class MongocryptdManager {
-  static { this.DEFAULT_MONGOCRYPTD_URI = 'mongodb://localhost:27020'; }
-  constructor(extraOptions = {}) {
-    this.spawnPath = '';
-    this.spawnArgs = [];
-    this.uri =
-      typeof extraOptions.mongocryptdURI === 'string' && extraOptions.mongocryptdURI.length > 0
-        ? extraOptions.mongocryptdURI
-        : MongocryptdManager.DEFAULT_MONGOCRYPTD_URI;
-    this.bypassSpawn = !!extraOptions.mongocryptdBypassSpawn;
-  }
-  async spawn() {
-    throw new Error('Datanoa bundled MongoDB driver does not spawn mongocryptd (CSFLE unsupported).');
-  }
-  async withRespawn(fn) {
-    return await fn();
-  }
+  constructor() { throw new Error('Datanoa bundled MongoDB driver does not support CSFLE / mongocryptd.'); }
 }
 module.exports = { MongocryptdManager };`,
             loader: 'js',
           }
         }
       )
+      build.onLoad({ filter: /[\\/]mongodb[\\/]lib[\\/]gridfs[\\/].*\.js$/ }, args => {
+        const resolved = path.resolve(args.path)
+        if (!resolved.startsWith(expectedGridfsDir + path.sep)) {
+          throw new Error(
+            `[bundle-drivers] mongo-clean gridfs matched unexpected path: ${args.path}`
+          )
+        }
+        state.gridfsReplacements += 1
+        const unsupported = `function unsupported(name) { return class { constructor() { throw new Error('Datanoa bundled MongoDB driver does not include ' + name + '.'); } }; }`
+        const base = path.basename(resolved)
+        if (base === 'download.js') {
+          return {
+            contents: `'use strict';\n${unsupported}\nmodule.exports = { GridFSBucketReadStream: unsupported('GridFSBucketReadStream') };`,
+            loader: 'js',
+          }
+        }
+        if (base === 'upload.js') {
+          return {
+            contents: `'use strict';\n${unsupported}\nmodule.exports = { GridFSBucketWriteStream: unsupported('GridFSBucketWriteStream') };`,
+            loader: 'js',
+          }
+        }
+        return {
+          contents: `'use strict';\n${unsupported}\nmodule.exports = { GridFSBucket: unsupported('GridFSBucket') };`,
+          loader: 'js',
+        }
+      })
       build.onLoad({ filter: /[\\/]mongodb[\\/]lib[\\/]runtime_adapters\.js$/ }, args => {
         if (path.resolve(args.path) !== expectedRuntimeAdaptersPath) {
           throw new Error(
@@ -238,6 +290,257 @@ module.exports = {
         }
       })
     },
+  }
+}
+
+// Howard Hinnant proleptic Gregorian day count from 1970-01-01 (exact across years 0001..9999).
+export function daysFromCivil(y, m, d) {
+  const yr = y - (m <= 2 ? 1 : 0)
+  const era = Math.floor(yr / 400)
+  const yoe = yr - era * 400
+  const doy = Math.floor((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1
+  const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+}
+
+export function createGregorianJodaShim() {
+  const ChronoUnit = { DAYS: 'DAYS' }
+  class LocalDate {
+    constructor(epochDay) {
+      this._d = epochDay
+    }
+    static of(y, m, d) {
+      return new LocalDate(daysFromCivil(y, m, d))
+    }
+    static ofYearDay(y, doy) {
+      return new LocalDate(daysFromCivil(y, 1, 1) + (doy - 1))
+    }
+    until(end, unit) {
+      if (unit !== ChronoUnit.DAYS) {
+        throw new Error('Datanoa Gregorian shim only supports ChronoUnit.DAYS.')
+      }
+      return end._d - this._d
+    }
+  }
+  return { LocalDate, ChronoUnit }
+}
+
+// Locked-importer plugin replacing tedious's ~197 KB @js-joda/core dependency (used strictly in
+// datetime.js and temporal.js for LocalDate.of / LocalDate.ofYearDay / until(..., ChronoUnit.DAYS)).
+function createTediousJodaShimPlugin(state) {
+  const allowedImporters = new Set([
+    path.resolve(projectRoot, 'node_modules/tedious/lib/data-types/datetime.js'),
+    path.resolve(projectRoot, 'node_modules/tedious/lib/data-types/temporal.js'),
+  ])
+  return {
+    name: 'tedious-joda-shim',
+    setup(build) {
+      build.onResolve({ filter: /^@js-joda\/core$/ }, args => {
+        const importer = path.resolve(args.importer)
+        if (!allowedImporters.has(importer)) {
+          throw new Error(
+            `[bundle-drivers] tedious-joda-shim matched unexpected importer: ${args.importer}`
+          )
+        }
+        state.replacements += 1
+        return { path: args.path, namespace: 'tedious-joda-shim' }
+      })
+      build.onLoad({ filter: /.*/, namespace: 'tedious-joda-shim' }, () => ({
+        contents: `'use strict';
+function daysFromCivil(y, m, d) {
+  const yr = y - (m <= 2 ? 1 : 0);
+  const era = Math.floor(yr / 400);
+  const yoe = yr - era * 400;
+  const doy = Math.floor((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1;
+  const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy;
+  return era * 146097 + doe - 719468;
+}
+const ChronoUnit = { DAYS: 'DAYS' };
+class LocalDate {
+  constructor(epochDay) { this._d = epochDay; }
+  static of(y, m, d) { return new LocalDate(daysFromCivil(y, m, d)); }
+  static ofYearDay(y, doy) { return new LocalDate(daysFromCivil(y, 1, 1) + (doy - 1)); }
+  until(end, unit) {
+    if (unit !== ChronoUnit.DAYS) throw new Error('Datanoa Gregorian shim only supports ChronoUnit.DAYS.');
+    return end._d - this._d;
+  }
+}
+module.exports = { LocalDate, ChronoUnit };`,
+        loader: 'js',
+      }))
+    },
+  }
+}
+
+// Lossless compact decoder for mysql2/lib/constants/errors.js (reconstructs all bidirectional
+// numeric <-> ER_* mappings with 0 diffs while shrinking the table from ~145 KB to ~61 KB).
+export function decodeCompactMysqlErrors(packed, overrides = {}) {
+  const errors = {}
+  for (const pair of packed.split(',')) {
+    const colon = pair.indexOf(':')
+    const code = +pair.slice(0, colon)
+    const rawName = pair.slice(colon + 1)
+    const name = rawName[0] === '!' ? rawName.slice(1) : 'ER_' + rawName
+    errors[code] = name
+    errors[name] = code
+  }
+  for (const [k, v] of Object.entries(overrides)) {
+    errors[k] = v
+  }
+  return errors
+}
+
+function createCompactMysqlErrorsPlugin(state) {
+  const target = path.resolve(projectRoot, 'node_modules/mysql2/lib/constants/errors.js')
+  return {
+    name: 'compact-mysql-errors',
+    setup(build) {
+      build.onLoad({ filter: /[\\/]mysql2[\\/]lib[\\/]constants[\\/]errors\.js$/ }, args => {
+        if (path.resolve(args.path) !== target) {
+          throw new Error(
+            `[bundle-drivers] compact-mysql-errors matched unexpected module: ${args.path} (expected ${target})`
+          )
+        }
+        const rawErrors = nodeRequire(target)
+        const numEntries = Object.entries(rawErrors)
+          .filter(([k]) => /^\d+$/.test(k))
+          .sort((a, b) => Number(a[0]) - Number(b[0]))
+        const packed = numEntries
+          .map(([num, name]) => `${num}:${name.startsWith('ER_') ? name.slice(3) : '!' + name}`)
+          .join(',')
+        const preview = decodeCompactMysqlErrors(packed)
+        const overrides = {}
+        for (const [k, v] of Object.entries(rawErrors)) {
+          if (preview[k] !== v) {
+            overrides[k] = v
+          }
+        }
+        const verified = decodeCompactMysqlErrors(packed, overrides)
+        const rawKeys = Object.keys(rawErrors)
+        if (
+          Object.keys(verified).length !== rawKeys.length ||
+          rawKeys.some(k => verified[k] !== rawErrors[k])
+        ) {
+          throw new Error('[bundle-drivers] compact-mysql-errors parity verification failed.')
+        }
+        state.replacements += 1
+        state.totalKeys = rawKeys.length
+        const overrideStmt =
+          Object.keys(overrides).length > 0 ? `Object.assign(e,${JSON.stringify(overrides)});` : ''
+        return {
+          contents: `'use strict';
+const e = module.exports = {};
+for (const p of ${JSON.stringify(packed)}.split(',')) {
+  const i = p.indexOf(':');
+  const n = +p.slice(0, i);
+  const r = p.slice(i + 1);
+  const v = r[0] === '!' ? r.slice(1) : 'ER_' + r;
+  e[n] = v;
+  e[v] = n;
+}
+${overrideStmt}`,
+          loader: 'js',
+        }
+      })
+    },
+  }
+}
+
+// Locked-path plugin stubbing unused SODA & AQ modules inside oracledb (Datanoa uses Thin Mode SQL only).
+function createOracleThinCleanPlugin(state) {
+  const oracledbLibDir = path.resolve(projectRoot, 'node_modules/oracledb/lib')
+  const stubFiles = new Set([
+    'aqDeqOptions.js',
+    'aqEnqOptions.js',
+    'aqMessage.js',
+    'aqQueue.js',
+    'sodaCollection.js',
+    'sodaDatabase.js',
+    'sodaDocCursor.js',
+    'sodaDocument.js',
+    'sodaOperation.js',
+    'impl/aqDeqOptions.js',
+    'impl/aqEnqOptions.js',
+    'impl/aqMessage.js',
+    'impl/aqQueue.js',
+    'impl/sodaCollection.js',
+    'impl/sodaDatabase.js',
+    'impl/sodaDocCursor.js',
+    'impl/sodaDocument.js',
+    'impl/sodaOperation.js',
+    'thin/aq.js',
+  ])
+  return {
+    name: 'oracle-thin-clean',
+    setup(build) {
+      build.onLoad(
+        { filter: /[\\/]oracledb[\\/]lib[\\/](?:(?:impl[\\/])?(?:aq|soda)[A-Za-z]*|thin[\\/]aq)\.js$/ },
+        args => {
+          const resolved = path.resolve(args.path)
+          const rel = path.relative(oracledbLibDir, resolved).replace(/\\/g, '/')
+          if (!stubFiles.has(rel)) {
+            throw new Error(
+              `[bundle-drivers] oracle-thin-clean matched unexpected path: ${args.path} (rel=${rel})`
+            )
+          }
+          state.replacements += 1
+          if (rel === 'thin/aq.js') {
+            return {
+              contents: `'use strict';
+class ThinQueueImpl { constructor() { throw new Error('Datanoa bundled oracledb Thin Mode does not include AQ.'); } }
+class ThinMsgPropsImpl { constructor() { throw new Error('Datanoa bundled oracledb Thin Mode does not include AQ.'); } }
+module.exports = { ThinQueueImpl, ThinMsgPropsImpl };`,
+              loader: 'js',
+            }
+          }
+          return {
+            contents: `'use strict';
+class UnsupportedOracleFeature {
+  constructor() { throw new Error('Datanoa bundled oracledb Thin Mode does not include SODA / AQ.'); }
+}
+module.exports = UnsupportedOracleFeature;`,
+            loader: 'js',
+          }
+        }
+      )
+    },
+  }
+}
+
+// Static ESM bridge to shared vendor/big-integer.js (mirrors shared-iconv-bridge so sql-parser bundles
+// deduplicate big-integer without CJS require("./big-integer.js") / ERR_REQUIRE_ESM).
+function createSharedBigIntBridgePlugin(state) {
+  return {
+    name: 'shared-bigint-bridge',
+    setup(build) {
+      build.onResolve({ filter: /^big-integer$/ }, () => {
+        state.bridges += 1
+        return { path: 'big-integer', namespace: 'shared-bigint-bridge' }
+      })
+      build.onLoad({ filter: /.*/, namespace: 'shared-bigint-bridge' }, () => ({
+        contents: `import bigInt from './big-integer.js';\nmodule.exports = bigInt;\n`,
+        loader: 'js',
+        resolveDir: vendorDir,
+      }))
+      build.onResolve({ filter: /^\.\/big-integer\.js$/ }, () => ({
+        path: './big-integer.js',
+        external: true,
+      }))
+    },
+  }
+}
+
+function assertStaticBigIntImport(outfile, bundleName) {
+  const content = fs.readFileSync(outfile, 'utf8')
+  if (!/import\s+[^;]*from\s*["']\.\/big-integer\.js["']/.test(content)) {
+    throw new Error(
+      `[bundle-drivers] ${bundleName} is missing static ESM import from "./big-integer.js".`
+    )
+  }
+  if (content.includes('("./big-integer.js")') || content.includes("('./big-integer.js')")) {
+    throw new Error(
+      `[bundle-drivers] ${bundleName} contains forbidden CJS require("./big-integer.js").`
+    )
   }
 }
 
@@ -634,6 +937,8 @@ export default mysql;
   const sharedIconvBridgePlugin = createSharedIconvBridgePlugin(iconvBridgeState)
   const tlsIpSanState = { loads: 0, replacements: 0 }
   const tlsIpSanPlugin = createMysqlTlsIpSanPlugin(tlsIpSanState)
+  const compactErrorsState = { replacements: 0, totalKeys: 0 }
+  const compactErrorsPlugin = createCompactMysqlErrorsPlugin(compactErrorsState)
 
   const outfile = path.join(vendorDir, 'mysql2.js')
   await esbuild.build({
@@ -647,7 +952,7 @@ export default mysql;
     format: 'esm',
     target: ['node22', 'es2022'],
     outfile,
-    plugins: [mockAwsSslPlugin, sharedIconvBridgePlugin, tlsIpSanPlugin],
+    plugins: [mockAwsSslPlugin, sharedIconvBridgePlugin, tlsIpSanPlugin, compactErrorsPlugin],
     minify: true,
     // Keep non-ASCII text as UTF-8 so bundled strings stay literal UTF-8
     // instead of long \xNN / \uNNNN escape runs that trigger Orca directory under-review (code).
@@ -664,6 +969,11 @@ export default mysql;
   if (awsSslState.replacements !== 1) {
     throw new Error(
       `[bundle-drivers] mock-aws-ssl expected 1 replacement in mysql2, got ${awsSslState.replacements}.`
+    )
+  }
+  if (compactErrorsState.replacements !== 1 || compactErrorsState.totalKeys < 3900) {
+    throw new Error(
+      `[bundle-drivers] compact-mysql-errors expected 1 replacement (>=3900 keys), got ${JSON.stringify(compactErrorsState)}.`
     )
   }
   if (iconvBridgeState.bridges < 1) {
@@ -710,6 +1020,8 @@ async function bundleCodeMirror() {
   assertInstalledVersion('@codemirror/state')
   assertInstalledVersion('@codemirror/view')
   assertInstalledVersion('@lezer/highlight')
+  assertInstalledVersion('@replit/codemirror-vim')
+  assertInstalledVersion('@replit/codemirror-vim-core')
   const code = `
 export { EditorState, EditorSelection, Compartment, StateField, StateEffect, Prec } from '@codemirror/state';
 export { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, Decoration, WidgetType, ViewPlugin, hoverTooltip, placeholder } from '@codemirror/view';
@@ -719,6 +1031,7 @@ export { autocompletion, completionKeymap, completionStatus, closeCompletion, ac
 export { search, searchKeymap, highlightSelectionMatches, openSearchPanel } from '@codemirror/search';
 export { sql, SQLite, PostgreSQL, MySQL, MariaSQL, schemaCompletionSource } from '@codemirror/lang-sql';
 export { tags } from '@lezer/highlight';
+export { vim, getCM, Vim } from '@replit/codemirror-vim';
 `
 
   const outfile = path.join(vendorDir, 'codemirror.js')
@@ -734,13 +1047,13 @@ export { tags } from '@lezer/highlight';
     target: ['es2022'],
     outfile,
     minify: true,
-    // Keep browser frame bundle ASCII (no iconv codepage tables; safe across HTML/iframe contexts).
-    charset: 'ascii',
+    // Keep browser frame bundle UTF-8 so bundled Vim/CM strings contain zero long \xNN / \uNNNN escape runs.
+    charset: 'utf8',
     treeShaking: true,
     legalComments: 'none',
   })
 
-  validateBundle(outfile, 'vendor/codemirror.js')
+  validateBundle(outfile, 'vendor/codemirror.js', { rejectEscapedRuns: true })
 
   // Emit companion TypeScript declaration
   const dtsContent = `
@@ -752,6 +1065,7 @@ export { autocompletion, completionKeymap, completionStatus, closeCompletion, ac
 export { search, searchKeymap, highlightSelectionMatches, openSearchPanel } from '@codemirror/search';
 export { sql, SQLite, PostgreSQL, MySQL, MariaSQL, schemaCompletionSource, type SQLDialect } from '@codemirror/lang-sql';
 export { tags } from '@lezer/highlight';
+export { vim, getCM, Vim, type vimState, type CodeMirror } from '@replit/codemirror-vim';
 `
   fs.writeFileSync(path.join(vendorDir, 'codemirror.d.ts'), dtsContent.trim() + '\n', 'utf8')
 }
@@ -763,7 +1077,8 @@ async function bundleMongoDB() {
   const mongoCleanState = {
     whatwgUrlReplacements: 0,
     bsonEvalReplacements: 0,
-    mongocryptdReplacements: 0,
+    csfleReplacements: 0,
+    gridfsReplacements: 0,
     runtimeOsImportReplacements: 0,
   }
   const mongoCleanPlugin = createMongoCleanPlugin(mongoCleanState)
@@ -848,9 +1163,14 @@ export default mongodb;
       `[bundle-drivers] mongo-clean expected 1 whatwg-url replacement, got ${mongoCleanState.whatwgUrlReplacements}.`
     )
   }
-  if (mongoCleanState.mongocryptdReplacements !== 1) {
+  if (mongoCleanState.csfleReplacements < 1) {
     throw new Error(
-      `[bundle-drivers] mongo-clean expected 1 mongocryptd_manager replacement, got ${mongoCleanState.mongocryptdReplacements}.`
+      `[bundle-drivers] mongo-clean expected >= 1 client-side-encryption replacement, got ${mongoCleanState.csfleReplacements}.`
+    )
+  }
+  if (mongoCleanState.gridfsReplacements < 1) {
+    throw new Error(
+      `[bundle-drivers] mongo-clean expected >= 1 gridfs replacement, got ${mongoCleanState.gridfsReplacements}.`
     )
   }
   if (mongoCleanState.runtimeOsImportReplacements !== 1) {
@@ -899,6 +1219,8 @@ async function bundleMSSQL() {
   const aliasReadableStreamPlugin = createAliasReadableStreamPlugin(readableStreamState)
   const iconvBridgeState = { bridges: 0 }
   const sharedIconvBridgePlugin = createSharedIconvBridgePlugin(iconvBridgeState)
+  const jodaShimState = { replacements: 0 }
+  const tediousJodaShimPlugin = createTediousJodaShimPlugin(jodaShimState)
   const code = `
 import mssql from 'mssql';
 
@@ -961,7 +1283,12 @@ export default mssql;
     format: 'esm',
     target: ['node22', 'es2022'],
     outfile,
-    plugins: [mockAzureTediousPlugin, aliasReadableStreamPlugin, sharedIconvBridgePlugin],
+    plugins: [
+      mockAzureTediousPlugin,
+      aliasReadableStreamPlugin,
+      sharedIconvBridgePlugin,
+      tediousJodaShimPlugin,
+    ],
     minify: true,
     charset: 'utf8',
     treeShaking: true,
@@ -989,6 +1316,11 @@ export default mssql;
   if (iconvBridgeState.bridges < 1) {
     throw new Error(
       `[bundle-drivers] shared-iconv-bridge expected >= 1 bridge in mssql, got ${iconvBridgeState.bridges}.`
+    )
+  }
+  if (jodaShimState.replacements !== 2) {
+    throw new Error(
+      `[bundle-drivers] tedious-joda-shim expected 2 replacements (datetime.js & temporal.js), got ${jodaShimState.replacements}.`
     )
   }
   assertStaticIconvImport(outfile, 'vendor/mssql.js')
@@ -1166,6 +1498,9 @@ export {
 export default oracledb;
 `
 
+  const oracleThinCleanState = { replacements: 0 }
+  const oracleThinCleanPlugin = createOracleThinCleanPlugin(oracleThinCleanState)
+
   const outfile = path.join(vendorDir, 'oracledb.js')
   await esbuild.build({
     stdin: {
@@ -1178,6 +1513,7 @@ export default oracledb;
     format: 'esm',
     target: ['node22', 'es2022'],
     outfile,
+    plugins: [oracleThinCleanPlugin],
     minify: true,
     charset: 'utf8',
     treeShaking: true,
@@ -1186,6 +1522,12 @@ export default oracledb;
       js: `import { createRequire as __createRequire } from "node:module";\nimport { fileURLToPath as __fileURLToPath } from "node:url";\nimport { dirname as __pathDirname } from "node:path";\nconst require = __createRequire(import.meta.url);\nconst __filename = __fileURLToPath(import.meta.url);\nconst __dirname = __pathDirname(__filename);`,
     },
   })
+
+  if (oracleThinCleanState.replacements !== 19) {
+    throw new Error(
+      `[bundle-drivers] oracle-thin-clean expected 19 SODA/AQ stub replacements, got ${oracleThinCleanState.replacements}.`
+    )
+  }
 
   validateBundle(outfile, 'vendor/oracledb.js', { rejectEscapedRuns: true })
 
@@ -1289,10 +1631,16 @@ export default _default
   fs.writeFileSync(path.join(vendorDir, 'oracledb.d.ts'), dtsContent.trim() + '\n', 'utf8')
 }
 
-async function buildSqlParserBundle({ filename, dtsFilename, code, exportedClasses }) {
-  const outfile = path.join(vendorDir, filename)
+async function bundleBigInteger() {
+  assertInstalledVersion('big-integer')
+  const code = `import bigInt from 'big-integer';\nexport default bigInt;\n`
+  const outfile = path.join(vendorDir, 'big-integer.js')
   await esbuild.build({
-    stdin: { contents: code, resolveDir: projectRoot, loader: 'js' },
+    stdin: {
+      contents: code,
+      resolveDir: projectRoot,
+      loader: 'js',
+    },
     bundle: true,
     platform: 'node',
     format: 'esm',
@@ -1303,6 +1651,49 @@ async function buildSqlParserBundle({ filename, dtsFilename, code, exportedClass
     treeShaking: true,
     legalComments: 'none',
   })
+
+  validateBundle(outfile, 'vendor/big-integer.js', { rejectEscapedRuns: true })
+
+  const dts = `export interface BigIntegerInstance {
+  toString(radix?: number, alphabet?: string): string
+  valueOf(): number
+}
+
+export type BigIntegerValue = number | string | bigint | BigIntegerInstance
+
+export interface BigIntegerStatic {
+  (value?: BigIntegerValue, radix?: BigIntegerValue, alphabet?: string, caseSensitive?: boolean): BigIntegerInstance
+}
+
+declare const bigInt: BigIntegerStatic
+export default bigInt
+`
+  fs.writeFileSync(path.join(vendorDir, 'big-integer.d.ts'), dts, 'utf8')
+}
+
+async function buildSqlParserBundle({ filename, dtsFilename, code, exportedClasses }) {
+  const outfile = path.join(vendorDir, filename)
+  const bigIntBridgeState = { bridges: 0 }
+  const sharedBigIntBridgePlugin = createSharedBigIntBridgePlugin(bigIntBridgeState)
+  await esbuild.build({
+    stdin: { contents: code, resolveDir: projectRoot, loader: 'js' },
+    bundle: true,
+    platform: 'node',
+    format: 'esm',
+    target: ['node22', 'es2022'],
+    outfile,
+    plugins: [sharedBigIntBridgePlugin],
+    minify: true,
+    charset: 'utf8',
+    treeShaking: true,
+    legalComments: 'none',
+  })
+  if (bigIntBridgeState.bridges < 1) {
+    throw new Error(
+      `[bundle-drivers] shared-bigint-bridge expected >= 1 bridge in ${filename}, got ${bigIntBridgeState.bridges}.`
+    )
+  }
+  assertStaticBigIntImport(outfile, `vendor/${filename}`)
   validateBundle(outfile, `vendor/${filename}`, { rejectEscapedRuns: true })
 
   const classDecls = exportedClasses
@@ -1366,10 +1757,12 @@ const SSH2_AGENT_PATH = 'node_modules/ssh2/lib/agent.js'
 const SSH2_AGENT_ANCHOR = "const { execFile, spawn } = require('child_process');"
 const SSH2_AGENT_PATCH =
   "const execFile = (_f, _a, _o, cb) => { const fn = typeof _o === 'function' ? _o : cb; if (typeof fn === 'function') fn(new Error('External SSH agent process execution is disabled')); };\nconst spawn = () => { throw new Error('External SSH agent process execution is disabled'); };"
+const SSH2_SFTP_PATH = 'node_modules/ssh2/lib/protocol/SFTP.js'
 
 function createSsh2CleanPlugin(state) {
   const expectedFsCompatPath = path.resolve(projectRoot, SSH2_NODE_FS_COMPAT)
   const expectedAgentPath = path.resolve(projectRoot, SSH2_AGENT_PATH)
+  const expectedSftpPath = path.resolve(projectRoot, SSH2_SFTP_PATH)
   return {
     name: 'ssh2-clean',
     setup(build) {
@@ -1381,6 +1774,24 @@ function createSsh2CleanPlugin(state) {
         contents: 'module.exports = undefined;',
         loader: 'js',
       }))
+      build.onLoad({ filter: /[\\/]ssh2[\\/]lib[\\/]protocol[\\/]SFTP\.js$/ }, args => {
+        if (path.resolve(args.path) !== expectedSftpPath) {
+          throw new Error(
+            `[bundle-drivers] ssh2-clean matched unexpected SFTP.js: ${args.path}`
+          )
+        }
+        state.sftpReplacements += 1
+        return {
+          contents: `'use strict';
+class SFTP {
+  constructor() {
+    throw new Error('Datanoa bundled ssh2 does not include SFTP (TCP bastion tunnel only).');
+  }
+}
+module.exports = { SFTP };`,
+          loader: 'js',
+        }
+      })
       build.onLoad(
         { filter: /[\\/]ssh2[\\/]lib[\\/]protocol[\\/]node-fs-compat\.js$/ },
         args => {
@@ -1437,6 +1848,7 @@ async function bundleSsh2() {
     nativeStubs: 0,
     nodeFsCompatReplacements: 0,
     agentChildProcessReplacements: 0,
+    sftpReplacements: 0,
   }
   const code = `
 import Client from 'ssh2/lib/client.js';
@@ -1463,9 +1875,12 @@ export default { Client, parseKey };
     plugins: [createSsh2CleanPlugin(state)],
   })
 
-  if (state.nodeFsCompatReplacements !== 1 || state.agentChildProcessReplacements !== 1) {
+  if (
+    state.agentChildProcessReplacements !== 1 ||
+    state.sftpReplacements !== 1
+  ) {
     throw new Error(
-      `[bundle-drivers] ssh2-clean expected 1 node-fs-compat and 1 agent replacement; got ${JSON.stringify(state)}`
+      `[bundle-drivers] ssh2-clean expected 1 agent and 1 SFTP replacement; got ${JSON.stringify(state)}`
     )
   }
 
@@ -1476,6 +1891,7 @@ export default { Client, parseKey };
 export interface Ssh2ConnectConfig {
   host?: string
   port?: number
+  sock?: Duplex
   username?: string
   password?: string
   privateKey?: Buffer | string
@@ -1487,6 +1903,9 @@ export interface Ssh2ConnectConfig {
   keepaliveCountMax?: number
   hostHash?: 'sha256' | 'md5'
   hostVerifier?: (key: Buffer | string, verify?: (valid: boolean) => void) => boolean | void
+  algorithms?: {
+    serverHostKey?: string[]
+  }
 }
 
 export interface Ssh2ClientChannel extends Duplex {
@@ -1561,6 +1980,7 @@ async function main() {
     await bundleMSSQL()
     await bundleOracleDB()
     await bundleCodeMirror()
+    await bundleBigInteger()
     await bundleSqlParsers()
     await bundleSsh2()
 
@@ -1572,4 +1992,6 @@ async function main() {
   }
 }
 
-main()
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  main()
+}

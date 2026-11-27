@@ -5,11 +5,23 @@ import type {
   ConnectionAiPolicy,
   ConnectionColorTag,
   ConnectionProfile,
+  ConnectionProfileInput,
   DatabaseDriverType,
   DiscoveredDockerComposeConnection,
   DriverInspectResult,
   DriverRegistryItem,
+  SshHostKeyChallenge,
+  SshHostKeyDecision,
+  SshJumpHopSecret,
+  SshJumpHostProfile,
+  SslMode,
+  TlsFailure,
 } from '../protocol.js'
+import {
+  renderSharedTlsFailureRemedy,
+  runWithSshHostKeyRetry,
+  type SshRetryableResult,
+} from '../shared-ssh-hostkey-modal.js'
 import {
   BYOD_ENGINES,
   CONNECTION_ENV_TAGS,
@@ -33,6 +45,7 @@ import {
 import { openStudioFilePickerModal } from './file-picker-modal.js'
 
 import { DEFAULT_RPC_TIMEOUT_MS } from '../shared-constants.js'
+import { isReservedFolderName, normalizeConnectionFolderKey } from '../shared-connection-order.js'
 import {
   findCredentialAuthorityAtIndex,
   isCloudDatabaseHost,
@@ -198,12 +211,14 @@ export function compactFilePath(filePath: string, maxLen = 48): string {
 }
 
 export type ConnectionSubmission = {
-  profile: ConnectionProfile
+  profile: ConnectionProfileInput
   password?: string
   authToken?: string
   sslKeyPassphrase?: string
   sshPassphrase?: string
   sshPassword?: string
+  sshExplicitlyDisabled?: boolean
+  sshJumpHopSecrets?: Record<string, SshJumpHopSecret>
 }
 
 export interface ParseUriResponse {
@@ -292,6 +307,7 @@ export function openStudioConnectionModal(
   let activeAutoRawUri: string | null = null
   let activeAutoDisplayUri: string | null = null
   let dockerApplySeq = 0
+  let pendingDockerResolve: Promise<void> | null = null
   const clearActiveAutoUri = (): void => {
     activeAutoCandidateId = null
     activeAutoRawUri = null
@@ -307,6 +323,7 @@ export function openStudioConnectionModal(
   let isBusy = false
   let parseSeq = 0
   let detectSeq = 0
+  const detectBtnSeq = new WeakMap<HTMLButtonElement, number>()
   let discoveredEnvs: DiscoveredEnvConnection[] = []
   let discoveredDocker: DiscoveredDockerComposeConnection[] = []
   let discoveredFiles: DiscoveredSqliteFile[] = []
@@ -319,6 +336,9 @@ export function openStudioConnectionModal(
   }
   let deleteArmed = false
   let deleteTimer: ReturnType<typeof setTimeout> | null = null
+  let spotlightTimer: ReturnType<typeof setTimeout> | null = null
+  let pasteTimer: ReturnType<typeof setTimeout> | null = null
+  let suppressPasteInputCancel = false
   const clearDeleteTimer = (): void => {
     if (deleteTimer !== null) {
       clearTimeout(deleteTimer)
@@ -326,10 +346,47 @@ export function openStudioConnectionModal(
     }
     deleteArmed = false
   }
+  const clearSpotlightTimer = (): void => {
+    if (spotlightTimer !== null) {
+      clearTimeout(spotlightTimer)
+      spotlightTimer = null
+    }
+  }
+  const clearPasteTimer = (): void => {
+    suppressPasteInputCancel = false
+    if (pasteTimer !== null) {
+      clearTimeout(pasteTimer)
+      pasteTimer = null
+    }
+  }
+  const focusElementWithoutScroll = (el: HTMLElement | null): void => {
+    if (!el || typeof el.focus !== 'function') return
+    try {
+      el.focus({ preventScroll: true })
+    } catch {
+      el.focus()
+    }
+  }
+  const prefersReducedMotion = (): boolean => {
+    try {
+      return Boolean(
+        typeof window !== 'undefined' &&
+          typeof window.matchMedia === 'function' &&
+          window.matchMedia('(prefers-reduced-motion: reduce)').matches
+      )
+    } catch {
+      return false
+    }
+  }
   let backdropRef: HTMLDivElement | null = null
   const isModalOpen = (): boolean => ctx.isBackdropActive(backdropRef)
   const closeModalClean = (): void => {
     clearDeleteTimer()
+    clearSpotlightTimer()
+    clearPasteTimer()
+    pendingDockerResolve = null
+    lastParsedUri = ''
+    clearActiveAutoUri()
     closeActiveStudioCollapsibleDropdown()
     ctx.closeModal()
   }
@@ -482,6 +539,15 @@ export function openStudioConnectionModal(
   noticeBox.className = 'datanoa-modal-box is-pinned'
   noticeBox.style.display = 'none'
   noticeBox.setAttribute('role', 'status')
+  const tlsRemedyBox = document.createElement('div')
+  tlsRemedyBox.className = 'datanoa-tls-remedy'
+  tlsRemedyBox.dataset.tlsRemedyPanel = 'true'
+  tlsRemedyBox.style.display = 'none'
+  const clearTlsRemedy = (): void => {
+    tlsRemedyBox.innerHTML = ''
+    tlsRemedyBox.style.display = 'none'
+    tlsRemedyBox.classList.remove('is-hard-error')
+  }
   const showNotice = (kind: 'error' | 'warn' | 'success' | 'neutral', text: string): void => {
     noticeBox.className = `datanoa-modal-box is-pinned${kind === 'neutral' ? '' : ` ${kind}`}`
     noticeBox.setAttribute('role', kind === 'error' ? 'alert' : 'status')
@@ -489,16 +555,22 @@ export function openStudioConnectionModal(
     noticeBox.style.display = 'block'
   }
 
-  // ---- Quick URI bar ----
+  // ---- Quick Import: Paste URI + Workspace Auto-Discovery ----
+  const quickImportCard = document.createElement('div')
+  quickImportCard.className = 'datanoa-conn-quick-card'
+
   const uriBar = document.createElement('div')
   uriBar.className = 'datanoa-conn-uri-bar'
+  uriBar.style.padding = '0'
+  uriBar.style.border = '0'
+  uriBar.style.background = 'transparent'
   const uriLabel = document.createElement('div')
   uriLabel.className = 'datanoa-conn-section-label'
   uriLabel.textContent = 'Quick Connect (Paste URI)'
   const uriRow = document.createElement('div')
   uriRow.className = 'datanoa-conn-row'
   const uriInp = createInput(
-    'Paste connection URI (postgres://, mysql://, mssql://, mongodb://, redis://, libsql://, sqlite://)...',
+    'postgres://, mysql://, mssql://, mongodb://, redis://, libsql://, clickhouse://, sqlite://...',
     true
   )
   uriInp.setAttribute('aria-label', 'Paste connection URI')
@@ -508,60 +580,60 @@ export function openStudioConnectionModal(
   uriRow.appendChild(parseBtn)
   uriBar.appendChild(uriLabel)
   uriBar.appendChild(uriRow)
-  body.appendChild(uriBar)
+  quickImportCard.appendChild(uriBar)
 
-  // ---- Workspace Auto-Detect controls (appended at bottom of modal body) ----
+  // ---- Workspace Auto-Detect controls ----
   const discoverySection = document.createElement('div')
-  discoverySection.className = 'datanoa-conn-uri-bar'
-  discoverySection.style.marginTop = '8px'
-  const discoveryLabel = document.createElement('div')
+  discoverySection.className = 'datanoa-conn-discovery-section'
+  const discoveryBar = document.createElement('div')
+  discoveryBar.className = 'datanoa-conn-discovery-bar'
+  const discoveryLabel = document.createElement('span')
   discoveryLabel.className = 'datanoa-conn-section-label'
-  discoveryLabel.textContent = 'Local Workspace & Docker Auto-Discovery (.env, Docker Compose & .db)'
-  const discoveryScopeNote = document.createElement('div')
-  discoveryScopeNote.className = 'datanoa-conn-hint'
-  discoveryScopeNote.style.marginBottom = '4px'
-  discoveryScopeNote.textContent =
-    'Scans local workspace folders for .env / .db files · Plus local Docker containers (non-workspace labeled "Other Local Docker").'
+  discoveryLabel.textContent = 'Auto-Discovery'
   const detectRow = document.createElement('div')
-  detectRow.className = 'datanoa-conn-row is-wrap'
+  detectRow.className = 'datanoa-conn-discovery-actions'
   const quickBrowseDbBtn = createButton('Browse DB File...')
   quickBrowseDbBtn.title = 'Browse and pick a local SQLite database file (.db, .sqlite, .sqlite3)'
+  const scanFolderBtn = createButton('Scan Folder...')
+  scanFolderBtn.title =
+    'Browse a folder on disk and scan it for .env, Docker Compose, and .db files'
   const detectBtn = createButton('Auto-Detect (.env, Docker, .db)')
   detectBtn.title =
     'Scan current workspace folder(s) for .env & .db files plus local Docker Compose containers'
-  const folderInp = createInput('Optional folder path to scan...', true)
-  folderInp.setAttribute('aria-label', 'Folder path to scan')
-  folderInp.style.flex = '1 1 160px'
-  const browseScanFolderBtn = createButton('Browse Folder...')
-  const scanBtn = createButton('Scan Folder')
-  browseScanFolderBtn.addEventListener('click', () => {
+  let lastScannedFolder = ''
+  scanFolderBtn.addEventListener('click', () => {
     if (isBusy) return
     void openStudioFilePickerModal(ctx, {
       title: 'Select folder to scan',
       mode: 'folder',
-      initialDir: folderInp.value.trim() || undefined,
+      initialDir: lastScannedFolder || filePathInp.value.trim() || undefined,
     })
       .then((res) => {
         if (!isModalOpen()) return
         if (res?.ok && res.path) {
-          folderInp.value = res.path
+          lastScannedFolder = res.path
           void detectWorkspace(res.path, true)
         }
       })
       .catch(() => {})
   })
   detectRow.appendChild(quickBrowseDbBtn)
+  detectRow.appendChild(scanFolderBtn)
   detectRow.appendChild(detectBtn)
-  detectRow.appendChild(folderInp)
-  detectRow.appendChild(browseScanFolderBtn)
-  detectRow.appendChild(scanBtn)
+  discoveryBar.appendChild(discoveryLabel)
+  discoveryBar.appendChild(detectRow)
+  const discoveryScopeNote = document.createElement('div')
+  discoveryScopeNote.className = 'datanoa-conn-hint'
+  discoveryScopeNote.textContent =
+    'Scans local workspace folders for .env / .db files · Plus local Docker containers.'
   const discoveredBox = document.createElement('div')
   discoveredBox.className = 'datanoa-conn-discovered'
   discoveredBox.style.display = 'none'
-  discoverySection.appendChild(discoveryLabel)
+  discoverySection.appendChild(discoveryBar)
   discoverySection.appendChild(discoveryScopeNote)
-  discoverySection.appendChild(detectRow)
   discoverySection.appendChild(discoveredBox)
+  quickImportCard.appendChild(discoverySection)
+  body.appendChild(quickImportCard)
 
   // ---- Engine grid ----
   const engineLabel = document.createElement('div')
@@ -590,9 +662,6 @@ export function openStudioConnectionModal(
   body.appendChild(engineLabel)
   body.appendChild(engineGrid)
 
-  const byodEngineLabel = document.createElement('div')
-  byodEngineLabel.className = 'datanoa-conn-section-label'
-  byodEngineLabel.textContent = 'Local Custom Drivers (BYOD)'
   const byodEngineGrid = document.createElement('div')
   byodEngineGrid.className = 'datanoa-engine-grid'
   const byodRegistryStatus = new Map<string, DriverRegistryItem>()
@@ -957,6 +1026,8 @@ export function openStudioConnectionModal(
     byodStatusBanner.appendChild(btnRow)
   }
 
+  const byodSection = createCollapsible('Local Custom Drivers (BYOD)')
+  byodSection.sync(`${BYOD_ENGINES.length}`)
   for (const eng of BYOD_ENGINES) {
     const tile = document.createElement('button')
     tile.type = 'button'
@@ -974,10 +1045,9 @@ export function openStudioConnectionModal(
     engineTiles.set(eng.id, tile)
     byodEngineGrid.appendChild(tile)
   }
-  body.appendChild(byodEngineLabel)
-  body.appendChild(byodEngineGrid)
+  byodSection.bodyEl.appendChild(byodEngineGrid)
+  body.appendChild(byodSection.root)
   body.appendChild(byodStatusBanner)
-  body.appendChild(discoverySection)
   void refreshByodRegistry()
 
   // ---- Fields ----
@@ -1066,7 +1136,13 @@ export function openStudioConnectionModal(
     const btn = document.createElement('button')
     btn.type = 'button'
     btn.className = `datanoa-conn-env-pill env-${tag.id}`
-    btn.textContent = tag.label
+    if (tag.id !== 'none') {
+      const dot = document.createElement('span')
+      dot.className = `datanoa-conn-env-dot env-${tag.id}`
+      dot.setAttribute('aria-hidden', 'true')
+      btn.appendChild(dot)
+    }
+    btn.appendChild(document.createTextNode(tag.label))
     btn.addEventListener('click', () => {
       if (isBusy) return
       colorTag = tag.id
@@ -1088,17 +1164,17 @@ export function openStudioConnectionModal(
   // ---- Folder / Group & Workspace Scope (Phase 5B) ----
   const folderGroupInp = createInput('Create or enter a folder name (optional)')
   folderGroupInp.maxLength = 64
-  if (editProfile?.folder) folderGroupInp.value = editProfile.folder
+  if (editProfile?.folder) folderGroupInp.value = normalizeConnectionFolderKey(editProfile.folder)
   const folderPresetsRow = document.createElement('div')
   folderPresetsRow.className = 'datanoa-conn-row is-wrap'
-  folderPresetsRow.style.marginTop = '5px'
-  folderPresetsRow.style.gap = '5px'
+  folderPresetsRow.style.marginTop = '4px'
+  folderPresetsRow.style.gap = '4px'
   folderPresetsRow.style.display = 'none'
   const renderFolderChips = (folders: string[]): void => {
     folderPresetsRow.innerHTML = ''
-    const unique = Array.from(new Set(folders.map((f) => f.trim()).filter(Boolean))).sort(
-      (a, b) => a.localeCompare(b)
-    )
+    const unique = Array.from(
+      new Set(folders.map((f) => normalizeConnectionFolderKey(f)).filter(Boolean))
+    ).sort((a, b) => a.localeCompare(b))
     if (unique.length === 0) {
       folderPresetsRow.style.display = 'none'
       return
@@ -1295,6 +1371,7 @@ export function openStudioConnectionModal(
         res?.currentScopeId || currentScope,
         res?.currentScopeLabel || ''
       )
+      syncOrgSafetyUi()
     })
     .catch(() => {})
 
@@ -1313,6 +1390,87 @@ export function openStudioConnectionModal(
   sqliteFileRowWrap.className = 'datanoa-conn-row'
   filePathInp.style.flex = '1 1 220px'
   const browseSqliteFileBtn = createButton('Browse File...')
+  const detailsCard = document.createElement('div')
+  detailsCard.className = 'datanoa-conn-details-card'
+  const detailsHead = document.createElement('div')
+  detailsHead.className = 'datanoa-conn-details-head'
+  const detailsTitle = document.createElement('span')
+  detailsTitle.className = 'datanoa-conn-details-title'
+  detailsTitle.textContent = 'Connection Details'
+  const detailsSourcePill = document.createElement('span')
+  detailsSourcePill.className = 'datanoa-conn-source-pill'
+  showEl(detailsSourcePill, false)
+  detailsHead.appendChild(detailsTitle)
+  detailsHead.appendChild(detailsSourcePill)
+
+  const clearFormSpotlight = (clearSourcePill = true): void => {
+    clearSpotlightTimer()
+    detailsCard.classList.remove('is-form-spotlight')
+    if (clearSourcePill) {
+      detailsSourcePill.textContent = ''
+      showEl(detailsSourcePill, false)
+    }
+  }
+
+  const focusFormAfterImport = (opts: {
+    sourceLabel?: string
+    preferredField?: HTMLElement | null
+    collapseDiscovery?: boolean
+  }): void => {
+    const { sourceLabel = '', preferredField = null, collapseDiscovery = false } = opts
+    if (collapseDiscovery) {
+      discoveredSearch = ''
+      discoverySearchInp.value = ''
+      discoveryCollapsed.env = true
+      discoveryCollapsed.docker = true
+      discoveryCollapsed.sqlite = true
+      renderDiscoveredGroups()
+    }
+    clearFormSpotlight(false)
+    if (sourceLabel) {
+      detailsSourcePill.textContent = `Filled from ${sourceLabel}`
+      showEl(detailsSourcePill, true)
+    }
+    let targetEl: HTMLElement | null = preferredField ?? null
+    if (!targetEl) {
+      if (isStudioFileDbDriver(driver) && !filePathInp.value.trim()) {
+        targetEl = filePathInp
+      } else if (driver === 'libsql' && !libsqlUrlInp.value.trim()) {
+        targetEl = libsqlUrlInp
+      } else if (driver === 'd1' && !d1EndpointInp.value.trim()) {
+        targetEl = !d1AccountInp.value.trim()
+          ? d1AccountInp
+          : !d1DatabaseInp.value.trim()
+            ? d1DatabaseInp
+            : nameInp
+      } else if (
+        !isStudioFileDbDriver(driver) &&
+        driver !== 'libsql' &&
+        driver !== 'd1' &&
+        !hostInp.value.trim()
+      ) {
+        targetEl = hostInp
+      } else {
+        targetEl = nameInp
+      }
+    }
+    const scrollBehavior: ScrollBehavior = prefersReducedMotion() ? 'auto' : 'smooth'
+    const scrollTarget = preferredField ?? detailsCard
+    scrollTarget.scrollIntoView?.({
+      behavior: scrollBehavior,
+      block: preferredField ? 'center' : 'nearest',
+    })
+    focusElementWithoutScroll(targetEl)
+    if (targetEl === nameInp && nameInp.value) {
+      nameInp.select?.()
+    }
+    detailsCard.classList.add('is-form-spotlight')
+    spotlightTimer = setTimeout(() => {
+      spotlightTimer = null
+      detailsCard.classList.remove('is-form-spotlight')
+    }, 1400)
+  }
+
   const handlePickLocalSqliteFile = (): void => {
     if (isBusy) return
     const currentDriver: string = driver
@@ -1335,6 +1493,7 @@ export function openStudioConnectionModal(
             nameInp.value = smartName
             lastAutoName = smartName
           }
+          focusFormAfterImport({ sourceLabel: 'local file', collapseDiscovery: true })
         }
       })
       .catch(() => {})
@@ -1364,10 +1523,6 @@ export function openStudioConnectionModal(
   const rowOptions = createField('Options (Cluster / Endpoint)', optionsInp, true)
   for (const row of [
     rowName,
-    rowEnv,
-    rowAiPolicy,
-    rowFolderGroup,
-    rowWorkspacePin,
     rowFilePath,
     rowLibsqlUrl,
     rowLibsqlDb,
@@ -1387,7 +1542,48 @@ export function openStudioConnectionModal(
   ]) {
     fieldsGrid.appendChild(row)
   }
-  body.appendChild(fieldsGrid)
+  detailsCard.appendChild(detailsHead)
+  detailsCard.appendChild(fieldsGrid)
+  body.appendChild(detailsCard)
+
+  // ---- Organization & Safety (Collapsible) ----
+  const orgSafetySection = createCollapsible('Organization & Safety')
+  const orgSafetyGrid = document.createElement('div')
+  orgSafetyGrid.className = 'datanoa-conn-fields'
+  for (const row of [rowFolderGroup, rowWorkspacePin, rowEnv, rowAiPolicy]) {
+    orgSafetyGrid.appendChild(row)
+  }
+  orgSafetySection.bodyEl.appendChild(orgSafetyGrid)
+  body.appendChild(orgSafetySection.root)
+
+  const hasNonDefaultOrgSafety = (): boolean =>
+    Boolean(
+      folderGroupInp.value.trim() ||
+        (workspaceScopeSel.value || '').trim() ||
+        colorTag !== 'none' ||
+        roCheck.input.checked ||
+        aiPolicySel.value.trim()
+    )
+
+  const syncOrgSafetyUi = (): void => {
+    const parts: string[] = []
+    if (colorTag !== 'none') {
+      parts.push(colorTag === 'prod' ? 'Prod' : colorTag === 'staging' ? 'Staging' : 'Dev')
+    }
+    if (roCheck.input.checked) parts.push('Read-Only')
+    const folder = folderGroupInp.value.trim()
+    if (folder) parts.push(folder.length > 18 ? `${folder.slice(0, 17)}…` : folder)
+    if ((workspaceScopeSel.value || '').trim()) parts.push('Pinned')
+    const policy = aiPolicySel.value.trim()
+    if (policy) parts.push(`AI: ${policy}`)
+    orgSafetySection.sync(parts.length > 0 ? parts.join(' · ') : null)
+  }
+  folderGroupInp.addEventListener('input', syncOrgSafetyUi)
+  workspaceScopeSel.addEventListener('change', syncOrgSafetyUi)
+  roCheck.input.addEventListener('change', syncOrgSafetyUi)
+  aiPolicySel.addEventListener('change', syncOrgSafetyUi)
+  envPillBtns.forEach((btn) => btn.addEventListener('click', syncOrgSafetyUi))
+  folderPresetsRow.addEventListener('click', syncOrgSafetyUi)
 
   // ---- TLS / Custom Certificates (mTLS) ----
   const tlsSection = createCollapsible('TLS / Custom Certificates (mTLS)')
@@ -1397,6 +1593,7 @@ export function openStudioConnectionModal(
     { value: 'require', label: 'Require (No CA Verify)' },
     { value: 'verify-ca', label: 'Verify CA' },
     { value: 'verify-full', label: 'Verify Full Hostname' },
+    { value: 'strict', label: 'Strict (Verified TLS + Host)' },
   ])
   const sslCaPathInp = createInput('/path/to/ca.pem', true)
   const sslCertPathInp = createInput('/path/to/client-cert.pem', true)
@@ -1404,6 +1601,8 @@ export function openStudioConnectionModal(
   const sslKeyPassphraseInp = createInput('Optional private key passphrase')
   sslKeyPassphraseInp.type = 'password'
   sslKeyPassphraseInp.setAttribute('autocomplete', 'new-password')
+  const tlsServernameInp = createInput('Optional TLS SNI / certificate hostname', false)
+  tlsServernameInp.dataset.tlsServername = 'true'
   const sslRejectCheck = createCheck('Reject Unauthorized Certs')
   sslRejectCheck.input.checked =
     editProfile?.sslRejectUnauthorized !== undefined
@@ -1413,6 +1612,7 @@ export function openStudioConnectionModal(
   tlsGrid.className = 'datanoa-conn-fields'
   tlsGrid.appendChild(createField('SSL Mode', sslModeSel))
   tlsGrid.appendChild(createField('Certificate Verification', sslRejectCheck.wrap))
+  tlsGrid.appendChild(createField('TLS Server Name (SNI)', tlsServernameInp, true))
   tlsGrid.appendChild(createField('CA Certificate Path', sslCaPathInp, true))
   tlsGrid.appendChild(createField('Client Certificate Path', sslCertPathInp, true))
   tlsGrid.appendChild(createField('Client Private Key Path', sslKeyPathInp, true))
@@ -1420,7 +1620,7 @@ export function openStudioConnectionModal(
   tlsSection.bodyEl.appendChild(tlsGrid)
   body.appendChild(tlsSection.root)
 
-  // ---- SSH Tunnel (Bastion) ----
+  // ---- SSH Tunnel (Bastion + Multi-Hop Chain 0..4) ----
   const sshSection = createCollapsible('SSH Tunnel (Bastion)')
   const sshCheck = createCheck('Enable SSH Tunnel')
   const sshHostInp = createInput('bastion.example.com', true)
@@ -1444,6 +1644,175 @@ export function openStudioConnectionModal(
   sshPasswordHint.className = 'datanoa-conn-hint'
   sshPasswordHint.textContent =
     'OS ssh runs non-interactively (-N -L): SSH Agent or a private key file is recommended over a password.'
+
+  interface EditableJumpHopState {
+    hopId: string
+    host: string
+    port: number
+    user: string
+    authMethod: 'agent' | 'key' | 'password'
+    privateKeyPath: string
+    hasPassphrase: boolean
+    hasPassword: boolean
+    passphrase: string
+    password: string
+  }
+
+  let jumpHops: EditableJumpHopState[] = Array.isArray(editProfile?.sshJumpHosts)
+    ? editProfile.sshJumpHosts.slice(0, 4).map((hop, idx) => ({
+        hopId: hop.hopId || `hop_${idx + 1}`,
+        host: hop.host || '',
+        port: typeof hop.port === 'number' && hop.port >= 1 && hop.port <= 65535 ? hop.port : 22,
+        user: hop.user || '',
+        authMethod:
+          hop.authMethod === 'key' || hop.authMethod === 'password' ? hop.authMethod : 'agent',
+        privateKeyPath: hop.privateKeyPath || '',
+        hasPassphrase: Boolean(hop.hasPassphrase),
+        hasPassword: Boolean(hop.hasPassword),
+        passphrase: '',
+        password: '',
+      }))
+    : []
+
+  const jumpHopsWrap = document.createElement('div')
+  jumpHopsWrap.className = 'datanoa-jump-hops-section'
+  const jumpHopsHead = document.createElement('div')
+  jumpHopsHead.className = 'datanoa-jump-hops-head'
+  const jumpHopsTitle = document.createElement('span')
+  jumpHopsTitle.textContent = 'Jump Hosts (0–4 Intermediate Hops)'
+  const addJumpHopBtn = document.createElement('button')
+  addJumpHopBtn.type = 'button'
+  addJumpHopBtn.className = 'datanoa-btn datanoa-btn-sm'
+  addJumpHopBtn.dataset.sshAddHop = 'true'
+  addJumpHopBtn.textContent = '+ Add Jump Host'
+  jumpHopsHead.appendChild(jumpHopsTitle)
+  jumpHopsHead.appendChild(addJumpHopBtn)
+
+  const jumpHopsList = document.createElement('div')
+  jumpHopsList.className = 'datanoa-jump-hops-list'
+  jumpHopsWrap.appendChild(jumpHopsHead)
+  jumpHopsWrap.appendChild(jumpHopsList)
+
+  const renderJumpHops = (): void => {
+    jumpHopsList.innerHTML = ''
+    addJumpHopBtn.disabled = jumpHops.length >= 4
+    jumpHops.forEach((hop, idx) => {
+      const card = document.createElement('div')
+      card.className = 'datanoa-jump-hop-card'
+      card.dataset.sshHopRow = String(idx)
+      card.dataset.hopId = hop.hopId
+
+      const bar = document.createElement('div')
+      bar.className = 'datanoa-jump-hop-bar'
+      const barTitle = document.createElement('span')
+      barTitle.textContent = `Jump Hop #${idx + 1}`
+      const removeBtn = document.createElement('button')
+      removeBtn.type = 'button'
+      removeBtn.className = 'datanoa-btn datanoa-btn-sm'
+      removeBtn.textContent = 'Remove'
+      removeBtn.addEventListener('click', () => {
+        jumpHops.splice(idx, 1)
+        renderJumpHops()
+      })
+      bar.appendChild(barTitle)
+      bar.appendChild(removeBtn)
+
+      const fields = document.createElement('div')
+      fields.className = 'datanoa-jump-hop-fields'
+
+      const hInp = createInput('jump.example.com', true)
+      hInp.dataset.sshHopHost = 'true'
+      hInp.value = hop.host
+      hInp.addEventListener('input', () => {
+        hop.host = hInp.value
+      })
+
+      const pInp = createInput('22', true)
+      pInp.dataset.sshHopPort = 'true'
+      pInp.inputMode = 'numeric'
+      pInp.value = String(hop.port || 22)
+      pInp.addEventListener('input', () => {
+        const parsed = Number.parseInt(pInp.value.trim(), 10)
+        hop.port = Number.isFinite(parsed) && parsed >= 1 && parsed <= 65535 ? parsed : 22
+      })
+
+      const uInp = createInput('ubuntu')
+      uInp.dataset.sshHopUser = 'true'
+      uInp.value = hop.user
+      uInp.addEventListener('input', () => {
+        hop.user = uInp.value
+      })
+
+      const aSel = createSelect([
+        { value: 'agent', label: 'Agent' },
+        { value: 'key', label: 'Key' },
+        { value: 'password', label: 'Password' },
+      ])
+      aSel.value = hop.authMethod
+      aSel.addEventListener('change', () => {
+        hop.authMethod =
+          aSel.value === 'key' || aSel.value === 'password' ? aSel.value : 'agent'
+        renderJumpHops()
+      })
+
+      fields.appendChild(hInp)
+      fields.appendChild(pInp)
+      fields.appendChild(uInp)
+      fields.appendChild(aSel)
+
+      card.appendChild(bar)
+      card.appendChild(fields)
+
+      if (hop.authMethod === 'key') {
+        const keyInp = createInput('~/.ssh/id_ed25519', true)
+        keyInp.value = hop.privateKeyPath
+        keyInp.addEventListener('input', () => {
+          hop.privateKeyPath = keyInp.value
+        })
+        const passInp = createInput(
+          hop.hasPassphrase ? '(stored passphrase — leave blank to keep)' : 'Key passphrase'
+        )
+        passInp.type = 'password'
+        passInp.value = hop.passphrase
+        passInp.addEventListener('input', () => {
+          hop.passphrase = passInp.value
+        })
+        card.appendChild(keyInp)
+        card.appendChild(passInp)
+      } else if (hop.authMethod === 'password') {
+        const pwInp = createInput(
+          hop.hasPassword ? '(stored password — leave blank to keep)' : 'SSH jump password'
+        )
+        pwInp.type = 'password'
+        pwInp.value = hop.password
+        pwInp.addEventListener('input', () => {
+          hop.password = pwInp.value
+        })
+        card.appendChild(pwInp)
+      }
+
+      jumpHopsList.appendChild(card)
+    })
+  }
+
+  addJumpHopBtn.addEventListener('click', () => {
+    if (jumpHops.length >= 4) return
+    jumpHops.push({
+      hopId: `hop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      host: '',
+      port: 22,
+      user: '',
+      authMethod: 'agent',
+      privateKeyPath: '',
+      hasPassphrase: false,
+      hasPassword: false,
+      passphrase: '',
+      password: '',
+    })
+    renderJumpHops()
+  })
+  renderJumpHops()
+
   const sshGrid = document.createElement('div')
   sshGrid.className = 'datanoa-conn-fields'
   const rowSshEnable = createField('Tunnel', sshCheck.wrap, true)
@@ -1464,6 +1833,7 @@ export function openStudioConnectionModal(
     rowSshPassphrase,
     rowSshPassword,
     sshPasswordHint,
+    jumpHopsWrap,
   ]) {
     sshGrid.appendChild(row)
   }
@@ -1474,7 +1844,10 @@ export function openStudioConnectionModal(
     const mode = sslModeSel.value
     const customMode = mode !== 'auto' && mode !== 'disable'
     const hasCert = Boolean(
-      sslCaPathInp.value.trim() || sslCertPathInp.value.trim() || sslKeyPathInp.value.trim()
+      sslCaPathInp.value.trim() ||
+        sslCertPathInp.value.trim() ||
+        sslKeyPathInp.value.trim() ||
+        tlsServernameInp.value.trim()
     )
     const hasPassphrase = Boolean(sslKeyPassphraseInp.value) || hadSslKeyPassphrase
     const rejectDisabled = sslRejectCheck.input.checked === false
@@ -1483,7 +1856,12 @@ export function openStudioConnectionModal(
   const reconcileSslCheckWithMode = (): void => {
     const mode = sslModeSel.value
     if (mode === 'disable') sslCheck.input.checked = false
-    else if (mode === 'require' || mode === 'verify-ca' || mode === 'verify-full') {
+    else if (
+      mode === 'require' ||
+      mode === 'verify-ca' ||
+      mode === 'verify-full' ||
+      mode === 'strict'
+    ) {
       sslCheck.input.checked = true
     }
   }
@@ -1494,6 +1872,7 @@ export function openStudioConnectionModal(
     showEl(rowSshPassphrase, method === 'key')
     showEl(rowSshPassword, method === 'password')
     showEl(sshPasswordHint, method === 'password')
+    showEl(jumpHopsWrap, sshCheck.input.checked)
   }
   sslCheck.input.addEventListener('change', () => {
     sslModeSel.value = sslCheck.input.checked ? 'auto' : 'disable'
@@ -1507,7 +1886,11 @@ export function openStudioConnectionModal(
     sslCheck.input.checked = sslModeSel.value !== 'disable'
     if (sslModeSel.value === 'require') {
       sslRejectCheck.input.checked = false
-    } else if (sslModeSel.value === 'verify-ca' || sslModeSel.value === 'verify-full') {
+    } else if (
+      sslModeSel.value === 'verify-ca' ||
+      sslModeSel.value === 'verify-full' ||
+      sslModeSel.value === 'strict'
+    ) {
       sslRejectCheck.input.checked = true
     }
     syncStudioSelectTooltip(sslModeSel, 'SSL Mode')
@@ -1520,7 +1903,8 @@ export function openStudioConnectionModal(
         sslModeSel.value === 'auto' ||
         sslModeSel.value === 'disable' ||
         sslModeSel.value === 'verify-ca' ||
-        sslModeSel.value === 'verify-full'
+        sslModeSel.value === 'verify-full' ||
+        sslModeSel.value === 'strict'
       ) {
         sslModeSel.value = 'require'
         syncStudioSelectTooltip(sslModeSel, 'SSL Mode')
@@ -1534,7 +1918,13 @@ export function openStudioConnectionModal(
   redisDbSel.addEventListener('change', () => {
     syncStudioSelectTooltip(redisDbSel, 'Redis DB Index')
   })
-  for (const inp of [sslCaPathInp, sslCertPathInp, sslKeyPathInp, sslKeyPassphraseInp]) {
+  for (const inp of [
+    sslCaPathInp,
+    sslCertPathInp,
+    sslKeyPathInp,
+    sslKeyPassphraseInp,
+    tlsServernameInp,
+  ]) {
     inp.addEventListener('input', syncTlsUi)
   }
   const invalidateDbStoredSecrets = (): void => {
@@ -1625,10 +2015,8 @@ export function openStudioConnectionModal(
     uriInp,
     parseBtn,
     quickBrowseDbBtn,
+    scanFolderBtn,
     detectBtn,
-    folderInp,
-    browseScanFolderBtn,
-    scanBtn,
     browseSqliteFileBtn,
     nameInp,
     filePathInp,
@@ -1652,6 +2040,7 @@ export function openStudioConnectionModal(
     folderGroupInp,
     workspaceScopeSel,
     sslModeSel,
+    tlsServernameInp,
     sslCaPathInp,
     sslCertPathInp,
     sslKeyPathInp,
@@ -1670,6 +2059,8 @@ export function openStudioConnectionModal(
     clearBtn,
     cancelBtn,
     saveBtn,
+    byodSection.head,
+    orgSafetySection.head,
     tlsSection.head,
     sshSection.head,
     ...Array.from(engineTiles.values()),
@@ -1692,9 +2083,9 @@ export function openStudioConnectionModal(
 
   const compactStudioSource = (raw: string): string => {
     const clean = String(raw || '').trim()
-    if (clean.length <= 44) return clean
     const parts = clean.split(/[\\/]/).filter(Boolean)
-    return parts.length <= 2 ? clean : `.../${parts.slice(-3).join('/')}`
+    if (parts.length <= 4) return clean.replace(/\\/g, '/')
+    return `.../${parts.slice(-4).join('/')}`
   }
 
   const resetFormAuthAndTunnels = (): void => {
@@ -1713,6 +2104,7 @@ export function openStudioConnectionModal(
     passwordInp.value = ''
     passwordInp.placeholder = 'Optional'
     sslModeSel.value = 'auto'
+    tlsServernameInp.value = ''
     sslCaPathInp.value = ''
     sslCertPathInp.value = ''
     sslKeyPathInp.value = ''
@@ -1742,6 +2134,7 @@ export function openStudioConnectionModal(
       return
     }
     const seq = ++dockerApplySeq
+    pendingDockerResolve = null
     resetFormAuthAndTunnels()
     clearActiveAutoUri()
     if (item.url) {
@@ -1803,17 +2196,21 @@ export function openStudioConnectionModal(
     }
     if (item.hint) {
       showNotice('warn', item.hint)
-      if (item.passwordFromFile) passwordInp.focus?.()
     } else {
       showNotice(
         'success',
         `Imported ${getStudioEngineMeta(item.driver).label} service "${item.name}" from Docker Compose.`
       )
     }
+    focusFormAfterImport({
+      sourceLabel: 'Docker',
+      preferredField: item.passwordFromFile ? passwordInp : null,
+      collapseDiscovery: true,
+    })
 
     if (item.candidateId) {
       const candidateId = item.candidateId
-      void ctx
+      const resolvePromise = ctx
         .requestPlugin<{
           ok: boolean
           parsed?: ParseUriResponse
@@ -1846,6 +2243,12 @@ export function openStudioConnectionModal(
         .catch(() => {
           // Best-effort secret resolution; Save/Parse URI still falls back to connection.parseUri({ candidateId })
         })
+        .finally(() => {
+          if (pendingDockerResolve === resolvePromise) {
+            pendingDockerResolve = null
+          }
+        })
+      pendingDockerResolve = resolvePromise
     }
   }
 
@@ -1911,21 +2314,18 @@ export function openStudioConnectionModal(
       renderDiscoveredGroups()
     })
 
-    if (collapsed) {
-      showEl(bodyEl, false)
+    const listEl = document.createElement('div')
+    listEl.className = 'datanoa-conn-chip-list'
+    if (filteredCount === 0) {
+      const empty = document.createElement('div')
+      empty.className = 'datanoa-cell-null'
+      empty.textContent = emptyText
+      listEl.appendChild(empty)
     } else {
-      const listEl = document.createElement('div')
-      listEl.className = 'datanoa-conn-chip-list'
-      if (filteredCount === 0) {
-        const empty = document.createElement('div')
-        empty.className = 'datanoa-cell-null'
-        empty.textContent = emptyText
-        listEl.appendChild(empty)
-      } else {
-        buildChips(listEl)
-      }
-      bodyEl.appendChild(listEl)
+      buildChips(listEl)
     }
+    bodyEl.appendChild(listEl)
+    showEl(bodyEl, !collapsed)
 
     group.appendChild(headBtn)
     group.appendChild(bodyEl)
@@ -1972,27 +2372,29 @@ export function openStudioConnectionModal(
             chip.className = 'datanoa-conn-chip'
             const masked = maskUriSecret(item.uri)
             chip.title = `${item.sourceFile} (${item.envKey}): ${masked}`
-            const main = document.createElement('span')
-            main.className = 'datanoa-conn-chip-main'
+            const top = document.createElement('div')
+            top.className = 'datanoa-conn-chip-top'
             const title = document.createElement('span')
             title.className = 'datanoa-conn-chip-title'
             if (isKnownConnectionDriver(item.driver)) title.appendChild(createDbLogoSvg(item.driver))
             const titleText = document.createElement('span')
+            titleText.className = 'datanoa-conn-chip-name'
             titleText.textContent = `${item.envKey} (${item.name || item.driver})`
             title.appendChild(titleText)
-            const sub = document.createElement('span')
-            sub.className = 'datanoa-conn-chip-sub'
-            sub.textContent = masked
-            main.appendChild(title)
-            main.appendChild(sub)
             const badge = document.createElement('span')
             badge.className = 'datanoa-badge datanoa-badge-neutral'
             badge.textContent = compactStudioSource(item.sourceFile || '.env')
-            chip.appendChild(main)
-            chip.appendChild(badge)
+            top.appendChild(title)
+            top.appendChild(badge)
+            const sub = document.createElement('div')
+            sub.className = 'datanoa-conn-chip-sub'
+            sub.textContent = masked
+            chip.appendChild(top)
+            chip.appendChild(sub)
             chip.addEventListener('click', () => {
               if (isBusy) return
               dockerApplySeq++
+              pendingDockerResolve = null
               uriInp.value = masked
               activeAutoCandidateId = item.candidateId || null
               activeAutoRawUri = item.candidateId ? null : item.uri
@@ -2006,7 +2408,8 @@ export function openStudioConnectionModal(
                   ...(item.candidateId ? { candidateId: item.candidateId } : { uri: item.uri }),
                   displayUri: masked,
                 },
-                true
+                true,
+                { sourceLabel: '.env', collapseDiscovery: true }
               )
             })
             list.appendChild(chip)
@@ -2051,21 +2454,15 @@ export function openStudioConnectionModal(
             chip.type = 'button'
             chip.className = 'datanoa-conn-chip'
             chip.title = `${item.name} (${item.driver}) — ${item.host}:${item.port} [${item.status}]`
-            const main = document.createElement('span')
-            main.className = 'datanoa-conn-chip-main'
+            const top = document.createElement('div')
+            top.className = 'datanoa-conn-chip-top'
             const title = document.createElement('span')
             title.className = 'datanoa-conn-chip-title'
             if (isKnownConnectionDriver(item.driver)) title.appendChild(createDbLogoSvg(item.driver))
             const titleText = document.createElement('span')
+            titleText.className = 'datanoa-conn-chip-name'
             titleText.textContent = item.name || `${item.project} · ${item.service}`
             title.appendChild(titleText)
-            const sub = document.createElement('span')
-            sub.className = 'datanoa-conn-chip-sub'
-            const targetDb = item.driver === 'redis' ? `db${item.redisDb ?? 0}` : item.database || ''
-            const userPrefix = item.user ? `${item.user}@` : ''
-            sub.textContent = `${userPrefix}${item.host}:${item.port}${targetDb ? `/${targetDb}` : ''} · ${compactStudioSource(item.sourceFile)}`
-            main.appendChild(title)
-            main.appendChild(sub)
 
             const badges = document.createElement('span')
             badges.className = 'datanoa-discovery-badges'
@@ -2097,8 +2494,17 @@ export function openStudioConnectionModal(
             statusBadge.textContent = item.status || 'live'
             badges.appendChild(statusBadge)
 
-            chip.appendChild(main)
-            chip.appendChild(badges)
+            top.appendChild(title)
+            top.appendChild(badges)
+
+            const sub = document.createElement('div')
+            sub.className = 'datanoa-conn-chip-sub'
+            const targetDb = item.driver === 'redis' ? `db${item.redisDb ?? 0}` : item.database || ''
+            const userPrefix = item.user ? `${item.user}@` : ''
+            sub.textContent = `${userPrefix}${item.host}:${item.port}${targetDb ? `/${targetDb}` : ''} · ${compactStudioSource(item.sourceFile)}`
+
+            chip.appendChild(top)
+            chip.appendChild(sub)
             chip.addEventListener('click', () => {
               if (!isBusy) applyDockerComposeItem(item)
             })
@@ -2130,24 +2536,26 @@ export function openStudioConnectionModal(
             chip.type = 'button'
             chip.className = `datanoa-conn-chip${filePathInp.value.trim() === file.filePath ? ' selected' : ''}`
             chip.title = file.filePath
-            const main = document.createElement('span')
-            main.className = 'datanoa-conn-chip-main'
+            const top = document.createElement('div')
+            top.className = 'datanoa-conn-chip-top'
             const title = document.createElement('span')
             title.className = 'datanoa-conn-chip-title'
             title.appendChild(createDbLogoSvg('sqlite'))
             const titleText = document.createElement('span')
+            titleText.className = 'datanoa-conn-chip-name'
             titleText.textContent = file.name
             title.appendChild(titleText)
-            const sub = document.createElement('span')
-            sub.className = 'datanoa-conn-chip-sub'
-            sub.textContent = file.filePath
-            main.appendChild(title)
-            main.appendChild(sub)
             const size = document.createElement('span')
-            size.className = 'datanoa-badge datanoa-badge-unique'
+            size.className = 'datanoa-badge datanoa-badge-ok'
             size.textContent = file.sizeLabel || `${file.sizeBytes} B`
-            chip.appendChild(main)
-            chip.appendChild(size)
+            top.appendChild(title)
+            top.appendChild(size)
+            const sub = document.createElement('div')
+            sub.className = 'datanoa-conn-chip-sub'
+            sub.textContent = compactStudioSource(file.filePath)
+            sub.title = file.filePath
+            chip.appendChild(top)
+            chip.appendChild(sub)
             chip.addEventListener('click', () => {
               if (isBusy) return
               if (driver !== 'sqlite') {
@@ -2158,7 +2566,7 @@ export function openStudioConnectionModal(
                 nameInp.value = file.name
                 lastAutoName = file.name
               }
-              renderDiscoveredGroups()
+              focusFormAfterImport({ sourceLabel: 'SQLite file', collapseDiscovery: true })
             })
             list.appendChild(chip)
           }
@@ -2224,7 +2632,6 @@ export function openStudioConnectionModal(
     const isMongo = next === 'mongodb'
     const hasUrlField = next === 'clickhouse' || isMongo
     const hasOptionsField = isStudioOptionsDriver(nextId)
-    showEl(quickBrowseDbBtn, isFileDb)
     showEl(rowFilePath, isFileDb)
     if (filePathLabel) {
       filePathLabel.textContent = isDuckdb ? 'DuckDB File Path' : 'SQLite File Path'
@@ -2279,6 +2686,15 @@ export function openStudioConnectionModal(
     }
     reconcileSslCheckWithMode()
     syncTlsUi()
+    if (isByodConnectionDriver(next)) {
+      byodSection.setExpanded(true)
+      byodSection.sync(meta.label)
+    } else {
+      if (isByodConnectionDriver(prevDriver)) {
+        byodSection.setExpanded(false)
+      }
+      byodSection.sync(`${BYOD_ENGINES.length}`)
+    }
     syncByodBanner()
     renderDiscovered()
   }
@@ -2286,6 +2702,9 @@ export function openStudioConnectionModal(
   const clearModalFields = (): void => {
     if (isBusy) return
     dockerApplySeq++
+    pendingDockerResolve = null
+    parseSeq++
+    clearPasteTimer()
     resetFormAuthAndTunnels()
     uriInp.value = ''
     clearActiveAutoUri()
@@ -2302,6 +2721,9 @@ export function openStudioConnectionModal(
     syncStudioSelectTooltip(aiPolicySel, 'AI Access Policy')
     syncEnvPills()
     roCheck.input.checked = false
+    orgSafetySection.setExpanded(false)
+    syncOrgSafetyUi()
+    clearFormSpotlight(true)
     filePathInp.value = ''
     libsqlUrlInp.value = ''
     libsqlDbInp.value = ''
@@ -2318,6 +2740,8 @@ export function openStudioConnectionModal(
     optionsInp.value = ''
     discoveredSearch = ''
     discoverySearchInp.value = ''
+    lastScannedFolder = ''
+    byodSection.setExpanded(BYOD_ENGINES.some((e) => e.id === driver))
     applyDriver(driver, true)
     showNotice('neutral', 'Form cleared.')
     nameInp.focus?.()
@@ -2328,21 +2752,17 @@ export function openStudioConnectionModal(
     const name = nameInp.value.trim()
     const readOnly = roCheck.input.checked
     const sameDriverAsStored = isEdit && editProfile?.driver === driver
-    const folderValue = folderGroupInp.value.trim().slice(0, 64)
+    const folderValue = normalizeConnectionFolderKey(folderGroupInp.value).slice(0, 64)
     const scopeValue = (workspaceScopeSel.value || '').trim().slice(0, 260)
     const rawAiPolicy = aiPolicySel.value
     const aiPolicy: ConnectionAiPolicy | undefined =
       rawAiPolicy === 'allow' || rawAiPolicy === 'ask' || rawAiPolicy === 'never'
         ? rawAiPolicy
         : undefined
-    const attachFolderScope = <T extends ConnectionProfile>(profile: T): T => {
+    const attachFolderScope = <T extends ConnectionProfileInput>(profile: T): T => {
       profile.folder = folderValue
       profile.workspaceScope = scopeValue
-      if (aiPolicy) {
-        profile.aiPolicy = aiPolicy
-      } else {
-        delete profile.aiPolicy
-      }
+      profile.aiPolicy = aiPolicy ?? null
       return profile
     }
 
@@ -2421,7 +2841,7 @@ export function openStudioConnectionModal(
     const ssl = sslCheck.input.checked
     const keepStoredPassword = sameDriverAsStored && hadPassword
 
-    const profile: ConnectionProfile = {
+    const profile: ConnectionProfileInput = {
       id,
       name: name || `${driver}@${host}`,
       driver,
@@ -2507,7 +2927,14 @@ export function openStudioConnectionModal(
     const keepStoredSslPassphrase = sameDriverAsStored && hadSslKeyPassphrase
     const sslKeyPassphrase = sslKeyPassphraseInp.value
     const sslMode = sslModeSel.value
-    if (sslMode === 'auto' || sslMode === 'disable' || sslMode === 'require' || sslMode === 'verify-ca' || sslMode === 'verify-full') {
+    if (
+      sslMode === 'auto' ||
+      sslMode === 'disable' ||
+      sslMode === 'require' ||
+      sslMode === 'verify-ca' ||
+      sslMode === 'verify-full' ||
+      sslMode === 'strict'
+    ) {
       profile.sslMode = sslMode
     }
     if (urlForcedSsl === false) {
@@ -2518,9 +2945,13 @@ export function openStudioConnectionModal(
     const sslCaPath = sslCaPathInp.value.trim()
     const sslCertPath = sslCertPathInp.value.trim()
     const sslKeyPath = sslKeyPathInp.value.trim()
+    const tlsServername = tlsServernameInp.value.trim()
     profile.sslCaPath = sslCaPath
     profile.sslCertPath = sslCertPath
     profile.sslKeyPath = sslKeyPath
+    if (tlsServername) {
+      profile.tlsServername = tlsServername
+    }
     profile.hasSslKeyPassphrase = Boolean(sslKeyPassphrase) || keepStoredSslPassphrase
     profile.sslRejectUnauthorized = sslRejectCheck.input.checked
     if (
@@ -2535,6 +2966,7 @@ export function openStudioConnectionModal(
     profile.sshEnabled = sshEnabled
     let sshPassphrase = ''
     let sshPassword = ''
+    const jumpHopSecrets: Record<string, SshJumpHopSecret> = {}
     if (sshEnabled) {
       profile.sshHost = sshHostInp.value.trim()
       const sshPortNum = Number.parseInt(sshPortInp.value.trim(), 10)
@@ -2554,13 +2986,59 @@ export function openStudioConnectionModal(
         Boolean(sshPassphrase) || (sshAuthMethod === 'key' && sameDriverAsStored && hadSshPassphrase)
       profile.hasSshPassword =
         Boolean(sshPassword) || (sshAuthMethod === 'password' && sameDriverAsStored && hadSshPassword)
+
+      if (jumpHops.length > 0) {
+        const builtHops: SshJumpHostProfile[] = []
+        for (const hop of jumpHops.slice(0, 4)) {
+          const hopHost = hop.host.trim()
+          const hopUser = hop.user.trim()
+          const hopProfile: SshJumpHostProfile = {
+            hopId: hop.hopId,
+            host: hopHost,
+            port: typeof hop.port === 'number' && hop.port >= 1 && hop.port <= 65535 ? hop.port : 22,
+            user: hopUser,
+            authMethod: hop.authMethod,
+            ...(hop.authMethod === 'key' && hop.privateKeyPath.trim()
+              ? { privateKeyPath: hop.privateKeyPath.trim() }
+              : {}),
+            hasPassphrase:
+              Boolean(hop.passphrase) || (hop.authMethod === 'key' && hop.hasPassphrase),
+            hasPassword:
+              Boolean(hop.password) || (hop.authMethod === 'password' && hop.hasPassword),
+          }
+          builtHops.push(hopProfile)
+          const sec: SshJumpHopSecret = {}
+          if (hop.authMethod === 'password' && hop.password) {
+            sec.password = hop.password
+          }
+          if (hop.authMethod === 'key' && hop.passphrase) {
+            sec.passphrase = hop.passphrase
+          }
+          if (sec.password || sec.passphrase) {
+            jumpHopSecrets[hop.hopId] = sec
+          }
+        }
+        profile.sshJumpHosts = builtHops
+      } else {
+        profile.sshJumpHosts = []
+      }
     }
 
     const submission: ConnectionSubmission = { profile: attachFolderScope(profile) }
+    if (
+      !sshEnabled &&
+      isEdit &&
+      Boolean(editProfile?.sshEnabled || (editProfile?.sshJumpHosts && editProfile.sshJumpHosts.length > 0))
+    ) {
+      submission.sshExplicitlyDisabled = true
+    }
     if (password) submission.password = password
     if (sslKeyPassphrase) submission.sslKeyPassphrase = sslKeyPassphrase
     if (sshPassphrase) submission.sshPassphrase = sshPassphrase
     if (sshPassword) submission.sshPassword = sshPassword
+    if (Object.keys(jumpHopSecrets).length > 0) {
+      submission.sshJumpHopSecrets = jumpHopSecrets
+    }
     return submission
   }
 
@@ -2573,8 +3051,10 @@ export function openStudioConnectionModal(
   // ---- URI parsing ----
   const parseUri = async (
     targetInput: string | ResolvedUriParseTarget,
-    clearMissingSecret = false
+    clearMissingSecret = false,
+    importOpts?: { sourceLabel?: string; collapseDiscovery?: boolean; skipFocus?: boolean }
   ): Promise<boolean> => {
+    clearPasteTimer()
     const target: ResolvedUriParseTarget =
       typeof targetInput === 'string'
         ? { uri: targetInput.trim(), displayUri: targetInput.trim() }
@@ -2628,7 +3108,11 @@ export function openStudioConnectionModal(
         invalidateSshStoredSecrets()
       }
       const nextPassword =
-        res.password !== undefined ? res.password : dropStored ? '' : passwordInp.value
+        res.password !== undefined
+          ? res.password
+          : dropStored || res.placeholderPassword
+            ? ''
+            : passwordInp.value
       const nextAuthToken =
         res.authToken !== undefined ? res.authToken : dropStored ? '' : authTokenInp.value
 
@@ -2654,7 +3138,10 @@ export function openStudioConnectionModal(
           ? scrubStudioNetworkFormUrl(p.url)
           : ''
       if (p.name) nameInp.value = p.name
-      if (p.readOnly !== undefined) roCheck.input.checked = Boolean(p.readOnly)
+      if (p.readOnly !== undefined) {
+        roCheck.input.checked = Boolean(p.readOnly)
+        syncOrgSafetyUi()
+      }
       if (isStudioFileDbDriver(nextDriver)) {
         filePathInp.value = p.filePath || ''
       } else if (nextDriver === 'libsql') {
@@ -2680,7 +3167,8 @@ export function openStudioConnectionModal(
           p.sslMode === 'disable' ||
           p.sslMode === 'require' ||
           p.sslMode === 'verify-ca' ||
-          p.sslMode === 'verify-full'
+          p.sslMode === 'verify-full' ||
+          p.sslMode === 'strict'
         ) {
           sslModeSel.value = p.sslMode
           syncStudioSelectTooltip(sslModeSel, 'TLS Verification Mode')
@@ -2697,6 +3185,9 @@ export function openStudioConnectionModal(
           sslRejectCheck.input.checked = false
         } else {
           sslRejectCheck.input.checked = true
+        }
+        if (p.tlsServername) {
+          tlsServernameInp.value = p.tlsServername
         }
         reconcileSslCheckWithMode()
         if (nextDriver === 'redis') {
@@ -2720,9 +3211,18 @@ export function openStudioConnectionModal(
       authTokenInp.placeholder =
         hadAuthToken && isEdit ? 'Stored token preserved (type to replace)' : 'Optional Bearer token'
       syncAuthTokenPlaceholder()
+      const maskedDisplayUri = target.uri ? maskUriSecret(target.uri) : target.displayUri
+      if (
+        !target.candidateId &&
+        target.uri &&
+        maskedDisplayUri &&
+        uriInp.value.trim() === target.uri
+      ) {
+        uriInp.value = maskedDisplayUri
+      }
       lastParsedUri = target.uri || ''
       lastParsedCandidateId = target.candidateId || ''
-      lastParsedDisplayUri = target.displayUri || (target.uri ? maskUriSecret(target.uri) : '')
+      lastParsedDisplayUri = maskedDisplayUri
       lastParsedPlaceholder = Boolean(res.placeholderPassword)
       placeholderPending = lastParsedPlaceholder && !passwordInp.value
       const engineLabelText = getStudioEngineMeta(nextDriver).label
@@ -2732,13 +3232,19 @@ export function openStudioConnectionModal(
           'error',
           `Parsed ${engineLabelText} URI — placeholder password was removed. Enter your actual Database Password below before testing.`
         )
-        passwordInp.focus?.()
       } else {
         passwordInp.placeholder =
           hadPassword && isEdit ? 'Stored password preserved (type to replace)' : 'Optional'
         showNotice('success', `Parsed ${engineLabelText} URI`)
       }
       syncTlsUi()
+      if (!importOpts?.skipFocus || placeholderPending) {
+        focusFormAfterImport({
+          sourceLabel: importOpts?.sourceLabel || 'URI',
+          preferredField: placeholderPending ? passwordInp : null,
+          collapseDiscovery: importOpts?.collapseDiscovery !== false,
+        })
+      }
       return true
     } catch (err: unknown) {
       if (seq !== parseSeq || !isModalOpen()) return false
@@ -2753,6 +3259,10 @@ export function openStudioConnectionModal(
   }
 
   const ensureUriParsed = async (): Promise<boolean> => {
+    if (pendingDockerResolve) {
+      await pendingDockerResolve
+      if (!isModalOpen()) return false
+    }
     const target = resolveUriInputForParse()
     if (!target.candidateId && !target.uri) {
       return true
@@ -2773,10 +3283,19 @@ export function openStudioConnectionModal(
     ) {
       return true
     }
-    return await parseUri(target, false)
+    return await parseUri(target, false, { skipFocus: true, collapseDiscovery: false })
   }
 
   const validateRequiredFields = (): boolean => {
+    if (isReservedFolderName(folderGroupInp.value)) {
+      orgSafetySection.setExpanded(true)
+      showNotice(
+        'error',
+        'Folder name "__ungrouped__" is reserved. Choose a different folder name or leave it blank.'
+      )
+      folderGroupInp.focus?.()
+      return false
+    }
     const driverId: string = driver
     if (isStudioFileDbDriver(driverId) && !filePathInp.value.trim()) {
       showNotice(
@@ -2852,6 +3371,30 @@ export function openStudioConnectionModal(
           sshKeyPathInp
         )
       }
+      for (let i = 0; i < jumpHops.length; i++) {
+        const hop = jumpHops[i]
+        const hopLabel = `Jump Hop #${i + 1}`
+        const hopHost = hop.host.trim()
+        const hopUser = hop.user.trim()
+        const hopKey = hop.privateKeyPath.trim()
+        if (hopHost.startsWith('-') || hopUser.startsWith('-') || hopKey.startsWith('-')) {
+          return failSsh(
+            `${hopLabel} values must not start with "-" — ssh option injection is blocked.`
+          )
+        }
+        if (!hopHost) {
+          return failSsh(`Please enter a Host for ${hopLabel}.`)
+        }
+        if (!hopUser) {
+          return failSsh(`Please enter an SSH Username for ${hopLabel}.`)
+        }
+        if (!Number.isFinite(hop.port) || hop.port < 1 || hop.port > 65535) {
+          return failSsh(`${hopLabel} Port must be between 1 and 65535.`)
+        }
+        if (hop.authMethod === 'key' && !hopKey) {
+          return failSsh(`Please enter a Private Key Path for ${hopLabel}.`)
+        }
+      }
     }
     return true
   }
@@ -2889,7 +3432,8 @@ export function openStudioConnectionModal(
   // ---- Workspace discovery ----
   const detectWorkspace = async (folderPath: string, manual: boolean): Promise<void> => {
     const seq = ++detectSeq
-    const activeBtn = folderPath ? scanBtn : detectBtn
+    const activeBtn = folderPath ? scanFolderBtn : detectBtn
+    detectBtnSeq.set(activeBtn, seq)
     setButtonLoading(activeBtn, true, 'Scanning...')
     try {
       const folder = folderPath.trim()
@@ -2971,7 +3515,7 @@ export function openStudioConnectionModal(
         )
       }
     } finally {
-      if (seq === detectSeq) {
+      if (detectBtnSeq.get(activeBtn) === seq) {
         setButtonLoading(activeBtn, false)
         if (isBusy) activeBtn.disabled = true
       }
@@ -2980,9 +3524,160 @@ export function openStudioConnectionModal(
   }
 
   // ---- Actions ----
+  const applySslModeAndRetest = (mode: SslMode, confirmedUnverified = false): void => {
+    sslModeSel.value = mode
+    sslCheck.input.checked = mode !== 'disable'
+    if (mode === 'require') {
+      sslRejectCheck.input.checked = !confirmedUnverified
+    } else if (mode === 'verify-ca' || mode === 'verify-full' || mode === 'strict') {
+      sslRejectCheck.input.checked = true
+    }
+    syncStudioSelectTooltip(sslModeSel, 'SSL Mode')
+    syncTlsUi()
+    clearTlsRemedy()
+  }
+
+  const showUnverifiedTlsConfirmation = (mode: SslMode, retest: boolean): void => {
+    tlsRemedyBox.textContent = ''
+    tlsRemedyBox.style.display = 'flex'
+    const warn = document.createElement('div')
+    warn.className = 'datanoa-conn-hint'
+    warn.textContent =
+      `Proceeding with "${mode}" disables certificate verification and exposes traffic to active interception. Confirm to proceed?`
+    const actionsRow = document.createElement('div')
+    actionsRow.className = 'datanoa-tls-remedy-actions'
+
+    const safeBtn = document.createElement('button')
+    safeBtn.type = 'button'
+    safeBtn.className = 'datanoa-btn datanoa-btn-sm datanoa-btn-primary'
+    safeBtn.dataset.tlsRemedyBtn = 'true'
+    safeBtn.textContent = 'Use Verified TLS (verify-full) & Retest'
+    safeBtn.addEventListener('click', () => {
+      applySslModeAndRetest('verify-full', false)
+      if (retest) void runTest()
+    })
+
+    const confirmBtn = document.createElement('button')
+    confirmBtn.type = 'button'
+    confirmBtn.className = 'datanoa-btn datanoa-btn-sm'
+    confirmBtn.dataset.tlsConfirmUnverified = 'true'
+    confirmBtn.textContent = `Confirm Unverified (${mode}) & Retest`
+    confirmBtn.addEventListener('click', () => {
+      applySslModeAndRetest(mode, true)
+      if (retest) void runTest()
+    })
+
+    actionsRow.appendChild(safeBtn)
+    actionsRow.appendChild(confirmBtn)
+    tlsRemedyBox.appendChild(warn)
+    tlsRemedyBox.appendChild(actionsRow)
+  }
+
+  const renderTlsFailureRemedy = (failure: TlsFailure): void => {
+    renderSharedTlsFailureRemedy(tlsRemedyBox, failure, {
+      displayMode: 'flex',
+      hintClass: 'datanoa-conn-hint',
+      actionsClass: 'datanoa-tls-remedy-actions',
+      buttonClass: 'datanoa-btn datanoa-btn-sm',
+      allowAutoSuggestedMode: true,
+      onInspectCaCert: (kind) => {
+        tlsSection.setExpanded(true)
+        if (kind === 'UnknownIssuer') {
+          void openStudioFilePickerModal(ctx, {
+            title: 'Select CA Certificate File',
+            mode: 'file',
+            initialDir: sslCaPathInp.value.trim() || undefined,
+            extensions: ['.pem', '.crt', '.cer', '.der', '.ca'],
+          })
+            .then((res) => {
+              if (!isModalOpen()) return
+              if (res?.ok && res.path) {
+                sslCaPathInp.value = res.path
+                syncTlsUi()
+                clearTlsRemedy()
+              }
+              sslCaPathInp.focus?.()
+            })
+            .catch(() => {
+              sslCaPathInp.focus?.()
+            })
+          return
+        }
+        sslCaPathInp.focus?.()
+      },
+      onInspectClientCert: () => {
+        tlsSection.setExpanded(true)
+        sslCertPathInp.focus?.()
+      },
+      onApplySslMode: (mode, retest) => {
+        const requiresExplicitConfirm =
+          (failure.kind === 'ServerRequiresTls' || failure.kind === 'ServerRefusedStrict') &&
+          (mode === 'require' || mode === 'disable')
+        if (requiresExplicitConfirm) {
+          showUnverifiedTlsConfirmation(mode, retest)
+          return
+        }
+        applySslModeAndRetest(mode, false)
+        if (retest) void runTest()
+      },
+      onSetServerName: (targetHost) => {
+        tlsSection.setExpanded(true)
+        tlsServernameInp.value = targetHost
+        syncTlsUi()
+        clearTlsRemedy()
+        void runTest()
+      },
+      onVerifyCaOnly: () => {
+        tlsSection.setExpanded(true)
+        sslModeSel.value = 'verify-ca'
+        syncStudioSelectTooltip(sslModeSel, 'SSL Mode')
+        syncTlsUi()
+      },
+      onInspectTls: () => {
+        tlsSection.setExpanded(true)
+        sslModeSel.focus?.()
+      },
+    })
+  }
+
+  type ConnectionTestRpcResult = SshRetryableResult
+
+  const executeConnectionTestWithHostKeyRetry = async (
+    sub: ConnectionSubmission
+  ): Promise<ConnectionTestRpcResult> =>
+    runWithSshHostKeyRetry<ConnectionTestRpcResult>({
+      connectionId: sub.profile.id,
+      panelId: 'studio',
+      jumpHosts: sub.profile.sshJumpHosts,
+      isActive: isModalOpen,
+      runAttempt: (retryCtx) =>
+        ctx.requestPlugin<ConnectionTestRpcResult>(
+          'connection.test',
+          retryCtx?.sshRetryToken ? { ...sub, sshRetryToken: retryCtx.sshRetryToken } : sub,
+          {
+            timeoutMs: DEFAULT_RPC_TIMEOUT_MS,
+          }
+        ),
+      resolveDecision: async (input) => {
+        const r = await ctx.requestPlugin<{
+          ok: boolean
+          decision: SshHostKeyDecision
+          savedPath?: string
+          retryToken?: string
+        }>('ssh.hostKey.resolve', input)
+        return {
+          ok: Boolean(r?.ok),
+          decision: r?.decision ?? input.decision,
+          savedPath: r?.savedPath,
+          ...(typeof r?.retryToken === 'string' && r.retryToken ? { retryToken: r.retryToken } : {}),
+        }
+      },
+    })
+
   const runTest = async (): Promise<void> => {
     if (isBusy) return
     setBusy(true)
+    clearTlsRemedy()
     setButtonLoading(testBtn, true, 'Testing... 0.0s')
     const stopTimer = ctx.createElapsedTimer((elapsed) => {
       setButtonLoading(testBtn, true, `Testing... ${elapsed}`)
@@ -2992,12 +3687,11 @@ export function openStudioConnectionModal(
       if (!validateRequiredFields() || !ensurePasswordBeforeSubmit()) return
       showNotice('neutral', 'Testing connection...')
       const sub = buildSubmission(editId || `conn_test_${Date.now()}`)
-      const res = await ctx.requestPlugin<{ ok: boolean; message?: string }>(
-        'connection.test',
-        sub,
-        { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
-      )
+      const res = await executeConnectionTestWithHostKeyRetry(sub)
       if (!isModalOpen()) return
+      if (res.tlsFailure) {
+        renderTlsFailureRemedy(res.tlsFailure)
+      }
       showNotice(
         res.ok ? 'success' : 'error',
         res.message ||
@@ -3005,6 +3699,11 @@ export function openStudioConnectionModal(
       )
     } catch (err: unknown) {
       if (!isModalOpen()) return
+      const maybeTls =
+        err && typeof err === 'object' && 'tlsFailure' in err
+          ? (err as { tlsFailure?: TlsFailure }).tlsFailure
+          : undefined
+      if (maybeTls) renderTlsFailureRemedy(maybeTls)
       showNotice('error', `Error: ${err instanceof Error ? err.message : String(err)}`)
     } finally {
       stopTimer()
@@ -3018,6 +3717,7 @@ export function openStudioConnectionModal(
   const runSave = async (): Promise<void> => {
     if (isBusy) return
     setBusy(true)
+    clearTlsRemedy()
     let phase = 'Testing...'
     setButtonLoading(saveBtn, true, 'Testing... 0.0s')
     const stopTimer = ctx.createElapsedTimer((elapsed) => {
@@ -3032,18 +3732,22 @@ export function openStudioConnectionModal(
       showNotice('neutral', 'Verifying & saving connection...')
       const sub = buildSubmission(targetId)
       try {
-        const testRes = await ctx.requestPlugin<{ ok: boolean; message?: string }>(
-          'connection.test',
-          sub,
-          { timeoutMs: DEFAULT_RPC_TIMEOUT_MS }
-        )
+        const testRes = await executeConnectionTestWithHostKeyRetry(sub)
         if (!isModalOpen()) return
         if (!testRes.ok) {
+          if (testRes.tlsFailure) {
+            renderTlsFailureRemedy(testRes.tlsFailure)
+          }
           showNotice('error', testRes.message || 'Connection test failed.')
           return
         }
       } catch (testErr: unknown) {
         if (!isModalOpen()) return
+        const maybeTls =
+          testErr && typeof testErr === 'object' && 'tlsFailure' in testErr
+            ? (testErr as { tlsFailure?: TlsFailure }).tlsFailure
+            : undefined
+        if (maybeTls) renderTlsFailureRemedy(maybeTls)
         showNotice(
           'error',
           `Connection failed: ${testErr instanceof Error ? testErr.message : String(testErr)}`
@@ -3131,11 +3835,38 @@ export function openStudioConnectionModal(
     ) {
       clearActiveAutoUri()
     }
+    if (lastParsedUri && lastParsedDisplayUri && displayUri === lastParsedDisplayUri) {
+      return { uri: lastParsedUri, displayUri }
+    }
     return { uri: displayUri, displayUri }
   }
 
-  uriInp.addEventListener('input', () => {
+  uriInp.addEventListener('input', (e) => {
+    const inputType = typeof (e as InputEvent).inputType === 'string' ? (e as InputEvent).inputType : ''
+    const isPasteOriginated =
+      inputType === 'insertFromPaste' || (inputType === '' && suppressPasteInputCancel)
+    if (isPasteOriginated) {
+      suppressPasteInputCancel = false
+    } else {
+      clearPasteTimer()
+    }
     clearActiveAutoUri()
+  })
+  uriInp.addEventListener('paste', (e) => {
+    clearPasteTimer()
+    clearActiveAutoUri()
+    const pasted = e.clipboardData?.getData('text')
+    if (pasted && pasted.trim()) {
+      const seqAtPaste = parseSeq
+      suppressPasteInputCancel = true
+      pasteTimer = setTimeout(() => {
+        pasteTimer = null
+        suppressPasteInputCancel = false
+        if (!isModalOpen() || isBusy || seqAtPaste !== parseSeq) return
+        const nextVal = uriInp.value.trim() || pasted.trim()
+        if (nextVal) void parseUri(nextVal, false)
+      }, 0)
+    }
   })
   parseBtn.addEventListener('click', () => {
     if (isBusy) return
@@ -3156,30 +3887,22 @@ export function openStudioConnectionModal(
   detectBtn.addEventListener('click', () => {
     if (!isBusy) void detectWorkspace('', true)
   })
-  scanBtn.addEventListener('click', () => {
-    if (isBusy) return
-    if (!folderInp.value.trim()) {
-      showNotice('error', 'Enter a folder path to scan.')
-      return
-    }
-    void detectWorkspace(folderInp.value, true)
-  })
-  folderInp.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault()
-      scanBtn.click()
-    }
-  })
   nameInp.addEventListener('input', () => {
     lastAutoName = ''
   })
   passwordInp.addEventListener('input', () => {
+    dockerApplySeq++
+    pendingDockerResolve = null
     placeholderPending = lastParsedPlaceholder && !passwordInp.value
     passwordInp.placeholder = placeholderPending
       ? 'Required (replace placeholder password)'
       : hadPassword && isEdit
         ? 'Stored password preserved (type to replace)'
         : 'Optional'
+  })
+  authTokenInp.addEventListener('input', () => {
+    dockerApplySeq++
+    pendingDockerResolve = null
   })
   testBtn.addEventListener('click', () => {
     void runTest()
@@ -3206,6 +3929,7 @@ export function openStudioConnectionModal(
         editProfile.sslCaPath ||
         editProfile.sslCertPath ||
         editProfile.sslKeyPath ||
+        editProfile.tlsServername ||
         editProfile.hasSslKeyPassphrase ||
         editProfile.sslRejectUnauthorized === false)
   )
@@ -3253,6 +3977,7 @@ export function openStudioConnectionModal(
       if (typeof editProfile.options === 'string') optionsInp.value = editProfile.options
       if (hadPassword) passwordInp.placeholder = 'Stored password preserved (type to replace)'
       sslModeSel.value = editProfile.sslMode || 'auto'
+      tlsServernameInp.value = editProfile.tlsServername || ''
       sslCaPathInp.value = editProfile.sslCaPath || ''
       sslCertPathInp.value = editProfile.sslCertPath || ''
       sslKeyPathInp.value = editProfile.sslKeyPath || ''
@@ -3281,8 +4006,10 @@ export function openStudioConnectionModal(
     hostInp.value = 'localhost'
     applyDriver(driver, true)
   }
+  orgSafetySection.setExpanded(hasNonDefaultOrgSafety() || options?.focusSection === 'ai')
   tlsSection.setExpanded(hasCustomTls || options?.focusSection === 'tls')
   sshSection.setExpanded(sshEnabledInitially)
+  syncOrgSafetyUi()
   syncTlsUi()
   syncSshUi()
   syncEnvPills()
@@ -3293,10 +4020,17 @@ export function openStudioConnectionModal(
 
   modal.appendChild(head)
   modal.appendChild(noticeBox)
+  modal.appendChild(tlsRemedyBox)
   modal.appendChild(body)
   modal.appendChild(actions)
   backdropRef = ctx.mountModal(modal, () => {
     if (isBusy) return false
+    clearDeleteTimer()
+    clearSpotlightTimer()
+    clearPasteTimer()
+    pendingDockerResolve = null
+    lastParsedUri = ''
+    clearActiveAutoUri()
     closeActiveStudioCollapsibleDropdown()
     return true
   })

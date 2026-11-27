@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -8,10 +8,15 @@ import {
   sanitizeJsonPayload,
   type ConnectionColorTag,
   type ConnectionProfile,
+  type ConnectionProfileInput,
   type DatabaseDriverType,
+  type ErLayoutStateEntry,
   type PersistedLocalDriverConfig,
   type QueryResult,
   type SavedQueryEntry,
+  type SshJumpHostProfile,
+  type StudioViewMode,
+  type TableDisplayStateEntry,
 } from '../protocol'
 import type { IDatabaseSession } from '../drivers'
 import { copyFailedStatementMeta } from '../drivers/common/driver'
@@ -23,8 +28,7 @@ import {
   ACTIONABLE_TLS_CERT_ERROR_HINT,
   appendActionableTlsErrorHint,
 } from '../drivers/common/tls-and-tunnel'
-
-export { ACTIONABLE_TLS_CERT_ERROR_HINT, appendActionableTlsErrorHint }
+import { isReservedFolderName, normalizeFolderOrder } from '../shared-connection-order.js'
 import {
   containsSensitiveSqlText,
   isSensitiveUriParamKey,
@@ -39,6 +43,8 @@ import {
   resolveSqliteFilePath,
 } from './discovery'
 import type { SessionManager } from './session-manager'
+
+export { ACTIONABLE_TLS_CERT_ERROR_HINT, appendActionableTlsErrorHint }
 
 export type WorkerRegisterHandler = OrcaWorkerApi['panels']['handle']
 
@@ -184,7 +190,57 @@ export function normalizeColorTag(tag: unknown): ConnectionColorTag | undefined 
   return undefined
 }
 
-export function sanitizeConnectionProfile(conn: ConnectionProfile): ConnectionProfile {
+const MAX_SSH_JUMP_HOPS = 8
+const SSH_HOP_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
+
+function sanitizeSshJumpHosts(raw: unknown): SshJumpHostProfile[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined
+  const cleaned: SshJumpHostProfile[] = []
+  const seenHopIds = new Set<string>()
+  for (const item of raw.slice(0, MAX_SSH_JUMP_HOPS)) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const rec = item as Record<string, unknown>
+    const hopId = typeof rec.hopId === 'string' ? rec.hopId.trim() : ''
+    const host = typeof rec.host === 'string' ? rec.host.trim() : ''
+    if (!SSH_HOP_ID_RE.test(hopId) || !host) continue
+    if (seenHopIds.has(hopId)) {
+      throw createHostError(
+        'invalid_params',
+        `Duplicate SSH jump hopId "${hopId}" — each intermediate hop must have a unique hopId.`
+      )
+    }
+    seenHopIds.add(hopId)
+    const port =
+      typeof rec.port === 'number' &&
+      Number.isInteger(rec.port) &&
+      rec.port >= 1 &&
+      rec.port <= 65535
+        ? rec.port
+        : undefined
+    const user = typeof rec.user === 'string' && rec.user.trim().length > 0 ? rec.user.trim() : undefined
+    const authMethod =
+      rec.authMethod === 'agent' || rec.authMethod === 'key' || rec.authMethod === 'password'
+        ? rec.authMethod
+        : undefined
+    const privateKeyPath =
+      typeof rec.privateKeyPath === 'string' && rec.privateKeyPath.trim().length > 0
+        ? rec.privateKeyPath.trim()
+        : undefined
+    cleaned.push({
+      hopId,
+      host,
+      ...(port !== undefined ? { port } : {}),
+      ...(user !== undefined ? { user } : {}),
+      ...(authMethod !== undefined ? { authMethod } : {}),
+      ...(privateKeyPath !== undefined ? { privateKeyPath } : {}),
+      ...(rec.hasPassphrase ? { hasPassphrase: true } : {}),
+      ...(rec.hasPassword ? { hasPassword: true } : {}),
+    })
+  }
+  return cleaned.length > 0 ? cleaned : undefined
+}
+
+export function sanitizeConnectionProfile(conn: ConnectionProfileInput): ConnectionProfile {
   const redisDb =
     typeof conn.redisDb === 'number' &&
     Number.isInteger(conn.redisDb) &&
@@ -207,16 +263,19 @@ export function sanitizeConnectionProfile(conn: ConnectionProfile): ConnectionPr
     const cleaned = value.replace(CONTROL_CHARS_RE, '').trim()
     return cleaned.length > 0 ? cleaned.slice(0, max) : undefined
   }
-  const folder = scopedText(conn.folder, 64)
+  const rawFolder = scopedText(conn.folder, 64)
+  const folder = rawFolder && !isReservedFolderName(rawFolder) ? rawFolder : undefined
   const workspaceScope = scopedText(conn.workspaceScope, 260)
   const sslMode =
     conn.sslMode === 'auto' ||
     conn.sslMode === 'disable' ||
     conn.sslMode === 'require' ||
     conn.sslMode === 'verify-ca' ||
-    conn.sslMode === 'verify-full'
+    conn.sslMode === 'verify-full' ||
+    conn.sslMode === 'strict'
       ? conn.sslMode
       : undefined
+  const sshJumpHosts = sanitizeSshJumpHosts(conn.sshJumpHosts)
   const sshAuthMethod =
     conn.sshAuthMethod === 'agent' ||
     conn.sshAuthMethod === 'key' ||
@@ -265,6 +324,7 @@ export function sanitizeConnectionProfile(conn: ConnectionProfile): ConnectionPr
       conn.sslRejectUnauthorized !== undefined
         ? Boolean(conn.sslRejectUnauthorized)
         : undefined,
+    tlsServername: scopedText(conn.tlsServername, 255),
     sshEnabled: conn.sshEnabled ? true : undefined,
     sshHost: text(conn.sshHost),
     sshPort,
@@ -273,13 +333,14 @@ export function sanitizeConnectionProfile(conn: ConnectionProfile): ConnectionPr
     sshPrivateKeyPath: text(conn.sshPrivateKeyPath),
     hasSshPassphrase: conn.hasSshPassphrase ? true : undefined,
     hasSshPassword: conn.hasSshPassword ? true : undefined,
+    ...(sshJumpHosts !== undefined ? { sshJumpHosts } : {}),
     ...(aiPolicy !== undefined ? { aiPolicy } : {}),
   })
 }
 
 export async function normalizeSqliteProfile(
-  profile: ConnectionProfile
-): Promise<ConnectionProfile> {
+  profile: ConnectionProfileInput
+): Promise<ConnectionProfileInput> {
   if (profile.driver !== 'sqlite') {
     return sanitizeJsonPayload(profile)
   }
@@ -318,11 +379,24 @@ export function createSerializedQueue(): SerializedQueue {
   }
 }
 
+function normalizeStudioViewMode(raw: unknown): StudioViewMode | undefined {
+  return raw === 'split' || raw === 'grid' || raw === 'sql' || raw === 'inspector' || raw === 'er'
+    ? raw
+    : undefined
+}
+
 export async function openStudioDocumentInOrca(
   orca: OrcaWorkerApi,
-  options?: { connectionId?: string; table?: string; schema?: string; sql?: string },
+  options?: {
+    connectionId?: string
+    table?: string
+    schema?: string
+    sql?: string
+    viewMode?: StudioViewMode
+    action?: 'import'
+  },
   sessionManager?: SessionManager
-): Promise<{ ok: boolean; path?: string; message?: string }> {
+): Promise<{ ok: boolean; path?: string; message?: string; navToken?: string }> {
   try {
     if (!orca.host || typeof orca.host.call !== 'function') {
       return {
@@ -418,10 +492,28 @@ export async function openStudioDocumentInOrca(
       }
     }
 
+    let resolvedSchema =
+      typeof options?.schema === 'string' && options.schema.trim().length > 0
+        ? options.schema.trim()
+        : undefined
+    if (!resolvedSchema && resolvedConnectionId && !options?.table) {
+      const persistedSchemas = await readPersistedSelectedSchemas(orca)
+      const remembered = persistedSchemas[resolvedConnectionId]?.schema
+      if (typeof remembered === 'string' && remembered.trim().length > 0) {
+        resolvedSchema = remembered.trim()
+      }
+    }
+
+    const validViewMode = normalizeStudioViewMode(options?.viewMode)
+    const studioAction = options?.action === 'import' ? 'import' : undefined
+    const navToken = randomUUID()
     const headerLines = [
       `-- datanoa: connectionId=${resolvedConnectionId}`,
       options?.table ? `-- datanoa: table=${options.table}` : '',
-      options?.schema ? `-- datanoa: schema=${options.schema}` : '',
+      resolvedSchema ? `-- datanoa: schema=${resolvedSchema}` : '',
+      validViewMode ? `-- datanoa: viewMode=${validViewMode}` : '',
+      studioAction ? `-- datanoa: action=${studioAction}` : '',
+      navToken ? `-- datanoa: navToken=${navToken}` : '',
     ].filter(Boolean)
 
     const profile =
@@ -432,10 +524,10 @@ export async function openStudioDocumentInOrca(
     const quotedTable = options?.table ? quoteIdentForDialect(options.table, dialect) : ''
     const qualifiedTable =
       quotedTable &&
-      options?.schema &&
-      !((dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1') && options.schema === 'main') &&
-      options.schema !== 'public'
-        ? `${quoteIdentForDialect(options.schema, dialect)}.${quotedTable}`
+      resolvedSchema &&
+      !((dialect === 'sqlite' || dialect === 'libsql' || dialect === 'd1') && resolvedSchema === 'main') &&
+      resolvedSchema !== 'public'
+        ? `${quoteIdentForDialect(resolvedSchema, dialect)}.${quotedTable}`
         : quotedTable
 
     const defaultSql =
@@ -475,16 +567,121 @@ export async function openStudioDocumentInOrca(
       orca.panels?.post?.('studio.opened', {
         connectionId: resolvedConnectionId || null,
         table: options?.table || null,
-        schema: options?.schema || null,
+        schema: resolvedSchema || null,
+        ...(typeof target.id === 'string' && target.id ? { workspaceId: target.id } : {}),
+        docPath: relPath,
+        ...(validViewMode ? { viewMode: validViewMode } : {}),
+        ...(studioAction ? { action: studioAction } : {}),
+        ...(navToken ? { navToken } : {}),
       })
     } catch {
       // Optional event broadcast in minimal/test hosts
     }
-    return { ok: true, path: relPath }
+    return {
+      ok: true,
+      path: relPath,
+      ...(navToken ? { navToken } : {}),
+    }
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
+    const msg = scrubCredentialsInText(err instanceof Error ? err.message : String(err))
     orca.log(`[Worker] studio.open failed: ${msg}`)
     return { ok: false, message: msg }
+  }
+}
+
+export const STUDIO_CONSUMED_NAV_TOKENS_STORAGE_KEY = 'datanoa.consumedNavTokens'
+const MAX_CONSUMED_NAV_TOKENS = 200
+
+/**
+ * Tracks one-shot Studio deep-link `navToken` consumption with bounded LRU storage persistence
+ * so closing/reopening `.datanoa/studio.datanoa` across sessions or restarts never re-triggers stale links.
+ */
+export function createStudioNavTokenConsumer(
+  orca: Pick<OrcaWorkerApi, 'storage'> & Partial<Pick<OrcaWorkerApi, 'host'>>
+): (navToken: string) => Promise<{ consumed: boolean; alreadyConsumed: boolean }> {
+  const seen = new Set<string>()
+  let loaded = false
+  let queue: Promise<void> = Promise.resolve()
+
+  const ensureLoaded = async (): Promise<boolean> => {
+    if (loaded) return true
+    const isLiveDesktopHost =
+      'host' in orca && Boolean(orca.host && typeof orca.host.call === 'function')
+    try {
+      let raw = await orca.storage.get(STUDIO_CONSUMED_NAV_TOKENS_STORAGE_KEY)
+      if ((!Array.isArray(raw) || raw.length === 0) && isLiveDesktopHost) {
+        const backup = await readHostConfigBackup()
+        if (Array.isArray(backup?.consumedNavTokens) && backup.consumedNavTokens.length > 0) {
+          raw = backup.consumedNavTokens as JsonValue
+        }
+      }
+      if (Array.isArray(raw)) {
+        for (const item of raw) {
+          if (typeof item === 'string' && item.trim().length > 0) {
+            seen.add(item.trim())
+          }
+        }
+        while (seen.size > MAX_CONSUMED_NAV_TOKENS) {
+          const oldest = seen.values().next().value
+          if (oldest === undefined) break
+          seen.delete(oldest)
+        }
+      }
+      loaded = true
+      return true
+    } catch {
+      if (isLiveDesktopHost) {
+        const backup = await readHostConfigBackup()
+        if (Array.isArray(backup?.consumedNavTokens)) {
+          for (const item of backup.consumedNavTokens) {
+            if (typeof item === 'string' && item.trim().length > 0) {
+              seen.add(item.trim())
+            }
+          }
+          loaded = true
+          return true
+        }
+      }
+      return false
+    }
+  }
+
+  return async (navToken: string): Promise<{ consumed: boolean; alreadyConsumed: boolean }> => {
+    const clean = typeof navToken === 'string' ? navToken.trim() : ''
+    if (!clean) {
+      return { consumed: false, alreadyConsumed: true }
+    }
+    let result = { consumed: false, alreadyConsumed: true }
+    const run = queue.then(async () => {
+      const isLoaded = await ensureLoaded()
+      if (!isLoaded) {
+        result = { consumed: false, alreadyConsumed: false }
+        return
+      }
+      if (seen.has(clean)) {
+        result = { consumed: false, alreadyConsumed: true }
+        return
+      }
+      const nextTokens = Array.from(seen)
+      nextTokens.push(clean)
+      while (nextTokens.length > MAX_CONSUMED_NAV_TOKENS) {
+        nextTokens.shift()
+      }
+      await orca.storage.set(STUDIO_CONSUMED_NAV_TOKENS_STORAGE_KEY, nextTokens)
+      if ('host' in orca && orca.host && typeof orca.host.call === 'function') {
+        void writeHostConfigBackupPatch({ consumedNavTokens: nextTokens })
+      }
+      seen.add(clean)
+      while (seen.size > MAX_CONSUMED_NAV_TOKENS) {
+        const oldest = seen.values().next().value
+        if (oldest === undefined) break
+        seen.delete(oldest)
+      }
+      result = { consumed: true, alreadyConsumed: false }
+    })
+    queue = run.catch(() => {})
+    await run
+    return result
   }
 }
 
@@ -619,13 +816,26 @@ export async function executeSessionQuery(
   }
 }
 
+export const SELECTED_SCHEMA_BY_CONN_STORAGE_KEY = 'datanoa.selectedSchemaByConn'
+const MAX_PERSISTED_SCHEMA_SELECTIONS = 500
+
+export interface PersistedSchemaSelectionEntry {
+  schema: string
+  updatedAt: number
+}
+
 export interface HostConfigBackupPayload {
   updatedAt?: number
   connections?: ConnectionProfile[]
+  folderOrder?: string[]
   byodConfigs?: PersistedLocalDriverConfig[]
   savedQueries?: SavedQueryEntry[]
   panelViewState?: Record<string, unknown>
   studioViewState?: Record<string, unknown>
+  tableDisplayState?: Record<string, TableDisplayStateEntry>
+  erLayoutState?: Record<string, ErLayoutStateEntry>
+  selectedSchemaByConn?: Record<string, PersistedSchemaSelectionEntry>
+  consumedNavTokens?: string[]
 }
 
 const inMemoryUiSessionSnapshots = new Map<
@@ -636,9 +846,260 @@ const inMemoryUiSessionSnapshots = new Map<
     updatedAt: number
   }
 >()
+let inMemorySelectedSchemaByConn: Record<string, PersistedSchemaSelectionEntry> | null = null
+const selectedSchemaStoreQueue = createSerializedQueue()
 
 export function clearInMemoryUiSessionSnapshots(): void {
   inMemoryUiSessionSnapshots.clear()
+  inMemorySelectedSchemaByConn = null
+}
+
+export function sanitizePersistedSchemaSelections(
+  raw: unknown
+): Record<string, PersistedSchemaSelectionEntry> {
+  const out: Record<string, PersistedSchemaSelectionEntry> = {}
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out
+  let count = 0
+  for (const [k, v] of Object.entries(raw)) {
+    const cleanConn = typeof k === 'string' ? k.trim() : ''
+    if (!cleanConn) continue
+    if (typeof v === 'string') {
+      const cleanSchema = v.trim()
+      if (cleanSchema.length > 0) {
+        out[cleanConn] = { schema: cleanSchema, updatedAt: 0 }
+        if (++count >= MAX_PERSISTED_SCHEMA_SELECTIONS) break
+      }
+      continue
+    }
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const rec = v as { schema?: unknown; updatedAt?: unknown }
+      const cleanSchema = typeof rec.schema === 'string' ? rec.schema.trim() : ''
+      if (!cleanSchema) continue
+      const updatedAt =
+        typeof rec.updatedAt === 'number' && Number.isFinite(rec.updatedAt) && rec.updatedAt >= 0
+          ? rec.updatedAt
+          : 0
+      out[cleanConn] = { schema: cleanSchema, updatedAt }
+      if (++count >= MAX_PERSISTED_SCHEMA_SELECTIONS) break
+    }
+  }
+  return out
+}
+
+export async function readPersistedSelectedSchemas(
+  orca: Pick<OrcaWorkerApi, 'storage'> & Partial<Pick<OrcaWorkerApi, 'host'>>
+): Promise<Record<string, PersistedSchemaSelectionEntry>> {
+  if (inMemorySelectedSchemaByConn) {
+    const copy: Record<string, PersistedSchemaSelectionEntry> = {}
+    for (const [cid, entry] of Object.entries(inMemorySelectedSchemaByConn)) {
+      copy[cid] = { ...entry }
+    }
+    return copy
+  }
+  let loaded: Record<string, PersistedSchemaSelectionEntry> = {}
+  try {
+    const raw = await orca.storage.get(SELECTED_SCHEMA_BY_CONN_STORAGE_KEY)
+    loaded = sanitizePersistedSchemaSelections(raw)
+  } catch {
+    // Ignore storage read failure
+  }
+  const isLiveDesktopHost =
+    'host' in orca && Boolean(orca.host && typeof orca.host.call === 'function')
+  if (Object.keys(loaded).length === 0 && isLiveDesktopHost) {
+    const backup = await readHostConfigBackup()
+    if (backup?.selectedSchemaByConn) {
+      loaded = sanitizePersistedSchemaSelections(backup.selectedSchemaByConn)
+    }
+  }
+  inMemorySelectedSchemaByConn = loaded
+  const copy: Record<string, PersistedSchemaSelectionEntry> = {}
+  for (const [cid, entry] of Object.entries(loaded)) {
+    copy[cid] = { ...entry }
+  }
+  return copy
+}
+
+function stripConnectionSchemaFromViewStateObj(
+  view: Record<string, unknown>,
+  cleanConn: string
+): { mutated: boolean; nextView: Record<string, unknown> } {
+  const nextView: Record<string, unknown> = { ...view }
+  let mutated = false
+  if (
+    nextView.selectedSchemaByConn &&
+    typeof nextView.selectedSchemaByConn === 'object' &&
+    !Array.isArray(nextView.selectedSchemaByConn)
+  ) {
+    const map = { ...(nextView.selectedSchemaByConn as Record<string, unknown>) }
+    if (cleanConn in map) {
+      delete map[cleanConn]
+      nextView.selectedSchemaByConn = map
+      mutated = true
+    }
+  }
+  if (
+    nextView.selectedSchemaUpdatedAtByConn &&
+    typeof nextView.selectedSchemaUpdatedAtByConn === 'object' &&
+    !Array.isArray(nextView.selectedSchemaUpdatedAtByConn)
+  ) {
+    const tsMap = { ...(nextView.selectedSchemaUpdatedAtByConn as Record<string, unknown>) }
+    if (cleanConn in tsMap) {
+      delete tsMap[cleanConn]
+      nextView.selectedSchemaUpdatedAtByConn = tsMap
+      mutated = true
+    }
+  }
+  if (nextView.activeConnectionId === cleanConn) {
+    if ('selectedSchema' in nextView) {
+      delete nextView.selectedSchema
+      mutated = true
+    }
+    if ('activeSchema' in nextView) {
+      delete nextView.activeSchema
+      mutated = true
+    }
+    if ('activeTable' in nextView) {
+      delete nextView.activeTable
+      mutated = true
+    }
+  }
+  return { mutated, nextView }
+}
+
+async function mergePersistedSelectedSchemas(
+  orca: Pick<OrcaWorkerApi, 'storage'> & Partial<Pick<OrcaWorkerApi, 'host'>>,
+  viewState: Record<string, unknown>
+): Promise<void> {
+  const rawMap =
+    viewState.selectedSchemaByConn &&
+    typeof viewState.selectedSchemaByConn === 'object' &&
+    !Array.isArray(viewState.selectedSchemaByConn)
+      ? (viewState.selectedSchemaByConn as Record<string, unknown>)
+      : null
+  const rawTsMap =
+    viewState.selectedSchemaUpdatedAtByConn &&
+    typeof viewState.selectedSchemaUpdatedAtByConn === 'object' &&
+    !Array.isArray(viewState.selectedSchemaUpdatedAtByConn)
+      ? (viewState.selectedSchemaUpdatedAtByConn as Record<string, unknown>)
+      : null
+  const fallbackConn =
+    typeof viewState.activeConnectionId === 'string' ? viewState.activeConnectionId.trim() : ''
+  const fallbackSchema =
+    typeof viewState.selectedSchema === 'string'
+      ? viewState.selectedSchema.trim()
+      : typeof viewState.activeSchema === 'string'
+        ? viewState.activeSchema.trim()
+        : ''
+  const viewUpdatedAt =
+    typeof viewState.updatedAt === 'number' &&
+    Number.isFinite(viewState.updatedAt) &&
+    viewState.updatedAt >= 0
+      ? viewState.updatedAt
+      : 0
+
+  const candidates: Array<{ connId: string; schema: string; updatedAt: number }> = []
+  if (rawMap) {
+    for (const [k, v] of Object.entries(rawMap)) {
+      const cleanConn = typeof k === 'string' ? k.trim() : ''
+      const cleanSchema = typeof v === 'string' ? v.trim() : ''
+      if (!cleanConn || !cleanSchema) continue
+      const rawEntryTs = rawTsMap ? rawTsMap[cleanConn] : undefined
+      const entryTs = rawTsMap
+        ? typeof rawEntryTs === 'number' && Number.isFinite(rawEntryTs) && rawEntryTs >= 0
+          ? rawEntryTs
+          : 0
+        : viewUpdatedAt
+      candidates.push({ connId: cleanConn, schema: cleanSchema, updatedAt: entryTs })
+    }
+  } else if (fallbackConn && fallbackSchema) {
+    candidates.push({ connId: fallbackConn, schema: fallbackSchema, updatedAt: viewUpdatedAt })
+  }
+  if (candidates.length === 0) return
+
+  await selectedSchemaStoreQueue.run(async () => {
+    const current = await readPersistedSelectedSchemas(orca)
+    let changed = false
+    for (const { connId, schema, updatedAt } of candidates) {
+      const existing = current[connId]
+      if (!existing || updatedAt > existing.updatedAt) {
+        current[connId] = { schema, updatedAt }
+        changed = true
+      }
+    }
+    if (!changed) return
+    const bounded = sanitizePersistedSchemaSelections(current)
+    inMemorySelectedSchemaByConn = bounded
+    try {
+      await orca.storage.set(SELECTED_SCHEMA_BY_CONN_STORAGE_KEY, bounded as unknown as JsonValue)
+    } catch {
+      // Ignore storage write failure
+    }
+    const isLiveDesktopHost =
+      'host' in orca && Boolean(orca.host && typeof orca.host.call === 'function')
+    if (isLiveDesktopHost) {
+      void writeHostConfigBackupPatch({ selectedSchemaByConn: bounded })
+    }
+  })
+}
+
+export async function clearPersistedSelectedSchema(
+  orca: Pick<OrcaWorkerApi, 'storage'> & Partial<Pick<OrcaWorkerApi, 'host'>>,
+  connectionId: string
+): Promise<void> {
+  const cleanConn = typeof connectionId === 'string' ? connectionId.trim() : ''
+  if (!cleanConn) return
+  const isLiveDesktopHost =
+    'host' in orca && Boolean(orca.host && typeof orca.host.call === 'function')
+  await selectedSchemaStoreQueue.run(async () => {
+    const current = await readPersistedSelectedSchemas(orca)
+    if (cleanConn in current) {
+      delete current[cleanConn]
+      inMemorySelectedSchemaByConn = current
+      try {
+        await orca.storage.set(SELECTED_SCHEMA_BY_CONN_STORAGE_KEY, current as unknown as JsonValue)
+      } catch {
+        // Ignore storage write failure
+      }
+      if (isLiveDesktopHost) {
+        void writeHostConfigBackupPatch({ selectedSchemaByConn: current })
+      }
+    }
+
+    const backupPatch: Partial<HostConfigBackupPayload> = {}
+    for (const surface of ['panel', 'studio'] as const) {
+      const mem = inMemoryUiSessionSnapshots.get(surface)
+      if (mem?.viewState && typeof mem.viewState === 'object') {
+        const cleanedMem = stripConnectionSchemaFromViewStateObj(mem.viewState, cleanConn)
+        if (cleanedMem.mutated) {
+          inMemoryUiSessionSnapshots.set(surface, {
+            ...mem,
+            viewState: cleanedMem.nextView,
+          })
+        }
+      }
+      const storageKey =
+        surface === 'panel' ? 'datanoa.panelViewState' : 'datanoa.studioViewState'
+      try {
+        const stored = await orca.storage.get(storageKey)
+        if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
+          const cleanedStored = stripConnectionSchemaFromViewStateObj(
+            stored as Record<string, unknown>,
+            cleanConn
+          )
+          if (cleanedStored.mutated) {
+            await orca.storage.set(storageKey, cleanedStored.nextView as JsonValue)
+            if (surface === 'panel') backupPatch.panelViewState = cleanedStored.nextView
+            else backupPatch.studioViewState = cleanedStored.nextView
+          }
+        }
+      } catch {
+        // Ignore storage update error
+      }
+    }
+    if (isLiveDesktopHost && (backupPatch.panelViewState || backupPatch.studioViewState)) {
+      void writeHostConfigBackupPatch(backupPatch)
+    }
+  })
 }
 
 function regexScrubUrlText(input: string): string {
@@ -692,18 +1153,52 @@ export function formatActionableWorkerErrorMessage(rawMessage: string, err?: unk
   return scrubbed
 }
 
+function isSshHostKeyVerificationError(err: Error): boolean {
+  const code = (err as Error & { code?: unknown }).code
+  return err.name === 'SshHostKeyVerificationError' || code === 'SSH_HOST_KEY_VERIFICATION_FAILED'
+}
+
 export function scrubAndEnhanceWorkerError(err: unknown): unknown {
   if (err instanceof Error) {
     const rawMsg = err.message
     const nextMsg = formatActionableWorkerErrorMessage(rawMsg, err)
+    if (isSshHostKeyVerificationError(err)) {
+      if (nextMsg !== rawMsg) {
+        try {
+          err.message = nextMsg
+        } catch {
+          const clone = Object.create(Object.getPrototypeOf(err)) as Error & Record<string, unknown>
+          Object.assign(clone, err)
+          clone.message = nextMsg
+          clone.name = err.name
+          return clone
+        }
+      }
+      return err
+    }
     if (nextMsg === rawMsg) {
       return err
     }
     const sanitized = new Error(nextMsg)
     sanitized.name = err.name
-    const rawCode = (err as Error & { code?: unknown }).code
-    if (rawCode !== undefined) {
-      ;(sanitized as Error & { code?: unknown }).code = rawCode
+    const rec = err as Error & {
+      code?: unknown
+      tlsFailure?: unknown
+      sshChallenge?: unknown
+    }
+    const sanitizedRec = sanitized as Error & {
+      code?: unknown
+      tlsFailure?: unknown
+      sshChallenge?: unknown
+    }
+    if (rec.code !== undefined) {
+      sanitizedRec.code = rec.code
+    }
+    if (rec.tlsFailure !== undefined) {
+      sanitizedRec.tlsFailure = rec.tlsFailure
+    }
+    if (rec.sshChallenge !== undefined) {
+      sanitizedRec.sshChallenge = rec.sshChallenge
     }
     return copyFailedStatementMeta(err, sanitized)
   }
@@ -793,10 +1288,47 @@ function scrubConsoleTabsObject(raw: unknown): unknown {
   return ct
 }
 
+function scrubSshJumpHostDraftArray(raw: unknown): unknown {
+  if (!Array.isArray(raw)) return raw
+  return raw.map((hop) => {
+    if (!hop || typeof hop !== 'object' || Array.isArray(hop)) return hop
+    const rec = { ...(hop as Record<string, unknown>) }
+    delete rec.password
+    delete rec.passphrase
+    delete rec.sshPassword
+    delete rec.sshPassphrase
+    delete rec.secret
+    delete rec.token
+    delete rec.authToken
+    delete rec.sslKeyPassphrase
+    return rec
+  })
+}
+
+function normalizeSqlResultTemplateForStorage(raw: unknown): unknown {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw
+  const rec = { ...(raw as Record<string, unknown>) }
+  if (typeof rec.templateSql === 'string' && rec.templateSql.trim().length > 0) {
+    const tmpl = rec.templateSql.trim()
+    rec.sql = tmpl
+    if (typeof rec.sqlPreview === 'string') {
+      rec.sqlPreview = tmpl.replace(/\s+/g, ' ').slice(0, 120)
+    }
+  }
+  if (Array.isArray(rec.resultSets)) {
+    rec.resultSets = rec.resultSets.map((rs) => normalizeSqlResultTemplateForStorage(rs))
+  }
+  return rec
+}
+
 function stripSecretsFromViewState(
   viewState: Record<string, unknown>
 ): Record<string, unknown> {
   const out: Record<string, unknown> = { ...viewState }
+  delete out.sshJumpHopSecrets
+  if (Array.isArray(out.sshJumpHosts)) {
+    out.sshJumpHosts = scrubSshJumpHostDraftArray(out.sshJumpHosts)
+  }
   if (typeof out.sqlDraft === 'string' && out.sqlDraft.trim().length > 0) {
     if (hasSensitiveDraftOrFilterSql(out.sqlDraft)) {
       out.sqlDraft = ''
@@ -823,7 +1355,9 @@ function stripSecretsFromViewState(
     }
   }
   if (out.lastSqlResult && typeof out.lastSqlResult === 'object') {
-    out.lastSqlResult = sanitizeSqlResultForStorage(out.lastSqlResult)
+    out.lastSqlResult = sanitizeSqlResultForStorage(
+      normalizeSqlResultTemplateForStorage(out.lastSqlResult)
+    )
   }
   if (out.formDraft && typeof out.formDraft === 'object' && !Array.isArray(out.formDraft)) {
     const draft = { ...(out.formDraft as Record<string, unknown>) }
@@ -833,6 +1367,10 @@ function stripSecretsFromViewState(
     delete draft.sshPassword
     delete draft.sshPassphrase
     delete draft.sslKeyPassphrase
+    delete draft.sshJumpHopSecrets
+    if (Array.isArray(draft.sshJumpHosts)) {
+      draft.sshJumpHosts = scrubSshJumpHostDraftArray(draft.sshJumpHosts)
+    }
     if (typeof draft.name === 'string') {
       draft.name = scrubConnectionNameForStorage(draft.name)
     }
@@ -866,7 +1404,9 @@ function sanitizeUiDataCache(cache: Record<string, unknown>): Record<string, unk
     }
   }
   if (out.lastSqlResult && typeof out.lastSqlResult === 'object') {
-    out.lastSqlResult = sanitizeSqlResultForStorage(out.lastSqlResult)
+    out.lastSqlResult = sanitizeSqlResultForStorage(
+      normalizeSqlResultTemplateForStorage(out.lastSqlResult)
+    )
   }
   return out
 }
@@ -910,6 +1450,7 @@ export async function saveUiSessionSnapshot(
   })
 
   if (nextViewState) {
+    await mergePersistedSelectedSchemas(orca, nextViewState)
     const storageKey =
       surface === 'panel' ? 'datanoa.panelViewState' : 'datanoa.studioViewState'
     try {
@@ -929,6 +1470,73 @@ export async function saveUiSessionSnapshot(
   return { ok: true, updatedAt }
 }
 
+function reconcileViewStateWithPersistedSchemas(
+  baseView: Record<string, unknown> | null,
+  sharedMap: Record<string, PersistedSchemaSelectionEntry>
+): Record<string, unknown> | null {
+  if (Object.keys(sharedMap).length === 0) {
+    return baseView
+  }
+  const nextView: Record<string, unknown> = baseView ? { ...baseView } : {}
+  const rawMap =
+    nextView.selectedSchemaByConn &&
+    typeof nextView.selectedSchemaByConn === 'object' &&
+    !Array.isArray(nextView.selectedSchemaByConn)
+      ? (nextView.selectedSchemaByConn as Record<string, unknown>)
+      : {}
+  const mergedSchemas: Record<string, string> = {}
+  for (const [k, v] of Object.entries(rawMap)) {
+    if (typeof k === 'string' && k.trim() && typeof v === 'string' && v.trim()) {
+      mergedSchemas[k.trim()] = v.trim()
+    }
+  }
+  const hasTsMap =
+    nextView.selectedSchemaUpdatedAtByConn !== undefined &&
+    nextView.selectedSchemaUpdatedAtByConn !== null &&
+    typeof nextView.selectedSchemaUpdatedAtByConn === 'object' &&
+    !Array.isArray(nextView.selectedSchemaUpdatedAtByConn)
+  const rawTsMap = hasTsMap
+    ? (nextView.selectedSchemaUpdatedAtByConn as Record<string, unknown>)
+    : {}
+  const mergedTs: Record<string, number> = {}
+  const viewBaseTs =
+    typeof nextView.updatedAt === 'number' &&
+    Number.isFinite(nextView.updatedAt) &&
+    nextView.updatedAt >= 0
+      ? nextView.updatedAt
+      : 0
+  for (const cid of Object.keys(mergedSchemas)) {
+    const ts = hasTsMap ? rawTsMap[cid] : viewBaseTs
+    mergedTs[cid] = typeof ts === 'number' && Number.isFinite(ts) && ts >= 0 ? ts : 0
+  }
+
+  const activeConn =
+    typeof nextView.activeConnectionId === 'string' ? nextView.activeConnectionId.trim() : ''
+  let maxAppliedTs = viewBaseTs
+  let upgraded = false
+  for (const [cid, entry] of Object.entries(sharedMap)) {
+    const existingTs = cid in mergedSchemas ? (mergedTs[cid] ?? 0) : -1
+    if (!(cid in mergedSchemas) || entry.updatedAt > existingTs) {
+      const prevSchema = mergedSchemas[cid]
+      mergedSchemas[cid] = entry.schema
+      mergedTs[cid] = entry.updatedAt
+      if (entry.updatedAt > maxAppliedTs) maxAppliedTs = entry.updatedAt
+      upgraded = true
+      if (activeConn && cid === activeConn && prevSchema !== entry.schema) {
+        nextView.selectedSchema = entry.schema
+        nextView.activeSchema = entry.schema
+        nextView.activeTable = null
+      }
+    }
+  }
+  nextView.selectedSchemaByConn = mergedSchemas
+  nextView.selectedSchemaUpdatedAtByConn = mergedTs
+  if (upgraded || !('updatedAt' in nextView)) {
+    nextView.updatedAt = maxAppliedTs
+  }
+  return nextView
+}
+
 export async function getUiSessionSnapshot(
   orca: OrcaWorkerApi,
   surface: 'panel' | 'studio'
@@ -938,35 +1546,44 @@ export async function getUiSessionSnapshot(
   updatedAt: number
 }> {
   const mem = inMemoryUiSessionSnapshots.get(surface)
-  if (mem && (mem.viewState || mem.dataCache)) {
-    return mem
-  }
-  const storageKey =
-    surface === 'panel' ? 'datanoa.panelViewState' : 'datanoa.studioViewState'
-  let storedView: Record<string, unknown> | null = null
-  try {
-    const raw = await orca.storage.get(storageKey)
-    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-      storedView = stripSecretsFromViewState(raw as Record<string, unknown>)
+  let baseView: Record<string, unknown> | null = mem?.viewState ?? null
+  if (!mem || (!mem.viewState && !mem.dataCache)) {
+    const storageKey =
+      surface === 'panel' ? 'datanoa.panelViewState' : 'datanoa.studioViewState'
+    try {
+      const raw = await orca.storage.get(storageKey)
+      if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        baseView = stripSecretsFromViewState(raw as Record<string, unknown>)
+      }
+    } catch {
+      // Ignore storage read failure
     }
-  } catch {
-    // Ignore storage read failure
-  }
-  const isLiveDesktopHost = Boolean(orca.host && typeof orca.host.call === 'function')
-  if (!storedView && isLiveDesktopHost) {
-    const backup = await readHostConfigBackup()
-    const fromBackup =
-      surface === 'panel' ? backup?.panelViewState : backup?.studioViewState
-    if (fromBackup && typeof fromBackup === 'object' && !Array.isArray(fromBackup)) {
-      storedView = stripSecretsFromViewState(fromBackup)
+    const isLiveDesktopHost = Boolean(orca.host && typeof orca.host.call === 'function')
+    if (!baseView && isLiveDesktopHost) {
+      const backup = await readHostConfigBackup()
+      const fromBackup =
+        surface === 'panel' ? backup?.panelViewState : backup?.studioViewState
+      if (fromBackup && typeof fromBackup === 'object' && !Array.isArray(fromBackup)) {
+        baseView = stripSecretsFromViewState(fromBackup)
+      }
     }
   }
+
+  const sharedMap = await readPersistedSelectedSchemas(orca)
+  const reconciledView = reconcileViewStateWithPersistedSchemas(baseView, sharedMap)
+  const viewTs =
+    reconciledView &&
+    typeof reconciledView.updatedAt === 'number' &&
+    Number.isFinite(reconciledView.updatedAt) &&
+    reconciledView.updatedAt >= 0
+      ? reconciledView.updatedAt
+      : 0
   const snapshot = {
-    viewState: storedView,
+    viewState: reconciledView,
     dataCache: mem?.dataCache ?? null,
-    updatedAt: mem?.updatedAt || (storedView ? Date.now() : 0),
+    updatedAt: Math.max(mem?.updatedAt ?? 0, viewTs),
   }
-  if (storedView) {
+  if (reconciledView) {
     inMemoryUiSessionSnapshots.set(surface, snapshot)
   }
   return snapshot
@@ -976,12 +1593,68 @@ function getHostBackupFilePath(): string {
   return path.join(os.homedir(), '.datanoa', 'workspace-backup.json')
 }
 
+const MAX_HOST_BACKUP_BYTES = 2 * 1024 * 1024 // 2 MiB
+
 export async function readHostConfigBackup(): Promise<HostConfigBackupPayload | null> {
   try {
-    const raw = await fs.promises.readFile(getHostBackupFilePath(), 'utf8')
+    const filePath = getHostBackupFilePath()
+    const stat = await fs.promises.lstat(filePath)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_HOST_BACKUP_BYTES) {
+      return null
+    }
+    const raw = await fs.promises.readFile(filePath, 'utf8')
+    if (Buffer.byteLength(raw, 'utf8') > MAX_HOST_BACKUP_BYTES) {
+      return null
+    }
     const parsed = JSON.parse(raw) as unknown
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
-    return parsed as HostConfigBackupPayload
+    const payload: HostConfigBackupPayload = { ...(parsed as HostConfigBackupPayload) }
+    if ('folderOrder' in payload) {
+      if (Array.isArray(payload.folderOrder)) {
+        payload.folderOrder = normalizeFolderOrder(payload.folderOrder)
+      } else {
+        delete payload.folderOrder
+      }
+    }
+    if ('tableDisplayState' in payload) {
+      if (
+        !payload.tableDisplayState ||
+        typeof payload.tableDisplayState !== 'object' ||
+        Array.isArray(payload.tableDisplayState)
+      ) {
+        delete payload.tableDisplayState
+      }
+    }
+    if ('erLayoutState' in payload) {
+      if (
+        !payload.erLayoutState ||
+        typeof payload.erLayoutState !== 'object' ||
+        Array.isArray(payload.erLayoutState)
+      ) {
+        delete payload.erLayoutState
+      }
+    }
+    if ('selectedSchemaByConn' in payload) {
+      if (
+        payload.selectedSchemaByConn &&
+        typeof payload.selectedSchemaByConn === 'object' &&
+        !Array.isArray(payload.selectedSchemaByConn)
+      ) {
+        payload.selectedSchemaByConn = sanitizePersistedSchemaSelections(payload.selectedSchemaByConn)
+      } else {
+        delete payload.selectedSchemaByConn
+      }
+    }
+    if ('consumedNavTokens' in payload) {
+      if (Array.isArray(payload.consumedNavTokens)) {
+        payload.consumedNavTokens = payload.consumedNavTokens
+          .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
+          .slice(-MAX_CONSUMED_NAV_TOKENS)
+      } else {
+        delete payload.consumedNavTokens
+      }
+    }
+    return payload
   } catch {
     return null
   }
@@ -1001,21 +1674,66 @@ export function writeHostConfigBackupPatch(
     try {
       const filePath = getHostBackupFilePath()
       const dir = path.dirname(filePath)
-      await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 })
+      let dirExists = false
+      try {
+        const dirStat = await fs.promises.lstat(dir)
+        if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+          return
+        }
+        dirExists = true
+      } catch (err: unknown) {
+        const code =
+          err && typeof err === 'object' && 'code' in err ? String((err as { code?: unknown }).code) : ''
+        if (code !== 'ENOENT') return
+      }
+      if (!dirExists) {
+        await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 })
+        const dirStatAfter = await fs.promises.lstat(dir)
+        if (dirStatAfter.isSymbolicLink() || !dirStatAfter.isDirectory()) {
+          return
+        }
+      }
+      try {
+        const targetStat = await fs.promises.lstat(filePath)
+        if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
+          return
+        }
+      } catch (err: unknown) {
+        const code =
+          err && typeof err === 'object' && 'code' in err ? String((err as { code?: unknown }).code) : ''
+        if (code !== 'ENOENT') return
+      }
       const existing = (await readHostConfigBackup()) ?? {}
+      const sanitizedPatch: Partial<HostConfigBackupPayload> =
+        patch.folderOrder !== undefined
+          ? { ...patch, folderOrder: normalizeFolderOrder(patch.folderOrder) }
+          : patch
       const merged: HostConfigBackupPayload = sanitizeJsonPayload({
         ...existing,
-        ...patch,
+        ...sanitizedPatch,
         updatedAt: Date.now(),
       })
       const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${++hostBackupTmpSeq}`
       await fs.promises.writeFile(tmpPath, JSON.stringify(merged, null, 2), {
         encoding: 'utf8',
         mode: 0o600,
+        flag: 'wx',
       })
       let renamed = false
       for (let attempt = 0; attempt < 4; attempt++) {
         try {
+          try {
+            const latestTargetStat = await fs.promises.lstat(filePath)
+            if (latestTargetStat.isSymbolicLink() || !latestTargetStat.isFile()) {
+              break
+            }
+          } catch (err: unknown) {
+            const code =
+              err && typeof err === 'object' && 'code' in err
+                ? String((err as { code?: unknown }).code)
+                : ''
+            if (code !== 'ENOENT') break
+          }
           await fs.promises.rename(tmpPath, filePath)
           renamed = true
           break
@@ -1715,7 +2433,7 @@ function resolvePrimaryKeyExemptions(rec: Record<string, unknown>): {
   return { exemptNames: names, exemptIndices: indices }
 }
 
-function measureJsonBytes(value: unknown): number {
+export function measureJsonBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), 'utf8')
 }
 
@@ -1767,11 +2485,366 @@ function clampViewStateToFit(rec: Record<string, unknown>, maxBytes: number): vo
   }
 }
 
+export function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+const V2_TABLE_KEY_COMPONENT_RE = /[:%|]|^\s|\s$/
+
+export function buildInjectiveTableDisplayKey(
+  connectionId: string,
+  schema: string | undefined,
+  table: string
+): string {
+  const rawConn = connectionId == null ? '' : String(connectionId)
+  const conn = rawConn.trim().length > 0 ? rawConn : 'none'
+  const sch = schema == null ? '' : String(schema)
+  const tbl = table == null ? '' : String(table)
+  if (
+    conn === 'v2' ||
+    V2_TABLE_KEY_COMPONENT_RE.test(conn) ||
+    V2_TABLE_KEY_COMPONENT_RE.test(sch) ||
+    V2_TABLE_KEY_COMPONENT_RE.test(tbl)
+  ) {
+    return `v2:${encodeURIComponent(conn)}:${encodeURIComponent(sch)}:${encodeURIComponent(tbl)}`
+  }
+  return `${conn}:${sch}:${tbl}`
+}
+
+function safeDecodeUriComponent(part: string): string {
+  try {
+    return decodeURIComponent(part)
+  } catch {
+    return part
+  }
+}
+
+export function normalizeMigratedTableDisplayKey(rawKey: string): string {
+  const raw = rawKey == null ? '' : String(rawKey)
+  if (!raw) return raw
+  if (raw.startsWith('v2:')) {
+    const parts = raw.slice(3).split(':')
+    if (parts.length === 3) {
+      return buildInjectiveTableDisplayKey(
+        safeDecodeUriComponent(parts[0]),
+        safeDecodeUriComponent(parts[1]),
+        safeDecodeUriComponent(parts[2])
+      )
+    }
+  }
+  const firstColon = raw.indexOf(':')
+  if (firstColon < 0) return raw
+  const secondColon = raw.indexOf(':', firstColon + 1)
+  if (secondColon < 0) return raw
+  return buildInjectiveTableDisplayKey(
+    raw.slice(0, firstColon),
+    raw.slice(firstColon + 1, secondColon),
+    raw.slice(secondColon + 1)
+  )
+}
+
+export function belongsToConnectionKey(key: string, connectionId: string): boolean {
+  if (!key || !connectionId) return false
+  if (key.startsWith('v2:')) {
+    const secondColon = key.indexOf(':', 3)
+    if (secondColon <= 3) return false
+    const rawConn = key.slice(3, secondColon)
+    if (rawConn === encodeURIComponent(connectionId)) return true
+    try {
+      return decodeURIComponent(rawConn) === connectionId
+    } catch {
+      // Ignore malformed percent-encoding
+      return false
+    }
+  }
+  return key === connectionId || key.startsWith(`${connectionId}:`)
+}
+
+const DEFAULT_LATEST_WINS_DEBOUNCE_MS = 120
+
+/**
+ * Coalescing async persistence writer ensuring only the latest snapshot wins and
+ * burst resize/reorder writes settle cleanly before shutdown (`flush()`).
+ */
+export class LatestWinsWriter {
+  private readonly debounceMs: number
+  private readonly persistFn: () => Promise<void>
+  private readonly canPersist?: () => boolean
+  private timer: ReturnType<typeof setTimeout> | null = null
+  private dirty = false
+  private inFlight: Promise<void> | null = null
+  private disposed = false
+
+  constructor(
+    persistFn: () => Promise<void>,
+    debounceMs = DEFAULT_LATEST_WINS_DEBOUNCE_MS,
+    canPersist?: () => boolean
+  ) {
+    this.persistFn = persistFn
+    this.debounceMs = Math.max(0, debounceMs)
+    this.canPersist = canPersist
+  }
+
+  schedule(): void {
+    if (this.disposed) return
+    this.dirty = true
+    if (this.timer !== null) {
+      clearTimeout(this.timer)
+    }
+    this.timer = setTimeout(() => {
+      this.timer = null
+      void this.drain()
+    }, this.debounceMs)
+    if (typeof this.timer.unref === 'function') {
+      this.timer.unref()
+    }
+  }
+
+  pauseTimer(): void {
+    if (this.timer !== null) {
+      clearTimeout(this.timer)
+      this.timer = null
+    }
+  }
+
+  private async drain(): Promise<void> {
+    if (this.inFlight) {
+      await this.inFlight
+      if (this.dirty && !this.disposed && (!this.canPersist || this.canPersist())) {
+        return await this.drain()
+      }
+      return
+    }
+    while (this.dirty && !this.disposed) {
+      if (this.canPersist && !this.canPersist()) {
+        break
+      }
+      this.dirty = false
+      const run = this.persistFn().catch(() => {})
+      this.inFlight = run
+      try {
+        await run
+      } finally {
+        this.inFlight = null
+      }
+    }
+  }
+
+  async flush(): Promise<void> {
+    this.pauseTimer()
+    await this.drain()
+  }
+
+  dispose(): void {
+    this.disposed = true
+    this.dirty = false
+    this.pauseTimer()
+  }
+}
+
+function pruneExplainNodeToDepth(
+  node: unknown,
+  maxDepth: number,
+  maxChildren: number,
+  stripDetails: boolean,
+  depth = 0
+): Record<string, unknown> | null {
+  if (!isPlainRecord(node)) return null
+  const out: Record<string, unknown> = { ...node }
+  if (stripDetails) {
+    delete out.details
+  }
+  const rawChildren = Array.isArray(out.children) ? out.children : []
+  if (depth >= maxDepth) {
+    out.children = []
+    return out
+  }
+  // Prioritize nodes carrying critical/high severity or warnings before truncation
+  const prioritized = rawChildren
+    .filter(isPlainRecord)
+    .sort((a, b) => {
+      const aHot =
+        a.severity === 'critical' ||
+        a.severity === 'high' ||
+        (Array.isArray(a.warnings) && a.warnings.length > 0)
+      const bHot =
+        b.severity === 'critical' ||
+        b.severity === 'high' ||
+        (Array.isArray(b.warnings) && b.warnings.length > 0)
+      return aHot === bHot ? 0 : aHot ? -1 : 1
+    })
+    .slice(0, maxChildren)
+    .map((child) => pruneExplainNodeToDepth(child, maxDepth, maxChildren, stripDetails, depth + 1))
+    .filter((child): child is Record<string, unknown> => child !== null)
+  out.children = prioritized
+  return out
+}
+
+function compactExplainPlanInRecord(
+  container: Record<string, unknown>,
+  maxBytes: number
+): boolean {
+  if (!isPlainRecord(container.explainPlan)) return false
+  let plan: Record<string, unknown> = { ...container.explainPlan }
+  if (typeof plan.rawText === 'string' && plan.rawText.length > 4096) {
+    plan.rawText = `${sliceUtf16Safe(plan.rawText, 4096)}\n-- [Truncated]`
+    plan.truncated = true
+  }
+  container.explainPlan = plan
+  if (measureJsonBytes(container) <= maxBytes) return true
+
+  delete plan.rawText
+  plan.truncated = true
+  container.explainPlan = plan
+  if (measureJsonBytes(container) <= maxBytes) return true
+
+  const steps: Array<{ maxDepth: number; maxChildren: number; stripDetails: boolean }> = [
+    { maxDepth: 12, maxChildren: 16, stripDetails: true },
+    { maxDepth: 6, maxChildren: 8, stripDetails: true },
+    { maxDepth: 3, maxChildren: 4, stripDetails: true },
+    { maxDepth: 1, maxChildren: 2, stripDetails: true },
+  ]
+  for (const step of steps) {
+    if (plan.root) {
+      plan = {
+        ...plan,
+        root: pruneExplainNodeToDepth(
+          plan.root,
+          step.maxDepth,
+          step.maxChildren,
+          step.stripDetails
+        ),
+        truncated: true,
+      }
+      container.explainPlan = plan
+      if (measureJsonBytes(container) <= maxBytes) return true
+    }
+  }
+
+  plan = { ...plan, root: null, missingIndexes: undefined, truncated: true }
+  container.explainPlan = plan
+  return measureJsonBytes(container) <= maxBytes
+}
+
+function compactSchemaErGraphToFit(rec: Record<string, unknown>, maxBytes: number): boolean {
+  if (!Array.isArray(rec.nodes) || !Array.isArray(rec.edges)) return false
+  const origNodes = rec.nodes.filter(isPlainRecord)
+  const origEdges = rec.edges.filter(isPlainRecord)
+  if (typeof rec.totalTableCount !== 'number') {
+    rec.totalTableCount = origNodes.length
+  }
+
+  // Pass 1: drop uniqueColumnSets and trim non-PK/non-FK columns from nodes
+  rec.nodes = origNodes.map((node) => {
+    const cols = Array.isArray(node.columns) ? node.columns.filter(isPlainRecord) : []
+    const keyCols = cols.filter((c) => Boolean(c.isPrimaryKey) || Boolean(c.isForeignKey))
+    const keptCols = (keyCols.length > 0 ? keyCols : cols.slice(0, 8)).slice(0, 16)
+    const nextNode: Record<string, unknown> = {
+      ...node,
+      columns: keptCols,
+    }
+    delete nextNode.uniqueColumnSets
+    return nextNode
+  })
+  rec.truncated = true
+  if (measureJsonBytes(rec) <= maxBytes) return true
+
+  // Pass 2: trim nodes proportionally and drop edges whose endpoints were pruned
+  let keptNodes = rec.nodes as Record<string, unknown>[]
+  while (keptNodes.length > 0 && measureJsonBytes(rec) > maxBytes) {
+    const curBytes = measureJsonBytes(rec)
+    const ratio = maxBytes / curBytes
+    const nextLen = Math.max(
+      0,
+      Math.min(keptNodes.length - 1, Math.floor(keptNodes.length * ratio * 0.85))
+    )
+    keptNodes = keptNodes.slice(0, nextLen)
+    const keptIds = new Set(
+      keptNodes.map((n) => (typeof n.id === 'string' ? n.id : '')).filter(Boolean)
+    )
+    rec.nodes = keptNodes
+    rec.edges = origEdges.filter(
+      (e) =>
+        typeof e.fromNodeId === 'string' &&
+        typeof e.toNodeId === 'string' &&
+        keptIds.has(e.fromNodeId) &&
+        keptIds.has(e.toNodeId)
+    )
+    rec.truncated = true
+  }
+  return measureJsonBytes(rec) <= maxBytes
+}
+
 /**
  * Guarantees every worker RPC response stays safely below Orca's hard 1 MiB (1,048,576-byte)
  * IPC response limit so wide tables (e.g. chrome_profile with large JSON/cookie columns),
- * large DDL exports, top-level arrays, or session snapshots never fail with "<method> answered with more than 1 MiB".
+ * large DDL exports, top-level arrays, ER graphs, EXPLAIN plans, or session snapshots never fail
+ * with "<method> answered with more than 1 MiB".
  */
+function compactValueGeneric(val: unknown, maxStrChars: number, maxArrItems: number): unknown {
+  if (typeof val === 'string') {
+    return val.length > maxStrChars ? `${sliceUtf16Safe(val, maxStrChars)}...` : val
+  }
+  if (Array.isArray(val)) {
+    return val.slice(0, maxArrItems).map((item) => compactValueGeneric(item, maxStrChars, maxArrItems))
+  }
+  if (isPlainRecord(val)) {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(val)) {
+      out[k] = compactValueGeneric(v, maxStrChars, maxArrItems)
+    }
+    return out
+  }
+  return val
+}
+
+function finalizeRecordWithinIpcLimit<T>(rec: Record<string, unknown>, maxBytes: number): T {
+  if (measureJsonBytes(rec) <= maxBytes) {
+    return rec as T
+  }
+  const tiers: Array<[number, number]> = [
+    [4096, 64],
+    [1024, 16],
+    [256, 4],
+    [64, 0],
+  ]
+  let current: Record<string, unknown> = { ...rec }
+  for (const [maxStr, maxArr] of tiers) {
+    current = compactValueGeneric(current, maxStr, maxArr) as Record<string, unknown>
+    current.truncated = true
+    if (measureJsonBytes(current) <= maxBytes) {
+      return current as T
+    }
+  }
+  // Drop largest keys iteratively until under maxBytes
+  const keysBySize = Object.keys(current).sort(
+    (a, b) => measureJsonBytes(current[b]) - measureJsonBytes(current[a])
+  )
+  for (const key of keysBySize) {
+    if (key === 'truncated') continue
+    delete current[key]
+    if (measureJsonBytes(current) <= maxBytes) {
+      return current as T
+    }
+  }
+  const envelope = {
+    ok: false,
+    truncated: true,
+    error: {
+      code: 'IPC_PAYLOAD_TOO_LARGE',
+      message: 'Response exceeded maximum IPC payload limit.',
+    },
+  }
+  if (measureJsonBytes(envelope) <= maxBytes) {
+    return envelope as unknown as T
+  }
+  const minimal = { truncated: true }
+  if (measureJsonBytes(minimal) <= maxBytes) {
+    return minimal as unknown as T
+  }
+  return {} as T
+}
+
 export function fitResponseWithinOrcaIpcLimit<T>(
   payload: T,
   maxBytes = MAX_ORCA_IPC_RESPONSE_BYTES
@@ -1784,6 +2857,16 @@ export function fitResponseWithinOrcaIpcLimit<T>(
   }
   if (!serialized || Buffer.byteLength(serialized, 'utf8') <= maxBytes) {
     return payload
+  }
+  if (typeof payload === 'string') {
+    const budget = Math.max(0, maxBytes - 16)
+    let end = Math.min(payload.length, budget)
+    let sliced = sliceUtf16Safe(payload, end)
+    while (sliced.length > 0 && measureJsonBytes(sliced) > maxBytes) {
+      end = Math.floor(end * 0.8)
+      sliced = sliceUtf16Safe(payload, end)
+    }
+    return sliced as unknown as T
   }
   if (!payload || typeof payload !== 'object') {
     return payload
@@ -1859,7 +2942,49 @@ export function fitResponseWithinOrcaIpcLimit<T>(
       entries = entries.slice(0, nextLen)
       rec.entries = entries
     }
-    return rec as T
+    if (measureJsonBytes(rec) <= maxBytes) {
+      return rec as T
+    }
+  }
+
+  // 2.6. Catalog wrapper `{ data: [...] }` (schema.listObjectsCatalog)
+  if (Array.isArray(rec.data)) {
+    const pass1 = compactRowsStrings(rec.data as unknown[], 1024)
+    rec.data = pass1.rows
+    if (pass1.anyChanged) rec.truncated = true
+    if (measureJsonBytes(rec) <= maxBytes) {
+      return rec as T
+    }
+    const pass2 = compactRowsStrings(rec.data as unknown[], 512)
+    let items = pass2.rows
+    rec.data = items
+    if (pass2.anyChanged) rec.truncated = true
+    for (;;) {
+      const curBytes = measureJsonBytes(rec)
+      if (items.length === 0 || curBytes <= maxBytes) break
+      const ratio = maxBytes / curBytes
+      const nextLen = Math.max(0, Math.min(items.length - 1, Math.floor(items.length * ratio * 0.88)))
+      items = items.slice(0, nextLen)
+      rec.data = items
+      rec.truncated = true
+    }
+    if (measureJsonBytes(rec) <= maxBytes) {
+      return rec as T
+    }
+  }
+
+  // 2.7. Schema ER graph (schema.erGraph)
+  if (Array.isArray(rec.nodes) && Array.isArray(rec.edges)) {
+    if (compactSchemaErGraphToFit(rec, maxBytes)) {
+      return rec as T
+    }
+  }
+
+  // 2.8. Compact standalone explainPlan when response has no tabular rows/resultSets
+  if (!Array.isArray(rec.rows) && !Array.isArray(rec.resultSets) && isPlainRecord(rec.explainPlan)) {
+    if (compactExplainPlanInRecord(rec, maxBytes)) {
+      return rec as T
+    }
   }
 
   // 3. Tabular rows & multi-resultSets response (data.fetchPage / query.run)
@@ -1968,8 +3093,21 @@ export function fitResponseWithinOrcaIpcLimit<T>(
         }
       }
     }
-    return rec as T
+    if (measureJsonBytes(rec) > maxBytes && Array.isArray(rec.resultSets)) {
+      rec.resultSets = (rec.resultSets as Array<Record<string, unknown>>).map((rs) => {
+        if (!isPlainRecord(rs) || !isPlainRecord(rs.explainPlan)) return rs
+        const copy = { ...rs }
+        compactExplainPlanInRecord(copy, maxBytes)
+        return copy
+      })
+    }
+    if (measureJsonBytes(rec) > maxBytes && isPlainRecord(rec.explainPlan)) {
+      compactExplainPlanInRecord(rec, maxBytes)
+    }
+    if (measureJsonBytes(rec) <= maxBytes) {
+      return rec as T
+    }
   }
 
-  return rec as T
+  return finalizeRecordWithinIpcLimit<T>(rec, maxBytes)
 }

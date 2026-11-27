@@ -28,6 +28,7 @@ import {
 } from '../common/driver'
 import type { DriverTlsOptions } from '../common/tls-and-tunnel'
 import { buildDefaultTlsOptions, resolveEffectiveTlsOptions } from '../common/tls-and-tunnel'
+import { networkDialer } from '../common/network-dialer'
 import { scrubDriverErrorText } from '../common/sql-credentials'
 import { assembleTableBrowseResult } from '../common/update-builder'
 import { tokenizeRedisCommandLine } from '../../shared-sql-safety.js'
@@ -364,10 +365,34 @@ export class RespSocketClient {
     tlsOptions?: tls.ConnectionOptions
   }): Promise<RespSocketClient> {
     const timeoutMs = options.timeoutMs ?? 10000
-    const socket = await new Promise<net.Socket>((resolve, reject) => {
-      const tlsOpts: tls.ConnectionOptions = {
+    let tcpSock: net.Socket
+    try {
+      tcpSock = await networkDialer.dialTcp({
         host: options.host,
         port: options.port,
+        timeoutMs,
+      })
+    } catch (err: unknown) {
+      throw new DatabaseDriverError(
+        formatRedisErrorMessage(err, 'Redis connection failed'),
+        'SOCKET_ERROR',
+        'redis',
+        scrubRedisError(err)
+      )
+    }
+
+    if (!options.ssl) {
+      tcpSock.setNoDelay(true)
+      return new RespSocketClient(tcpSock)
+    }
+
+    const tlsSocket = await new Promise<net.Socket>((resolve, reject) => {
+      tcpSock.on('error', () => {
+        // Prevent unhandled error if TLS wrapper destroys the underlying TCP socket
+      })
+      const tlsOpts: tls.ConnectionOptions = {
+        socket: tcpSock,
+        host: options.host,
         rejectUnauthorized: true,
       }
       if (!net.isIP(options.host)) {
@@ -375,23 +400,56 @@ export class RespSocketClient {
       }
       // Custom CA / client certs (mTLS) and SNI of the real remote host override the defaults
       Object.assign(tlsOpts, options.tlsOptions)
+      tlsOpts.socket = tcpSock
 
-      const sock: net.Socket = options.ssl
-        ? tls.connect(tlsOpts)
-        : net.connect({ host: options.host, port: options.port })
-
+      let settled = false
+      let tlsSock: tls.TLSSocket | undefined
       const timer = setTimeout(() => {
-        sock.destroy(new Error(`Redis connection timed out after ${timeoutMs}ms`))
+        if (settled) return
+        settled = true
+        const err = new Error(`Redis TLS handshake timed out after ${timeoutMs}ms`)
+        if (tlsSock && !tlsSock.destroyed) tlsSock.destroy()
+        if (!tcpSock.destroyed) tcpSock.destroy()
+        reject(
+          new DatabaseDriverError(
+            formatRedisErrorMessage(err, 'Redis connection failed'),
+            'SOCKET_ERROR',
+            'redis',
+            scrubRedisError(err)
+          )
+        )
       }, timeoutMs)
 
-      const connectEvent = options.ssl ? 'secureConnect' : 'connect'
-      sock.once(connectEvent, () => {
+      try {
+        tlsSock = tls.connect(tlsOpts)
+      } catch (err: unknown) {
         clearTimeout(timer)
-        sock.setNoDelay(true)
-        resolve(sock)
+        if (!tcpSock.destroyed) tcpSock.destroy()
+        reject(
+          new DatabaseDriverError(
+            formatRedisErrorMessage(err, 'Redis connection failed'),
+            'SOCKET_ERROR',
+            'redis',
+            scrubRedisError(err)
+          )
+        )
+        return
+      }
+
+      const activeTlsSock = tlsSock
+      activeTlsSock.once('secureConnect', () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        activeTlsSock.setNoDelay(true)
+        resolve(activeTlsSock)
       })
-      sock.once('error', (err) => {
+      activeTlsSock.once('error', (err) => {
+        if (settled) return
+        settled = true
         clearTimeout(timer)
+        if (!activeTlsSock.destroyed) activeTlsSock.destroy()
+        if (!tcpSock.destroyed) tcpSock.destroy()
         reject(
           new DatabaseDriverError(
             formatRedisErrorMessage(err, 'Redis connection failed'),
@@ -401,9 +459,21 @@ export class RespSocketClient {
           )
         )
       })
+      activeTlsSock.once('close', () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        reject(
+          new DatabaseDriverError(
+            'Redis TLS socket closed during handshake',
+            'SOCKET_ERROR',
+            'redis'
+          )
+        )
+      })
     })
 
-    return new RespSocketClient(socket)
+    return new RespSocketClient(tlsSocket)
   }
 
   isAlive(): boolean {

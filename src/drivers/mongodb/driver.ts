@@ -2274,6 +2274,10 @@ export class MongoSession implements IDatabaseSession {
     return !this.isClosed
   }
 
+  clearSchemaCache(): void {
+    this.tableDetailsCache.clear()
+  }
+
   async test(): Promise<{ ok: boolean; message?: string }> {
     if (this.isClosed) {
       return { ok: false, message: 'Session is closed' }

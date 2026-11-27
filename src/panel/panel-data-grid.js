@@ -4,6 +4,23 @@
 
 import { formatJsonPreservingNumbers } from '../shared-grid-paste.js'
 import {
+  RowHeightIndex,
+  clampWrapMaxLines,
+  countNormalizedLines,
+  isWrappableCellValue,
+  DEFAULT_WRAP_MAX_LINES,
+} from '../shared-row-height-index.js'
+import {
+  HIGHLIGHT_CSS_CLASSES,
+  areHighlightRulesEqual,
+  buildColumnKeyResolver,
+  parseOccurrenceColumnKey,
+  computePinnedColumnsViewportCap,
+  computeScrollLeftForFocusedCell,
+  createHighlightEvaluator,
+  resolveCellDisplayHighlight,
+} from '../shared-table-display.js'
+import {
   formatExportData,
   formatSelectionAsOutput,
   parseDelimitedClipboard,
@@ -22,6 +39,8 @@ import {
   syncSelectTooltip,
   syncVirtualTableWindow,
 } from './panel-utils.js'
+
+const ALL_HIGHLIGHT_CLASSES = Object.values(HIGHLIGHT_CSS_CLASSES)
 
 export function shouldDisableEditStructureButton({ busy, isView, activeTable, driver }) {
   return Boolean(
@@ -44,6 +63,10 @@ export function createPanelDataGridController(ctx) {
     getPinnedColsSet,
     getHiddenColsSet,
     getActiveForeignKeyMap,
+    getActiveTableDisplayEntry,
+    patchTableDisplayState,
+    getColKeyResolver,
+    reorderColumnByDrop,
     getLastPanelCopiedText,
     setLastPanelCopiedText,
     getSuppressSortClickUntil,
@@ -58,6 +81,39 @@ export function createPanelDataGridController(ctx) {
     renderDataColsPopoverList,
   } = ctx
 
+  const dataRowHeightIndex = new RowHeightIndex({
+    baseRowHeightPx: VIRT_ROW_HEIGHT_PX,
+    lineHeightPx: 16,
+    maxLines: DEFAULT_WRAP_MAX_LINES,
+    wrapEnabled: false,
+  })
+  const highlightEvaluator = createHighlightEvaluator(4096)
+
+  let localColResolverCols = null
+  let localColResolverLen = -1
+  let localColResolver = null
+  function resolvePanelGridKeyResolver(columnsOrHeaders = state.pageData?.columns) {
+    if (typeof getColKeyResolver === 'function') {
+      return getColKeyResolver(columnsOrHeaders)
+    }
+    if (!Array.isArray(columnsOrHeaders) || columnsOrHeaders.length === 0) return null
+    if (
+      localColResolver &&
+      localColResolverCols === columnsOrHeaders &&
+      localColResolverLen === columnsOrHeaders.length
+    ) {
+      return localColResolver
+    }
+    const headers =
+      typeof columnsOrHeaders[0] === 'string'
+        ? columnsOrHeaders
+        : columnsOrHeaders.map((c) => c.name)
+    localColResolver = buildColumnKeyResolver(headers)
+    localColResolverCols = columnsOrHeaders
+    localColResolverLen = columnsOrHeaders.length
+    return localColResolver
+  }
+
   let displayRowsCache = {
     pageData: null,
     stagedInsertsLen: -1,
@@ -66,18 +122,89 @@ export function createPanelDataGridController(ctx) {
     rows: [],
   }
 
+  const rowHighlightRevisionByKey = new Map()
+  let highlightRevisionEpoch = 0
+
+  function getRowHighlightRevision(rowKey) {
+    return `${highlightRevisionEpoch}:${rowHighlightRevisionByKey.get(rowKey) || 0}`
+  }
+
+  function bumpRowHighlightRevision(rowKey) {
+    if (!rowKey) return
+    rowHighlightRevisionByKey.set(rowKey, (rowHighlightRevisionByKey.get(rowKey) || 0) + 1)
+  }
+
+  function bumpAllHighlightRevisions() {
+    highlightRevisionEpoch += 1
+    rowHighlightRevisionByKey.clear()
+  }
+
+  function buildEffectiveHighlightRow(entry, staged, allColNames) {
+    if (!staged || !staged.changes) return entry.data
+    if (!Array.isArray(entry.data)) {
+      return { ...entry.data, ...staged.changes }
+    }
+    const nextArr = entry.data.slice()
+    for (let i = 0; i < allColNames.length; i++) {
+      const colName = allColNames[i]
+      if (Object.prototype.hasOwnProperty.call(staged.changes, colName)) {
+        nextArr[i] = staged.changes[colName]
+      }
+    }
+    return nextArr
+  }
+
+  function evaluateDataRowHighlight(entry) {
+    if (!dataVirt.highlightRules || dataVirt.highlightRules.length === 0) return null
+    const staged = state.stagedUpdates.get(entry.rowKey)
+    const evalRow = buildEffectiveHighlightRow(entry, staged, dataVirt.allColNames)
+    return highlightEvaluator.evaluateRow({
+      row: evalRow,
+      columns: dataVirt.allColNames,
+      rules: dataVirt.highlightRules,
+      rowKey: entry.rowKey,
+      rowRevision: getRowHighlightRevision(entry.rowKey),
+    })
+  }
+
   const dataVirt = {
     active: false,
+    transposed: false,
     allRows: [],
+    cappedRows: [],
+    hasOverflowCol: false,
+    rowColWidths: [],
+    fieldWidth: 180,
+    hStart: 0,
+    hEnd: 0,
     visCols: [],
+    visColKeys: [],
+    visColWidths: [],
+    pinnedCandidateKeys: [],
     pinnedCount: 0,
     stickyLefts: [],
+    totalPinnedWidthPx: 56,
+    wrapCells: false,
+    wrapMaxLines: DEFAULT_WRAP_MAX_LINES,
+    highlightRules: [],
+    allColNames: [],
     fkMap: new Map(),
     pageOffset: 0,
     stagedInsertCount: 0,
     isConnRo: false,
     canEditTable: false,
     tbody: null,
+    colgroupEl: null,
+    theadEl: null,
+    headerRowEl: null,
+    rowNumColEl: null,
+    rowNumThEl: null,
+    headerPageDataRef: null,
+    lastRenderedPageDataRef: null,
+    lastRenderedStagedCount: -1,
+    colPoolByKey: new Map(),
+    thPoolByKey: new Map(),
+    syncTableWidthFn: null,
     topSpacerTr: null,
     topSpacerTd: null,
     bottomSpacerTr: null,
@@ -87,13 +214,49 @@ export function createPanelDataGridController(ctx) {
     rafId: null,
   }
 
-  function computeVirtualRange(scrollTop, viewportH, totalRows) {
+  function computeTransposedPanelColRange(scrollLeft, clientWidth, fieldWidth, rowColWidths) {
+    const totalDataCols = Array.isArray(rowColWidths) ? rowColWidths.length : 0
+    if (totalDataCols <= 16 || !clientWidth || clientWidth <= 0) {
+      return { hStart: 0, hEnd: totalDataCols }
+    }
+    const left = Math.max(0, Number(scrollLeft) || 0)
+    const visibleViewportW = Math.max(120, clientWidth - (Number(fieldWidth) || 180))
+    const viewRight = left + visibleViewportW
+    let x = 0
+    let visStart = totalDataCols - 1
+    let visEnd = 0
+    let foundStart = false
+    for (let i = 0; i < totalDataCols; i++) {
+      const colW = Number(rowColWidths[i]) || 180
+      const nextX = x + colW
+      if (!foundStart && nextX > left) {
+        visStart = i
+        foundStart = true
+      }
+      if (x < viewRight) {
+        visEnd = i + 1
+      } else if (foundStart) {
+        break
+      }
+      x = nextX
+    }
+    if (!foundStart) {
+      visStart = Math.max(0, totalDataCols - 1)
+      visEnd = totalDataCols
+    }
+    return {
+      hStart: Math.max(0, visStart - 2),
+      hEnd: Math.min(totalDataCols, Math.max(visStart + 1, visEnd) + 3),
+    }
+  }
+
+  function computeVirtualRange(scrollTop, viewportH, totalRows, overscan = VIRT_OVERSCAN_ROWS) {
     return coreComputeVirtualRange(
       scrollTop,
       viewportH,
       totalRows,
       VIRT_ROW_HEIGHT_PX,
-      VIRT_OVERSCAN_ROWS
+      overscan
     )
   }
 
@@ -178,7 +341,7 @@ export function createPanelDataGridController(ctx) {
   function getSelectedDataRowKeys() {
     const allRows = getAllDisplayRows()
     const dataGridSel = getDataGridSel()
-    if (!state.transposed && dataGridSel && dataGridSel.hasSelection()) {
+    if (dataGridSel && dataGridSel.hasSelection()) {
       const indices = dataGridSel.getSelectedRowIndices()
       const keys = indices.map((i) => allRows[i]?.rowKey).filter(Boolean)
       if (keys.length > 0) return keys
@@ -190,7 +353,7 @@ export function createPanelDataGridController(ctx) {
     const strip = $('dataSelectionStats')
     if (!strip) return
     const dataGridSel = getDataGridSel()
-    if (!dataGridSel || !dataGridSel.hasSelection() || state.dataLoading || state.transposed) {
+    if (!dataGridSel || !dataGridSel.hasSelection() || state.dataLoading) {
       strip.hidden = true
       strip.textContent = ''
       return
@@ -243,6 +406,20 @@ export function createPanelDataGridController(ctx) {
         : conn?.driver === 'mongodb'
           ? 'MongoDB collections are schemaless — inspect inferred fields in Structure tab'
           : 'Edit Table Structure (ALTER TABLE)'
+    }
+
+    const importBtn = $('importDataBtn')
+    if (importBtn) {
+      const noActiveTable = !state.activeTable || !state.activeConnectionId
+      const isRedis = conn?.driver === 'redis'
+      importBtn.disabled = busy || isConnRo || isView || isRedis || noActiveTable
+      importBtn.title = isConnRo
+        ? 'Cannot import data on a Read-Only connection'
+        : isView
+          ? 'Cannot import rows into a view — select a table'
+          : isRedis
+            ? 'Import is not supported on Redis connections'
+            : 'Import CSV/JSON/TSV into this table in Full Studio'
     }
 
     $('addRowBtn').disabled = busy || isConnRo || isView || !pd
@@ -354,6 +531,29 @@ export function createPanelDataGridController(ctx) {
     const val = getEffectiveCellValue(entry.rowKey, entry.data, colName)
     const fkInfo = (dataVirt.active ? dataVirt.fkMap : getActiveForeignKeyMap()).get(colName) || null
     renderDataCellContent(td, entry, col, val, fkInfo)
+    if (!state.transposed && dataVirt.highlightRules && dataVirt.highlightRules.length > 0) {
+      const rowHl = evaluateDataRowHighlight(entry)
+      const tr = td.closest ? td.closest('tr') : td.parentElement
+      if (tr) {
+        const cells = tr.children
+        for (let i = 0; i < cells.length; i++) {
+          const cell = cells[i]
+          if (!(cell instanceof HTMLElement) || cell.dataset.colName === undefined) continue
+          const cellColName = cell.dataset.colName
+          const cellColKey = cell.dataset.colKey || dataVirt.colKeyByName?.get(cellColName) || cellColName
+          applyCellHighlightClass(
+            cell,
+            rowHl,
+            cellColKey,
+            cellColName,
+            false
+          )
+        }
+      } else {
+        const cellColKey = td.dataset.colKey || dataVirt.colKeyByName?.get(colName) || colName
+        applyCellHighlightClass(td, rowHl, cellColKey, colName, false)
+      }
+    }
     if (state.findQuery && state.findQuery.trim()) {
       updateDataFindHighlights(false)
     }
@@ -403,6 +603,7 @@ export function createPanelDataGridController(ctx) {
       const ins = state.stagedInserts.find((r) => r.tempId === rowKey)
       if (ins) {
         ins.values[colName] = nextVal
+        bumpRowHighlightRevision(rowKey)
         if (!deferRender) {
           if (!patchRenderedDataCell(rowKey, colName, patchTd)) {
             renderDataGrid()
@@ -430,6 +631,7 @@ export function createPanelDataGridController(ctx) {
     } else {
       entry.changes[colName] = nextVal
     }
+    bumpRowHighlightRevision(rowKey)
     if (!deferRender) {
       if (!patchRenderedDataCell(rowKey, colName, patchTd)) {
         renderDataGrid()
@@ -978,41 +1180,102 @@ export function createPanelDataGridController(ctx) {
     renderValueInspector()
   }
 
-  function toggleColumnPinned(colName) {
-    const set = getPinnedColsSet()
-    if (set.has(colName)) set.delete(colName)
-    else set.add(colName)
-    getDataGridSel()?.clear(true)
-    renderDataGrid()
-    if (!$('dataColsPopover').hidden) renderDataColsPopoverList()
+  function resolveActiveColumnKey(rawKey) {
+    const resolver = resolvePanelGridKeyResolver(state.pageData?.columns)
+    return (resolver ? resolver.resolveKey(rawKey) : null) || rawKey
   }
 
-  function toggleColumnHidden(colName) {
+  function ensureUserResizedSet(tblKey) {
+    if (!state.userResizedColKeysByTable) state.userResizedColKeysByTable = {}
+    if (!(state.userResizedColKeysByTable[tblKey] instanceof Set)) {
+      state.userResizedColKeysByTable[tblKey] = new Set(
+        Array.isArray(state.userResizedColKeysByTable[tblKey])
+          ? state.userResizedColKeysByTable[tblKey]
+          : []
+      )
+    }
+    return state.userResizedColKeysByTable[tblKey]
+  }
+
+  function exportUserResizedColumnWidths(tblKey, allColNames, allOccKeys, allColWidths) {
+    const resizedSet = ensureUserResizedSet(tblKey)
+    const resolver = resolvePanelGridKeyResolver(state.pageData?.columns || allColNames)
+    const out = {}
+    for (const rawKey of resizedSet) {
+      const oi = resolver ? resolver.resolveIndex(rawKey) : -1
+      if (oi >= 0 && Number.isFinite(allColWidths[oi]) && allColWidths[oi] > 0) {
+        out[allOccKeys[oi]] = Math.round(allColWidths[oi])
+      }
+    }
+    return out
+  }
+
+  function syncColsPatchToDisplayState() {
+    if (typeof patchTableDisplayState !== 'function') return
+    const resolver = resolvePanelGridKeyResolver(state.pageData?.columns)
+    const normalizeList = (set) => {
+      const out = []
+      const seen = new Set()
+      for (const k of set) {
+        const resolved = resolver ? resolver.resolveKey(k) : k
+        if (resolved && !seen.has(resolved)) {
+          seen.add(resolved)
+          out.push(resolved)
+        }
+      }
+      return out
+    }
+    patchTableDisplayState({
+      pinnedColumns: normalizeList(getPinnedColsSet()),
+      hiddenColumns: normalizeList(getHiddenColsSet()),
+    })
+  }
+
+  function toggleColumnPinned(colKeyOrName) {
+    const colKey = resolveActiveColumnKey(colKeyOrName)
+    const set = getPinnedColsSet()
+    if (set.has(colKey)) set.delete(colKey)
+    else set.add(colKey)
+    getDataGridSel()?.clear(true)
+    renderDataGrid({ layoutOnly: true })
+    if ($('dataColsPopover') && !$('dataColsPopover').hidden) renderDataColsPopoverList()
+    syncColsPatchToDisplayState()
+  }
+
+  function toggleColumnHidden(colKeyOrName) {
     const pd = state.pageData
     if (!pd) return
+    const colKey = resolveActiveColumnKey(colKeyOrName)
     const set = getHiddenColsSet()
-    if (set.has(colName)) {
-      set.delete(colName)
+    if (set.has(colKey)) {
+      set.delete(colKey)
     } else {
       if (pd.columns.length - set.size <= 1) {
         showBanner('At least one column must remain visible.', 'neutral')
+        if ($('dataColsPopover') && !$('dataColsPopover').hidden) renderDataColsPopoverList()
         return
       }
-      set.add(colName)
-      getPinnedColsSet().delete(colName)
+      set.add(colKey)
+      getPinnedColsSet().delete(colKey)
     }
     getDataGridSel()?.clear(true)
-    renderDataGrid()
-    if (!$('dataColsPopover').hidden) renderDataColsPopoverList()
+    renderDataGrid({ layoutOnly: true })
+    if ($('dataColsPopover') && !$('dataColsPopover').hidden) renderDataColsPopoverList()
+    syncColsPatchToDisplayState()
   }
 
-  function autoFitDataColumn(colName) {
+  function autoFitDataColumn(colKeyOrName) {
     const pd = state.pageData
     if (!pd) return
     const tblKey = getActiveTableKey()
     const colWidths = state.columnWidthsByTable[tblKey]
-    const origIdx = pd.columns.findIndex((c) => c.name === colName)
-    if (!colWidths || origIdx < 0) return
+    const resolver = resolvePanelGridKeyResolver(pd.columns)
+    if (!colWidths || !resolver) return
+    const allColNames = pd.columns.map((c) => c.name)
+    const allOccKeys = resolver.occKeys
+    const origIdx = resolver.resolveIndex(colKeyOrName)
+    if (origIdx < 0) return
+    const colKey = allOccKeys[origIdx]
     const colDef = pd.columns[origIdx]
     const allRows = getAllDisplayRows()
     let maxLen = colDef.name.length + (colDef.isPrimaryKey ? 5 : 0) + 2
@@ -1022,8 +1285,15 @@ export function createPanelDataGridController(ctx) {
         val == null ? 4 : (typeof val === 'object' ? JSON.stringify(val) : String(val)).length
       if (textLen > maxLen) maxLen = textLen
     }
-    colWidths[origIdx] = Math.max(64, Math.min(440, Math.round(maxLen * 7.5 + 26)))
+    const nextW = Math.max(64, Math.min(440, Math.round(maxLen * 7.5 + 26)))
+    colWidths[origIdx] = nextW
+    ensureUserResizedSet(tblKey).add(colKey)
     renderDataGrid()
+    if (typeof patchTableDisplayState === 'function') {
+      patchTableDisplayState({
+        columnWidths: exportUserResizedColumnWidths(tblKey, allColNames, allOccKeys, colWidths),
+      })
+    }
   }
 
   function exportCurrentDataPage(format, asDownload, ext, mime) {
@@ -1083,7 +1353,8 @@ export function createPanelDataGridController(ctx) {
       state.findMatchIdx = -1
       return
     }
-    const allRows = dataVirt.active ? dataVirt.allRows : getAllDisplayRows()
+    const rawRows = dataVirt.active ? dataVirt.allRows : getAllDisplayRows()
+    const allRows = state.transposed ? rawRows.slice(0, 100) : rawRows
     const visCols = dataVirt.active ? dataVirt.visCols : getOrderedVisibleColumns()
     for (let r = 0; r < allRows.length; r++) {
       const entry = allRows[r]
@@ -1126,7 +1397,15 @@ export function createPanelDataGridController(ctx) {
         if (!(td instanceof HTMLElement) || td.dataset.colName === undefined) continue
         let isMatch = false
         let isActive = false
-        if (state.transposed) {
+        if (td.dataset.rowIdx !== undefined && td.dataset.colIdx !== undefined) {
+          const key = `${td.dataset.rowIdx}:${td.dataset.colIdx}`
+          isMatch = state.findMatchSet.has(key)
+          isActive = Boolean(
+            activeMatch &&
+              String(activeMatch.r) === td.dataset.rowIdx &&
+              String(activeMatch.c) === td.dataset.colIdx
+          )
+        } else if (state.transposed) {
           const rk = td.dataset.rowKey
           const cn = td.dataset.colName
           if (state.findMatches.length > 0 && rk && cn) {
@@ -1139,14 +1418,6 @@ export function createPanelDataGridController(ctx) {
               }
             }
           }
-        } else if (td.dataset.rowIdx !== undefined && td.dataset.colIdx !== undefined) {
-          const key = `${td.dataset.rowIdx}:${td.dataset.colIdx}`
-          isMatch = state.findMatchSet.has(key)
-          isActive = Boolean(
-            activeMatch &&
-              String(activeMatch.r) === td.dataset.rowIdx &&
-              String(activeMatch.c) === td.dataset.colIdx
-          )
         }
         td.classList.toggle('cell-match', isMatch)
         td.classList.toggle('cell-match-active', isActive)
@@ -1168,19 +1439,24 @@ export function createPanelDataGridController(ctx) {
     }
     const activeMatch = state.findMatches[state.findMatchIdx]
     if (jumpToActive && activeMatch) {
-      if (dataVirt.active && !state.transposed) {
-        ensureDataVirtualRowVisible(activeMatch.r)
+      if (dataVirt.active) {
+        ensureDataVirtualRowVisible(
+          state.transposed ? activeMatch.c : activeMatch.r,
+          state.transposed ? activeMatch.r : undefined
+        )
       }
       applyFindClassesToRenderedDataRows()
       const tbl = $('dataTable')
-      const activeTd = state.transposed
-        ? Array.from(tbl?.querySelectorAll('tbody td[data-col-name]') || []).find(
-            (el) =>
-              el.dataset.rowKey === activeMatch.rowKey && el.dataset.colName === activeMatch.colName
-          )
-        : tbl?.querySelector(
-            `tbody td[data-row-idx="${activeMatch.r}"][data-col-idx="${activeMatch.c}"]`
-          )
+      const activeTd =
+        tbl?.querySelector(
+          `tbody td[data-row-idx="${activeMatch.r}"][data-col-idx="${activeMatch.c}"]`
+        ) ||
+        (state.transposed
+          ? Array.from(tbl?.querySelectorAll('tbody td[data-col-name]') || []).find(
+              (el) =>
+                el.dataset.rowKey === activeMatch.rowKey && el.dataset.colName === activeMatch.colName
+            )
+          : null)
       if (activeTd && typeof activeTd.scrollIntoView === 'function') {
         activeTd.scrollIntoView({ block: 'nearest', inline: 'nearest' })
       }
@@ -1194,7 +1470,7 @@ export function createPanelDataGridController(ctx) {
 
   function updateGridSelectionHighlight() {
     const dataGridSel = getDataGridSel()
-    if (dataGridSel && !state.transposed) {
+    if (dataGridSel) {
       dataGridSel.applyDomClasses()
       renderDataSelectionStats()
       return
@@ -1212,6 +1488,17 @@ export function createPanelDataGridController(ctx) {
       })
     }
     if (state.selectedCol) {
+      if (state.transposed && dataVirt.visCols.length > 0) {
+        const cIdx = dataVirt.visCols.findIndex((c) => c.name === state.selectedCol)
+        const rIdx = dataVirt.cappedRows.findIndex((r) => r.rowKey === state.selectedRowKey)
+        if (cIdx >= 0 && rIdx >= 0) {
+          const targetTd = tbl.querySelector(`tbody td[data-row-idx="${rIdx}"][data-col-idx="${cIdx}"]`)
+          if (targetTd) {
+            targetTd.classList.add('cell-selected')
+            return
+          }
+        }
+      }
       tbl.querySelectorAll('tbody td').forEach((td) => {
         if (
           td.dataset.rowKey === state.selectedRowKey &&
@@ -1228,12 +1515,23 @@ export function createPanelDataGridController(ctx) {
     colEl,
     thEl,
     isRowNum,
-    colIdx,
-    colWidths,
-    syncTableWidth,
-    getAutoFitWidth,
-    rowNumStateKey = 'rowNumWidth'
+    colIdxOrBinding,
+    colWidthsArg,
+    syncTableWidthArg,
+    getAutoFitWidthArg,
+    rowNumStateKey = 'rowNumWidth',
+    onResizeCommitArg = null
   ) {
+    const getBinding = () =>
+      colIdxOrBinding && typeof colIdxOrBinding === 'object'
+        ? colIdxOrBinding
+        : {
+            colIdx: colIdxOrBinding,
+            colWidths: colWidthsArg,
+            syncTableWidth: syncTableWidthArg,
+            getAutoFitWidth: getAutoFitWidthArg,
+            onResizeCommit: onResizeCommitArg,
+          }
     handle.addEventListener('click', (e) => {
       e.preventDefault()
       e.stopPropagation()
@@ -1243,17 +1541,66 @@ export function createPanelDataGridController(ctx) {
       e.stopPropagation()
       const prevCleanup = getActiveResizeCleanup()
       if (prevCleanup) prevCleanup()
+      const binding = getBinding()
+      const colIdx = binding.colIdx
+      const colWidths = binding.colWidths
+      const syncTableWidth = binding.syncTableWidth
+      const onResizeCommit = binding.onResizeCommit
       const startX = e.clientX
       const startWidth = isRowNum ? state[rowNumStateKey] : colWidths[colIdx]
+      const ownerTable = thEl.closest ? thEl.closest('table') : null
+      const ownerWrap = ownerTable?.parentElement || null
+      const mountedRowsCount = ownerTable?.tBodies?.[0]?.children?.length || ownerTable?.rows?.length || 0
+      const mountedColsCount = ownerTable?.tHead?.rows?.[0]?.cells?.length || colWidths.length + 1
+      const useGuideLine =
+        Boolean(ownerTable?.classList?.contains('transposed')) ||
+        mountedRowsCount * Math.max(1, mountedColsCount) >= 400
       let didMove = false
       handle.classList.add('resizing')
       document.body.style.cursor = 'col-resize'
       document.body.style.userSelect = 'none'
 
+      let guideEl = null
+      let baseGuideX = startX
+      let guideMinX = -Infinity
+      let guideMaxX = Infinity
+      if (useGuideLine) {
+        ownerWrap?.classList?.add('grid-resizing')
+        const handleRect = handle.getBoundingClientRect ? handle.getBoundingClientRect() : null
+        const wrapRect = ownerWrap?.getBoundingClientRect ? ownerWrap.getBoundingClientRect() : null
+        if (handleRect && handleRect.width > 0) {
+          baseGuideX = handleRect.left + handleRect.width / 2
+        }
+        if (wrapRect && wrapRect.width > 0) {
+          guideMinX = wrapRect.left
+          guideMaxX = wrapRect.right
+        }
+        guideEl = document.createElement('div')
+        guideEl.className = 'col-resize-guide'
+        guideEl.style.top = `${wrapRect && wrapRect.height > 0 ? Math.round(wrapRect.top) : 0}px`
+        guideEl.style.height = `${wrapRect && wrapRect.height > 0 ? Math.round(wrapRect.height) : 440}px`
+        const clampedInitX = Math.max(guideMinX, Math.min(guideMaxX, Math.round(baseGuideX)))
+        guideEl.style.transform = `translate3d(${clampedInitX}px, 0, 0)`
+        const guideHost = document.body || ownerWrap || ownerTable
+        if (guideHost) guideHost.appendChild(guideEl)
+      }
+
       let pendingW = startWidth
       let resizeRafId = null
+      const applyGuidePos = () => {
+        resizeRafId = null
+        if (!guideEl) return
+        const rawX = Math.round(baseGuideX + (pendingW - startWidth))
+        const clampedX = Math.max(guideMinX, Math.min(guideMaxX, rawX))
+        guideEl.style.transform = `translate3d(${clampedX}px, 0, 0)`
+      }
       const applyPendingResize = () => {
         resizeRafId = null
+        if (isRowNum) {
+          state[rowNumStateKey] = pendingW
+        } else {
+          colWidths[colIdx] = pendingW
+        }
         colEl.style.width = `${pendingW}px`
         thEl.style.width = `${pendingW}px`
         syncTableWidth()
@@ -1262,20 +1609,23 @@ export function createPanelDataGridController(ctx) {
       const onMove = (moveEvent) => {
         const delta = moveEvent.clientX - startX
         if (Math.abs(delta) >= 2) didMove = true
-        const minW = isRowNum ? 48 : 50
+        const minW = isRowNum ? (rowNumStateKey === 'transposeFieldWidth' ? 80 : 48) : 50
         const nextW = Math.max(minW, Math.round(startWidth + delta))
         pendingW = nextW
-        if (isRowNum) {
-          state[rowNumStateKey] = nextW
-        } else {
-          colWidths[colIdx] = nextW
+        if (!useGuideLine) {
+          if (isRowNum) {
+            state[rowNumStateKey] = nextW
+          } else {
+            colWidths[colIdx] = nextW
+          }
         }
+        const tickFn = useGuideLine ? applyGuidePos : applyPendingResize
         if (typeof requestAnimationFrame === 'function') {
           if (resizeRafId === null) {
-            resizeRafId = requestAnimationFrame(applyPendingResize)
+            resizeRafId = requestAnimationFrame(tickFn)
           }
         } else {
-          applyPendingResize()
+          tickFn()
         }
       }
 
@@ -1289,6 +1639,11 @@ export function createPanelDataGridController(ctx) {
         window.removeEventListener('blur', onUp)
         setActiveResizeCleanup(null)
         handle.classList.remove('resizing')
+        ownerWrap?.classList?.remove('grid-resizing')
+        if (guideEl) {
+          guideEl.remove()
+          guideEl = null
+        }
         document.body.style.cursor = ''
         document.body.style.userSelect = ''
       }
@@ -1297,14 +1652,23 @@ export function createPanelDataGridController(ctx) {
         if (resizeRafId !== null) {
           if (typeof cancelAnimationFrame === 'function') {
             cancelAnimationFrame(resizeRafId)
+            resizeRafId = null
           }
+          if (!useGuideLine) {
+            applyPendingResize()
+          }
+        }
+        if (useGuideLine && pendingW !== startWidth) {
           applyPendingResize()
         } else if (didMove) {
           syncTableWidth()
         }
         cleanup()
-        if (didMove) {
+        if (didMove || (useGuideLine && pendingW !== startWidth)) {
           setSuppressSortClickUntil(Date.now() + 250)
+          if (!isRowNum && typeof onResizeCommit === 'function') {
+            onResizeCommit(colIdx, pendingW)
+          }
         }
       }
 
@@ -1316,17 +1680,90 @@ export function createPanelDataGridController(ctx) {
     handle.addEventListener('dblclick', (e) => {
       e.preventDefault()
       e.stopPropagation()
-      let nextW = 56
-      if (!isRowNum && typeof getAutoFitWidth === 'function') {
-        nextW = getAutoFitWidth()
-        colWidths[colIdx] = nextW
-      } else {
+      const binding = getBinding()
+      const colIdx = binding.colIdx
+      const colWidths = binding.colWidths
+      const syncTableWidth = binding.syncTableWidth
+      const getAutoFitWidth = binding.getAutoFitWidth
+      const onResizeCommit = binding.onResizeCommit
+      const nextW = typeof getAutoFitWidth === 'function' ? getAutoFitWidth() : 56
+      if (isRowNum) {
         state[rowNumStateKey] = nextW
+      } else {
+        colWidths[colIdx] = nextW
       }
       colEl.style.width = `${nextW}px`
       thEl.style.width = `${nextW}px`
       syncTableWidth()
+      if (!isRowNum && typeof onResizeCommit === 'function') {
+        onResizeCommit(colIdx, nextW)
+      }
     })
+  }
+
+  function estimateCellWrappedLines(val, col, colWidthPx, wrapMaxLines) {
+    if (!isWrappableCellValue(val, col.type)) return 1
+    const explicit = countNormalizedLines(val, wrapMaxLines)
+    if (explicit >= wrapMaxLines) return wrapMaxLines
+    const text = typeof val === 'object' ? JSON.stringify(val) : String(val)
+    const charsPerLine = Math.max(8, Math.floor((Math.max(48, colWidthPx || 120) - 14) / 7))
+    if (text.length <= charsPerLine) return explicit
+    let totalLines = 0
+    const rawLines = text.split('\n')
+    for (let i = 0; i < rawLines.length; i++) {
+      totalLines += Math.max(1, Math.ceil(rawLines[i].length / charsPerLine))
+      if (totalLines >= wrapMaxLines) return wrapMaxLines
+    }
+    return Math.min(wrapMaxLines, Math.max(explicit, totalLines))
+  }
+
+  function computeRowWrapLines(rowIdx, visCols, visColWidths, wrapMaxLines) {
+    if (!dataRowHeightIndex.wrapEnabled || state.transposed) return 1
+    const entry = dataVirt.allRows[rowIdx]
+    if (!entry) return 1
+    let maxLines = 1
+    for (let c = 0; c < visCols.length; c++) {
+      const col = visCols[c]
+      const val = getEffectiveCellValue(entry.rowKey, entry.data, col.name)
+      const lines = estimateCellWrappedLines(val, col, visColWidths[c], wrapMaxLines)
+      if (lines > maxLines) {
+        maxLines = lines
+        if (maxLines >= wrapMaxLines) break
+      }
+    }
+    return maxLines
+  }
+
+  function measureRowWrapLines(rowIdx, visCols, visColWidths, wrapMaxLines) {
+    if (!dataRowHeightIndex.wrapEnabled || state.transposed) return 1
+    const maxLines = computeRowWrapLines(rowIdx, visCols, visColWidths, wrapMaxLines)
+    dataRowHeightIndex.setRowLines(rowIdx, maxLines)
+    return maxLines
+  }
+
+  function applyCellHighlightClass(td, rowHl, colKey, colName, isSelected = false) {
+    for (const cls of ALL_HIGHLIGHT_CLASSES) {
+      td.classList.remove(cls)
+    }
+    td.classList.remove('datanoa-hl-row', 'datanoa-hl-cell')
+    if (!rowHl) return
+    const resolvedKey = colKey || dataVirt.colKeyByName?.get(colName) || colName
+    const parsedKey = parseOccurrenceColumnKey(resolvedKey)
+    const bareFallback = parsedKey && parsedKey.occurrence === 1 ? parsedKey.name : null
+    const cellTone =
+      rowHl.cellTonesByKey?.[resolvedKey] ??
+      (bareFallback ? rowHl.cellTonesByKey?.[bareFallback] : null) ??
+      null
+    const res = resolveCellDisplayHighlight({
+      isSelected,
+      rowTone: rowHl.rowTone,
+      cellTone,
+    })
+    if (res.className) {
+      td.classList.add(res.className)
+      if (res.source === 'cell') td.classList.add('datanoa-hl-cell')
+      else if (res.source === 'row') td.classList.add('datanoa-hl-row')
+    }
   }
 
   function renderDataCellContent(td, entry, col, val, fkInfo) {
@@ -1337,7 +1774,7 @@ export function createPanelDataGridController(ctx) {
     td.dataset.colName = col.name
     td.dataset.editable = canEditCell ? '1' : '0'
 
-    td.classList.remove('cell-null', 'cell-num', 'cell-edited')
+    td.classList.remove('cell-null', 'cell-num', 'cell-edited', 'cell-wrap')
     td.textContent = ''
     if (entry.isInsert && val === undefined) {
       td.classList.add('cell-null')
@@ -1348,6 +1785,9 @@ export function createPanelDataGridController(ctx) {
     } else {
       if (typeof val === 'number') td.classList.add('cell-num')
       td.textContent = typeof val === 'object' ? JSON.stringify(val) : String(val)
+      if (!state.transposed && dataVirt.wrapCells && isWrappableCellValue(val, col.type)) {
+        td.classList.add('cell-wrap')
+      }
       if (fkInfo) {
         const fkBadge = document.createElement('span')
         fkBadge.className = 'fk-link-badge'
@@ -1381,6 +1821,12 @@ export function createPanelDataGridController(ctx) {
     const isRowDeleted = state.stagedDeletes.has(entry.rowKey)
     if (isRowDeleted) tr.classList.add('row-deleted')
 
+    if (!state.transposed && dataVirt.wrapCells) {
+      measureRowWrapLines(rowIdx, dataVirt.visCols, dataVirt.visColWidths, dataVirt.wrapMaxLines)
+    }
+
+    const rowHl = evaluateDataRowHighlight(entry)
+
     const tdNum = document.createElement('td')
     tdNum.className = 'td-rownum'
     tdNum.dataset.rowIdx = String(rowIdx)
@@ -1404,9 +1850,11 @@ export function createPanelDataGridController(ctx) {
 
     for (let colIdx = 0; colIdx < dataVirt.visCols.length; colIdx++) {
       const col = dataVirt.visCols[colIdx]
+      const colKey = dataVirt.visColKeys?.[colIdx] || col.name
       const td = document.createElement('td')
       td.dataset.rowIdx = String(rowIdx)
       td.dataset.colIdx = String(colIdx)
+      td.dataset.colKey = colKey
       if (colIdx < dataVirt.pinnedCount) {
         td.classList.add('col-pinned')
         td.style.left = `${dataVirt.stickyLefts[colIdx]}px`
@@ -1415,6 +1863,7 @@ export function createPanelDataGridController(ctx) {
       const val = getEffectiveCellValue(entry.rowKey, entry.data, col.name)
       const fkInfo = dataVirt.fkMap.get(col.name) || null
       renderDataCellContent(td, entry, col, val, fkInfo)
+      applyCellHighlightClass(td, rowHl, colKey, col.name, false)
       if (state.findMatchSet.size > 0 && state.findMatchSet.has(`${rowIdx}:${colIdx}`)) {
         td.classList.add('cell-match')
         if (activeMatch && activeMatch.r === rowIdx && activeMatch.c === colIdx) {
@@ -1427,21 +1876,220 @@ export function createPanelDataGridController(ctx) {
     return tr
   }
 
+  function populateTransposedRowCells(tr, cIdx, hStart, hEnd) {
+    const col = dataVirt.visCols[cIdx]
+    const cappedRows = dataVirt.cappedRows
+    const totalDataCols = cappedRows.length + (dataVirt.hasOverflowCol ? 1 : 0)
+    const startCol = Math.max(0, Math.min(hStart, totalDataCols))
+    const endCol = Math.max(startCol, Math.min(hEnd, totalDataCols))
+    const dataEnd = Math.min(endCol, cappedRows.length)
+    const showMore = dataVirt.hasOverflowCol && endCol === totalDataCols
+    const rightSpan = Math.max(0, totalDataCols - endCol)
+
+    const dataGridSel = getDataGridSel()
+
+    // Remove everything after the sticky field <th>
+    while (tr.children.length > 1) {
+      const last = tr.lastElementChild
+      if (!last) break
+      const activeInp = last.querySelector?.('input.cell-edit-input')
+      if (activeInp instanceof HTMLInputElement) {
+        activeInp.dataset.scrollDetached = '1'
+        activeInp.blur()
+      }
+      dataGridSel?.detachCell?.(last)
+      last.remove()
+    }
+
+    if (startCol > 0) {
+      const leftSp = document.createElement('td')
+      leftSp.className = 'h-spacer-td'
+      leftSp.colSpan = startCol
+      tr.appendChild(leftSp)
+    }
+
+    const fkInfo = dataVirt.fkMap.get(col.name) || null
+    const activeMatch =
+      state.findMatchIdx >= 0 && state.findMatchIdx < state.findMatches.length
+        ? state.findMatches[state.findMatchIdx]
+        : null
+
+    for (let rIdx = startCol; rIdx < dataEnd; rIdx++) {
+      const entry = cappedRows[rIdx]
+      const td = document.createElement('td')
+      td.dataset.rowIdx = String(rIdx)
+      td.dataset.colIdx = String(cIdx)
+      if (entry.isInsert) td.style.background = 'color-mix(in srgb, var(--ok) 12%, var(--bg))'
+      if (state.stagedDeletes.has(entry.rowKey)) td.style.textDecoration = 'line-through'
+      const val = getEffectiveCellValue(entry.rowKey, entry.data, col.name)
+      renderDataCellContent(td, entry, col, val, fkInfo)
+      if (state.selectedRowKey === entry.rowKey && state.selectedCol === col.name) {
+        td.classList.add('cell-selected')
+      }
+      if (state.findMatchSet.size > 0 && state.findMatchSet.has(`${rIdx}:${cIdx}`)) {
+        td.classList.add('cell-match')
+        if (activeMatch && activeMatch.r === rIdx && activeMatch.c === cIdx) {
+          td.classList.add('cell-match-active')
+        }
+      }
+      tr.appendChild(td)
+    }
+    if (showMore) {
+      const moreTd = document.createElement('td')
+      moreTd.className = 'cell-null'
+      moreTd.textContent = `... (${dataVirt.allRows.length - 100} more)`
+      tr.appendChild(moreTd)
+    }
+    if (rightSpan > 0) {
+      const rightSp = document.createElement('td')
+      rightSp.className = 'h-spacer-td'
+      rightSp.colSpan = rightSpan
+      tr.appendChild(rightSp)
+    }
+    dataGridSel?.applyClassesToRow(tr, cIdx)
+  }
+
+  function createTransposedVirtualRow(cIdx) {
+    const col = dataVirt.visCols[cIdx]
+    const totalDataCols = dataVirt.cappedRows.length + (dataVirt.hasOverflowCol ? 1 : 0)
+    const hStart = dataVirt.active && dataVirt.transposed ? dataVirt.hStart : 0
+    const hEnd = dataVirt.active && dataVirt.transposed ? dataVirt.hEnd : totalDataCols
+    const tr = document.createElement('tr')
+    tr.dataset.rowIdx = String(cIdx)
+    const colHead = document.createElement('th')
+    colHead.className = 'transpose-col-head'
+    const colLabelSpan = document.createElement('span')
+    colLabelSpan.textContent = col.name
+    colHead.appendChild(colLabelSpan)
+    if (col.isPrimaryKey) {
+      const pkSpan = document.createElement('span')
+      pkSpan.className = 'transpose-pk'
+      pkSpan.textContent = ' [PK]'
+      colHead.appendChild(pkSpan)
+    }
+    colHead.title = `${col.name}${col.isPrimaryKey ? ' [PK]' : ''}`
+    tr.appendChild(colHead)
+    populateTransposedRowCells(tr, cIdx, hStart, hEnd)
+    return tr
+  }
+
   function renderDataVirtualWindow(force = false) {
     if (!dataVirt.active || !dataVirt.tbody) return
     const wrap = $('dataGridWrap')
-    const total = dataVirt.allRows.length
+    const total = dataVirt.transposed ? dataVirt.visCols.length : dataVirt.allRows.length
     if (total === 0) return
     const scrollTop = wrap ? wrap.scrollTop : 0
     const viewportH = wrap ? wrap.clientHeight : 420
-    const { start, end } = computeVirtualRange(scrollTop, viewportH, total)
-    syncVirtualTableWindow({
+    let start = 0
+    let end = total
+    let topSpacerPx
+    let bottomSpacerPx
+    if (dataVirt.transposed) {
+      const range = coreComputeVirtualRange(scrollTop, viewportH, total, VIRT_ROW_HEIGHT_PX, 4)
+      start = range.start
+      end = range.end
+    } else if (dataRowHeightIndex.wrapEnabled && dataVirt.wrapCells) {
+      let effectiveScrollTop = scrollTop
+      const anchorRowIndex =
+        effectiveScrollTop > 0 ? dataRowHeightIndex.findRowAtOffset(effectiveScrollTop) : 0
+      const preRange = dataRowHeightIndex.getVisibleRange(
+        effectiveScrollTop,
+        viewportH,
+        VIRT_OVERSCAN_ROWS
+      )
+      const reads = []
+      for (let r = preRange.start; r < preRange.end; r++) {
+        reads.push({
+          row: r,
+          lines: computeRowWrapLines(
+            r,
+            dataVirt.visCols,
+            dataVirt.visColWidths,
+            dataVirt.wrapMaxLines
+          ),
+        })
+      }
+      const batchRes = dataRowHeightIndex.measureBatch(reads, anchorRowIndex)
+      if (wrap && batchRes.scrollTopDeltaPx !== 0) {
+        effectiveScrollTop = Math.max(0, effectiveScrollTop + batchRes.scrollTopDeltaPx)
+        wrap.scrollTop = effectiveScrollTop
+      }
+      const rangeAfter = dataRowHeightIndex.getVisibleRange(
+        effectiveScrollTop,
+        viewportH,
+        VIRT_OVERSCAN_ROWS
+      )
+      if (rangeAfter.start < preRange.start || rangeAfter.end > preRange.end) {
+        const extraReads = []
+        for (let r = rangeAfter.start; r < preRange.start; r++) {
+          extraReads.push({
+            row: r,
+            lines: computeRowWrapLines(
+              r,
+              dataVirt.visCols,
+              dataVirt.visColWidths,
+              dataVirt.wrapMaxLines
+            ),
+          })
+        }
+        for (let r = preRange.end; r < rangeAfter.end; r++) {
+          extraReads.push({
+            row: r,
+            lines: computeRowWrapLines(
+              r,
+              dataVirt.visCols,
+              dataVirt.visColWidths,
+              dataVirt.wrapMaxLines
+            ),
+          })
+        }
+        if (extraReads.length > 0) {
+          const extraRes = dataRowHeightIndex.measureBatch(extraReads, anchorRowIndex)
+          if (wrap && extraRes.scrollTopDeltaPx !== 0) {
+            effectiveScrollTop = Math.max(0, effectiveScrollTop + extraRes.scrollTopDeltaPx)
+            wrap.scrollTop = effectiveScrollTop
+          }
+        }
+      }
+      const range = dataRowHeightIndex.getVisibleRange(
+        effectiveScrollTop,
+        viewportH,
+        VIRT_OVERSCAN_ROWS
+      )
+      start = range.start
+      end = range.end
+      topSpacerPx = range.topSpacerPx
+      bottomSpacerPx = range.bottomSpacerPx
+    } else {
+      const range = computeVirtualRange(scrollTop, viewportH, total)
+      start = range.start
+      end = range.end
+    }
+
+    let hChanged = false
+    if (dataVirt.transposed) {
+      const nextH = computeTransposedPanelColRange(
+        wrap ? wrap.scrollLeft : 0,
+        wrap ? wrap.clientWidth : 0,
+        dataVirt.fieldWidth,
+        dataVirt.rowColWidths
+      )
+      hChanged = nextH.hStart !== dataVirt.hStart || nextH.hEnd !== dataVirt.hEnd
+      dataVirt.hStart = nextH.hStart
+      dataVirt.hEnd = nextH.hEnd
+    }
+
+    const prevStart = dataVirt.start
+    const prevEnd = dataVirt.end
+    const didSyncVert = syncVirtualTableWindow({
       virt: dataVirt,
       total,
       start,
       end,
       rowHeightPx: VIRT_ROW_HEIGHT_PX,
-      createRow: createDataVirtualRow,
+      topSpacerPx,
+      bottomSpacerPx,
+      createRow: dataVirt.transposed ? createTransposedVirtualRow : createDataVirtualRow,
       selectionController: getDataGridSel(),
       onBeforeDetachRow: (node) => {
         const activeInp = node.querySelector('input.cell-edit-input')
@@ -1452,14 +2100,34 @@ export function createPanelDataGridController(ctx) {
       },
       force,
     })
+
+    // If horizontal range changed while vertical window slid (or stayed identical), patch surviving
+    // mounted transposed rows in-place so their horizontal cells stay synced with scrollLeft.
+    if (dataVirt.transposed && hChanged && !force && prevStart >= 0 && prevEnd > prevStart) {
+      const overlapStart = Math.max(start, prevStart)
+      const overlapEnd = Math.min(end, prevEnd)
+      if (!didSyncVert || overlapStart < overlapEnd) {
+        const children = dataVirt.tbody.children
+        for (let i = 0; i < children.length; i++) {
+          const tr = children[i]
+          if (!(tr instanceof HTMLElement) || tr.dataset.rowIdx === undefined) continue
+          const cIdx = Number(tr.dataset.rowIdx)
+          if (cIdx >= overlapStart && cIdx < overlapEnd) {
+            populateTransposedRowCells(tr, cIdx, dataVirt.hStart, dataVirt.hEnd)
+          }
+        }
+      }
+    }
   }
 
-  function ensureDataVirtualRowVisible(rowIdx) {
+  function ensureDataVirtualRowVisible(rowIdx, horizIdx) {
     if (!dataVirt.active) return
     const wrap = $('dataGridWrap')
     if (!wrap) return
-    const rowTop = rowIdx * VIRT_ROW_HEIGHT_PX
-    const rowBottom = rowTop + VIRT_ROW_HEIGHT_PX
+    const useWrap = !dataVirt.transposed && dataRowHeightIndex.wrapEnabled && dataVirt.wrapCells
+    const rowTop = useWrap ? dataRowHeightIndex.getRowOffset(rowIdx) : rowIdx * VIRT_ROW_HEIGHT_PX
+    const rowH = useWrap ? dataRowHeightIndex.getRowHeight(rowIdx) : VIRT_ROW_HEIGHT_PX
+    const rowBottom = rowTop + rowH
     const viewTop = wrap.scrollTop
     const effH = wrap.clientHeight > 0 ? wrap.clientHeight : 420
     const viewBottom = viewTop + Math.max(VIRT_ROW_HEIGHT_PX, effH - VIRT_ROW_HEIGHT_PX)
@@ -1471,10 +2139,676 @@ export function createPanelDataGridController(ctx) {
         rowBottom - Math.max(VIRT_ROW_HEIGHT_PX, effH - VIRT_ROW_HEIGHT_PX)
       )
     }
+    if (
+      dataVirt.transposed &&
+      typeof horizIdx === 'number' &&
+      Number.isFinite(horizIdx) &&
+      horizIdx >= 0 &&
+      dataVirt.rowColWidths.length > 0
+    ) {
+      let colLeft = 0
+      const limit = Math.min(horizIdx, dataVirt.rowColWidths.length - 1)
+      for (let i = 0; i < limit; i++) {
+        colLeft += Number(dataVirt.rowColWidths[i]) || 180
+      }
+      const colW = Number(dataVirt.rowColWidths[limit]) || 180
+      const visibleW = Math.max(120, (wrap.clientWidth || 360) - (dataVirt.fieldWidth || 180))
+      if (colLeft < wrap.scrollLeft) {
+        wrap.scrollLeft = colLeft
+      } else if (colLeft + colW > wrap.scrollLeft + visibleW) {
+        wrap.scrollLeft = Math.max(0, colLeft - Math.floor(visibleW / 3))
+      }
+    } else if (
+      !dataVirt.transposed &&
+      typeof horizIdx === 'number' &&
+      Number.isFinite(horizIdx) &&
+      horizIdx >= dataVirt.pinnedCount &&
+      horizIdx < dataVirt.visCols.length
+    ) {
+      const tbl = $('dataTable')
+      const renderedTd = tbl?.querySelector(
+        `tbody td[data-row-idx="${rowIdx}"][data-col-idx="${horizIdx}"]`
+      )
+      let cellLeftPx = state.rowNumWidth
+      for (let i = 0; i < horizIdx; i++) {
+        cellLeftPx += Number(dataVirt.visColWidths[i]) || 120
+      }
+      if (renderedTd instanceof HTMLElement && renderedTd.offsetLeft > 0) {
+        cellLeftPx = renderedTd.offsetLeft
+      }
+      const cellWidthPx =
+        renderedTd instanceof HTMLElement && renderedTd.offsetWidth > 0
+          ? renderedTd.offsetWidth
+          : Number(dataVirt.visColWidths[horizIdx]) || 120
+      const nextScrollLeft = computeScrollLeftForFocusedCell({
+        cellLeftPx,
+        cellWidthPx,
+        scrollLeftPx: wrap.scrollLeft || 0,
+        viewportWidthPx: wrap.clientWidth || 300,
+        totalPinnedWidthPx: dataVirt.totalPinnedWidthPx || state.rowNumWidth,
+      })
+      if (nextScrollLeft !== wrap.scrollLeft) {
+        wrap.scrollLeft = nextScrollLeft
+      }
+    }
     renderDataVirtualWindow(false)
   }
 
-  function renderDataGrid() {
+  function measurePanelCellTextLen(val) {
+    if (val == null) return 4
+    return (typeof val === 'object' ? JSON.stringify(val) : String(val)).length
+  }
+
+  function computeInitialTransposedPanelWidths(visCols, cappedRows, stagedInsLen, hasOverflowCol) {
+    let maxFieldChars = 'Column'.length + 2
+    for (let i = 0; i < Math.min(visCols.length, 40); i++) {
+      const col = visCols[i]
+      const len = col.name.length + (col.isPrimaryKey ? 5 : 0)
+      if (len > maxFieldChars) maxFieldChars = len
+    }
+    const fieldWidth = Math.max(140, Math.min(260, Math.round(maxFieldChars * 7.2 + 24)))
+    const rowWidths = cappedRows.map((entry, idx) => {
+      const labelText = entry.isInsert ? `+ New ${idx + 1}` : `Row ${idx - stagedInsLen + 1}`
+      let maxChars = labelText.length + 4
+      for (let ci = 0; ci < Math.min(visCols.length, 32); ci++) {
+        const col = visCols[ci]
+        const val = getEffectiveCellValue(entry.rowKey, entry.data, col.name)
+        const cappedLen = Math.min(measurePanelCellTextLen(val), 34)
+        if (cappedLen > maxChars) maxChars = cappedLen
+      }
+      return Math.max(160, Math.min(280, Math.round(maxChars * 7.5 + 24)))
+    })
+    if (hasOverflowCol) {
+      rowWidths.push(150)
+    }
+    return { fieldWidth, rowWidths }
+  }
+
+  function renderTransposedDataGrid(tbl, tblKey, allRows, visCols, fkMap) {
+    dataVirt.active = false
+    dataVirt.transposed = false
+    dataVirt.allRows = allRows
+    dataVirt.visCols = visCols
+    dataVirt.fkMap = fkMap
+    dataVirt.start = -1
+    dataVirt.end = -1
+
+    const stagedInsLen = state.stagedInserts.length
+    const cappedRows = allRows.slice(0, 100)
+    const hasOverflowCol = allRows.length > 100
+    const expectedDataColCount = cappedRows.length + (hasOverflowCol ? 1 : 0)
+
+    if (!state.transposeWidthsByTable) state.transposeWidthsByTable = {}
+    let tWidths = state.transposeWidthsByTable[tblKey]
+    if (
+      !tWidths ||
+      !Array.isArray(tWidths.rowWidths) ||
+      tWidths.rowWidths.length !== expectedDataColCount
+    ) {
+      const computed = computeInitialTransposedPanelWidths(
+        visCols,
+        cappedRows,
+        stagedInsLen,
+        hasOverflowCol
+      )
+      tWidths = {
+        fieldWidth:
+          tWidths && typeof tWidths.fieldWidth === 'number'
+            ? tWidths.fieldWidth
+            : computed.fieldWidth,
+        rowWidths: computed.rowWidths,
+      }
+      state.transposeWidthsByTable[tblKey] = tWidths
+    }
+    state.transposeFieldWidth = tWidths.fieldWidth
+    const rowColWidths = tWidths.rowWidths
+    const hasDataCols = rowColWidths.length > 0
+
+    let fieldColEl = null
+    let dataColEls = []
+    if (hasDataCols) {
+      const colgroup = document.createElement('colgroup')
+      fieldColEl = document.createElement('col')
+      fieldColEl.style.width = `${state.transposeFieldWidth}px`
+      colgroup.appendChild(fieldColEl)
+      dataColEls = rowColWidths.map((w) => {
+        const colEl = document.createElement('col')
+        colEl.style.width = `${w}px`
+        colgroup.appendChild(colEl)
+        return colEl
+      })
+      tbl.appendChild(colgroup)
+    }
+
+    let transposeMounted = false
+    const syncTransposeTableWidth = () => {
+      tWidths.fieldWidth = state.transposeFieldWidth
+      dataVirt.fieldWidth = state.transposeFieldWidth
+      if (!hasDataCols) {
+        tbl.style.width = '100%'
+        return
+      }
+      let total = state.transposeFieldWidth
+      for (let i = 0; i < rowColWidths.length; i++) {
+        total += rowColWidths[i]
+      }
+      tbl.style.width = `${total}px`
+      if (transposeMounted && dataVirt.active && dataVirt.transposed) {
+        renderDataVirtualWindow(false)
+      }
+    }
+    syncTransposeTableWidth()
+
+    const buildTransposeHeaderCell = (
+      labelText,
+      thClass,
+      colEl,
+      widthPx,
+      isFieldCol,
+      colIdx,
+      getAutoFitWidth
+    ) => {
+      const th = document.createElement('th')
+      if (thClass) th.className = thClass
+      if (colEl) th.style.width = `${widthPx}px`
+      const inner = document.createElement('div')
+      inner.className = 'th-inner'
+      const label = document.createElement('span')
+      label.className = 'th-label'
+      label.textContent = labelText
+      label.title = labelText
+      inner.appendChild(label)
+      th.appendChild(inner)
+      if (colEl) {
+        const handle = document.createElement('div')
+        handle.className = 'col-resize-handle'
+        attachColumnResizeHandle(
+          handle,
+          colEl,
+          th,
+          isFieldCol,
+          colIdx,
+          rowColWidths,
+          syncTransposeTableWidth,
+          getAutoFitWidth,
+          'transposeFieldWidth'
+        )
+        th.appendChild(handle)
+      }
+      return th
+    }
+
+    const getFieldAutoFitWidth = () => {
+      let maxChars = 'Column'.length + 2
+      for (let i = 0; i < visCols.length; i++) {
+        const col = visCols[i]
+        const len = col.name.length + (col.isPrimaryKey ? 5 : 0)
+        if (len > maxChars) maxChars = len
+      }
+      return Math.max(80, Math.min(440, Math.round(maxChars * 7.5 + 26)))
+    }
+
+    const thead = document.createElement('thead')
+    const hr = document.createElement('tr')
+    hr.appendChild(
+      buildTransposeHeaderCell(
+        'Column',
+        'transpose-col-head',
+        fieldColEl,
+        state.transposeFieldWidth,
+        true,
+        -1,
+        getFieldAutoFitWidth
+      )
+    )
+    cappedRows.forEach((entry, idx) => {
+      const labelText = entry.isInsert ? `+ New ${idx + 1}` : `Row ${idx - stagedInsLen + 1}`
+      const getRowAutoFitWidth = () => {
+        let maxChars = labelText.length + 2
+        for (let ci = 0; ci < visCols.length; ci++) {
+          const col = visCols[ci]
+          const val = getEffectiveCellValue(entry.rowKey, entry.data, col.name)
+          const textLen = measurePanelCellTextLen(val)
+          if (textLen > maxChars) maxChars = textLen
+        }
+        return Math.max(80, Math.min(440, Math.round(maxChars * 7.5 + 26)))
+      }
+      hr.appendChild(
+        buildTransposeHeaderCell(
+          labelText,
+          'transpose-row-head',
+          dataColEls[idx],
+          rowColWidths[idx],
+          false,
+          idx,
+          getRowAutoFitWidth
+        )
+      )
+    })
+    if (hasOverflowCol) {
+      const moreText = `+${allRows.length - 100} more rows`
+      const moreIdx = cappedRows.length
+      hr.appendChild(
+        buildTransposeHeaderCell(
+          moreText,
+          'transpose-row-head',
+          dataColEls[moreIdx],
+          rowColWidths[moreIdx],
+          false,
+          moreIdx,
+          () => Math.max(90, Math.min(360, Math.round(moreText.length * 7.5 + 26)))
+        )
+      )
+    }
+    thead.appendChild(hr)
+    tbl.appendChild(thead)
+
+    const tbody = document.createElement('tbody')
+    const dataWrap = $('dataGridWrap')
+    const canVirtualizeTransposed = Boolean(
+      dataWrap &&
+        ((visCols.length > 20 && (dataWrap.clientHeight || 0) > 0) ||
+          (expectedDataColCount > 16 && (dataWrap.clientWidth || 0) > 0))
+    )
+    dataVirt.rowColWidths = rowColWidths
+    dataVirt.fieldWidth = state.transposeFieldWidth
+    if (canVirtualizeTransposed) {
+      const colSpan = 1 + expectedDataColCount
+      const topSpacerTr = document.createElement('tr')
+      topSpacerTr.className = 'virt-spacer-row'
+      topSpacerTr.style.display = 'none'
+      const topSpacerTd = document.createElement('td')
+      topSpacerTd.colSpan = colSpan
+      topSpacerTr.appendChild(topSpacerTd)
+
+      const bottomSpacerTr = document.createElement('tr')
+      bottomSpacerTr.className = 'virt-spacer-row'
+      bottomSpacerTr.style.display = 'none'
+      const bottomSpacerTd = document.createElement('td')
+      bottomSpacerTd.colSpan = colSpan
+      bottomSpacerTr.appendChild(bottomSpacerTd)
+
+      tbody.append(topSpacerTr, bottomSpacerTr)
+      tbl.appendChild(tbody)
+
+      dataVirt.active = true
+      dataVirt.transposed = true
+      dataVirt.allRows = allRows
+      dataVirt.cappedRows = cappedRows
+      dataVirt.hasOverflowCol = hasOverflowCol
+      dataVirt.visCols = visCols
+      dataVirt.fkMap = fkMap
+      dataVirt.tbody = tbody
+      dataVirt.topSpacerTr = topSpacerTr
+      dataVirt.topSpacerTd = topSpacerTd
+      dataVirt.bottomSpacerTr = bottomSpacerTr
+      dataVirt.bottomSpacerTd = bottomSpacerTd
+      dataVirt.start = -1
+      dataVirt.end = -1
+      dataVirt.hStart = -1
+      dataVirt.hEnd = -1
+      computeDataFindMatches()
+      renderDataVirtualWindow(true)
+      transposeMounted = true
+    } else {
+      dataVirt.active = false
+      dataVirt.transposed = false
+      dataVirt.cappedRows = cappedRows
+      dataVirt.hasOverflowCol = hasOverflowCol
+      dataVirt.hStart = 0
+      dataVirt.hEnd = expectedDataColCount
+      const frag = document.createDocumentFragment()
+      for (let cIdx = 0; cIdx < visCols.length; cIdx++) {
+        frag.appendChild(createTransposedVirtualRow(cIdx))
+      }
+      tbody.appendChild(frag)
+      tbl.appendChild(tbody)
+    }
+  }
+
+  function clearPanelDataGridPools() {
+    dataVirt.colgroupEl = null
+    dataVirt.theadEl = null
+    dataVirt.headerRowEl = null
+    dataVirt.rowNumColEl = null
+    dataVirt.rowNumThEl = null
+    dataVirt.headerPageDataRef = null
+    dataVirt.lastRenderedPageDataRef = null
+    dataVirt.lastRenderedStagedCount = -1
+    dataVirt.colKeyByObjRef = null
+    dataVirt.colKeyByObj = null
+    dataVirt.draggedHeaderCol = null
+    dataVirt.syncTableWidthFn = null
+    dataVirt.colPoolByKey.clear()
+    dataVirt.thPoolByKey.clear()
+  }
+
+  function syncOrderedChildren(parent, desiredChildren) {
+    const desiredSet = new Set(desiredChildren)
+    const existing = parent.children
+    for (let i = existing.length - 1; i >= 0; i--) {
+      const child = existing[i]
+      if (!desiredSet.has(child)) {
+        child.remove()
+      }
+    }
+    let nextNode = null
+    for (let i = desiredChildren.length - 1; i >= 0; i--) {
+      const child = desiredChildren[i]
+      if (child.parentNode !== parent || child.nextSibling !== nextNode) {
+        parent.insertBefore(child, nextNode)
+      }
+      nextNode = child
+    }
+  }
+
+  function syncPanelDataTableWidth(tbl, allColWidths, origIdxByKey) {
+    let total = state.rowNumWidth
+    const colKeys = dataVirt.visColKeys
+    const colWidths = dataVirt.visColWidths
+    for (let ci = 0; ci < colKeys.length; ci++) {
+      const oi = origIdxByKey.get(colKeys[ci]) ?? 0
+      const w = colWidths[ci] || 120
+      allColWidths[oi] = w
+      total += w
+    }
+    tbl.style.width = `${total}px`
+    if (
+      !state.transposed &&
+      dataVirt.active &&
+      dataVirt.tbody &&
+      dataVirt.tbody.parentNode === tbl &&
+      dataVirt.visCols.length > 0 &&
+      $('dataTable') === tbl
+    ) {
+      recomputePinnedForViewport()
+    }
+  }
+
+  function ensurePanelColumnElements({
+    col,
+    colKey,
+    colIdx,
+    colWidth,
+    isPinned,
+    isPinnedLast,
+    stickyLeft,
+    visColWidths,
+    syncTableWidth,
+    allRows,
+    origIdxByKey,
+    allColWidths,
+    userResizedSet,
+    tblKey,
+    allColNames,
+    allOccKeys,
+    dataGridSel,
+  }) {
+    let colEl = dataVirt.colPoolByKey.get(colKey)
+    if (!colEl) {
+      colEl = document.createElement('col')
+      dataVirt.colPoolByKey.set(colKey, colEl)
+    }
+    colEl.style.width = `${colWidth}px`
+
+    const isSorted = state.sortCol === col.name
+    let th = dataVirt.thPoolByKey.get(colKey)
+    if (!th) {
+      th = document.createElement('th')
+      th.dataset.colName = col.name
+      th.dataset.colKey = colKey
+      th.draggable = true
+
+      th.addEventListener('dragstart', (e) => {
+        dataVirt.draggedHeaderCol = colKey
+        if (e.dataTransfer) {
+          e.dataTransfer.effectAllowed = 'move'
+          e.dataTransfer.setData('text/plain', colKey)
+        }
+      })
+      th.addEventListener('dragover', (e) => {
+        const src = dataVirt.draggedHeaderCol || e.dataTransfer?.getData('text/plain')
+        if (!src || src === colKey) return
+        e.preventDefault()
+        th.classList.add('th-drop-target')
+      })
+      th.addEventListener('dragleave', () => {
+        th.classList.remove('th-drop-target')
+      })
+      th.addEventListener('drop', (e) => {
+        e.preventDefault()
+        th.classList.remove('th-drop-target')
+        const src = dataVirt.draggedHeaderCol || e.dataTransfer?.getData('text/plain')
+        dataVirt.draggedHeaderCol = null
+        if (src && src !== colKey) {
+          reorderColumnByDrop?.(src, colKey, 'before')
+        }
+      })
+      th.addEventListener('dragend', () => {
+        dataVirt.draggedHeaderCol = null
+        dataVirt.headerRowEl?.querySelectorAll('.th-drop-target').forEach((el) => el.classList.remove('th-drop-target'))
+      })
+
+      const inner = document.createElement('div')
+      inner.className = 'th-inner'
+      const label = document.createElement('span')
+      label.className = 'th-label'
+      inner.appendChild(label)
+
+      const colGrip = document.createElement('button')
+      colGrip.type = 'button'
+      colGrip.className = 'th-col-grip'
+      colGrip.title = `Select column "${col.name}"`
+      colGrip.setAttribute('aria-label', `Select column ${col.name}`)
+      colGrip.textContent = '▾'
+      colGrip.addEventListener('click', (e) => {
+        e.preventDefault()
+        e.stopPropagation()
+        const activeColIdx = Number(th.dataset.colIdx)
+        if (Number.isFinite(activeColIdx)) {
+          dataGridSel?.selectCol(activeColIdx, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
+        }
+        $('dataGridWrap')?.focus({ preventScroll: true })
+      })
+      inner.appendChild(colGrip)
+
+      const resizeHandle = document.createElement('div')
+      resizeHandle.className = 'col-resize-handle'
+      const resizeBinding = {
+        colIdx,
+        colWidths: visColWidths,
+        syncTableWidth,
+        getAutoFitWidth: null,
+        onResizeCommit: null,
+      }
+      th._panelResizeBinding = resizeBinding
+      th._panelInnerEl = inner
+      th._panelLabelEl = label
+      th._panelGripEl = colGrip
+      th._panelSortIconEl = null
+      attachColumnResizeHandle(resizeHandle, colEl, th, false, resizeBinding, null, null, null, 'rowNumWidth')
+
+      th.append(inner, resizeHandle)
+      th.addEventListener('click', (e) => {
+        if (Date.now() < getSuppressSortClickUntil()) return
+        if (e.shiftKey || e.ctrlKey || e.metaKey) {
+          e.preventDefault()
+          const activeColIdx = Number(th.dataset.colIdx)
+          if (Number.isFinite(activeColIdx)) {
+            dataGridSel?.selectCol(activeColIdx, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
+          }
+          $('dataGridWrap')?.focus({ preventScroll: true })
+          return
+        }
+        if (state.sortCol === col.name) {
+          state.sortDir = state.sortDir === 'ASC' ? 'DESC' : 'ASC'
+        } else {
+          state.sortCol = col.name
+          state.sortDir = 'ASC'
+        }
+        state.orderByClause = ''
+        $('dataOrderInput').value = ''
+        if (state.activeConnectionId && state.activeTable) {
+          void loadTablePage(state.activeConnectionId, state.activeTable, 1, state.activeSchema)
+        }
+      })
+      dataVirt.thPoolByKey.set(colKey, th)
+    }
+
+    th.style.width = `${colWidth}px`
+    th.dataset.colIdx = String(colIdx)
+    th.classList.toggle('sorted', isSorted)
+    th.classList.toggle('col-pinned', isPinned)
+    th.classList.toggle('col-pinned-last', isPinnedLast)
+    th.style.left = isPinned ? `${stickyLeft}px` : ''
+    th._panelLabelEl.textContent = `${isPinned ? '• ' : ''}${col.name}${col.isPrimaryKey ? ' [PK]' : ''}`
+
+    if (isSorted) {
+      let sortIcon = th._panelSortIconEl
+      if (!sortIcon) {
+        sortIcon = document.createElement('span')
+        sortIcon.className = 'th-sort-icon'
+        th._panelSortIconEl = sortIcon
+      }
+      if (th.dataset.sortDir !== state.sortDir || sortIcon.children.length === 0) {
+        sortIcon.textContent = ''
+        sortIcon.appendChild(createSortSvg(state.sortDir))
+        th.dataset.sortDir = state.sortDir
+      }
+      if (sortIcon.parentNode !== th._panelInnerEl || sortIcon.nextSibling !== th._panelGripEl) {
+        th._panelInnerEl.insertBefore(sortIcon, th._panelGripEl)
+      }
+    } else if (th._panelSortIconEl) {
+      th._panelSortIconEl.remove()
+      th.dataset.sortDir = ''
+    }
+
+    const binding = th._panelResizeBinding
+    binding.colIdx = colIdx
+    binding.colWidths = visColWidths
+    binding.syncTableWidth = syncTableWidth
+    binding.getAutoFitWidth = () => {
+      let maxLen = col.name.length + (col.isPrimaryKey ? 5 : 0) + 2
+      const sampleRows = allRows.length > 500 ? allRows.slice(0, 500) : allRows
+      for (let r = 0; r < sampleRows.length; r++) {
+        const entry = sampleRows[r]
+        const val = getEffectiveCellValue(entry.rowKey, entry.data, col.name)
+        const textLen =
+          val == null
+            ? 4
+            : (typeof val === 'object' ? JSON.stringify(val) : String(val)).length
+        if (textLen > maxLen) maxLen = textLen
+      }
+      return Math.max(64, Math.min(440, Math.round(maxLen * 7.5 + 26)))
+    }
+    binding.onResizeCommit = (ci, nextW) => {
+      const cKey = dataVirt.visColKeys[ci]
+      if (!cKey || typeof patchTableDisplayState !== 'function') return
+      const oi = origIdxByKey.get(cKey)
+      if (oi !== undefined) allColWidths[oi] = nextW
+      userResizedSet.add(cKey)
+      patchTableDisplayState({
+        columnWidths: exportUserResizedColumnWidths(tblKey, allColNames, allOccKeys, allColWidths),
+      })
+    }
+
+    return { colEl, th }
+  }
+
+  function patchMountedPanelRowColumnsInPlace({ rulesChanged, wrapChanged, dataGridSel }) {
+    const tbody = dataVirt.tbody
+    if (!tbody) return
+    const visCols = dataVirt.visCols
+    const visColKeys = dataVirt.visColKeys
+    const pinnedCount = dataVirt.pinnedCount
+    const stickyLefts = dataVirt.stickyLefts
+    const colSpan = visCols.length + 1
+    if (dataVirt.topSpacerTd) dataVirt.topSpacerTd.colSpan = colSpan
+    if (dataVirt.bottomSpacerTd) dataVirt.bottomSpacerTd.colSpan = colSpan
+
+    const visKeySet = new Set(visColKeys)
+    const activeMatch =
+      state.findMatchIdx >= 0 && state.findMatchIdx < state.findMatches.length
+        ? state.findMatches[state.findMatchIdx]
+        : null
+    const hasFindMatches = state.findMatchSet.size > 0
+    const hasHighlightRules = Array.isArray(dataVirt.highlightRules) && dataVirt.highlightRules.length > 0
+
+    const bodyRows = tbody.children
+    for (let r = 0; r < bodyRows.length; r++) {
+      const tr = bodyRows[r]
+      if (tr === dataVirt.topSpacerTr || tr === dataVirt.bottomSpacerTr) continue
+      if (tr.dataset?.rowIdx === undefined) continue
+      const rowIdx = Number(tr.dataset.rowIdx)
+      const entry = dataVirt.allRows[rowIdx]
+      if (!entry) continue
+
+      let tdNum = null
+      const tdByKey = new Map()
+      const rowChildren = tr.children
+      for (let i = rowChildren.length - 1; i >= 0; i--) {
+        const node = rowChildren[i]
+        if (node.classList?.contains('td-rownum')) {
+          tdNum = node
+          continue
+        }
+        const key = node.dataset?.colKey
+        if (key && visKeySet.has(key) && !tdByKey.has(key)) {
+          tdByKey.set(key, node)
+        } else {
+          node.remove()
+        }
+      }
+
+      const needsRowHl = hasHighlightRules && (rulesChanged || tdByKey.size < visCols.length)
+      const rowHl = needsRowHl ? evaluateDataRowHighlight(entry) : null
+      const desiredCells = []
+      if (tdNum) desiredCells.push(tdNum)
+
+      for (let colIdx = 0; colIdx < visCols.length; colIdx++) {
+        const col = visCols[colIdx]
+        const colKey = visColKeys[colIdx] || col.name
+        let td = tdByKey.get(colKey)
+        const isNewCell = !td
+        if (!td) {
+          td = document.createElement('td')
+          td.dataset.rowIdx = String(rowIdx)
+          td.dataset.colKey = colKey
+          const val = getEffectiveCellValue(entry.rowKey, entry.data, col.name)
+          const fkInfo = dataVirt.fkMap.get(col.name) || null
+          renderDataCellContent(td, entry, col, val, fkInfo)
+        } else if (wrapChanged) {
+          if (!dataVirt.wrapCells || state.transposed) {
+            td.classList.remove('cell-wrap')
+          } else {
+            const val = getEffectiveCellValue(entry.rowKey, entry.data, col.name)
+            td.classList.toggle('cell-wrap', isWrappableCellValue(val, col.type))
+          }
+        }
+        td.dataset.colIdx = String(colIdx)
+        const isPinned = colIdx < pinnedCount
+        td.classList.toggle('col-pinned', isPinned)
+        td.classList.toggle('col-pinned-last', isPinned && colIdx === pinnedCount - 1)
+        td.style.left = isPinned ? `${stickyLefts[colIdx]}px` : ''
+
+        if (rulesChanged || (isNewCell && hasHighlightRules)) {
+          applyCellHighlightClass(td, rowHl, colKey, col.name, false)
+        }
+        const isMatch = hasFindMatches && state.findMatchSet.has(`${rowIdx}:${colIdx}`)
+        const isActiveMatch = Boolean(
+          isMatch && activeMatch && activeMatch.r === rowIdx && activeMatch.c === colIdx
+        )
+        td.classList.toggle('cell-match', isMatch)
+        td.classList.toggle('cell-match-active', isActiveMatch)
+        desiredCells.push(td)
+      }
+
+      syncOrderedChildren(tr, desiredCells)
+      dataGridSel?.applyClassesToRow(tr, rowIdx)
+    }
+  }
+
+  function renderDataGrid(opts = {}) {
     const prevCleanup = getActiveResizeCleanup()
     if (prevCleanup) prevCleanup()
     if (dataVirt.rafId !== null && typeof cancelAnimationFrame === 'function') {
@@ -1489,6 +2823,7 @@ export function createPanelDataGridController(ctx) {
       dataVirt.active = false
       dataVirt.start = -1
       dataVirt.end = -1
+      clearPanelDataGridPools()
       $('dataEmpty').hidden = true
       $('dataGridWrap').hidden = false
       $('dataPager').hidden = false
@@ -1538,6 +2873,7 @@ export function createPanelDataGridController(ctx) {
       dataVirt.visCols = []
       dataVirt.start = -1
       dataVirt.end = -1
+      clearPanelDataGridPools()
       $('dataEmpty').hidden = false
       $('dataGridWrap').hidden = true
       $('dataPager').hidden = true
@@ -1561,68 +2897,16 @@ export function createPanelDataGridController(ctx) {
     const visCols = getOrderedVisibleColumns()
     const pinnedSet = getPinnedColsSet(tblKey)
     const fkMap = getActiveForeignKeyMap()
-    tbl.textContent = ''
     tbl.classList.toggle('transposed', state.transposed)
 
     if (state.transposed) {
-      dataVirt.active = false
-      dataVirt.allRows = allRows
-      dataVirt.visCols = visCols
-      dataVirt.fkMap = fkMap
-      dataVirt.start = -1
-      dataVirt.end = -1
-      tbl.style.width = ''
-      const thead = document.createElement('thead')
-      const hr = document.createElement('tr')
-      const firstTh = document.createElement('th')
-      firstTh.className = 'transpose-col-head'
-      firstTh.textContent = 'Column'
-      hr.appendChild(firstTh)
-      const stagedInsLen = state.stagedInserts.length
-      const cappedRows = allRows.slice(0, 100)
-      cappedRows.forEach((entry, idx) => {
-        const th = document.createElement('th')
-        th.textContent = entry.isInsert ? `+ New ${idx + 1}` : `Row ${idx - stagedInsLen + 1}`
-        hr.appendChild(th)
-      })
-      if (allRows.length > 100) {
-        const moreTh = document.createElement('th')
-        moreTh.textContent = `+${allRows.length - 100} more rows`
-        hr.appendChild(moreTh)
-      }
-      thead.appendChild(hr)
-      tbl.appendChild(thead)
-
-      const tbody = document.createElement('tbody')
-      for (let cIdx = 0; cIdx < visCols.length; cIdx++) {
-        const col = visCols[cIdx]
-        const tr = document.createElement('tr')
-        const colHead = document.createElement('th')
-        colHead.className = 'transpose-col-head'
-        colHead.textContent = `${col.name}${col.isPrimaryKey ? ' [PK]' : ''}`
-        tr.appendChild(colHead)
-        const fkInfo = fkMap.get(col.name) || null
-        for (let rIdx = 0; rIdx < cappedRows.length; rIdx++) {
-          const entry = cappedRows[rIdx]
-          const td = document.createElement('td')
-          td.dataset.rowIdx = String(rIdx)
-          td.dataset.colIdx = String(cIdx)
-          if (entry.isInsert) td.style.background = 'color-mix(in srgb, var(--ok) 12%, var(--bg))'
-          if (state.stagedDeletes.has(entry.rowKey)) td.style.textDecoration = 'line-through'
-          const val = getEffectiveCellValue(entry.rowKey, entry.data, col.name)
-          renderDataCellContent(td, entry, col, val, fkInfo)
-          tr.appendChild(td)
-        }
-        if (allRows.length > 100) {
-          const moreTd = document.createElement('td')
-          moreTd.className = 'cell-null'
-          moreTd.textContent = `... (${allRows.length - 100} more)`
-          tr.appendChild(moreTd)
-        }
-        tbody.appendChild(tr)
-      }
-      tbl.appendChild(tbody)
+      clearPanelDataGridPools()
+      tbl.textContent = ''
+      dataVirt.wrapCells = false
+      dataRowHeightIndex.setWrapEnabled(false)
+      renderTransposedDataGrid(tbl, tblKey, allRows, visCols, fkMap)
     } else {
+      const displayEntry = getActiveTableDisplayEntry?.(tblKey) || null
       if (
         !Array.isArray(state.columnWidthsByTable[tblKey]) ||
         state.columnWidthsByTable[tblKey].length !== pd.columns.length
@@ -1630,201 +2914,246 @@ export function createPanelDataGridController(ctx) {
         state.columnWidthsByTable[tblKey] = computeInitialColumnWidths(pd.columns, allRows)
       }
       const allColWidths = state.columnWidthsByTable[tblKey]
-      const origIdxByName = new Map(pd.columns.map((c, idx) => [c.name, idx]))
-      const visColWidths = visCols.map((c) => allColWidths[origIdxByName.get(c.name) ?? 0] || 120)
+      const colResolver = resolvePanelGridKeyResolver(pd.columns)
+      const allOccKeys = colResolver ? colResolver.occKeys : []
+      const origIdxByKey = colResolver ? colResolver.indexByKey : new Map()
+      const allColNames =
+        dataVirt.lastRenderedPageDataRef === pd &&
+        Array.isArray(dataVirt.allColNames) &&
+        dataVirt.allColNames.length === pd.columns.length
+          ? dataVirt.allColNames
+          : pd.columns.map((c) => c.name)
 
-      const pinnedCount = visCols.filter((c) => pinnedSet.has(c.name)).length
+      if (dataVirt.colKeyByObjRef !== pd.columns || !dataVirt.colKeyByObj || !dataVirt.colKeyByName) {
+        dataVirt.colKeyByObj = new Map(pd.columns.map((c, idx) => [c, allOccKeys[idx]]))
+        const byName = new Map()
+        for (let idx = 0; idx < allColNames.length; idx++) {
+          if (!byName.has(allColNames[idx])) {
+            byName.set(allColNames[idx], allOccKeys[idx])
+          }
+        }
+        dataVirt.colKeyByName = byName
+        dataVirt.colKeyByObjRef = pd.columns
+      }
+      const colKeyByObj = dataVirt.colKeyByObj
+
+      const userResizedSet = ensureUserResizedSet(tblKey)
+      if (displayEntry?.columnWidths) {
+        for (const [rawKey, w] of Object.entries(displayEntry.columnWidths)) {
+          const oi = colResolver ? colResolver.resolveIndex(rawKey) : -1
+          if (oi >= 0 && typeof w === 'number' && Number.isFinite(w) && w > 0) {
+            allColWidths[oi] = w
+            userResizedSet.add(allOccKeys[oi])
+          }
+        }
+      }
+      const visColKeys = visCols.map((c, ci) => colKeyByObj.get(c) ?? allOccKeys[ci] ?? c.name)
+      const visColWidths = visColKeys.map((k) => allColWidths[origIdxByKey.get(k) ?? 0] || 120)
+
+      const wrapEl = $('dataGridWrap')
+      const viewportW = wrapEl?.clientWidth || 800
+      const widthsByKey = {}
+      visColKeys.forEach((colKey, ci) => {
+        widthsByKey[colKey] = visColWidths[ci]
+      })
+      const resolvedPinnedSet = new Set()
+      for (const k of pinnedSet) {
+        resolvedPinnedSet.add((colResolver ? colResolver.resolveKey(k) : null) || k)
+      }
+      const pinnedCandidateKeys = visColKeys.filter((k) => resolvedPinnedSet.has(k))
+      const pinnedCap = computePinnedColumnsViewportCap({
+        pinnedKeys: pinnedCandidateKeys,
+        widthsByKey,
+        viewportWidthPx: viewportW,
+        rowNumWidthPx: state.rowNumWidth,
+      })
+      const pinnedCount = pinnedCap.activePinnedKeys.length
+      const totalPinnedWidthPx = pinnedCap.totalPinnedWidthPx
       const stickyLefts = []
       let accLeft = state.rowNumWidth
-      for (let i = 0; i < visCols.length; i++) {
-        stickyLefts.push(accLeft)
+      for (let i = 0; i < visColKeys.length; i++) {
+        stickyLefts.push(i < pinnedCount ? (pinnedCap.stickyLeftByKey[visColKeys[i]] ?? accLeft) : accLeft)
         if (i < pinnedCount) accLeft += visColWidths[i]
       }
 
-      const colgroup = document.createElement('colgroup')
-      const rowNumColEl = document.createElement('col')
-      rowNumColEl.style.width = `${state.rowNumWidth}px`
-      colgroup.appendChild(rowNumColEl)
-      const dataColEls = visColWidths.map((w) => {
-        const c = document.createElement('col')
-        c.style.width = `${w}px`
-        colgroup.appendChild(c)
-        return c
-      })
-      tbl.appendChild(colgroup)
+      const wrapCells = Boolean(displayEntry?.wrapCells)
+      const wrapMaxLines = clampWrapMaxLines(displayEntry?.wrapMaxLines ?? DEFAULT_WRAP_MAX_LINES)
+      const highlightRules = Array.isArray(displayEntry?.highlightRules)
+        ? displayEntry.highlightRules
+        : []
 
-      const syncTableWidth = () => {
-        let total = state.rowNumWidth
-        visCols.forEach((c, ci) => {
-          const oi = origIdxByName.get(c.name) ?? 0
-          allColWidths[oi] = visColWidths[ci]
-          total += visColWidths[ci]
-        })
-        tbl.style.width = `${total}px`
-        if (pinnedCount > 0) {
-          let leftPx = state.rowNumWidth
-          const headerCells = tbl.querySelectorAll('thead th[data-col-idx]')
-          const tbodyEl = tbl.tBodies?.[0] || tbl.querySelector('tbody')
-          const bodyRows = tbodyEl ? tbodyEl.children : []
-          for (let pi = 0; pi < pinnedCount; pi++) {
-            stickyLefts[pi] = leftPx
-            if (dataVirt.active && dataVirt.stickyLefts) {
-              dataVirt.stickyLefts[pi] = leftPx
-            }
-            const thEl = headerCells[pi]
-            if (thEl instanceof HTMLElement) thEl.style.left = `${leftPx}px`
-            for (let r = 0; r < bodyRows.length; r++) {
-              const tr = bodyRows[r]
-              if (!(tr instanceof HTMLElement) || tr.dataset.rowIdx === undefined) continue
-              const tdEl = tr.children[pi + 1]
-              if (tdEl instanceof HTMLElement) tdEl.style.left = `${leftPx}px`
-            }
-            leftPx += visColWidths[pi]
-          }
+      const stagedCount = typeof getStagedCount === 'function' ? getStagedCount() : 0
+      const rulesChanged = !areHighlightRulesEqual(dataVirt.highlightRules, highlightRules)
+      const wrapChanged = dataVirt.wrapCells !== wrapCells || dataVirt.wrapMaxLines !== wrapMaxLines
+      const pageDataChanged = dataVirt.lastRenderedPageDataRef !== pd
+      const stagedChanged = dataVirt.lastRenderedStagedCount !== stagedCount
+      const canPatchMountedGrid =
+        opts?.layoutOnly === true &&
+        Boolean(dataVirt.active) &&
+        !dataVirt.transposed &&
+        allRows.length > 0 &&
+        Boolean(dataVirt.tbody && dataVirt.tbody.parentNode === tbl) &&
+        Boolean(dataVirt.colgroupEl && dataVirt.colgroupEl.parentNode === tbl) &&
+        Boolean(dataVirt.theadEl && dataVirt.theadEl.parentNode === tbl) &&
+        Boolean(dataVirt.headerRowEl) &&
+        !pageDataChanged &&
+        dataVirt.allRows.length === allRows.length &&
+        !stagedChanged
+
+      if (!canPatchMountedGrid) {
+        if (dataVirt.headerPageDataRef !== pd) {
+          dataVirt.colPoolByKey.clear()
+          dataVirt.thPoolByKey.clear()
+          dataVirt.rowNumColEl = null
+          dataVirt.rowNumThEl = null
+          dataVirt.headerPageDataRef = pd
         }
+        dataVirt.colgroupEl = null
+        dataVirt.theadEl = null
+        dataVirt.headerRowEl = null
+        tbl.textContent = ''
       }
-      syncTableWidth()
 
-      const thead = document.createElement('thead')
-      const hRow = document.createElement('tr')
+      if (!canPatchMountedGrid || dataRowHeightIndex.rowCount !== allRows.length) {
+        dataRowHeightIndex.reset(allRows.length)
+      }
+      dataRowHeightIndex.setWrapEnabled(wrapCells)
+      dataRowHeightIndex.setMaxLines(wrapMaxLines)
 
-      const thIdx = document.createElement('th')
-      thIdx.style.width = `${state.rowNumWidth}px`
-      thIdx.style.cursor = 'pointer'
-      thIdx.style.left = '0px'
-      thIdx.dataset.cornerSelect = '1'
-      thIdx.title = 'Click to Select All (Ctrl+A)'
-      const idxInner = document.createElement('div')
-      idxInner.className = 'th-inner'
-      const idxLabel = document.createElement('span')
-      idxLabel.className = 'th-label'
-      idxLabel.style.textAlign = 'right'
-      idxLabel.textContent = '#'
-      idxInner.appendChild(idxLabel)
-      const idxResize = document.createElement('div')
-      idxResize.className = 'col-resize-handle'
-      attachColumnResizeHandle(
-        idxResize,
-        rowNumColEl,
-        thIdx,
-        true,
-        -1,
-        visColWidths,
-        syncTableWidth,
-        null,
-        'rowNumWidth'
-      )
-      thIdx.append(idxInner, idxResize)
-      thIdx.addEventListener('click', (e) => {
-        if (Date.now() < getSuppressSortClickUntil()) return
-        e.stopPropagation()
-        dataGridSel?.selectAll()
-      })
-      hRow.appendChild(thIdx)
-
-      visCols.forEach((col, colIdx) => {
-        const th = document.createElement('th')
-        th.style.width = `${visColWidths[colIdx]}px`
-        th.dataset.colIdx = String(colIdx)
-        th.dataset.colName = col.name
-        const isSorted = state.sortCol === col.name
-        if (isSorted) th.classList.add('sorted')
-        const isPinned = colIdx < pinnedCount
-        if (isPinned) {
-          th.classList.add('col-pinned')
-          th.style.left = `${stickyLefts[colIdx]}px`
-          if (colIdx === pinnedCount - 1) th.classList.add('col-pinned-last')
-        }
-
-        const inner = document.createElement('div')
-        inner.className = 'th-inner'
-        const label = document.createElement('span')
-        label.className = 'th-label'
-        label.textContent = `${isPinned ? '• ' : ''}${col.name}${col.isPrimaryKey ? ' [PK]' : ''}`
-        inner.appendChild(label)
-
-        if (isSorted) {
-          const sortIcon = document.createElement('span')
-          sortIcon.className = 'th-sort-icon'
-          sortIcon.appendChild(createSortSvg(state.sortDir))
-          inner.appendChild(sortIcon)
-        }
-
-        const colGrip = document.createElement('button')
-        colGrip.type = 'button'
-        colGrip.className = 'th-col-grip'
-        colGrip.title = `Select column "${col.name}"`
-        colGrip.setAttribute('aria-label', `Select column ${col.name}`)
-        colGrip.textContent = '▾'
-        colGrip.addEventListener('click', (e) => {
-          e.preventDefault()
-          e.stopPropagation()
-          dataGridSel?.selectCol(colIdx, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
-          $('dataGridWrap')?.focus({ preventScroll: true })
-        })
-        inner.appendChild(colGrip)
-
-        const resizeHandle = document.createElement('div')
-        resizeHandle.className = 'col-resize-handle'
-        attachColumnResizeHandle(
-          resizeHandle,
-          dataColEls[colIdx],
-          th,
-          false,
-          colIdx,
-          visColWidths,
-          syncTableWidth,
-          () => {
-            let maxLen = col.name.length + (col.isPrimaryKey ? 5 : 0) + 2
-            const sampleRows = allRows.length > 500 ? allRows.slice(0, 500) : allRows
-            for (let r = 0; r < sampleRows.length; r++) {
-              const entry = sampleRows[r]
-              const val = getEffectiveCellValue(entry.rowKey, entry.data, col.name)
-              const textLen =
-                val == null
-                  ? 4
-                  : (typeof val === 'object' ? JSON.stringify(val) : String(val)).length
-              if (textLen > maxLen) maxLen = textLen
-            }
-            return Math.max(64, Math.min(440, Math.round(maxLen * 7.5 + 26)))
-          },
-          'rowNumWidth'
-        )
-
-        th.append(inner, resizeHandle)
-        th.addEventListener('click', (e) => {
-          if (Date.now() < getSuppressSortClickUntil()) return
-          if (e.shiftKey || e.ctrlKey || e.metaKey) {
-            e.preventDefault()
-            dataGridSel?.selectCol(colIdx, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
-            $('dataGridWrap')?.focus({ preventScroll: true })
-            return
-          }
-          if (state.sortCol === col.name) {
-            state.sortDir = state.sortDir === 'ASC' ? 'DESC' : 'ASC'
-          } else {
-            state.sortCol = col.name
-            state.sortDir = 'ASC'
-          }
-          state.orderByClause = ''
-          $('dataOrderInput').value = ''
-          if (state.activeConnectionId && state.activeTable) {
-            void loadTablePage(state.activeConnectionId, state.activeTable, 1, state.activeSchema)
-          }
-        })
-        hRow.appendChild(th)
-      })
-      thead.appendChild(hRow)
-      tbl.appendChild(thead)
+      if (pageDataChanged || stagedChanged || rulesChanged) {
+        bumpAllHighlightRevisions()
+      }
 
       const pageOffset = ((pd.page || 1) - 1) * (pd.pageSize || state.pageSize || 100)
-      const tbody = document.createElement('tbody')
+      dataVirt.visCols = visCols
+      dataVirt.visColKeys = visColKeys
+      dataVirt.visColWidths = visColWidths
+      dataVirt.pinnedCandidateKeys = pinnedCandidateKeys
+      dataVirt.pinnedCount = pinnedCount
+      dataVirt.stickyLefts = stickyLefts
+      dataVirt.totalPinnedWidthPx = totalPinnedWidthPx
+      dataVirt.wrapCells = wrapCells
+      dataVirt.wrapMaxLines = wrapMaxLines
+      dataVirt.highlightRules = highlightRules
+      dataVirt.allColNames = allColNames
+      dataVirt.fkMap = fkMap
+      dataVirt.pageOffset = pageOffset
+      dataVirt.stagedInsertCount = state.stagedInserts.length
+      dataVirt.isConnRo = isConnRo
+      dataVirt.canEditTable = Boolean(pd.canEdit)
+      dataVirt.draggedHeaderCol = null
+
+      const syncTableWidth = () => syncPanelDataTableWidth(tbl, allColWidths, origIdxByKey)
+      dataVirt.syncTableWidthFn = syncTableWidth
+
+      let colgroup = dataVirt.colgroupEl
+      let rowNumColEl = dataVirt.rowNumColEl
+      if (!colgroup || !rowNumColEl) {
+        colgroup = document.createElement('colgroup')
+        rowNumColEl = document.createElement('col')
+        colgroup.appendChild(rowNumColEl)
+        dataVirt.colgroupEl = colgroup
+        dataVirt.rowNumColEl = rowNumColEl
+      }
+      rowNumColEl.style.width = `${state.rowNumWidth}px`
+
+      let thead = dataVirt.theadEl
+      let hRow = dataVirt.headerRowEl
+      let thIdx = dataVirt.rowNumThEl
+      if (!thead || !hRow || !thIdx) {
+        thead = document.createElement('thead')
+        hRow = document.createElement('tr')
+        thIdx = document.createElement('th')
+        thIdx.style.cursor = 'pointer'
+        thIdx.style.left = '0px'
+        thIdx.dataset.cornerSelect = '1'
+        thIdx.title = 'Click to Select All (Ctrl+A)'
+        const idxInner = document.createElement('div')
+        idxInner.className = 'th-inner'
+        const idxLabel = document.createElement('span')
+        idxLabel.className = 'th-label'
+        idxLabel.style.textAlign = 'right'
+        idxLabel.textContent = '#'
+        idxInner.appendChild(idxLabel)
+        const idxResize = document.createElement('div')
+        idxResize.className = 'col-resize-handle'
+        const rowNumBinding = {
+          colIdx: -1,
+          colWidths: visColWidths,
+          syncTableWidth,
+          getAutoFitWidth: null,
+          onResizeCommit: null,
+        }
+        thIdx._rowNumResizeBinding = rowNumBinding
+        attachColumnResizeHandle(idxResize, rowNumColEl, thIdx, true, rowNumBinding, null, null, null, 'rowNumWidth')
+        thIdx.append(idxInner, idxResize)
+        thIdx.addEventListener('click', (e) => {
+          if (Date.now() < getSuppressSortClickUntil()) return
+          e.stopPropagation()
+          dataGridSel?.selectAll()
+        })
+        thead.appendChild(hRow)
+        dataVirt.theadEl = thead
+        dataVirt.headerRowEl = hRow
+        dataVirt.rowNumThEl = thIdx
+      }
+      thIdx.style.width = `${state.rowNumWidth}px`
+      if (thIdx._rowNumResizeBinding) {
+        thIdx._rowNumResizeBinding.colWidths = visColWidths
+        thIdx._rowNumResizeBinding.syncTableWidth = syncTableWidth
+      }
+
+      const desiredCols = [rowNumColEl]
+      const desiredThs = [thIdx]
+      for (let colIdx = 0; colIdx < visCols.length; colIdx++) {
+        const col = visCols[colIdx]
+        const colKey = visColKeys[colIdx]
+        const isPinned = colIdx < pinnedCount
+        const { colEl, th } = ensurePanelColumnElements({
+          col,
+          colKey,
+          colIdx,
+          colWidth: visColWidths[colIdx],
+          isPinned,
+          isPinnedLast: isPinned && colIdx === pinnedCount - 1,
+          stickyLeft: stickyLefts[colIdx],
+          visColWidths,
+          syncTableWidth,
+          allRows,
+          origIdxByKey,
+          allColWidths,
+          userResizedSet,
+          tblKey,
+          allColNames,
+          allOccKeys,
+          dataGridSel,
+        })
+        desiredCols.push(colEl)
+        desiredThs.push(th)
+      }
+      syncOrderedChildren(colgroup, desiredCols)
+      syncOrderedChildren(hRow, desiredThs)
+
+      if (!canPatchMountedGrid) {
+        tbl.appendChild(colgroup)
+        tbl.appendChild(thead)
+      }
+
+      let totalWidthPx = state.rowNumWidth
+      for (let ci = 0; ci < visColWidths.length; ci++) {
+        totalWidthPx += visColWidths[ci] || 120
+      }
+      tbl.style.width = `${totalWidthPx}px`
+
       if (allRows.length === 0) {
         dataVirt.active = false
         dataVirt.allRows = []
-        dataVirt.visCols = visCols
         dataVirt.start = -1
         dataVirt.end = -1
+        dataVirt.tbody = null
+        dataVirt.lastRenderedPageDataRef = pd
+        dataVirt.lastRenderedStagedCount = stagedCount
+        const tbody = document.createElement('tbody')
         const emptyTr = document.createElement('tr')
         const emptyTd = document.createElement('td')
         emptyTd.colSpan = visCols.length + 1
@@ -1837,7 +3166,15 @@ export function createPanelDataGridController(ctx) {
         emptyTr.appendChild(emptyTd)
         tbody.appendChild(emptyTr)
         tbl.appendChild(tbody)
+      } else if (canPatchMountedGrid) {
+        dataVirt.allRows = allRows
+        computeDataFindMatches()
+        patchMountedPanelRowColumnsInPlace({ rulesChanged, wrapChanged, dataGridSel })
+        renderDataVirtualWindow(false)
+        dataVirt.lastRenderedPageDataRef = pd
+        dataVirt.lastRenderedStagedCount = stagedCount
       } else {
+        const tbody = document.createElement('tbody')
         const topSpacerTr = document.createElement('tr')
         topSpacerTr.className = 'virt-spacer-row'
         topSpacerTr.style.display = 'none'
@@ -1856,15 +3193,8 @@ export function createPanelDataGridController(ctx) {
         tbl.appendChild(tbody)
 
         dataVirt.active = true
+        dataVirt.transposed = false
         dataVirt.allRows = allRows
-        dataVirt.visCols = visCols
-        dataVirt.pinnedCount = pinnedCount
-        dataVirt.stickyLefts = stickyLefts
-        dataVirt.fkMap = fkMap
-        dataVirt.pageOffset = pageOffset
-        dataVirt.stagedInsertCount = state.stagedInserts.length
-        dataVirt.isConnRo = isConnRo
-        dataVirt.canEditTable = Boolean(pd.canEdit)
         dataVirt.tbody = tbody
         dataVirt.topSpacerTr = topSpacerTr
         dataVirt.topSpacerTd = topSpacerTd
@@ -1872,6 +3202,20 @@ export function createPanelDataGridController(ctx) {
         dataVirt.bottomSpacerTd = bottomSpacerTd
         dataVirt.start = -1
         dataVirt.end = -1
+        dataVirt.topSpacerPx = -1
+        dataVirt.bottomSpacerPx = -1
+        dataVirt.lastRenderedPageDataRef = pd
+        dataVirt.lastRenderedStagedCount = stagedCount
+
+        if (wrapCells) {
+          const preMeasureCount =
+            pd.columns.length * allRows.length <= 15000
+              ? Math.min(allRows.length, 500)
+              : Math.min(allRows.length, 60)
+          for (let r = 0; r < preMeasureCount; r++) {
+            measureRowWrapLines(r, visCols, visColWidths, wrapMaxLines)
+          }
+        }
 
         computeDataFindMatches()
         renderDataVirtualWindow(true)
@@ -2014,41 +3358,66 @@ export function createPanelDataGridController(ctx) {
         }
 
         if (
-          !state.transposed &&
           dataVirt.active &&
           td.dataset.rowIdx !== undefined &&
           td.dataset.colIdx !== undefined
         ) {
           const curR = Number(td.dataset.rowIdx)
           const curC = Number(td.dataset.colIdx)
-          const totalR = dataVirt.allRows.length
-          const totalC = dataVirt.visCols.length
           const step = e.shiftKey ? -1 : 1
-          let linear = curR * totalC + curC + step
           let targetR = -1
           let targetC = -1
-          const maxSteps = totalR * totalC
-          for (let checked = 0; checked < maxSteps && linear >= 0 && linear < maxSteps; checked++) {
-            const nr = Math.floor(linear / totalC)
-            const nc = linear % totalC
-            const candEntry = dataVirt.allRows[nr]
-            const candCol = dataVirt.visCols[nc]
-            if (
-              isDataCellEditable(candEntry, candCol, state.pageData, Boolean(getActiveConn()?.readOnly))
-            ) {
-              targetR = nr
-              targetC = nc
-              break
+          if (state.transposed) {
+            const totalR = dataVirt.cappedRows.length
+            const totalC = dataVirt.visCols.length
+            const maxSteps = totalR * totalC
+            let linear = curC * totalR + curR + step
+            for (let checked = 0; checked < maxSteps && linear >= 0 && linear < maxSteps; checked++) {
+              const nc = Math.floor(linear / totalR)
+              const nr = linear % totalR
+              const candEntry = dataVirt.cappedRows[nr]
+              const candCol = dataVirt.visCols[nc]
+              if (
+                isDataCellEditable(candEntry, candCol, state.pageData, Boolean(getActiveConn()?.readOnly))
+              ) {
+                targetR = nr
+                targetC = nc
+                break
+              }
+              linear += step
             }
-            linear += step
+          } else {
+            const totalR = dataVirt.allRows.length
+            const totalC = dataVirt.visCols.length
+            const maxSteps = totalR * totalC
+            let linear = curR * totalC + curC + step
+            for (let checked = 0; checked < maxSteps && linear >= 0 && linear < maxSteps; checked++) {
+              const nr = Math.floor(linear / totalC)
+              const nc = linear % totalC
+              const candEntry = dataVirt.allRows[nr]
+              const candCol = dataVirt.visCols[nc]
+              if (
+                isDataCellEditable(candEntry, candCol, state.pageData, Boolean(getActiveConn()?.readOnly))
+              ) {
+                targetR = nr
+                targetC = nc
+                break
+              }
+              linear += step
+            }
           }
           if (targetR >= 0 && targetC >= 0) {
-            ensureDataVirtualRowVisible(targetR)
+            ensureDataVirtualRowVisible(
+              state.transposed ? targetC : targetR,
+              state.transposed ? targetR : undefined
+            )
             dataGridSel?.selectCell(targetR, targetC)
             const freshTd = $('dataTable')?.querySelector(
               `tbody td[data-row-idx="${targetR}"][data-col-idx="${targetC}"]`
             )
-            const freshEntry = dataVirt.allRows[targetR]
+            const freshEntry = state.transposed
+              ? dataVirt.cappedRows[targetR]
+              : dataVirt.allRows[targetR]
             const freshCol = dataVirt.visCols[targetC]
             if (freshTd && freshEntry && freshCol) {
               if (typeof freshTd.scrollIntoView === 'function') {
@@ -2072,11 +3441,19 @@ export function createPanelDataGridController(ctx) {
           const nextIdx = curIdx >= 0 ? curIdx + (e.shiftKey ? -1 : 1) : -1
           const freshTd = nextIdx >= 0 && nextIdx < editableTds.length ? editableTds[nextIdx] : null
           if (freshTd && freshTd.dataset.rowKey && freshTd.dataset.colName) {
-            state.selectedRowKey = freshTd.dataset.rowKey
-            state.selectedCol = freshTd.dataset.colName
-            updateGridSelectionHighlight()
-            renderStagingBar()
-            renderValueInspector()
+            if (
+              dataGridSel &&
+              freshTd.dataset.rowIdx !== undefined &&
+              freshTd.dataset.colIdx !== undefined
+            ) {
+              dataGridSel.selectCell(Number(freshTd.dataset.rowIdx), Number(freshTd.dataset.colIdx))
+            } else {
+              state.selectedRowKey = freshTd.dataset.rowKey
+              state.selectedCol = freshTd.dataset.colName
+              updateGridSelectionHighlight()
+              renderStagingBar()
+              renderValueInspector()
+            }
             const freshEntry = getAllDisplayRows().find((r) => r.rowKey === freshTd.dataset.rowKey)
             const freshCol = state.pageData?.columns?.find(
               (c) => c.name === freshTd.dataset.colName
@@ -2288,8 +3665,83 @@ export function createPanelDataGridController(ctx) {
     $('inspectorNullBtn').disabled = !editable || (col ? !col.nullable : false)
   }
 
+  function recomputePinnedForViewport() {
+    if (state.transposed || !state.pageData || dataVirt.visCols.length === 0) return false
+    const wrapEl = $('dataGridWrap')
+    const tbl = $('dataTable')
+    if (!tbl || !wrapEl) return false
+    const viewportW = wrapEl.clientWidth || 800
+    const widthsByKey = {}
+    dataVirt.visColKeys.forEach((colKey, ci) => {
+      widthsByKey[colKey] = dataVirt.visColWidths[ci] || 120
+    })
+    const pinnedCap = computePinnedColumnsViewportCap({
+      pinnedKeys: dataVirt.pinnedCandidateKeys || [],
+      widthsByKey,
+      viewportWidthPx: viewportW,
+      rowNumWidthPx: state.rowNumWidth,
+    })
+    const nextPinnedCount = pinnedCap.activePinnedKeys.length
+    const nextTotalPinnedWidthPx = pinnedCap.totalPinnedWidthPx
+    const nextStickyLefts = []
+    let accLeft = state.rowNumWidth
+    for (let i = 0; i < dataVirt.visColKeys.length; i++) {
+      nextStickyLefts.push(
+        i < nextPinnedCount
+          ? (pinnedCap.stickyLeftByKey[dataVirt.visColKeys[i]] ?? accLeft)
+          : accLeft
+      )
+      if (i < nextPinnedCount) accLeft += dataVirt.visColWidths[i] || 120
+    }
+    const prevPinnedCount = dataVirt.pinnedCount
+    dataVirt.pinnedCount = nextPinnedCount
+    dataVirt.totalPinnedWidthPx = nextTotalPinnedWidthPx
+    dataVirt.stickyLefts = nextStickyLefts
+
+    const headerCells = tbl.querySelectorAll('thead th[data-col-idx]')
+    for (let colIdx = 0; colIdx < headerCells.length; colIdx++) {
+      const th = headerCells[colIdx]
+      if (!(th instanceof HTMLElement)) continue
+      const isPinned = colIdx < nextPinnedCount
+      th.classList.toggle('col-pinned', isPinned)
+      th.classList.toggle('col-pinned-last', isPinned && colIdx === nextPinnedCount - 1)
+      th.style.left = isPinned ? `${nextStickyLefts[colIdx]}px` : ''
+      const col = dataVirt.visCols[colIdx]
+      const labelEl = th.querySelector('.th-label')
+      if (col && labelEl) {
+        labelEl.textContent = `${isPinned ? '• ' : ''}${col.name}${col.isPrimaryKey ? ' [PK]' : ''}`
+      }
+    }
+
+    const tbodyEl = tbl.tBodies?.[0] || tbl.querySelector('tbody')
+    const bodyRows = tbodyEl ? tbodyEl.children : []
+    for (let r = 0; r < bodyRows.length; r++) {
+      const tr = bodyRows[r]
+      if (!(tr instanceof HTMLElement) || tr.dataset.rowIdx === undefined) continue
+      for (let colIdx = 0; colIdx < dataVirt.visCols.length; colIdx++) {
+        const td = tr.children[colIdx + 1]
+        if (!(td instanceof HTMLElement)) continue
+        const isPinned = colIdx < nextPinnedCount
+        td.classList.toggle('col-pinned', isPinned)
+        td.classList.toggle('col-pinned-last', isPinned && colIdx === nextPinnedCount - 1)
+        td.style.left = isPinned ? `${nextStickyLefts[colIdx]}px` : ''
+      }
+    }
+
+    if (dataVirt.active && state.selectedRowKey && state.selectedCol) {
+      const focusRowIdx = dataVirt.allRows.findIndex((r) => r.rowKey === state.selectedRowKey)
+      const focusColIdx = dataVirt.visCols.findIndex((c) => c.name === state.selectedCol)
+      if (focusRowIdx >= 0 && focusColIdx >= nextPinnedCount) {
+        ensureDataVirtualRowVisible(focusRowIdx, focusColIdx)
+      }
+    }
+    return nextPinnedCount !== prevPinnedCount
+  }
+
   return {
     dataVirt,
+    bumpAllHighlightRevisions,
+    recomputePinnedForViewport,
     computeVirtualRange,
     isActiveDataObjectView,
     renderDataToolbar,

@@ -30,6 +30,7 @@ export function getEffectiveResultSets(res, fallbackSql = '') {
       affectedRows: res.affectedRows,
       truncated: Boolean(res.truncated),
       isSelect: Boolean(res.isSelect),
+      ...(res.explainPlan ? { explainPlan: res.explainPlan } : {}),
     },
   ]
 }
@@ -64,6 +65,7 @@ export function buildSingleSetQueryResult(res, index) {
     isSelect: Boolean(rs.isSelect),
     isError: Boolean(rs.isError),
     errorMessage: rs.errorMessage,
+    ...(rs.explainPlan ? { explainPlan: rs.explainPlan } : {}),
   }
 }
 
@@ -169,6 +171,9 @@ export function buildCombinedExplainResult(collectedSets, firstNonError, totalMs
     truncated: false,
     isSelect: true,
   }
+  const leadExplainPlan =
+    firstNonError?.explainPlan ??
+    collectedSets.find((s) => s && s.explainPlan)?.explainPlan
   return {
     columns: lead.columns || [],
     rows: lead.rows || [],
@@ -176,6 +181,7 @@ export function buildCombinedExplainResult(collectedSets, firstNonError, totalMs
     executionTimeMs: totalMs,
     truncated: Boolean(lead.truncated),
     isSelect: true,
+    ...(leadExplainPlan ? { explainPlan: leadExplainPlan } : {}),
     ...(collectedSets.length > 1 ? { resultSets: collectedSets } : {}),
   }
 }

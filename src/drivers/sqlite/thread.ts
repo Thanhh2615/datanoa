@@ -176,6 +176,12 @@ export type WorkerRequest =
   | { id: string; type: 'txRollback' }
   | { id: string; type: 'txSetAutoCommit'; enabled: boolean }
   | { id: string; type: 'txStatus' }
+  | {
+      id: string
+      type: 'erIntrospectBatch'
+      schema?: string
+      tables: Array<{ name: string; kind: 'table' | 'view' }>
+    }
 
 workerPort.on('message', (msg: WorkerRequest) => {
   try {
@@ -592,6 +598,59 @@ workerPort.on('message', (msg: WorkerRequest) => {
     if (msg.type === 'serialize') {
       const data = db.serialize()
       workerPort.postMessage({ id: msg.id, ok: true, data })
+      return
+    }
+
+    if (msg.type === 'erIntrospectBatch') {
+      const targetSchema = (msg.schema || 'main').trim() || 'main'
+      const prefix =
+        targetSchema.toLowerCase() === 'main' ? '' : `"${targetSchema.replace(/"/g, '""')}".`
+      const colRows: Array<Record<string, unknown>> = []
+      const fkRows: Array<Record<string, unknown>> = []
+
+      for (const item of msg.tables || []) {
+        const tableName = typeof item.name === 'string' ? item.name : ''
+        if (!tableName) continue
+        const escapedTable = `"${tableName.replace(/"/g, '""')}"`
+
+        try {
+          const pragmaCols = db.prepare(`PRAGMA ${prefix}table_xinfo(${escapedTable});`).all()
+          for (const rawCol of normalizeSqliteRecordList(pragmaCols)) {
+            colRows.push({
+              table_name: tableName,
+              col_name: rawCol.name,
+              col_type: rawCol.type,
+              col_notnull: rawCol.notnull,
+              col_pk: rawCol.pk,
+              col_hidden: rawCol.hidden,
+            })
+          }
+        } catch {
+          // Skip broken views or restricted pragmas without crashing the batch
+        }
+
+        if (item.kind === 'table') {
+          try {
+            const pragmaFks = db.prepare(`PRAGMA ${prefix}foreign_key_list(${escapedTable});`).all()
+            for (const rawFk of normalizeSqliteRecordList(pragmaFks)) {
+              fkRows.push({
+                table_name: tableName,
+                fk_id: rawFk.id,
+                seq: rawFk.seq,
+                to_table: rawFk.table,
+                from_col: rawFk.from,
+                to_col: rawFk.to,
+                on_delete: rawFk.on_delete,
+                on_update: rawFk.on_update,
+              })
+            }
+          } catch {
+            // Skip per-table foreign_key_list failures cleanly
+          }
+        }
+      }
+
+      workerPort.postMessage({ id: msg.id, ok: true, data: { colRows, fkRows } })
       return
     }
 
